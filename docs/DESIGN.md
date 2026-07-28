@@ -805,10 +805,35 @@ caller never asked for.
 ### 7.1 Pipeline
 
 ```
-resolve alias → resolve group → filter (health, quota, budget, policy, capability)
-  → order by strategy → try acquire (§5.3; next candidate on failure)
+resolve alias → resolve group → filter (quota, budget, policy, capability)
+  → order by strategy → try acquire (health, then capacity — §5.3; next candidate on failure)
   → execute → on error classify → fallback (§7.6) → meter (§12)
 ```
+
+> **Health is not in the filter stage, because health is not a query.** An earlier draft put it
+> there. Admitting a half-open deployment *consumes* its single probe slot, so evaluating
+> health for every candidate during filtering burns probes on candidates that are never
+> dispatched — delaying recovery precisely when the system is under the load that makes
+> recovery matter. It is therefore evaluated once per candidate inside the try-acquire walk,
+> where a positive answer is immediately followed by a dispatch.
+
+**A no-opinion signal must never read as a winning one.** Three inputs can be absent, and each
+has a direction in which absence silently wins:
+
+| Signal | Absent means | The trap |
+|---|---|---|
+| latency sample | unproven | zero is the *fastest* value — an unproven backend wins on ignorance |
+| throughput sample | unproven | zero is the *slowest* — it loses forever and never earns the sample that would let it compete |
+| price | unpriced | zero is the *cheapest* — the deployment nobody priced wins every group, permanently and silently |
+
+All three resolve the same way: **absent is no opinion, not a value.** The candidate is skipped
+by that comparator and ranked by the next one in the chain, and a counter records it so an
+operator can see what is unmeasured rather than inferring it from suspicious routing.
+
+Two of these were only half-stated before. §8.3's "an unpriced model costs zero" is right for
+*accounting* and wrong for *routing*: routing reads marginal cost only when it is actually
+known. And the throughput direction is the more dangerous of the latency pair, because losing
+forever reads as conservative and survives review.
 
 ### 7.2 Alias **[R1-C1]**
 
@@ -982,6 +1007,13 @@ priority_mapping:
 
 Unknown backends receive only the header, which is harmless if ignored.
 
+> **Negating for a descending engine puts dorang's entire scale on the non-positive half-line**,
+> which is internally consistent and dangerous on a *shared* server: any co-tenant sending a
+> naive positive priority then outranks all dorang traffic, realtime included. `EmitRule.Base`
+> offsets the emitted range for exactly this case. It defaults to plain negation, because on a
+> dedicated engine that is correct and an arbitrary offset is not — but an operator sharing an
+> engine must set it, and the profile says so.
+
 > ⚠️ **The two self-hosted engines order priority in opposite directions, using the same field
 > name and type, and both return `200` either way.** vLLM schedules the lowest value first;
 > SGLang schedules the **highest** first by default. A single shared constant is therefore
@@ -1029,7 +1061,7 @@ Unknown backends receive only the header, which is harmless if ignored.
 After that, an error event ends the stream. Duplicated output is worse than a visible
 failure. This boundary is enforced by a test.
 
-Bounded by `max_hops` and a wall-clock budget. Per-deployment circuit breakers remove
+Bounded by `max_hops` and a wall-clock budget. **`max_hops` counts hops after the first dispatch**, so `max_hops: 3` permits four attempts in total — stated because either reading is defensible and the difference is a whole extra request. Per-deployment circuit breakers remove
 repeatedly failing targets from candidacy, with a single probe on half-open.
 
 ---

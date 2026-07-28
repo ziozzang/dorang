@@ -472,7 +472,12 @@ func contentCapabilities(c Content) Capability {
 //
 // Droppable losses are NOT reported here: they are reported by name, and the
 // name is all there is to say about them. Callers get those from
-// RequiredCapabilities().Missing(have).Droppable().Params().
+// have.Missing(RequiredCapabilities()).Droppable().Params().
+//
+// Note the receiver: Missing reports what the RECEIVER lacks of its argument, so the
+// backend's capabilities go on the left. Written the other way round it yields the
+// backend's *surplus* capabilities, which is silently plausible — the first caller to
+// follow an earlier version of this line implemented exactly that bug.
 func (r *Request) Downgrades(have Capability) []Downgrade {
 	if r == nil {
 		return nil
