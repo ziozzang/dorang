@@ -222,6 +222,12 @@ Importing existing credentials is a **migration window**, not an architecture.
 
 **Lookup with two schemes stays one lookup.** A scheme-independent index key
 `lookup = sha256(token)[:16]` selects the row; only verification branches on scheme.
+
+> That definition is load-bearing for import, not merely convenient: since it is a **prefix of
+> the legacy digest**, an importer can derive both `lookup` and the legacy `token_hash` from
+> the digest a source system already stores, and therefore **never needs the plaintext key**.
+> If `lookup` were defined any other way, importing would require credentials nobody has, and
+> migration would become a flag day. A test pins the identity so it cannot drift.
 With `auth.rehash_on_use`, a successful legacy verification schedules an asynchronous
 upgrade to `dorang_v1`, so the migration completes without downtime and without a flag day.
 
@@ -994,14 +1000,31 @@ scan. The supported queries are fixed first:
 
 | Query | Index |
 |---|---|
-| recent requests for a key | `(api_key_id, ts DESC)` |
-| recent requests for a team | `(team_id, ts DESC)` |
-| by trace id | `(trace_id)` |
-| spend for a credential over a range | `(credential_id, ts DESC)` |
-| errors over a range | partial index on `status >= 400`, `(ts DESC)` |
-| by tag | normalized `request_log_tags`, not an array scan |
+| recent requests for a key | `(api_key_id, ts DESC, id DESC)` |
+| recent requests for a team | `(team_id, ts DESC, id DESC)` |
+| by trace id, within a range | `(trace_id, ts DESC, id DESC)` |
+| spend for a credential over a range | `(credential_id, ts DESC, id DESC)` |
+| errors over a range | partial index on `status >= 400`, `(ts DESC, id DESC)` |
+| by tag | normalized `request_log_tags (tag, ts DESC, request_id DESC)` |
 
 All ledger queries require a bounded time range and paginate. Unbounded search is refused.
+
+Three corrections the implementation forced:
+
+- **The trailing `id` is not decoration.** Pagination is keyset — `(ts, id) < (?, ?)` — so
+  without `id` in the index every page costs a sort. An earlier draft listed `(key, ts DESC)`
+  and would have paginated by sorting.
+- **Trace-id lookup takes a range like everything else.** The draft exempted it, which
+  contradicts the same section's own rule: on a partitioned ledger a bare trace-id lookup
+  fans out across every partition's index for the whole retention period.
+- **There is deliberately no default partition.** It converts a missing-partition failure
+  from loud to silent, and then attaching the real partition later requires a full scan of
+  everything that landed in the default. The writer instead pre-creates ahead and recovers
+  in-line when the server reports no partition for a row.
+
+**Cross-node write ordering matters.** Rollup batches are written in sorted primary-key
+order. Two nodes flushing overlapping key sets in map-iteration order deadlock against each
+other — a failure that appears only under concurrency and only sometimes.
 
 ### 9.4 Rollups **[R1-13]**
 
