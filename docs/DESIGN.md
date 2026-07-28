@@ -2174,6 +2174,81 @@ the same account. The token is an implementation detail of talking to it.
 `Snapshot`. The only thing that leaves this subsystem is the credential's opaque id and its
 health.
 
+### 11.2c Key rotation, and how fast a revocation actually takes effect
+
+Client keys are managed the way a credential should be: **the identity is durable and the
+secret is not.**
+
+#### Rotation
+
+A key has an id, and one or more **secrets** attached to it. Rotation mints a new secret and
+leaves the old one valid for a grace period.
+
+```yaml
+auth:
+  rotation:
+    grace: 24h              # old secret stays valid this long after rotation
+    max_secrets: 2          # at most one overlap in flight
+    max_age: 90d            # policy: warn, then require rotation
+```
+
+Everything else about the key — its tier, budget, spend to date, model allow-list, rate
+limits, team, and its whole ledger history — **belongs to the id, not the secret**. That is
+the entire point. A rotation that also reset the limits would be a re-provisioning, and an
+operator facing that will put it off, which is how a five-year-old secret happens.
+
+- `POST /key/rotate` returns the new secret **once**, and reports when the old one expires.
+- Both secrets authenticate to the same principal during the grace period, and the ledger
+  records which one was used — so an operator can see whether the client actually rolled
+  before the window closes, instead of finding out when it shuts.
+- The grace period can be **ended early**, which is what a suspected compromise needs: rotate
+  now, cut the old secret immediately, keep everything else.
+- `max_age` is a policy, not an execution. dorang warns and reports; it does not silently
+  break a working integration on a timer.
+
+#### Revocation is only as fast as the cache — and that was not stated
+
+§11.2's hot path answers from a lock-free snapshot with a TTL. That is what makes
+authentication 354 ns, and it means a revoked key **keeps working until the snapshot
+refreshes** — on every node independently.
+
+For an expiry that is fine. For a **compromised key**, a pended key (§11.6), or a rotation cut
+short, it is a window during which the thing you just switched off is still serving. Nothing
+in the design said how long that window is, which is the same class of omission as a control
+that is never called: the mechanism exists and its guarantee was never stated.
+
+So revocation is explicit rather than incidental:
+
+1. **A revocation, a pend, and an early grace cut all publish an invalidation**, and the
+   snapshot drops that key immediately on receipt. The TTL becomes the *fallback* for a node
+   that missed the message, not the mechanism.
+2. **Single node**: immediate, since there is one snapshot.
+   **Clustered**: through the same coordination §13 already uses, and the **worst case is
+   published as a number** — the same rule §5.6 applies to overshoot. "Revocation is fast" is
+   not a specification.
+3. **The bound is enforced by shortening the TTL for negative entries specifically.** A key
+   that was refused is cheap to re-check; a key that is serving is not. The two do not need
+   the same freshness, and treating them alike is what made the number large.
+4. **A revocation must not be lost by a node that was down.** On rejoin a node reloads rather
+   than trusting a stale snapshot, and this is one of the few places the request path is
+   deliberately allowed to wait: serving from a snapshot known to be stale is worse than a
+   brief pause at startup.
+
+> This interacts directly with the token guard (§11.6). A guard that pends a key but leaves it
+> serving for a cache TTL has not stopped anything — it has only started a timer. Pend uses
+> the same invalidation path, and the guard's own tests assert the key stops serving, not that
+> a flag was set.
+
+#### What is deliberately not built
+
+Short-lived derived tokens — minting a brief access token from a long-lived key, the way OAuth
+does — would shrink the exposure of a leaked secret further. It is not built, because it moves
+a token exchange onto the client's critical path and requires every client to implement
+refresh, which is a large cost for callers who mostly hold their key in an environment
+variable. Rotation with a grace period gets most of the benefit for none of that, and the
+door is left open: the key already has multiple secrets and an expiry per secret, which is
+the shape a derived token would use.
+
 ### 11.3 Administration UI
 
 A single SPA embedded in the binary — no external assets, works offline. Version 1 ships
@@ -2575,5 +2650,6 @@ done when something end to end exercises it and asserts an observable outside it
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
 | W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **closed** — soft reservation as a prefix-ordered claim on one unit per axis key; deadlock excluded by the §5.7 axis order; the oldest waiter is served within `SoftReserveAfter + axes` releases. Measured +5.3% on the mixed contended benchmark, nil on single-axis. On by default, with an off switch |
+| W11 | **Revocation latency was never specified** (§11.2c) | **open** — the auth snapshot's TTL is what makes authentication 354 ns, and it also means a revoked, pended, or rotation-cut key keeps serving until the snapshot refreshes, per node. An invalidation path plus a published worst case closes it; until then the guarantee is "eventually", which for a compromised key is not a guarantee |
 | W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
 | W9 | **Quota and budget state is in-memory only** (§9.6) | **closed** — the request path reserves against the durable ledger. The gate holds an upper bound before every upstream call, settles with the actual cost, and refuses an exhausted budget as a terminal `400` (§6.4); a restart re-reads the counter rather than starting the period over, and a graceful stop returns the unspent part so a planned restart costs nothing. The hold is taken after the routing decision rather than at the gate, because §6.4's estimate prices output at `max_tokens` and there is no price before a deployment is chosen — the property that mattered (concurrent requests cannot both see the pre-spend balance, and anything that never reaches an upstream is refunded in full) is unaffected. No in-memory path is kept beside it: `quota.Budget` serializes on one mutex where the ledger takes an atomic compare-and-swap on a block it already holds, so the durable path is also the cheaper one. Was **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Was **open** — a restart resets the windows |
