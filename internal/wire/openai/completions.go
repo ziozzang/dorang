@@ -168,6 +168,12 @@ func (p *Prompt) UnmarshalJSON(b []byte) error {
 }
 
 // CompletionResponse is a complete legacy text completion.
+//
+// This shape is NOT chat completions and its unmodelled members do not
+// interchange with that one — a choice here has `text` where a choice there has
+// `message`. It carries its own [canonical.FamilyOpenAICompletions] tag for
+// exactly that reason, so a chat backend's extras never surface here and this
+// surface's never surface there.
 type CompletionResponse struct {
 	ID      string             `json:"id"`
 	Object  string             `json:"object"`
@@ -177,6 +183,34 @@ type CompletionResponse struct {
 	Usage   *Usage             `json:"usage,omitempty"`
 
 	SystemFingerprint *string `json:"system_fingerprint,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var completionResponseKnown = knownKeys("id", "object", "created", "model",
+	"choices", "usage", "system_fingerprint")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (r CompletionResponse) MarshalJSON() ([]byte, error) {
+	type alias CompletionResponse
+	return marshalWithExtra(alias(r), r.Extra, completionResponseKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
+// json.Unmarshal rather than the strict filter — see [strictUnmarshal].
+func (r *CompletionResponse) UnmarshalJSON(b []byte) error {
+	type alias CompletionResponse
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, completionResponseKnown)
+	if err != nil {
+		return err
+	}
+	*r = CompletionResponse(a)
+	r.Extra = extra
+	return nil
 }
 
 // CompletionChoice is one completed choice.
@@ -188,6 +222,33 @@ type CompletionChoice struct {
 	Logprobs               json.RawMessage            `json:"logprobs,omitempty"`
 	FinishReason           *string                    `json:"finish_reason,omitempty"`
 	ProviderSpecificFields map[string]json.RawMessage `json:"provider_specific_fields,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var completionChoiceKnown = knownKeys("index", "text", "logprobs",
+	"finish_reason", "provider_specific_fields")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (c CompletionChoice) MarshalJSON() ([]byte, error) {
+	type alias CompletionChoice
+	return marshalWithExtra(alias(c), c.Extra, completionChoiceKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (c *CompletionChoice) UnmarshalJSON(b []byte) error {
+	type alias CompletionChoice
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, completionChoiceKnown)
+	if err != nil {
+		return err
+	}
+	*c = CompletionChoice(a)
+	c.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +332,11 @@ func CompletionResponseToCanonical(w *CompletionResponse, opt *DecodeOptions) (*
 	if w == nil {
 		return nil, errorString("openai: nil completion response")
 	}
-	out := &canonical.Response{ID: w.ID, Model: w.Model, Created: w.Created}
+	out := &canonical.Response{
+		ID: w.ID, Model: w.Model, Created: w.Created,
+		Extra:       w.Extra,
+		ExtraFamily: canonical.FamilyOpenAICompletions,
+	}
 	if opt != nil && opt.Model != "" {
 		out.Model = opt.Model
 	}
@@ -280,6 +345,7 @@ func CompletionResponseToCanonical(w *CompletionResponse, opt *DecodeOptions) (*
 	}
 	if w.Usage != nil {
 		out.Usage = usageToCanonical(w.Usage)
+		out.UsageExtra = usageExtraOf(w.Usage)
 	}
 	out.Choices = make([]canonical.Choice, 0, len(w.Choices))
 	for i := range w.Choices {
@@ -290,7 +356,9 @@ func CompletionResponseToCanonical(w *CompletionResponse, opt *DecodeOptions) (*
 				Role:    canonical.RoleAssistant,
 				Content: canonical.Content{canonical.TextBlock(c.Text)},
 			},
-			Logprobs: c.Logprobs,
+			Logprobs:       c.Logprobs,
+			Extra:          c.Extra,
+			ProviderFields: c.ProviderSpecificFields,
 		}
 		cc.StopReason, cc.NativeStopReason = stopReasonOfChoice(c.FinishReason, c.ProviderSpecificFields, opt.warn())
 		out.Choices = append(out.Choices, cc)
@@ -433,14 +501,26 @@ func EncodeCompletionResponse(r *canonical.Response, opt *ResponseOptions) (*Com
 	if r.SystemFingerprint != "" {
 		out.SystemFingerprint = ptr(r.SystemFingerprint)
 	}
+	// Same-family only; see [canonical.Family].
+	same := r.SameFamily(canonical.FamilyOpenAICompletions)
+	if same {
+		out.Extra = r.Extra
+	}
 	if r.Usage != nil {
 		out.Usage = EncodeUsage(*r.Usage)
+		if same {
+			attachUsageExtra(out.Usage, r.UsageExtra)
+		}
 	}
 	loss := opt.loss()
 	out.Choices = make([]CompletionChoice, 0, len(r.Choices))
 	for i := range r.Choices {
 		c := &r.Choices[i]
 		wc := CompletionChoice{Index: c.Index, Logprobs: c.Logprobs}
+		if same {
+			wc.Extra = c.Extra
+			wc.ProviderSpecificFields = c.ProviderFields
+		}
 		wc.Text = c.Message.Content.Flatten()
 		for j := range c.Message.Content {
 			if c.Message.Content[j].Kind != canonical.KindText {
@@ -458,7 +538,7 @@ func EncodeCompletionResponse(r *canonical.Response, opt *ResponseOptions) (*Com
 				native = string(c.StopReason)
 			}
 			if native != "" {
-				wc.ProviderSpecificFields = nativeFinishFields(native)
+				wc.ProviderSpecificFields = withNativeFinish(wc.ProviderSpecificFields, native)
 			}
 		}
 		out.Choices = append(out.Choices, wc)

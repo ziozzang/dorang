@@ -294,8 +294,11 @@ func TestMultipartFileOverTheCapIs413(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"code":"request_too_large"`) {
 		t.Errorf("body %s", w.Body.String())
 	}
-	// COMPATIBILITY §11.2 fixes the type for this row.
-	if !strings.Contains(w.Body.String(), `"type":"request_too_large"`) {
+	// COMPATIBILITY §11.2 fixes the type for this row PER FAMILY, and this is an
+	// OpenAI-family route: the OpenAI column says `invalid_request_error` and
+	// only the Anthropic column says `request_too_large`. This assertion used to
+	// require the Anthropic spelling here while citing §11.2 for it.
+	if !strings.Contains(w.Body.String(), `"type":"invalid_request_error"`) {
 		t.Errorf("body %s", w.Body.String())
 	}
 }
@@ -308,7 +311,9 @@ func TestMultipartRejectsANonMultipartBody(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"code":"invalid_body"`) {
+	// §11.2's "Malformed request body" row: `invalid_request`, not dorang's own
+	// `invalid_body`.
+	if !strings.Contains(w.Body.String(), `"code":"invalid_request"`) {
 		t.Errorf("body %s", w.Body.String())
 	}
 }

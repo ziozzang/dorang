@@ -207,7 +207,21 @@ func TestToolNameRegistryDoesNotCostTheFastPath(t *testing.T) {
 // ready. Nothing is hidden there — the client sees the truncated stream the
 // backend sent — and validating it would mean parsing every frame, which is the
 // entire cost that path exists to avoid.
+// # The two endings are different findings
+//
+// A tool call whose arguments never parse is finding 4 only when the stream
+// ENDED: the frames all arrived, [DONE] arrived, and what the backend produced
+// is a call nobody can execute. The same broken document with no [DONE] is a
+// stream that stopped mid-write, and the operator's next step is the connection
+// rather than the backend's tool serialization. Both are asserted below,
+// because until the relay could see a terminator at all only the second fixture
+// existed and it was reported as the first.
 func TestMalformedToolArgumentsAreCountedAndSaidInBand(t *testing.T) {
+	const callFrame = `data: {"id":"1","object":"chat.completion.chunk","created":1,` +
+		`"model":"upstream-model","choices":[{"index":0,"delta":{"tool_calls":[` +
+		`{"index":0,"id":"call_1","type":"function","function":` +
+		`{"name":%s,"arguments":"{\"a\":"}}]}}]}` + "\n\n"
+
 	for _, tc := range []struct {
 		name   string
 		client catalog.API
@@ -216,35 +230,41 @@ func TestMalformedToolArgumentsAreCountedAndSaidInBand(t *testing.T) {
 		{"messages client", catalog.APIAnthropicMessages, `"type":"error"`},
 		{"chat client", catalog.APIOpenAIChat, `"error"`},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFakeUpstream(t)
-			f.setHandler(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(w, `data: {"id":"1","object":"chat.completion.chunk","created":1,`+
-					`"model":"upstream-model","choices":[{"index":0,"delta":{"tool_calls":[`+
-					`{"index":0,"id":"call_1","type":"function","function":`+
-					`{"name":`+strconv.Quote(longToolName)+`,"arguments":"{\"a\":"}}]}}]}`+"\n\n")
-				// No [DONE], no finish_reason: the upstream stopped mid-document.
-			})
+		for _, end := range []struct {
+			name string
+			tail string
+			code string
+		}{
+			{"the stream ended on the broken call", "data: [DONE]\n\n", CodeMalformedToolArguments},
+			{"the stream stopped mid-document", "", CodeUpstreamStreamTruncated},
+		} {
+			t.Run(tc.name+"/"+end.name, func(t *testing.T) {
+				f := newFakeUpstream(t)
+				f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, callFrame, strconv.Quote(longToolName))
+					_, _ = io.WriteString(w, end.tail)
+				})
 
-			p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
-			rec := httptest.NewRecorder()
-			res := testBackend("k").Do(context.Background(), target(p), toolCall(tc.client, true), rec)
-			if res.Err == nil {
-				t.Fatal("a stream that ended mid-JSON was recorded as a clean success")
-			}
-			if res.Err.Code != CodeMalformedToolArguments {
-				t.Errorf("code = %q, want %q", res.Err.Code, CodeMalformedToolArguments)
-			}
-			body := rec.Body.String()
-			if strings.Contains(body, `"finish_reason":"tool_calls"`) ||
-				strings.Contains(body, `"stop_reason":"tool_use"`) {
-				t.Errorf("the client was told a broken call is ready:\n%s", body)
-			}
-			if !strings.Contains(body, tc.errKey) {
-				t.Errorf("no in-band error reached the client:\n%s", body)
-			}
-		})
+				p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+				rec := httptest.NewRecorder()
+				res := testBackend("k").Do(context.Background(), target(p), toolCall(tc.client, true), rec)
+				if res.Err == nil {
+					t.Fatal("a stream that ended mid-JSON was recorded as a clean success")
+				}
+				if res.Err.Code != end.code {
+					t.Errorf("code = %q, want %q", res.Err.Code, end.code)
+				}
+				body := rec.Body.String()
+				if strings.Contains(body, `"finish_reason":"tool_calls"`) ||
+					strings.Contains(body, `"stop_reason":"tool_use"`) {
+					t.Errorf("the client was told a broken call is ready:\n%s", body)
+				}
+				if !strings.Contains(body, tc.errKey) {
+					t.Errorf("no in-band error reached the client:\n%s", body)
+				}
+			})
+		}
 	}
 }
 

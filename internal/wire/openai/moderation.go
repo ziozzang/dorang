@@ -157,10 +157,41 @@ type moderationPart struct {
 }
 
 // ModerationResponse is a moderations answer.
+//
+// Moderation arrives and leaves in the same shape — there is one moderations
+// wire form and dorang serves it to the same clients the backend answers — so
+// Extra is a straight pass-through with no family question to ask.
 type ModerationResponse struct {
 	ID      string             `json:"id"`
 	Model   string             `json:"model"`
 	Results []ModerationResult `json:"results"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var moderationResponseKnown = knownKeys("id", "model", "results")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (r ModerationResponse) MarshalJSON() ([]byte, error) {
+	type alias ModerationResponse
+	return marshalWithExtra(alias(r), r.Extra, moderationResponseKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
+// json.Unmarshal with a case-folding split — see [splitExtraFold].
+func (r *ModerationResponse) UnmarshalJSON(b []byte) error {
+	type alias ModerationResponse
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, moderationResponseKnown)
+	if err != nil {
+		return err
+	}
+	*r = ModerationResponse(a)
+	r.Extra = extra
+	return nil
 }
 
 // ModerationResult is the verdict for one input.
@@ -174,6 +205,17 @@ type ModerationResult struct {
 	CategoryScores    moderationScores  `json:"category_scores"`
 	CategoryApplied   moderationApplied `json:"category_applied_input_types,omitempty"`
 	categoriesBacking []canonical.ModerationCategory
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var moderationResultKnown = knownKeys("flagged", "categories", "category_scores",
+	"category_applied_input_types")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (r ModerationResult) MarshalJSON() ([]byte, error) {
+	type alias ModerationResult
+	return marshalWithExtra(alias(r), r.Extra, moderationResultKnown)
 }
 
 type moderationFlags struct {
@@ -279,7 +321,11 @@ func (r *ModerationResult) UnmarshalJSON(b []byte) error {
 		c.Applied = raw.CategoryApplied[n]
 		cats = append(cats, c)
 	}
-	*r = ModerationResult{Flagged: raw.Flagged}
+	extra, err := splitExtraFold(b, moderationResultKnown)
+	if err != nil {
+		return err
+	}
+	*r = ModerationResult{Flagged: raw.Flagged, Extra: extra}
 	r.setCategories(cats)
 	return nil
 }
@@ -331,7 +377,7 @@ func DecodeModerationResponse(b []byte, model string) (*canonical.ModerationResp
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
 	}
-	out := &canonical.ModerationResponse{ID: w.ID, Model: w.Model}
+	out := &canonical.ModerationResponse{ID: w.ID, Model: w.Model, Extra: w.Extra}
 	if model != "" {
 		// DESIGN §7.2: the body carries the name the client asked for.
 		out.Model = model
@@ -341,6 +387,7 @@ func DecodeModerationResponse(b []byte, model string) (*canonical.ModerationResp
 		out.Results = append(out.Results, canonical.ModerationResult{
 			Flagged:    w.Results[i].Flagged,
 			Categories: w.Results[i].categoriesBacking,
+			Extra:      w.Results[i].Extra,
 		})
 	}
 	return out, nil
@@ -351,10 +398,11 @@ func MarshalModerationResponse(r *canonical.ModerationResponse) ([]byte, error) 
 	if r == nil {
 		return nil, errorString("openai: nil moderation response")
 	}
-	w := ModerationResponse{ID: r.ID, Model: r.Model}
+	w := ModerationResponse{ID: r.ID, Model: r.Model, Extra: r.Extra}
 	w.Results = make([]ModerationResult, len(r.Results))
 	for i := range r.Results {
 		w.Results[i].Flagged = r.Results[i].Flagged
+		w.Results[i].Extra = r.Results[i].Extra
 		w.Results[i].setCategories(r.Results[i].Categories)
 	}
 	return Marshal(w)

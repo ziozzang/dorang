@@ -118,6 +118,16 @@ const (
 	// HeaderNativeErrorType carries an upstream error type outside the
 	// canonical vocabulary.
 	HeaderNativeErrorType = "X-Dorang-Native-Error-Type"
+	// HeaderNativeErrorCode carries the upstream's own error code when dorang
+	// could not put it in the envelope — a number where §7.1 requires a string,
+	// or a JSON object or array where it requires a scalar.
+	//
+	// The envelope then carries dorang's canonical code and this carries what
+	// the backend actually sent, which is the pair COMPATIBILITY §11.3 promises.
+	// A backend that sent a plain string code does not set this: that code is
+	// already in the envelope, and repeating it would make the header's presence
+	// mean nothing.
+	HeaderNativeErrorCode = "X-Dorang-Native-Error-Code"
 	// HeaderReplayable reports whether the body was retained for a fallback
 	// hop (DESIGN §15.4).
 	HeaderReplayable = "X-Dorang-Replayable"
@@ -136,6 +146,82 @@ const (
 	quotaPrefix = "X-Dorang-Quota-"
 	quotaSuffix = "-Used-Pct"
 )
+
+// The legacy header spellings dorang mirrors when compat.legacy_headers is on
+// (COMPATIBILITY §7.7).
+//
+// They are the reference proxy's names, and they are here because a cutover
+// breaks SILENTLY without them: a dashboard, a cost exporter or a support script
+// that reads x-litellm-response-cost does not error when the header stops
+// arriving, it reports zero. §0.3's "run alongside, then take over" is not a
+// migration anyone can perform if taking over quietly zeroes the numbers.
+//
+// Only names dorang has a real value for are mirrored. The reference proxy emits
+// several more; each one dorang does NOT mirror is listed in §7.7 with the
+// reason, because a header emitted with an invented value is worse than an
+// absent one — the reader cannot tell it apart from a real measurement. In
+// particular there is no x-litellm-version (dorang is not that proxy and would
+// have to lie about which one it is) and no x-litellm-model-api-base (the
+// upstream's URL is not a tenant's business).
+//
+// Each mirror is stamped beside the dorang header it copies, so it inherits the
+// same §10.4 detail gating: a mirror that arrived when its source did not would
+// be a second, disagreeing answer to "what is always on".
+const (
+	// LegacyHeaderCallID mirrors HeaderRequestID.
+	LegacyHeaderCallID = "X-Litellm-Call-Id"
+	// LegacyHeaderModelID mirrors HeaderDeployment: the reference proxy's
+	// "model id" is the id of the DEPLOYMENT that served the request, which is
+	// what dorang calls a deployment. It is deliberately not HeaderUpstreamModel,
+	// which is the provider-side model name.
+	LegacyHeaderModelID = "X-Litellm-Model-Id"
+	// LegacyHeaderResponseCost mirrors HeaderCostUSD.
+	LegacyHeaderResponseCost = "X-Litellm-Response-Cost"
+	// LegacyHeaderKeySpend mirrors HeaderSpendUSD.
+	LegacyHeaderKeySpend = "X-Litellm-Key-Spend"
+	// LegacyHeaderKeyMaxBudget mirrors HeaderBudgetUSD.
+	LegacyHeaderKeyMaxBudget = "X-Litellm-Key-Max-Budget"
+	// LegacyHeaderAttemptedRetries mirrors HeaderAttempt, less one: dorang
+	// counts attempts and the reference proxy counts retries, so the first
+	// attempt is 1 here and 0 there. Copying the number across unchanged would
+	// report one retry for every request that never retried.
+	LegacyHeaderAttemptedRetries = "X-Litellm-Attempted-Retries"
+	// LegacyHeaderResponseDuration mirrors HeaderLatencyMS.
+	LegacyHeaderResponseDuration = "X-Litellm-Response-Duration-Ms"
+)
+
+// stampLegacyHeaders mirrors the legacy spellings for the values dorang has.
+//
+// It is called only when compat.legacy_headers is on, which is off by default:
+// these are another vendor's names on dorang's responses, and emitting them
+// unasked would make dorang claim to be a proxy it is not.
+func stampLegacyHeaders(h http.Header, rq *Request, r *Result) {
+	h.Set(LegacyHeaderCallID, rq.ID)
+	if r.UpstreamModel != "" {
+		h.Set(HeaderRealModel, r.UpstreamModel)
+	}
+	if r.Deployment != "" {
+		h.Set(LegacyHeaderModelID, r.Deployment)
+	}
+	if r.Priced {
+		var b [32]byte
+		h.Set(LegacyHeaderResponseCost, string(appendNanoUSD(b[:0], r.CostNanoUSD)))
+	}
+	if !rq.Detail {
+		return
+	}
+	if r.Attempt > 0 {
+		h.Set(LegacyHeaderAttemptedRetries, strconv.Itoa(r.Attempt-1))
+	}
+	setMillis(h, LegacyHeaderResponseDuration, r.LatencyNS)
+	if r.Priced {
+		var b [32]byte
+		h.Set(LegacyHeaderKeySpend, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
+		if r.BudgetNanoUSD > 0 {
+			h.Set(LegacyHeaderKeyMaxBudget, string(appendNanoUSD(b[:0], r.BudgetNanoUSD)))
+		}
+	}
+}
 
 // The standard-form rate-limit headers.
 const (
@@ -179,9 +265,6 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int) {
 	}
 	if r.UpstreamModel != "" {
 		h.Set(HeaderUpstreamModel, r.UpstreamModel)
-		if cfg.legacyHeaders {
-			h.Set(HeaderRealModel, r.UpstreamModel)
-		}
 	}
 	if r.Deployment != "" {
 		h.Set(HeaderDeployment, r.Deployment)
@@ -189,6 +272,9 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int) {
 	if r.Priced {
 		var b [32]byte
 		h.Set(HeaderCostUSD, string(appendNanoUSD(b[:0], r.CostNanoUSD)))
+	}
+	if cfg.legacyHeaders {
+		stampLegacyHeaders(h, rq, r)
 	}
 
 	if status == http.StatusTooManyRequests && r.RetryAfterSeconds > 0 {

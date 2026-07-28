@@ -64,7 +64,7 @@ the ratio, not a preference.
 |---|---|
 | 3.1 | A usage chunk is emitted **only** when `stream_options.include_usage` is exactly `true`. Truthy is not enough. |
 | 3.2 | Without `stream_options`, usage is computed but **not** put on the wire. |
-| 3.3 | ⚠️ **Divergence from OpenAI.** The reference proxy's usage chunk carries `"choices":[{"index":0,"delta":{}}]`; OpenAI sends `"choices": []`. dorang follows **the reference proxy**, because existing clients were built against it, and exposes `compat.usage_chunk_choices: empty` for callers who want strict OpenAI shape. |
+| 3.3 | ⚠️ **Divergence from OpenAI.** The reference proxy's usage chunk carries `"choices":[{"index":0,"delta":{}}]`; OpenAI sends `"choices": []`. dorang follows **the reference proxy**, because existing clients were built against it. `compat.usage_chunk_choices` is in the schema and **this build serves only `stub`**: `empty` is refused at load, naming what is missing, rather than accepted and ignored. CONFIG §23.1 carries the row. |
 | 3.4 | Some backends send usage *after* `finish_reason`. The accumulator must accept late usage rather than closing on the finish. |
 | 3.5 | Usage may carry non-OpenAI extensions — cost, cached-token detail, server tool use. dorang emits its own under `x-dorang-*` headers and mirrors the widely-read usage extension fields for compatibility. |
 
@@ -102,7 +102,7 @@ not a passthrough.
 | 6.5 | `stop_sequence` is `null` on the adapter path. |
 | 6.6 | Content-block indexing is **stateful**: a held `message_delta`, a chunk queue, and synthesized `content_block_stop` → `content_block_start` pairs on block transitions. A `content_block_stop` must always precede the terminal `message_delta`. This is the most intricate state machine in the whole gateway and gets its own fuzz target. |
 | 6.7 | Prompt caching: the final `message_delta` carries the real values, and cache fields appear **only when `> 0`** — so `message_start` omits them rather than zero-seeding. An earlier draft said both "seeds at 0" and "only when > 0", which cannot both be literal. The vendor itself emits explicit zeros there, so a golden captured from the vendor will not match one captured from a proxy. `input_tokens = prompt − cache_read − cache_creation`, clamped at zero — which only type-checks if the canonical count is **inclusive** (DESIGN §10.7). |
-| 6.8 | ⚠️ Non-streaming responses include a **non-spec `usage.total_tokens`** while streaming responses omit it. The two shapes differ by one field. dorang reproduces this asymmetry by default under `compat.anthropic_total_tokens: true`. |
+| 6.8 | ⚠️ Non-streaming responses include a **non-spec `usage.total_tokens`** while streaming responses omit it. The two shapes differ by one field. dorang reproduces this asymmetry. `compat.anthropic_total_tokens` is in the schema and **this build serves only `true`**: `false` is refused at load, naming what is missing, rather than accepted and ignored. CONFIG §23.1 carries the row. |
 | 6.9 | `/v1/messages/count_tokens` returns exactly `{"input_tokens": <number>}` and accepts `?beta=true`. |
 
 ## 7. Cross-cutting
@@ -115,8 +115,49 @@ not a passthrough.
 | 7.4 | `GET /v1/models` items are `{"id","object":"model","created":<constant>,"owned_by"}`. `created` is a **fixed constant**, not the current time — clients cache on it. The list is filtered by the calling key's model allow-list. |
 | 7.5 | ⚠️ **Route matching is specificity-ordered.** `/openai/deployments/{model}/chat/completions` must match before `/openai/{endpoint...}`. A naive prefix router silently swallows the specific route into the catch-all. |
 | 7.6 | Unsupported parameters are **dropped silently by default**, not rejected. A gateway that forwards everything verbatim surfaces upstream 400s that clients have never seen. dorang defaults `drop_unsupported: true` for this reason. |
-| 7.7 | Response headers are read by tooling — a call id and a model/deployment id in particular. dorang emits `x-dorang-request-id` and `x-dorang-deployment`, and mirrors the widely-read legacy header names when `compat.legacy_headers` is on. |
+| 7.7 | Response headers are read by tooling — a call id and a model/deployment id in particular. dorang emits `x-dorang-request-id` and `x-dorang-deployment`, and mirrors the legacy header names when `compat.legacy_headers` is on. The mirrored set and the names dorang deliberately does **not** mirror are §7.7a; the flag is off by default. |
 | 7.8 | An inbound call-id header, if the client sets one, is honored as the request id. |
+
+### 7.7a The legacy header mirror, name by name
+
+`compat.legacy_headers: true` adds the reference proxy's spellings **alongside** dorang's own;
+nothing is renamed and nothing is removed. It is off by default, because these are another
+vendor's names and a gateway that emits them unasked is claiming to be that vendor.
+
+The reason it exists is that the failure mode is silent. A cost exporter reading
+`x-litellm-response-cost` does not error when the header stops arriving — it reports zero, and
+so does the dashboard built on it. §0.3's "run alongside, then take over" is not a migration
+anyone can perform if taking over quietly zeroes the numbers.
+
+| Legacy name | dorang header it mirrors | Always on? |
+|---|---|---|
+| `x-litellm-call-id` | `x-dorang-request-id` | yes |
+| `x-dorang-real-model` | `x-dorang-upstream-model` | yes |
+| `x-litellm-model-id` | `x-dorang-deployment` | yes |
+| `x-litellm-response-cost` | `x-dorang-cost-usd` | yes |
+| `x-litellm-key-spend` | `x-dorang-spend-usd` | detail only (§10.4) |
+| `x-litellm-key-max-budget` | `x-dorang-budget-usd` | detail only |
+| `x-litellm-attempted-retries` | `x-dorang-attempt`, **less one** | detail only |
+| `x-litellm-response-duration-ms` | `x-dorang-latency-ms` | detail only |
+
+Each mirror is stamped beside the header it copies, so it inherits the same §10.4 detail gate:
+a mirror arriving when its source did not would be a second, disagreeing answer to "what is
+always on". `attempted-retries` is deliberately not a copy — dorang counts attempts from 1 and
+the reference proxy counts retries from 0, so copying the number across would report one retry
+for every request that never retried.
+
+**Names dorang does not mirror, and why.** A header emitted with an invented value is worse
+than an absent one: the reader cannot tell it apart from a measurement.
+
+| Legacy name | Why not |
+|---|---|
+| `x-litellm-version` | dorang is not that proxy. Any value here is a claim to be a version of something else. |
+| `x-litellm-model-api-base` | The upstream's URL is deployment topology, not a tenant's business. It is not on a dorang header either. |
+| `x-litellm-model-region` | dorang has no region concept on a deployment. |
+| `x-litellm-attempted-fallbacks`, `x-litellm-max-fallbacks` | dorang records which model a fallback came *from* (`x-dorang-fallback-from`), not a count and not a configured ceiling; the attempt counter does not separate retries from fallbacks. |
+| `x-litellm-key-rpm-limit`, `x-litellm-key-tpm-limit` | dorang publishes the same facts in the standard-form `x-ratelimit-limit-requests` / `-tokens`, which more clients already read. Mirroring them twice would create two names that can disagree. |
+| `x-litellm-overhead-duration-ms` | `x-dorang-queue-ms` is a capacity wait, not proxy overhead. They are near enough to be confused and not near enough to be equal. |
+| `x-litellm-timeout`, `x-litellm-applied-guardrails` | No dorang equivalent is computed per request. |
 
 ## 8. Routing behavior is part of compatibility
 
@@ -191,7 +232,22 @@ folded into the message.
 
 ### 11.2 Canonical conditions
 
-One internal condition per row. dorang never emits a `type` outside this table.
+One internal condition per row. dorang never emits a `type` outside this table — the eight
+strings in its two type columns are the whole vocabulary, and
+`TestEveryTypeOnTheWireIsInTheTable` walks every status through both families and fails on a
+ninth. `timeout_error`, `not_implemented_error` and `service_unavailable_error` are declared in
+`internal/server` and are in **neither vendor's** vocabulary; the first two used to go out on
+real 504s and 501s, where this table says `api_error` in both columns. They are folded now.
+Nothing is lost: what a client acts on for a 501 is the code — `route_not_implemented` versus
+`route_unknown` (DESIGN §0.2) — and the status carries the rest.
+
+The two `type` columns are **not the same function of the status**. A 404 is
+`invalid_request_error` to an OpenAI client and `not_found_error` to an Anthropic one; a 413 is
+`invalid_request_error` and `request_too_large`. The projection lives in one place —
+`server.TypeForFamily`, applied by `(*server.Error).ForFamily` on the single path every error
+response takes — so that a new condition cannot pick a family's spelling by accident. The two
+429 capacity rows are the only ones whose type is chosen by *condition* rather than by status;
+they set the alternate spelling explicitly where they are raised.
 
 | Condition | HTTP | OpenAI `type` | OpenAI `code` | Anthropic `type` |
 |---|---:|---|---|---|
@@ -213,9 +269,9 @@ One internal condition per row. dorang never emits a `type` outside this table.
 | No healthy deployment | 429 | `rate_limit_error` | `no_healthy_deployment` | `overloaded_error` |
 | Capacity wait timed out (§5.4) | 429 | `rate_limit_error` | `capacity_unavailable` | `overloaded_error` |
 | Gateway fault | 500 | `api_error` | `internal_error` | `api_error` |
-| Upstream 5xx after fallback | 502 | `api_error` | `upstream_error` | `api_error` |
+| Upstream 5xx after fallback | 502 | `api_error` | the upstream's own string `code` when it sent one, else `"502"` | `api_error` |
 | Route declared but unimplemented (§0.2) | 501 | `api_error` | `route_not_implemented` | `api_error` |
-| Upstream timeout | 504 | `api_error` | `timeout` | `api_error` |
+| Upstream timeout | 504 | `api_error` | `timeout` when dorang's own deadline fired, else as the 502 row | `api_error` |
 
 Three of these deserve their reasoning stated, because a plausible alternative is wrong:
 
@@ -229,13 +285,103 @@ Three of these deserve their reasoning stated, because a plausible alternative i
 - **No healthy deployment is 429 and not 503.** It is a capacity condition with a
   `Retry-After`, and clients already back off correctly on `429`.
 
+The `code` column of the 502 and 504 rows says what it says because §11.3's preservation rule
+comes first: a backend that sent a usable **string** code already satisfies §7.1, and that code
+is more useful to a client than `upstream_error` would be. It is passed through; a code that
+cannot go in the envelope — a number, an object, an array — is replaced by dorang's canonical
+one and preserved on `x-dorang-native-error-code`. An earlier revision of this table specified
+`upstream_error` unconditionally, which no build has ever emitted and which contradicts §11.3
+two subsections later.
+
+#### 11.2a dorang's own refusals
+
+These have no row above because the reference vocabulary has no condition for them. They are
+listed so the next audit does not read them as drift, and so that the *reason* each one is
+separate is written down rather than re-derived.
+
+Each is a refusal whose **fix is different** from the row it would otherwise collapse into.
+That is the whole test for belonging here: a condition a caller cannot act on differently gets
+the §11.2 code and folds into the rows above. The `type` columns are the same projection
+§11.2 uses, so nothing here escapes the type vocabulary.
+
+This is not an exhaustive code registry — dorang also emits operational codes for conditions no
+client branches on (`method_not_allowed`, `admin_required`, `catalog_not_configured`, the
+`passthrough_*` family). Those are diagnostic text with a stable spelling; the table is for
+codes a client is expected to *match*.
+
+| Condition | HTTP | OpenAI `type` | OpenAI `code` | Anthropic `type` |
+|---|---:|---|---|---|
+| Rotated secret retired (§11.2c) | 401 | `authentication_error` | `secret_retired` | `authentication_error` |
+| Stored credential uses an unsupported hash scheme | 401 | `authentication_error` | `unsupported_hash_scheme` | `authentication_error` |
+| Legacy hash scheme disabled | 401 | `authentication_error` | `legacy_scheme_disabled` | `authentication_error` |
+| Legacy import window closed | 401 | `authentication_error` | `legacy_window_closed` | `authentication_error` |
+| Key pended by the token guard (§11.6) | 403 | `permission_error` | `credential_pended` | `permission_error` |
+| Key has no owning user or team | 403 | `permission_error` | `no_principal` | `permission_error` |
+| Credential store unreachable | 503 | `api_error` | `auth_unavailable` | `overloaded_error` |
+| Route is unknown (not merely unbuilt) | 501 | `api_error` | `route_unknown` | `api_error` |
+| Structural pin cannot be routed (§B.2) | 503 | `api_error` | `state_pin_unroutable` | `overloaded_error` |
+| Credential pin cannot be routed | 503 | `api_error` | `credential_pin_unroutable` | `overloaded_error` |
+| Credential pin exhausted / saturated | 503 | `api_error` | `credential_pin_exhausted`, `credential_pin_saturated` | `overloaded_error` |
+| Every fallback candidate already tried (§7.6) | 503 | `api_error` | `fallback_exhausted` | `overloaded_error` |
+| Fallback hop or wall-clock budget spent | varies | per status | `max_hops_exhausted`, `fallback_budget_elapsed` | per status |
+| Stream already committed, cannot hop (§7.6) | 503 | `api_error` | `stream_committed` | `overloaded_error` |
+
+`secret_retired` is the one worth arguing about, because `invalid_api_key` is so nearly right.
+The fix for a retired secret is "use the secret the last rotation issued", not "get a new key".
+Reporting it as `invalid_api_key` sends a caller to re-provisioning, which is precisely the
+thing rotation exists to avoid. The same reasoning keeps `credential_pended` apart from
+`key_blocked`: one is a statistical judgement an operator can release in a single action, the
+other is a decision an operator made, and a support ticket that cannot tell them apart goes to
+the wrong screen.
+
+What was collapsed *into* `invalid_api_key`: `missing_credential`, `malformed_credential`,
+`invalid_credential` (twice — unknown key and digest mismatch) and `credential_expired`. Five
+spellings, one client-visible condition, and five ways for a client's `invalid_api_key` branch
+to miss. The distinction survives in the message, which is where §11.1 already says the
+Anthropic family folds everything `code` would have carried.
+
 ### 11.3 The native error is preserved, never forwarded
 
-The upstream's own `type`, `code`, and message are recorded in the ledger and surfaced in
-`x-dorang-native-error-type` / `x-dorang-native-error-code`. They are **not** put in the
-response body. Forwarding them reproduces the exact defect this section exists to fix — a
-client branching on `type` mis-branches on a vendor-specific string — and it is the same
-out-of-band pattern §4.2a uses for stop reasons.
+The upstream's own `type` and `code` are surfaced in `x-dorang-native-error-type` /
+`x-dorang-native-error-code`. They are **not** put in the response body. Forwarding them
+reproduces the exact defect this section exists to fix — a client branching on `type`
+mis-branches on a vendor-specific string — and it is the same out-of-band pattern §4.2a uses
+for stop reasons.
+
+`x-dorang-native-error-code` carries the backend's own code only when that code could not
+*be* the envelope's code: a number where §7.1 requires a string, or a JSON object or array
+where it requires a scalar. A backend that sent a plain string code sets no header, because
+that code is already in the envelope and a header repeating it on every error would signal
+nothing. Both headers are clamped to 128 bytes and refused if they contain a control
+character; a backend is a less trusted source than the caller, and the caller's path is
+already checked.
+
+#### 11.3a The upstream's *message* goes to the operator, not to the client
+
+There is no `x-dorang-native-error-message`, and there deliberately will not be one.
+
+The reason the message is kept out of the body is concrete rather than tidy: several
+OpenAI-compatible servers answer 401 with the offending key quoted in the message, so a gateway
+that copies the upstream's text into its own envelope hands the operator's provider credential
+to whichever tenant happened to be calling while a credential was invalid or mid-rotation. A
+hostile backend does not have to wait for that — it can answer any request with the `x-api-key`
+header it was just given.
+
+**That reasoning transfers to a response header unchanged.** A header is read by the same
+client, over the same connection, by every HTTP library ever written. Moving the text from the
+body to a header would relocate the leak, not close it. The `type` and the `code` do go out of
+band because they are enumerated tokens, not free text.
+
+So the message goes to the **operator log**, joined to the request by `x-dorang-request-id`,
+scrubbed by `internal/redact` with the exact secret that request carried. That is recoverable
+without a database round trip, which is what an operator debugging an outage needs. What a
+client gets is dorang's own wording for the status, the canonical `code`, and — when the
+backend sent a usable one — the backend's own string `code` in the envelope, which is often the
+whole answer: a `model_retired` code identifies the condition without the sentence.
+
+This is a **known reduction in fidelity against the incumbent**, which does put the upstream's
+sentence in the body. It is deliberate. Restoring it for clients would be a new decision with a
+security review attached, not a bug fix.
 
 ### 11.4 `Retry-After` is mandatory on every 429 and 503
 

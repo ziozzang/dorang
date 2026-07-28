@@ -71,16 +71,33 @@ const (
 )
 
 // String returns the wire code for the reason.
+//
+// The first five collapse onto COMPATIBILITY §11.2's `invalid_api_key`, which is
+// what OpenAI, Anthropic and the reference proxy all put in `code` for "this
+// credential is not usable". §11.2 has one row for "Missing or malformed
+// credential" and one for "Expired or revoked credential" and both name that
+// code, so five distinct spellings here were five ways for a client's
+// `code == "invalid_api_key"` branch to miss — the exact defect §11 opens by
+// describing.
+//
+// What is NOT collapsed: a refusal whose fix is different from "fix your key".
+// `secret_retired` sends the caller to the secret they were issued by the last
+// rotation rather than to re-provisioning; `credential_pended` and `key_blocked`
+// are a statistical judgement and an operator decision, and
+// telling them apart is what decides whether a support ticket goes to the
+// security screen or the release notes. Those keep their own codes, and §11.2
+// lists them as dorang's own rows rather than pretending they are one of
+// OpenAI's.
 func (r Reason) String() string {
 	switch r {
 	case ReasonMissingCredential:
-		return "missing_credential"
+		return "invalid_api_key"
 	case ReasonMalformed:
-		return "malformed_credential"
+		return "invalid_api_key"
 	case ReasonUnknownKey:
-		return "invalid_credential"
+		return "invalid_api_key"
 	case ReasonDigestMismatch:
-		return "invalid_credential"
+		return "invalid_api_key"
 	case ReasonSchemeUnsupported:
 		return "unsupported_hash_scheme"
 	case ReasonLegacyDisabled:
@@ -88,9 +105,10 @@ func (r Reason) String() string {
 	case ReasonLegacyWindowClosed:
 		return "legacy_window_closed"
 	case ReasonExpired:
-		return "credential_expired"
+		return "invalid_api_key"
 	case ReasonBlocked:
-		return "credential_blocked"
+		// COMPATIBILITY §11.2's "Key blocked" row spells it this way.
+		return "key_blocked"
 	case ReasonModelNotAllowed:
 		return "model_not_allowed"
 	case ReasonRouteNotAllowed:

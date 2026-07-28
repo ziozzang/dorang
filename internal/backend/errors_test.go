@@ -9,7 +9,9 @@ import (
 	"testing"
 
 	"github.com/ziozzang/dorang/internal/auth"
+	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/server"
+	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -537,4 +539,42 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	c.n += n
 	return n, err
+}
+
+// TestOpaqueRefusalKeepsItsMachineReadableHalf.
+//
+// [anthropic.OpaqueError] is dorang declining to fabricate opaque state, and it
+// carries two fields for the caller: Reason, which its own ToError renders as
+// the wire code, and Construct, which exists so the caller "can put it in
+// x-dorang-allow-lossy and retry deliberately". encodeError used to flatten the
+// whole thing into a sentence under the generic conversion_failed code, with no
+// Unwrap — so the one construct id the retry mechanism takes never reached
+// anybody, and the mechanism could not be used.
+func TestOpaqueRefusalKeepsItsMachineReadableHalf(t *testing.T) {
+	oe := &anthropic.OpaqueError{
+		Reason:    anthropic.ReasonUnsignedThinking,
+		Construct: canonical.ConstructThinkingBlock,
+		Detail:    "messages[1].content[0]",
+	}
+
+	e := encodeError(oe)
+
+	if e.Code != anthropic.ReasonUnsignedThinking {
+		t.Errorf("code = %q, want the reason %q: a caller branching on the code has to be able "+
+			"to name what was refused", e.Code, anthropic.ReasonUnsignedThinking)
+	}
+	if e.Code == CodeConversionFailed {
+		t.Error("the refusal is still flattened under the generic code")
+	}
+	if !strings.Contains(e.Message, canonical.ConstructThinkingBlock) {
+		t.Errorf("the construct id x-dorang-allow-lossy takes is not in the refusal: %q", e.Message)
+	}
+	if e.Status != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400: no sibling deployment accepts it either", e.Status)
+	}
+
+	// Everything else still lands where it did.
+	if got := encodeError(errNilRequest); got.Code != CodeConversionFailed {
+		t.Errorf("an ordinary encode failure now reports %q", got.Code)
+	}
 }

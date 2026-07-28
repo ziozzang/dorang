@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -80,6 +81,45 @@ func SplitExtra(b []byte, known map[string]struct{}) (map[string]json.RawMessage
 	for k := range raw {
 		if _, ok := known[k]; ok {
 			delete(raw, k)
+		}
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return raw, nil
+}
+
+// SplitExtraFold is [SplitExtra] for a type decoded with plain json.Unmarshal
+// instead of the strict filter — which is every RESPONSE type, because a
+// differently-cased key from a backend is a vendor quirk that must not cost the
+// caller its usage counts.
+//
+// The difference is the whole reason it exists. encoding/json matches field
+// names case-INSENSITIVELY, so a backend that sends "Usage" populates the Usage
+// field; an exact-match split then leaves "Usage" in the map as well, and the
+// re-serialized answer carries the object twice under two spellings. Nothing is
+// lost by folding — the value was already read into the struct — and a client
+// is not handed a duplicate it has to guess about.
+//
+// Request types must NOT use this. They are filtered by StrictBytes first, so
+// the cased key is dropped from the struct decode and from the map together;
+// folding there would silently accept a key the authorization gate never saw
+// (COMPATIBILITY 2.0).
+func SplitExtraFold(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, err
+	}
+	for k := range raw {
+		if _, ok := known[k]; ok {
+			delete(raw, k)
+			continue
+		}
+		for want := range known {
+			if strings.EqualFold(k, want) {
+				delete(raw, k)
+				break
+			}
 		}
 	}
 	if len(raw) == 0 {

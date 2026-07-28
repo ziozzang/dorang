@@ -195,6 +195,42 @@ func (c *Config) validate(col *collector) {
 	c.validateNotifications(col)
 	c.validatePriorityMapping(col)
 	c.validateLeasedLimits(col)
+	c.validateCompat(col)
+}
+
+// validateCompat checks the three divergence switches of COMPATIBILITY §3.3,
+// §6.8 and §7.7.
+//
+// Two of them are accepted only at the value this build serves. That is not
+// timidity about the schema: the switch has to reach internal/wire, the only
+// path there is a field on backend.Call, and no such field exists — so a
+// deployment that set `usage_chunk_choices: empty` would send every client the
+// stub shape anyway. DESIGN §17.1 calls a setting that loads and does nothing
+// this repository's dominant defect, and the two ways not to commit it are to
+// wire it or to refuse it. This refuses, and names what wiring it needs, so the
+// refusal is a work item rather than a wall.
+func (c *Config) validateCompat(col *collector) {
+	switch c.Compat.UsageChunkChoices {
+	case "", UsageChunkChoicesStub:
+	case UsageChunkChoicesEmpty:
+		col.add("compat.usage_chunk_choices",
+			"%q is not served by this build: every streaming usage chunk carries the "+
+				"reference proxy's %q shape. The value has to reach openai.StreamConfig "+
+				"in internal/backend/stream.go, which reads only backend.Call, and "+
+				"backend.Call has no field for it. Remove the key or set %q",
+			UsageChunkChoicesEmpty, UsageChunkChoicesStub, UsageChunkChoicesStub)
+	default:
+		col.add("compat.usage_chunk_choices",
+			"unknown value %q: expected %q or %q",
+			c.Compat.UsageChunkChoices, UsageChunkChoicesStub, UsageChunkChoicesEmpty)
+	}
+	if c.Compat.AnthropicTotalTokens != nil && !*c.Compat.AnthropicTotalTokens {
+		col.add("compat.anthropic_total_tokens",
+			"false is not served by this build: a non-streaming Anthropic response always "+
+				"carries usage.total_tokens, because anthropic.ResponseOptions.TotalTokens "+
+				"is never set in internal/backend/backend.go and defaults to emitting it. "+
+				"Remove the key or set true")
+	}
 }
 
 func (c *Config) validateServer(col *collector) {

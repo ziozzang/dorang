@@ -143,10 +143,18 @@ const (
 	// branches on in the error envelope. §11 opens by describing exactly this
 	// failure — a gateway whose error code does not match the contract it
 	// publishes — so the code follows the document rather than the config key.
-	CodeContextWindow     = "context_length_exceeded"
-	CodeQuotaExhausted    = "insufficient_quota"
-	CodeNoCapacity        = "no_capacity"
-	CodeNoCandidate       = "no_candidate"
+	CodeContextWindow  = "context_length_exceeded"
+	CodeQuotaExhausted = "insufficient_quota"
+	// CodeNoCapacity and CodeNoCandidate follow §11.2 for the same reason
+	// CodeContextWindow and CodeQuotaExhausted do. They used to read
+	// `no_capacity` and `no_candidate`, which are dorang's internal words for
+	// two conditions §11.2 names `capacity_unavailable` and
+	// `no_healthy_deployment` — and a client cannot branch on a vocabulary it
+	// was never given. Both answer 429 rather than 503, which §11.2 argues for
+	// explicitly: this is back-pressure, and every SDK retries a 429 with
+	// backoff while treating a 503 as a dead gateway.
+	CodeNoCapacity        = "capacity_unavailable"
+	CodeNoCandidate       = "no_healthy_deployment"
 	CodeFallbackExhausted = "fallback_exhausted"
 	CodeHopsExhausted     = "max_hops_exhausted"
 	CodeBudgetElapsed     = "fallback_budget_elapsed"

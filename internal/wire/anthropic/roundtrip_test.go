@@ -443,7 +443,12 @@ func TestResponseDecodeIsTheBackendDirection(t *testing.T) {
 	if c.Message.Content[0].Thinking.Signature != "sig" {
 		t.Error("signature lost on decode")
 	}
-	want := canonical.Usage{InputTokens: 1000, OutputTokens: 20, CacheReadTokens: 800, CacheWriteTokens: 150}
+	// Reported names the counters this body actually stated. All four are here,
+	// so all four are marked — that is what lets the encoder put a measured zero
+	// back rather than treating it as an absent field.
+	want := canonical.Usage{InputTokens: 1000, OutputTokens: 20, CacheReadTokens: 800, CacheWriteTokens: 150,
+		Reported: canonical.UsageInput | canonical.UsageOutput |
+			canonical.UsageCacheRead | canonical.UsageCacheWrite}
 	if *got.Usage != want {
 		t.Errorf("usage = %+v, want %+v", *got.Usage, want)
 	}

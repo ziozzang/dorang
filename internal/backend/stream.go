@@ -2,6 +2,7 @@ package backend
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,9 +16,23 @@ import (
 )
 
 // eventSource reads an upstream stream as neutral events. next returns io.EOF
-// when the stream ends cleanly.
+// when the stream ends.
+//
+// io.EOF is not by itself the end of a stream. A connection cut mid-generation
+// ends the body too, and the difference between the two is the difference
+// between an answer and half an answer — which is invisible to the client
+// unless this package makes it visible. terminated is how a source reports
+// which of the two it just saw.
 type eventSource interface {
 	next() ([]canonical.StreamEvent, error)
+	// terminated reports that the FAMILY's own end-of-stream marker arrived. It
+	// is consulted only after next returned io.EOF.
+	//
+	// A family that defines no such marker reports false and the relay falls
+	// back to the stop event, which every family expresses and which is the
+	// statement "the generation ended, and here is why". Reporting false is
+	// therefore not a weaker answer, only a differently sourced one.
+	terminated() bool
 }
 
 // eventSink writes neutral events in the caller's protocol.
@@ -40,7 +55,20 @@ type eventSink interface {
 //
 // Neither path buffers. The scanner writes through as it scans; the crossing
 // path holds at most one frame, which is the unit the wire already defines.
-func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter) (canonical.Usage, error) {
+//
+// # What it reports
+//
+// sent is the number of bytes that actually reached the client, which is the
+// only honest source for [Result.FirstByteSent]: that flag closes fail-back for
+// good (§7.6), so a stream that committed nothing must not set it and a stream
+// that committed one byte must.
+//
+// A non-nil error is a [relayFailure] whenever the upstream answered 200 and
+// then did not finish — an in-band error frame, or a body that stopped without
+// its terminator. The client-facing half of both is unchanged: bytes already
+// sent stay sent, and the failure is delivered in band because the status is
+// spent. What changes is that the attempt is now reported as one.
+func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter) (canonical.Usage, int64, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -63,28 +91,37 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	//     filtered request takes the neutral path, and only a filtered one pays.
 	if x.call.ClientAPI == catalog.APIOpenAIChat && x.prov.api == catalog.APIOpenAIChat &&
 		x.names.Len() == 0 && x.call.Transform == nil {
-		sc := openai.NewScanner(fw, openai.ScannerOptions{
+		// The scanner forwards bytes, so nothing on this path decodes a frame —
+		// and nothing on it noticed an upstream that stopped answering either.
+		// [relayWatch] sits between the scanner and the client and reads the two
+		// facts that decide whether the exchange succeeded, at the same cost per
+		// line the scanner's own usage hunt already pays.
+		watch := &relayWatch{w: fw, secrets: x.secrets}
+		sc := openai.NewScanner(watch, openai.ScannerOptions{
 			From:         x.target.UpstreamModel,
 			To:           x.call.Model,
 			CollectUsage: true,
 		})
 		if _, err := io.Copy(sc, resp.Body); err != nil {
-			return canonical.Usage{}, err
+			return canonical.Usage{}, fw.n, err
 		}
 		if err := sc.Flush(); err != nil {
-			return canonical.Usage{}, err
+			return canonical.Usage{}, fw.n, err
+		}
+		if err := watch.flush(); err != nil {
+			return canonical.Usage{}, fw.n, err
 		}
 		u, _ := sc.Usage()
-		return u, nil
+		return u, fw.n, watch.failure(x.secrets)
 	}
 
 	src, err := x.prov.ad.source(resp.Body, x)
 	if err != nil {
-		return canonical.Usage{}, err
+		return canonical.Usage{}, fw.n, err
 	}
 	sink, err := newEventSink(x.call, fw)
 	if err != nil {
-		return canonical.Usage{}, err
+		return canonical.Usage{}, fw.n, err
 	}
 	// The transform composes into this one pass (§10.5): it takes decoded events
 	// and returns decoded events, holding at most a placeholder's width minus one
@@ -94,6 +131,12 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	if x.call.Transform != nil {
 		tr = x.call.Transform.Stream()
 	}
+	// fail is the upstream's own in-band failure, kept because the sink consumes
+	// the event and the caller of this function needs the fact. sawStop is the
+	// fallback end-of-stream marker for the families that define no terminator
+	// frame; see [eventSource.terminated].
+	var fail *relayFailure
+	sawStop := false
 	for {
 		batch, err := src.next()
 		if err == io.EOF {
@@ -113,18 +156,39 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 					Code:       CodeUpstreamDecode,
 				},
 			})
-			return sink.usage(), err
+			return sink.usage(), fw.n, err
 		}
 		for i := range batch {
+			switch batch[i].Type {
+			case canonical.EventStop:
+				sawStop = true
+			case canonical.EventError:
+				// COMPATIBILITY 1.3 in both directions: the frame goes on to the
+				// client below, exactly as it did before, AND the attempt is
+				// recorded as the failure it is. Only the first of those two used
+				// to happen.
+				if fail == nil {
+					fail = inBandFailure(batch[i].Err, x.secrets)
+				}
+				// DESIGN §10.6 rule 4, the response direction. The 4xx/5xx path
+				// scrubs the upstream's body before any of it can be rendered
+				// ([upstreamError]); this one re-encodes the upstream's own
+				// sentence into a frame bound for the client and scrubbed
+				// nothing. A backend that answers "invalid x-api-key: sk-…" mid
+				// stream — and a helpful error message is all it takes — hands
+				// the operator's provider credential to whichever tenant was
+				// talking to it.
+				scrubEvent(&batch[i], x.secrets)
+			}
 			if tr != nil {
 				if flush := tr.Rewrite(&batch[i]); flush != nil {
 					if err := sink.write(*flush); err != nil {
-						return sink.usage(), err
+						return sink.usage(), fw.n, err
 					}
 				}
 			}
 			if err := sink.write(batch[i]); err != nil {
-				return sink.usage(), err
+				return sink.usage(), fw.n, err
 			}
 		}
 	}
@@ -133,14 +197,60 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	if tr != nil {
 		if flush := tr.Flush(); flush != nil {
 			if err := sink.write(*flush); err != nil {
-				return sink.usage(), err
+				return sink.usage(), fw.n, err
 			}
 		}
 	}
-	if err := sink.close(); err != nil {
-		return sink.usage(), err
+	if fail != nil {
+		// The sink already terminated the stream on the error event; closing it
+		// again would append a second ending.
+		return sink.usage(), fw.n, fail
 	}
-	return sink.usage(), nil
+	if !sawStop && !src.terminated() {
+		trunc := truncatedStream()
+		// sink.close is deliberately NOT called. It is what synthesizes the
+		// terminal chunk of COMPATIBILITY §4.4, and a broken stream given a
+		// finish_reason of "stop" is a truncated answer handed to the client as a
+		// complete one — the one failure here no client can detect. What goes out
+		// instead is the truth, in band (1.3).
+		//
+		// Unless nothing went out at all: an upstream stream with no frames is an
+		// empty body with no terminator (1.4), and inventing an error frame for a
+		// client that received nothing would be dorang authoring the only bytes on
+		// a response it can still fail back instead.
+		if fw.n > 0 {
+			_ = sink.write(canonical.StreamEvent{
+				Type: canonical.EventError,
+				Err: &canonical.Error{
+					StatusCode: http.StatusBadGateway,
+					Type:       "api_error",
+					Message:    trunc.Error(),
+					Code:       CodeUpstreamStreamTruncated,
+				},
+			})
+		}
+		return sink.usage(), fw.n, trunc
+	}
+	if err := sink.close(); err != nil {
+		return sink.usage(), fw.n, err
+	}
+	return sink.usage(), fw.n, nil
+}
+
+// scrubEvent removes every credential from an in-band error before it is
+// re-encoded for the client.
+//
+// It runs on the neutral form, which is why it covers every protocol pairing at
+// once, and it runs only on the error event: no other event carries upstream
+// prose, and scanning a content delta for the key would put a search over every
+// token on the hot path to protect a field that cannot hold one.
+func scrubEvent(ev *canonical.StreamEvent, secrets []string) {
+	if len(secrets) == 0 || ev.Err == nil {
+		return
+	}
+	ev.Err.Message = scrub(ev.Err.Message, secrets)
+	ev.Err.Type = scrub(ev.Err.Type, secrets)
+	ev.Err.Code = scrub(ev.Err.Code, secrets)
 }
 
 // newEventSink builds the writer for the caller's protocol.
@@ -180,6 +290,16 @@ type anthropicSource struct{ d *anthropic.StreamDecoder }
 
 func (s *anthropicSource) next() ([]canonical.StreamEvent, error) { return s.d.Next() }
 
+// terminated reports false, and the relay reads the stop event instead.
+//
+// This family's terminator frame is message_stop, and
+// internal/wire/anthropic's StreamDecoder does not surface it: the frame
+// carries no content and is dispatched to `return nil, nil`. The stop event is
+// the available signal and it is a sound one — the protocol requires the
+// message_delta that carries stop_reason BEFORE message_stop, so a stream that
+// reached its ending has one and a stream cut mid-generation has neither.
+func (s *anthropicSource) terminated() bool { return false }
+
 // openaiSource reads chat-completion SSE frames.
 //
 // internal/wire/openai exposes a chunk decoder and a relay scanner but no frame
@@ -191,6 +311,10 @@ type openaiSource struct {
 	data   strings.Builder
 	done   bool
 	engine Engine
+	// sawDone records the [DONE] terminator (COMPATIBILITY 1.2), which is this
+	// family's end-of-stream marker and the thing that separates a stream that
+	// ended from one whose connection did.
+	sawDone bool
 
 	// opt carries the per-stream tool state. It is ONE value for the whole
 	// stream, not one per frame: a tool name can arrive split across frames and
@@ -230,10 +354,23 @@ func (s *openaiSource) next() ([]canonical.StreamEvent, error) {
 			return s.flush()
 		}
 		if payload == "[DONE]" {
-			s.done = true
+			s.done, s.sawDone = true, true
 			return s.flush()
 		}
 		raw := []byte(payload)
+		// An in-band error envelope (COMPATIBILITY 1.3). It has no choices, so
+		// openai.DecodeChunk decodes it to zero events and this reader used to
+		// step straight over it to the [DONE] that follows — an upstream failure
+		// that vanished on its way across the family boundary, leaving the client
+		// with a stream that simply stopped and dorang with an attempt it called
+		// a success.
+		if ev, ok := errorFrame(raw); ok {
+			// The error frame ends the stream; there is nothing after it worth
+			// reading, and the [DONE] the shape puts behind it is not a
+			// terminator for a message that failed.
+			s.done = true
+			return []canonical.StreamEvent{ev}, nil
+		}
 		_, events, derr := openai.DecodeChunk(raw, s.opt)
 		if derr != nil {
 			return nil, derr
@@ -259,6 +396,9 @@ func (s *openaiSource) flush() ([]canonical.StreamEvent, error) {
 	}
 	return nil, io.EOF
 }
+
+// terminated reports the [DONE] frame (COMPATIBILITY 1.2).
+func (s *openaiSource) terminated() bool { return s.sawDone }
 
 func (s *openaiSource) note(evs []canonical.StreamEvent) {
 	if s.id != "" {
@@ -435,13 +575,271 @@ func (s *openaiSource) adoptReasoning(raw []byte, events []canonical.StreamEvent
 	return events
 }
 
+// errorMember is the prefilter for an in-band error envelope.
+//
+// Every shape COMPATIBILITY §11 recognizes spells the member the same way, and
+// a chat-completion chunk does not carry it. The scan is the same per-line cost
+// internal/wire/openai's Scanner already pays hunting for the usage frame, and
+// like that one it is only paid until the thing it is looking for is found.
+var errorMember = []byte(`"error"`)
+
+// errorFrame reports whether one SSE data payload is an in-band error envelope
+// and decodes it (COMPATIBILITY 1.3).
+//
+// The gate is a non-empty top-level `error` member — or `"object":"error"`,
+// which is the flat envelope SGLang's OpenAI routes produce and which
+// [server.Normalize] already recognizes as ShapeFlat. It is deliberately not
+// the presence of the word: a model writing about errors produces frames full
+// of it, and answering a request with a paragraph about error handling must
+// neither end the stream nor be rewritten.
+func errorFrame(payload []byte) (canonical.StreamEvent, bool) {
+	if !bytes.Contains(payload, errorMember) {
+		return canonical.StreamEvent{}, false
+	}
+	var probe struct {
+		Error  json.RawMessage `json:"error"`
+		Object string          `json:"object"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		return canonical.StreamEvent{}, false
+	}
+	inner := bytes.TrimSpace(probe.Error)
+	nested := len(inner) > 0 && !bytes.Equal(inner, jsonNull)
+	if !nested && probe.Object != "error" {
+		return canonical.StreamEvent{}, false
+	}
+	e, err := openai.DecodeError(payload, nil)
+	if err != nil || e == nil {
+		return canonical.StreamEvent{}, false
+	}
+	if e.StatusCode == 0 {
+		e.StatusCode = http.StatusBadGateway
+	}
+	return canonical.StreamEvent{Type: canonical.EventError, Err: e.ToCanonical()}, true
+}
+
+var jsonNull = []byte("null")
+
+// relayWatch is the byte relay's failure detector and its credential scrubber.
+//
+// The fast path forwards bytes without decoding a frame, which is what keeps
+// the per-token path free of a JSON round trip — and is also why it could tell
+// neither a completed stream from a broken one nor an ordinary frame from one
+// carrying the operator's provider credential back out. This reads both facts
+// from the line boundaries the wire already provides.
+//
+// # Why it inspects before it forwards
+//
+// The first version wrote the bytes and then looked at them, on the reasoning
+// that a relay must not withhold. That is the wrong boundary. DESIGN §7.6 is
+// about not RETRACTING output once it is committed; it says nothing about
+// deciding what to commit, and DESIGN §10.6 rule 4 — "credentials are stripped
+// in both directions" — is unconditional. An upstream that answers mid-stream
+// with "invalid x-api-key: sk-…", which is a real message from a real server,
+// had that sentence relayed verbatim to whichever tenant was talking to it. The
+// 4xx/5xx path has scrubbed exactly this since it was written; the streaming
+// path scrubbed nothing.
+//
+// # What it costs
+//
+// One line. Not one frame, not a window — the bytes between two newlines, which
+// this type already accumulated in order to inspect them, so the ceiling is the
+// same [maxStreamFrame] and the memory is the same buffer. Nothing else is
+// delayed: an SSE client cannot act on half a `data:` line, so a line held until
+// its own newline arrives is invisible to it. In practice it makes the relay
+// write LESS often, not more: internal/wire/openai's Scanner emits a rewritten
+// model line in three pieces, and those three now leave as one.
+//
+// Only an error frame is rewritten. Every other line is forwarded byte for byte,
+// including the run of clean lines before and after one — which is the same
+// batching rule the Scanner itself applies, for the same reason.
+type relayWatch struct {
+	w io.Writer
+	// secrets is what went out on this request's credential headers, read back
+	// from the headers themselves (see [collectSecrets]).
+	secrets []string
+
+	// line holds the current line until its newline arrives. Reused, so a steady
+	// stream does not allocate after the first frame.
+	//
+	// This is a bound this type ADDED rather than one it found: nothing else in
+	// the byte relay accumulates, so an upstream that never sends a newline would
+	// otherwise grow the heap through the detector. over is the ceiling.
+	line []byte
+	// over marks a line that outgrew [maxStreamFrame]. What is held is forwarded
+	// and the rest of that line is passed through uninspected, which is the same
+	// degradation internal/wire/openai's Scanner applies to an oversized frame
+	// and for the same reason: faithful forwarding beats an unbounded buffer. No
+	// error envelope any vendor sends is four megabytes on one line.
+	over bool
+
+	// done records the [DONE] terminator (COMPATIBILITY 1.2).
+	done bool
+	// frame is the in-band error envelope, already scrubbed, kept whole so that
+	// [server.Normalize] reads it rather than a second implementation of §11.
+	frame []byte
+
+	err error
+}
+
+// Write forwards p, holding back at most the trailing partial line.
+//
+// It always reports len(p) consumed on success. The held bytes are this type's
+// responsibility from here, not the caller's, and a short count would make the
+// Scanner believe a stream it fully handed over was only partly taken.
+func (r *relayWatch) Write(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	total := len(p)
+	// start indexes the run of clean bytes waiting to be forwarded in one write.
+	start, pos := 0, 0
+	for pos < len(p) {
+		i := bytes.IndexByte(p[pos:], '\n')
+		if i < 0 {
+			break
+		}
+		end := pos + i + 1 // the newline belongs to the line it terminates
+		if len(r.line) > 0 || r.over {
+			// The line began in an earlier write, so nothing before end can be
+			// pending: the held bytes were never forwarded.
+			r.hold(p[pos:end])
+			r.emitHeld()
+			start = end
+		} else if repl, rewritten := r.inspect(p[pos:end]); rewritten {
+			r.write(p[start:pos])
+			r.write(repl)
+			start = end
+		}
+		pos = end
+	}
+	r.write(p[start:pos])
+	// The tail has no newline. It is the beginning of a line and is held rather
+	// than forwarded, which is the whole of the delay this type introduces.
+	if pos < len(p) {
+		r.hold(p[pos:])
+	}
+	if r.err != nil {
+		return 0, r.err
+	}
+	return total, nil
+}
+
+// flush emits a final line that never got its newline.
+//
+// COMPATIBILITY 1.5 leaves an unterminated trailing frame to the Scanner, which
+// re-frames it and hands the newlines down; this exists so that a body which
+// ends without either is not silently swallowed by the detector.
+func (r *relayWatch) flush() error {
+	if r.err == nil && (len(r.line) > 0 || r.over) {
+		r.emitHeld()
+	}
+	return r.err
+}
+
+// hold accumulates the current line, degrading past the ceiling.
+func (r *relayWatch) hold(b []byte) {
+	if r.over {
+		r.write(b)
+		return
+	}
+	if len(r.line)+len(b) > maxStreamFrame {
+		r.over = true
+		r.write(r.line)
+		r.line = r.line[:0]
+		r.write(b)
+		return
+	}
+	r.line = append(r.line, b...)
+}
+
+// emitHeld inspects and forwards the line that has just been completed.
+func (r *relayWatch) emitHeld() {
+	if r.over {
+		// Already forwarded as it arrived, and never inspected.
+		r.over = false
+		return
+	}
+	if repl, rewritten := r.inspect(r.line); rewritten {
+		r.write(repl)
+	} else {
+		r.write(r.line)
+	}
+	r.line = r.line[:0]
+}
+
+// inspect reads one complete line, including its newline, and returns a
+// replacement when the line must not go out as it stands.
+//
+// The replacement is the scrubbed WHOLE line rather than a spliced payload: a
+// credential cannot occur in `data: ` or in a line terminator, so the two edits
+// have the same result and this one has no seams to get wrong.
+func (r *relayWatch) inspect(line []byte) ([]byte, bool) {
+	body := bytes.TrimRight(line, "\r\n")
+	rest, ok := bytes.CutPrefix(body, []byte("data:"))
+	if !ok {
+		return nil, false
+	}
+	payload := bytes.TrimSpace(rest)
+	if len(payload) == 0 {
+		return nil, false
+	}
+	if string(payload) == "[DONE]" {
+		r.done = true
+		return nil, false
+	}
+	if _, isErr := errorFrame(payload); !isErr {
+		return nil, false
+	}
+	scrubbed := scrub(string(payload), r.secrets)
+	if r.frame == nil {
+		// Copied, and scrubbed: payload aliases a buffer the caller reuses, and
+		// what is recorded, logged and metered is read back out of this.
+		r.frame = []byte(scrubbed)
+	}
+	if len(scrubbed) == len(payload) && scrubbed == string(payload) {
+		// The ordinary case: the upstream echoed nothing. Nothing is rewritten,
+		// and its own bytes reach the client exactly as they always did.
+		return nil, false
+	}
+	return []byte(scrub(string(line), r.secrets)), true
+}
+
+func (r *relayWatch) write(b []byte) {
+	if r.err != nil || len(b) == 0 {
+		return
+	}
+	if _, err := r.w.Write(b); err != nil {
+		r.err = err
+	}
+}
+
+// failure is the verdict on the whole stream.
+func (r *relayWatch) failure(secrets []string) error {
+	if r.frame != nil {
+		return normalizedFailure(r.frame, secrets)
+	}
+	if !r.done {
+		return truncatedStream()
+	}
+	return nil
+}
+
 // flushWriter pushes every relayed chunk to the client immediately. Without it
 // a streaming response is buffered and arrives as one block, which is not a
 // stream.
-type flushWriter struct{ w http.ResponseWriter }
+//
+// It also counts, because the count is what [Result.FirstByteSent] means: not
+// "this exchange was a stream" but "the client has already seen output", which
+// is the fact §7.6 refuses to fail back across.
+type flushWriter struct {
+	w http.ResponseWriter
+	n int64
+}
 
 func (f *flushWriter) Write(p []byte) (int, error) {
 	n, err := f.w.Write(p)
+	f.n += int64(n)
 	if fl, ok := f.w.(http.Flusher); ok {
 		fl.Flush()
 	}

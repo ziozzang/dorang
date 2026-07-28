@@ -722,19 +722,28 @@ func seedUsage(u canonical.Usage) *Usage {
 
 // finalUsage renders the terminal message_delta's usage.
 //
-// output_tokens is always present; everything else appears only when non-zero.
-// total_tokens is NEVER here: COMPATIBILITY 6.8 says the streaming and
-// non-streaming shapes differ by exactly that field, and reproducing the
-// asymmetry is the point.
+// output_tokens is always present; everything else appears when the backend
+// reported it or when it is non-zero. total_tokens is NEVER here:
+// COMPATIBILITY 6.8 says the streaming and non-streaming shapes differ by
+// exactly that field, and reproducing the asymmetry is the point.
+//
+// The presence clause is what makes this frame agree with [EncodeUsage]. 6.7
+// calls this the frame that "carries the real values", and a measured zero is a
+// real value — without the clause the same exchange reports a cache read of
+// zero when the caller did not stream and says nothing when the caller did,
+// which is the inconsistency the non-streaming fix exists to remove. It does
+// NOT extend to [seedUsage]: 6.7 specifies that message_start omits the cache
+// fields rather than zero-seeding them, and that is a shape rule about a frame
+// sent before the counts are known, not an accounting rule.
 func finalUsage(u canonical.Usage) *Usage {
 	w := &Usage{OutputTokens: ptr(u.OutputTokens)}
-	if in := ExclusiveInputTokens(u); in > 0 {
+	if in := ExclusiveInputTokens(u); in > 0 || u.Reports(canonical.UsageInput) {
 		w.InputTokens = ptr(in)
 	}
-	if u.CacheWriteTokens > 0 {
+	if u.CacheWriteTokens > 0 || u.Reports(canonical.UsageCacheWrite) {
 		w.CacheCreationInputTokens = ptr(u.CacheWriteTokens)
 	}
-	if u.CacheReadTokens > 0 {
+	if u.CacheReadTokens > 0 || u.Reports(canonical.UsageCacheRead) {
 		w.CacheReadInputTokens = ptr(u.CacheReadTokens)
 	}
 	return w

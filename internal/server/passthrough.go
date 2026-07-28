@@ -347,7 +347,7 @@ func authorizePassthroughModel(rq *Request, body io.Reader, contentType string) 
 	peeked, err := io.ReadAll(io.LimitReader(body, passthroughPeekLimit+1))
 	if err != nil {
 		return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-			"could not read the request body").WithCode("invalid_body")
+			"could not read the request body").WithCode(CodeInvalidRequest)
 	}
 	rest := io.Reader(bytes.NewReader(peeked))
 	if len(peeked) > passthroughPeekLimit {

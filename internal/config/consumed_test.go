@@ -159,6 +159,21 @@ var readExempt = map[string]bool{
 	// Refused here as well: numeric metering cannot be turned off, so the flag
 	// exists to carry the refusal rather than to be consulted downstream.
 	"Config.Metering.Numeric": true,
+	// Refused at their non-default value by validateCompat, for a reason the
+	// refusal message states: the value would have to reach internal/wire
+	// through a field on backend.Call, and there is no such field. They are
+	// here rather than in knownUnwired because they are not inert — a
+	// configuration that asks for the shape this build cannot serve fails to
+	// load instead of being quietly ignored. COMPATIBILITY §3.3 and §6.8;
+	// docs/CONFIG.md §23.1 carries the same two rows in prose.
+	//
+	// Config.Compat.UsageChunkChoices in particular must stay listed even
+	// though the scan currently finds the name: the identifier it matches is
+	// internal/wire/openai's own UsageChunkChoices TYPE, not a read of this
+	// field, so the check passes for the wrong reason and would keep passing if
+	// this were deleted.
+	"Config.Compat.UsageChunkChoices":    true,
+	"Config.Compat.AnthropicTotalTokens": true,
 }
 
 // knownUnwired is the ledger of settings that still load and do nothing. It is

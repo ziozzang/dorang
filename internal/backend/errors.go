@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -46,6 +47,20 @@ const (
 	// repair the call; the client was told in band, and this is the counted half
 	// of the same fact (DESIGN §12.4).
 	CodeMalformedToolArguments = "malformed_tool_arguments"
+	// CodeUpstreamStreamError is an upstream failure delivered IN BAND, inside a
+	// stream the upstream had already answered 200 to (COMPATIBILITY 1.3).
+	//
+	// It is dorang's code for the condition rather than the upstream's own,
+	// because the upstream's own is a code for a 500 that arrived on a 200 and
+	// an operator reading "internal_error" next to "status 200" learns nothing.
+	// The upstream's words are where they always are: NativeType and
+	// NativeMessage.
+	CodeUpstreamStreamError = "upstream_stream_error"
+	// CodeUpstreamStreamTruncated is a stream that stopped without its family's
+	// end-of-stream marker: no [DONE], no message_stop, no stop reason. The
+	// generation was cut off, and the part that arrived is a prefix of an answer
+	// rather than an answer.
+	CodeUpstreamStreamTruncated = "upstream_stream_truncated"
 )
 
 // streamError classifies a relay that did not end cleanly.
@@ -56,6 +71,10 @@ const (
 // broken backend envelope, the other a model that stopped mid-call — and because
 // the client has already been told, in band, which no other branch here can say.
 func streamError(err error) *server.Error {
+	var rf *relayFailure
+	if errors.As(err, &rf) {
+		return rf.serverError()
+	}
 	if errors.Is(err, openai.ErrMalformedToolArguments) ||
 		errors.Is(err, anthropic.ErrMalformedToolArguments) {
 		return server.NewError(http.StatusBadGateway, server.TypeAPIError,
@@ -64,6 +83,92 @@ func streamError(err error) *server.Error {
 	}
 	return server.NewError(http.StatusBadGateway, server.TypeAPIError,
 		"the upstream stream ended abnormally: "+err.Error()).WithCode(CodeUpstreamDecode)
+}
+
+// relayFailure is a stream the upstream answered 200 to and then did not
+// complete.
+//
+// It exists because the relay's return value was the one place these two
+// conditions had nowhere to go. A 200 is spent the moment the first frame is
+// written (DESIGN §7.6), so the client is told in band (COMPATIBILITY 1.3) —
+// but "the client was told" is not the same fact as "the attempt failed", and
+// only the second one reaches internal/health, the meter and the fail-back
+// boundary. Returning nil from the relay asserted the second, and it was not
+// true.
+//
+// It is a type rather than two sentinels because the in-band case carries the
+// upstream's own envelope and the truncation case carries nothing at all: there
+// is no envelope, which IS the condition.
+type relayFailure struct {
+	// err is the failure, already normalized into dorang's envelope and already
+	// scrubbed. Never nil.
+	err *server.Error
+}
+
+func (e *relayFailure) Error() string {
+	if e == nil || e.err == nil {
+		return "backend: the upstream stream did not complete"
+	}
+	return e.err.Message
+}
+
+func (e *relayFailure) serverError() *server.Error { return e.err }
+
+// truncatedStream is a stream that stopped without its family's end marker.
+//
+// COMPATIBILITY §4.4 permits synthesizing a terminal chunk when the backend
+// never sent one. That licence is for a stream that ENDED — the frames all
+// arrived, the backend simply omitted the finish_reason its own protocol makes
+// optional. It is not for a stream that BROKE, and the difference is not
+// cosmetic: dressing a cut-off generation in finish_reason "stop" hands the
+// client a half answer labelled complete, which no client can detect and every
+// client will act on.
+func truncatedStream() *relayFailure {
+	return &relayFailure{err: server.NewError(http.StatusBadGateway, server.TypeAPIError,
+		"the upstream stream ended without its terminator, so the answer is incomplete").
+		WithCode(CodeUpstreamStreamTruncated)}
+}
+
+// inBandFailure records an upstream error frame.
+//
+// The upstream's own type is kept only when it is outside dorang's vocabulary,
+// which is COMPATIBILITY §11.3's split applied to the one envelope
+// [server.Normalize] never sees: an error that arrived as a frame rather than
+// as a body. Its message goes to NativeMessage and stays there — the client has
+// already been told in band, and §11.3's reason for keeping upstream text out of
+// dorang's own envelope (several servers quote the offending key into it) is
+// exactly as true of a frame as of a body.
+func inBandFailure(e *canonical.Error, secrets []string) *relayFailure {
+	out := server.NewError(http.StatusBadGateway, server.TypeAPIError,
+		"the upstream failed inside a stream it had already begun").
+		WithCode(CodeUpstreamStreamError)
+	if e == nil {
+		return &relayFailure{err: out}
+	}
+	if server.KnownTypes(e.Type) {
+		out.Type = e.Type
+	} else if e.Type != "" {
+		out.NativeType = scrub(e.Type, secrets)
+	}
+	out.NativeMessage = scrub(e.Message, secrets)
+	return &relayFailure{err: out}
+}
+
+// normalizedFailure records an upstream error frame the relay saw as bytes
+// rather than as a decoded event.
+//
+// [server.Normalize] is the single implementation of COMPATIBILITY §11's
+// taxonomy and is used here for the same reason [upstreamError] uses it: an
+// in-band envelope is one of the same five shapes, and a second reading of that
+// table is how two parts of one gateway come to disagree about what a backend
+// said.
+func normalizedFailure(frame []byte, secrets []string) *relayFailure {
+	e := server.Normalize(http.StatusBadGateway, frame)
+	e.Message = "the upstream failed inside a stream it had already begun"
+	e.NativeMessage = scrub(e.NativeMessage, secrets)
+	e.NativeType = scrub(e.NativeType, secrets)
+	e.Code = CodeUpstreamStreamError
+	return &relayFailure{err: e}
 }
 
 // credentialHeaders are the headers this package puts key material into. They
@@ -232,7 +337,33 @@ func unsupportedError(code, message string) *server.Error {
 }
 
 // encodeError is a request the selected deployment cannot express.
+//
+// An [anthropic.OpaqueError] is not flattened. It is dorang declining to invent
+// opaque state, and it carries the two fields that make the refusal actionable:
+// Reason, which its own ToError renders as the wire `code`, and Construct, which
+// is the value §10.1 says the caller "can put in x-dorang-allow-lossy and retry
+// deliberately". Rendering both into a sentence under the generic
+// conversion_failed code is what made that mechanism unusable — a caller was
+// told what went wrong in prose and given nothing to act on.
+//
+// The construct id is in the message rather than in Param because Param names an
+// offending REQUEST FIELD and the construct is not one: `thinking_block` is a
+// capability, and a client that fed it to a field-locating SDK would be pointed
+// at a member that does not exist.
 func encodeError(err error) *server.Error {
+	var oe *anthropic.OpaqueError
+	if errors.As(err, &oe) {
+		we := oe.ToError()
+		msg := we.Message
+		if oe.Construct != "" {
+			msg += "; retry with x-dorang-allow-lossy: " + oe.Construct
+		}
+		e := server.NewError(we.Status(), server.TypeInvalidRequest, msg)
+		// The reason IS the code, which is the whole of the machine-readable
+		// half: a caller branching on it can map the refusal to the construct
+		// without parsing the sentence.
+		return e.WithCode(we.Code)
+	}
 	return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
 		"the request cannot be expressed by the selected deployment: "+err.Error()).
 		WithCode(CodeConversionFailed)

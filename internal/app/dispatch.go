@@ -833,6 +833,12 @@ func droppedParams(dec *router.Decision) string {
 // routeError renders a routing refusal as an HTTP answer. router.Error already
 // carries the status, the code and a message written for a human, so nothing is
 // paraphrased here.
+//
+// What it does add is the two things §11 fixes per CONDITION rather than per
+// status: the offending parameter, and the Anthropic family's spelling where it
+// differs. A router refusal is the most common error a client sees from a
+// gateway, and it was the one leaving with `param: null` where §11.1's own
+// worked example shows `"model"`.
 func routeError(err error) error {
 	var re *router.Error
 	if errors.As(err, &re) {
@@ -843,6 +849,20 @@ func routeError(err error) error {
 		e := server.NewError(status, server.TypeForStatus(status), re.Message)
 		if re.Code != "" {
 			e = e.WithCode(re.Code)
+		}
+		switch re.Code {
+		case router.CodeModelNotFound:
+			// §11.1's OpenAI envelope names the field: the model the caller
+			// asked for is the offending parameter, and a client that renders
+			// `param` has nothing to show without it.
+			e = e.WithParam("model")
+		case router.CodeContextWindow:
+			e = e.WithParam("messages")
+		case router.CodeNoCapacity, router.CodeNoCandidate:
+			// §11.2's two capacity rows are the only ones whose type is chosen
+			// by condition rather than by status: 429 is `rate_limit_error` to
+			// an OpenAI client and `overloaded_error` to an Anthropic one.
+			e.AltType = server.TypeOverloaded
 		}
 		if !re.ResetAt.IsZero() {
 			e.RetryAfterSeconds = int(time.Until(re.ResetAt).Seconds()) + 1

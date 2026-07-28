@@ -234,6 +234,14 @@ func (c *Config) ApplyDefaults() {
 		c.TokenGuard.Trigger.MinAbsolute = defaultGuardMinAbsolute
 	}
 
+	// compat (COMPATIBILITY §3.3, §6.8, §7.7). Filled so that a rendered
+	// configuration shows what this build actually does, which for two of the
+	// three is the only value it can do.
+	setStr(&c.Compat.UsageChunkChoices, UsageChunkChoicesStub)
+	if c.Compat.AnthropicTotalTokens == nil {
+		c.Compat.AnthropicTotalTokens = boolPtr(true)
+	}
+
 	// cluster
 	setStr(&c.Cluster.RedisURLEnv, defaultRedisURLEnv)
 	setStr(&c.Cluster.CapacityMode, defaultCapacityMode)

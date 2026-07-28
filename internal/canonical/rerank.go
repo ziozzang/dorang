@@ -64,9 +64,28 @@ type RerankResponse struct {
 	// input counts (DESIGN §10.7). A vendor that bills rerank in "search units"
 	// rather than tokens reports them in SearchUnits, never folded into a token
 	// count that would then be priced per token.
-	Usage       *Usage
-	SearchUnits int
-	Extra       map[string]json.RawMessage
+	Usage *Usage
+	// SearchUnits is what the vendor charged. SearchUnitsReported distinguishes
+	// a billed_units block that said zero from one that was never sent, for the
+	// reason [UsageField] gives about token counters: a billing integration
+	// reads those two differently.
+	SearchUnits         int
+	SearchUnitsReported bool
+
+	// Extra carries members of the response object dorang does not model.
+	//
+	// Rerank needs no [Family] gate. There is one client-facing rerank shape —
+	// the union of the two vendor billing blocks, which this package emits
+	// whichever dialect answered — so an answer never leaves in a shape other
+	// than the one this type describes.
+	Extra map[string]json.RawMessage
+	// UsageExtra, MetaExtra and BilledUnitsExtra are the unmodelled members of
+	// the three billing sub-objects. They are separate maps for the same reason
+	// [UsageExtra] has three: flattening them loses which object a member
+	// belonged to.
+	UsageExtra       map[string]json.RawMessage
+	MetaExtra        map[string]json.RawMessage
+	BilledUnitsExtra map[string]json.RawMessage
 }
 
 // RerankResult is one scored document.

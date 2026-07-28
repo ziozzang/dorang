@@ -480,6 +480,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
+		LegacyHeaders:     cfg.Compat.LegacyHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),
 		Routes:            a.extraRoutes(),
 		Observer:          shadowObserver(a.Shadow),

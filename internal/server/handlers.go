@@ -390,7 +390,7 @@ func (s *Server) handleModelRetrieve(w http.ResponseWriter, rq *Request) error {
 	}
 	if found == nil || (rq.Principal != nil && !rq.Principal.AllowsModel(id)) {
 		return NewError(http.StatusNotFound, TypeInvalidRequest,
-			"no such model").WithCode("model_not_found").WithParam("model")
+			"no such model").WithCode(CodeModelNotFound).WithParam("model")
 	}
 
 	buf := getBuf()

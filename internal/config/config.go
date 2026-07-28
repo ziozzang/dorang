@@ -43,6 +43,8 @@ type Config struct {
 	// TokenGuard is §11.6's per-key anomaly guard. Off by default: an automated
 	// refusal is a thing an operator opts into.
 	TokenGuard TokenGuard `yaml:"token_guard,omitempty"`
+	// Compat is COMPATIBILITY's three operator-settable divergence switches.
+	Compat Compat `yaml:"compat,omitempty"`
 
 	// idx is built once, after validation, and never mutated afterwards.
 	idx *index
@@ -209,6 +211,45 @@ type TokenGuard struct {
 	Action   string   `yaml:"action,omitempty"`
 	Cooldown Duration `yaml:"cooldown,omitempty"`
 }
+
+// Compat is the `compat` block: the three places COMPATIBILITY names a
+// divergence an operator gets to choose.
+//
+// All three were documented as settable and existed only as Go constants, so a
+// configuration that set any of them failed to load with an unknown-key error
+// and the document was describing a knob that was not there. Two of the three
+// still cannot be turned off in this build — the value has to reach
+// internal/wire through internal/backend and nothing carries it — and those two
+// are REFUSED at their non-default value rather than accepted and ignored.
+// Refusing names the gap at the moment an operator makes the decision; accepting
+// would let them believe they had changed something. docs/CONFIG.md §23.1
+// records both, and the refusal message names the file and line a fix lands in.
+type Compat struct {
+	// LegacyHeaders mirrors the reference proxy's response header names
+	// alongside dorang's own (§7.7). Off by default: they are another vendor's
+	// names, and a gateway that emits them unasked is claiming to be that
+	// vendor. Turn it on for a cutover, turn it off once nothing reads them.
+	LegacyHeaders bool `yaml:"legacy_headers,omitempty"`
+
+	// UsageChunkChoices selects the shape of a streaming usage chunk's
+	// `choices` array (§3.3): "stub" is the reference proxy's
+	// [{"index":0,"delta":{}}] and "empty" is strict OpenAI's [].
+	//
+	// Only "stub" is served. "empty" is refused at load.
+	UsageChunkChoices string `yaml:"usage_chunk_choices,omitempty"`
+
+	// AnthropicTotalTokens reproduces the reference implementation's non-spec
+	// `usage.total_tokens` on non-streaming Anthropic responses (§6.8).
+	//
+	// Only true is served. false is refused at load.
+	AnthropicTotalTokens *bool `yaml:"anthropic_total_tokens,omitempty"`
+}
+
+// The values `compat.usage_chunk_choices` accepts.
+const (
+	UsageChunkChoicesStub  = "stub"
+	UsageChunkChoicesEmpty = "empty"
+)
 
 // TokenGuardTrigger is the pair of conditions, BOTH of which must hold.
 //

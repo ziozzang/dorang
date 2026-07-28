@@ -1337,6 +1337,35 @@ Dropping the hint is reported in `x-dorang-dropped-params` rather than being sil
 
 ---
 
+## 21a. `compat`
+
+The three places [COMPATIBILITY.md](COMPATIBILITY.md) names a divergence an operator gets to
+choose. All three are documented there as operator-settable; until this section existed the
+schema had no `compat:` block at all, so a file that set any of them failed to load with an
+unknown-key error and the document was describing a knob that was not there.
+
+```yaml
+compat:
+  legacy_headers: false         # mirror the reference proxy's response header names
+  usage_chunk_choices: stub     # stub | empty   — only `stub` is served
+  anthropic_total_tokens: true  # only `true` is served
+```
+
+| Key | Type | Default | What it does | What breaks if it is wrong |
+|---|---|---|---|---|
+| `legacy_headers` | bool | `false` | Adds the reference proxy's response header spellings **alongside** dorang's own (COMPATIBILITY §7.7a lists them name by name). Nothing is renamed and nothing is removed | Nothing breaks; it emits another vendor's names, which is why it is off by default. Turn it on for a cutover and off once nothing reads them. The failure it prevents is silent: an exporter reading `x-litellm-response-cost` does not error when the header stops arriving, it reports **zero** |
+| `usage_chunk_choices` | string | `stub` | COMPATIBILITY §3.3. `stub` is the reference proxy's `"choices":[{"index":0,"delta":{}}]`; `empty` is strict OpenAI's `[]` | **`empty` is refused at load.** This build serves only `stub` — see §23.1. Any other value is refused as unknown |
+| `anthropic_total_tokens` | bool | `true` | COMPATIBILITY §6.8. Reproduces the reference implementation's non-spec `usage.total_tokens` on non-streaming Anthropic responses | **`false` is refused at load.** This build always emits it — see §23.1 |
+
+Two of the three are refused at their non-default value rather than accepted and ignored. That
+is deliberate and is the point of §23: DESIGN §17.1 names "a setting that loads, validates and
+is read by nothing" as this repository's dominant defect, and the two ways not to commit it are
+to wire the setting or to refuse it. Refusing names the gap at the moment an operator makes the
+decision, and the refusal message names the file the fix lands in. Accepting would let them
+believe they had changed something.
+
+---
+
 ## 22. Referential integrity
 
 Every cross-reference is checked at load, by name, with the YAML path:
@@ -1404,6 +1433,8 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 | `cluster.redis_url_env` | Required for `capacity_mode: shared-redis` and no Redis client is constructed anywhere |
 | `observability.otlp_endpoint` | No exporter is wired |
 | `observability.log_level`, `.log_format` | No logger reads either; diagnostics go through the `Logf` hook the embedder supplies |
+| `compat.usage_chunk_choices: empty` | **Refused, not inert.** The value would have to reach `openai.StreamConfig` in `internal/backend/stream.go`, which reads only `backend.Call`, and `backend.Call` has no field for it. Every streaming usage chunk carries the `stub` shape. COMPATIBILITY §3.3 |
+| `compat.anthropic_total_tokens: false` | **Refused, not inert.** `anthropic.ResponseOptions.TotalTokens` is never set in `internal/backend/backend.go` and defaults to emitting the field, and `anthropic.StreamConfig` has no such field at all. A non-streaming Anthropic response always carries `usage.total_tokens`. COMPATIBILITY §6.8 |
 
 `internal/config/consumed_test.go` holds this list as executable state rather than prose:
 adding a setting with no consumer fails the build, and so does wiring one without striking it
@@ -1428,6 +1459,7 @@ Everything below used to be in the table above.
 | `key_ref` | **Refused**, naming `key_env` and `key_file` |
 | `providers[].prefix_ttl`, `models[].deployments[].prefix_ttl` | New. The affinity lifetime is per backend, because that is what it models; `until_evicted` is the honest value for vLLM and SGLang |
 | `DORANG_STATE_DIR` | Wired. A leading `~` in any state path resolves to it, so the image's defaults land inside its declared volume |
+| `compat.legacy_headers` | New, and wired end to end. It had existed as a `server.Options` field with a working consumer that **no configuration could reach** — `internal/app` never set it — so COMPATIBILITY §7.7's mirroring claim was true of the code and false of every deployment. §21a |
 
 ### 23.2 Designed and not in the schema at all
 

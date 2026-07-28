@@ -629,6 +629,12 @@ func (s *geminiSource) next() ([]canonical.StreamEvent, error) {
 	}
 }
 
+// terminated reports false: this family sends no terminator frame at all — no
+// [DONE], no message_stop, the body simply ends. A candidate's finishReason is
+// the only end-of-stream marker it defines, and the relay reads that as the stop
+// event.
+func (s *geminiSource) terminated() bool { return false }
+
 func (s *geminiSource) events(w *geminiResponse) []canonical.StreamEvent {
 	var out []canonical.StreamEvent
 	if !s.start {

@@ -389,8 +389,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.metrics.panics.Add(1)
 			cfg.logf("server: panic serving %s %s: %v", rq.Method, rq.Path, v)
 			if !rw.wrote {
+				// COMPATIBILITY §11.2's "Gateway fault" row: `internal_error`,
+				// not the stringified status NewError would otherwise default
+				// to. A 500 is the one status a client cannot infer anything
+				// from, so the code is the whole of what it learns.
 				WriteError(rw, NewError(http.StatusInternalServerError,
-					TypeAPIError, "internal error"))
+					TypeAPIError, "internal error").WithCode(CodeInternalError))
 			}
 		}
 		s.finish(cfg, rq, rw)
@@ -473,7 +477,7 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 				model, stream, ok := peekRequest(b)
 				if !ok {
 					return NewError(http.StatusBadRequest, TypeInvalidRequest,
-						"request body is not a JSON object").WithCode("invalid_body")
+						"request body is not a JSON object").WithCode(CodeInvalidRequest)
 				}
 				rq.Model, rq.Stream = model, stream
 			}
@@ -551,6 +555,13 @@ func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 	// The dispatcher has already scrubbed the credential it sent from these.
 	rq.Result.NativeErrorType = e.NativeType
 	rq.Result.NativeErrorMessage = e.NativeMessage
+	// The vendor's own vocabulary, chosen by which family the caller is speaking
+	// (COMPATIBILITY §11's opening rule). This is the one place a family reaches
+	// an envelope, and every error response goes through it.
+	if rq.Route != nil {
+		e = e.ForFamily(rq.Route.Family)
+	}
+	s.logUpstreamError(rq, e)
 	if !rw.wrote {
 		WriteError(rw, e)
 		return
@@ -563,6 +574,42 @@ func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 		rw.flush()
 	}
 	rq.srv.metrics.lateErrors.Add(1)
+}
+
+// logUpstreamError puts the backend's own words somewhere an operator can read
+// them without a database round trip.
+//
+// This is the deliberate answer to "what carries the upstream's message", and
+// the answer is: the operator log, not the client.
+//
+// COMPATIBILITY §11.3 keeps the backend's message out of the response body, and
+// the reason is concrete rather than tidy — several OpenAI-compatible servers
+// quote the offending key back in a 401 message, so a gateway that relays that
+// text hands the operator's provider credential to whichever tenant happened to
+// be calling. That reasoning applies to a RESPONSE HEADER exactly as it applies
+// to a body: both are read by the same client, over the same connection, by
+// every HTTP library ever written. So there is no x-dorang-native-error-message
+// and there deliberately will not be one. What §11.3 promises out of band is the
+// native TYPE and CODE — enumerated tokens, not free text — and those are on
+// headers.
+//
+// The free text goes here. Before this it was assigned to
+// Result.NativeErrorMessage and read by nothing anywhere in the tree, so §11.3's
+// other promise — "recorded in the ledger" — was not true either and an upstream
+// reason was erased with no recovery path at all. A gateway whose only record of
+// why a backend refused is a field nobody reads is a gateway that makes an
+// outage undebuggable, which is the failure mode §11.3's own excerpt rule exists
+// to avoid.
+//
+// The text is already scrubbed: internal/backend runs internal/redact over it
+// with the exact secret that request carried, before it ever reaches here.
+func (s *Server) logUpstreamError(rq *Request, e *Error) {
+	if e == nil || (e.NativeMessage == "" && e.NativeType == "" && e.NativeCode == "") {
+		return
+	}
+	s.snap.Load().logf(
+		"server: upstream error: request=%s status=%d code=%s native_type=%q native_code=%q native_message=%q",
+		rq.ID, e.StatusCode(), e.Code, e.NativeType, e.NativeCode, e.NativeMessage)
 }
 
 // asError coerces any error into an *Error with a default status.
@@ -578,7 +625,7 @@ func asError(err error, status int, typ string) *Error {
 	}
 	if ctxErr := err; ctxErr == context.DeadlineExceeded {
 		return NewError(http.StatusGatewayTimeout, TypeTimeout,
-			"request exceeded the configured timeout").WithCode("timeout")
+			"request exceeded the configured timeout").WithCode(CodeTimeout)
 	}
 	return NewError(status, typ, err.Error())
 }
@@ -603,7 +650,7 @@ func (s *Server) unimplemented(rw *responseWriter, rq *Request) error {
 	code := "route_unknown"
 	msg := "no such route; dorang does not serve this path"
 	if plannedSurface(rq.Path) {
-		code = "route_not_implemented"
+		code = CodeRouteNotImplemented
 		msg = "route is part of dorang's declared surface but is not implemented yet"
 	}
 	return NewError(http.StatusNotImplemented, TypeNotImplemented, msg).

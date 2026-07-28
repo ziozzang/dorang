@@ -221,7 +221,7 @@ func (s *StreamWriter) WriteEvent(ev canonical.StreamEvent) error {
 			native = string(ev.Delta.StopReason)
 		}
 		if native != "" {
-			ch.ProviderSpecificFields = nativeFinishFields(native)
+			ch.ProviderSpecificFields = withNativeFinish(ch.ProviderSpecificFields, native)
 		}
 		c := &Chunk{Choices: []ChunkChoice{ch}}
 		if ev.Usage != nil {

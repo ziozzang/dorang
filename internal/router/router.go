@@ -828,7 +828,10 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 		return nil, &Error{Status: 503, Code: CodeFallbackExhausted, terminal: true,
 			Message: "every candidate has already been tried"}
 	}
-	return nil, &Error{Status: 503, Code: CodeNoCandidate,
+	// 429, not 503: COMPATIBILITY §11.2's "No healthy deployment" row and the
+	// reasoning printed under it. A 503 tells an SDK the gateway is down and
+	// stops its retry loop; a 429 is the back-pressure this actually is.
+	return nil, &Error{Status: 429, Code: CodeNoCandidate,
 		Message: "no deployment is eligible for this request"}
 }
 
@@ -1179,7 +1182,10 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 		}
 		return nil, e
 	}
-	e := &Error{Status: 503, Code: CodeNoCapacity, Attempt: st.attempts + 1,
+	// Both spellings are 429 by §11.2 — "Capacity wait timed out" and "No
+	// healthy deployment" are the same row's two neighbours, and both are
+	// conditions a client should back off from rather than give up on.
+	e := &Error{Status: 429, Code: CodeNoCapacity, Attempt: st.attempts + 1,
 		Message: "no candidate of this model had room"}
 	if saturated == 0 && unhealthy > 0 {
 		e.Code = CodeNoCandidate

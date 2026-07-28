@@ -1013,11 +1013,20 @@ func TestErrorMapping(t *testing.T) {
 		status int
 		code   string
 	}{
-		{ErrMissingCredential, http.StatusUnauthorized, "missing_credential"},
-		{ErrMalformed, http.StatusUnauthorized, "malformed_credential"},
-		{ErrUnknownKey, http.StatusUnauthorized, "invalid_credential"},
-		{ErrExpired, http.StatusUnauthorized, "credential_expired"},
-		{ErrBlocked, http.StatusForbidden, "credential_blocked"},
+		// COMPATIBILITY §11.2's "Missing or malformed credential" and "Expired
+		// or revoked credential" rows both pin `invalid_api_key`. Five distinct
+		// spellings here were five ways for a client's invalid_api_key branch
+		// to miss.
+		{ErrMissingCredential, http.StatusUnauthorized, "invalid_api_key"},
+		{ErrMalformed, http.StatusUnauthorized, "invalid_api_key"},
+		{ErrUnknownKey, http.StatusUnauthorized, "invalid_api_key"},
+		{ErrDigestMismatch, http.StatusUnauthorized, "invalid_api_key"},
+		{ErrExpired, http.StatusUnauthorized, "invalid_api_key"},
+		// Not collapsed, because the fix is different: §11.2 carries these as
+		// dorang's own rows.
+		{ErrSecretRetired, http.StatusUnauthorized, "secret_retired"},
+		{ErrPended, http.StatusForbidden, "credential_pended"},
+		{ErrBlocked, http.StatusForbidden, "key_blocked"},
 		{ErrModelNotAllowed, http.StatusForbidden, "model_not_allowed"},
 		{ErrRouteNotAllowed, http.StatusForbidden, "route_not_allowed"},
 		{ErrRateLimited, http.StatusTooManyRequests, "rate_limit_exceeded"},

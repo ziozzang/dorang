@@ -704,12 +704,15 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 			// Inclusive, as this family reports it (DESIGN §10.7).
 			InputTokens:  w.Usage.InputTokens,
 			OutputTokens: w.Usage.OutputTokens,
+			Reported:     canonical.UsageInput | canonical.UsageOutput,
 		}
 		if w.Usage.InputTokensDetails != nil {
 			u.CacheReadTokens = w.Usage.InputTokensDetails.CachedTokens
+			u.Report(canonical.UsageCacheRead)
 		}
 		if w.Usage.OutputTokensDetails != nil {
 			u.ReasoningTokens = w.Usage.OutputTokensDetails.ReasoningTokens
+			u.Report(canonical.UsageReasoning)
 		}
 		out.Usage = u
 	}
@@ -1084,10 +1087,15 @@ func EncodeResponsesResponse(r *canonical.Response, opt *ResponsesOptions) (*Res
 			OutputTokens: r.Usage.OutputTokens,
 			TotalTokens:  r.Usage.TotalTokens(),
 		}
-		if r.Usage.CacheReadTokens > 0 {
+		// Reported, not `> 0`: a breakdown the backend stated is emitted as
+		// stated, zero included, and one dorang synthesized is still omitted.
+		// The same rule as [EncodeUsage], for the same billing reason — this
+		// surface's clients read input_tokens_details.cached_tokens exactly the
+		// way a chat client reads prompt_tokens_details.cached_tokens.
+		if r.Usage.CacheReadTokens > 0 || r.Usage.Reports(canonical.UsageCacheRead) {
 			u.InputTokensDetails = &InputTokensDetails{CachedTokens: r.Usage.CacheReadTokens}
 		}
-		if r.Usage.ReasoningTokens > 0 {
+		if r.Usage.ReasoningTokens > 0 || r.Usage.Reports(canonical.UsageReasoning) {
 			u.OutputTokensDetails = &OutputTokensDetails{ReasoningTokens: r.Usage.ReasoningTokens}
 		}
 		out.Usage = u

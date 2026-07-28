@@ -39,8 +39,18 @@ func TestUsageBothDirections(t *testing.T) {
 	}
 
 	back := UsageToCanonical(w)
-	if *back != in {
-		t.Errorf("round trip changed the counts:\n got %+v\nwant %+v", *back, in)
+	// The decode direction learns something the encode direction was not told:
+	// WHICH counters the wire stated. `in` was hand-built and states nothing, so
+	// the round trip is an identity on the counts and strictly gains presence.
+	counts := *back
+	counts.Reported = 0
+	if counts != in {
+		t.Errorf("round trip changed the counts:\n got %+v\nwant %+v", counts, in)
+	}
+	if want := canonical.UsageInput | canonical.UsageOutput |
+		canonical.UsageCacheRead | canonical.UsageCacheWrite; back.Reported != want {
+		t.Errorf("decoded presence = %04b, want %04b — every counter this wire stated must be marked",
+			back.Reported, want)
 	}
 }
 

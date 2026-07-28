@@ -427,5 +427,5 @@ func tooLarge(max int64) *Error {
 	*buf = appendInt(*buf, max)
 	*buf = append(*buf, " bytes)"...)
 	e := NewError(http.StatusRequestEntityTooLarge, TypeRequestTooLarge, string(*buf))
-	return e.WithCode("request_too_large")
+	return e.WithCode(CodeRequestTooLarge)
 }

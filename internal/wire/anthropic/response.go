@@ -127,6 +127,11 @@ func EncodeResponse(r *canonical.Response, opt *ResponseOptions) (*EncodedRespon
 	caps := opt.caps()
 	loss := opt.loss()
 
+	// Unmodelled members are forwarded only when the answer is going back out in
+	// the shape it arrived in. A chat completion's `timings` has no meaning here
+	// and inventing it is the compatibility break §10.7 exists to prevent.
+	same := r.SameFamily(canonical.FamilyAnthropicMessages)
+
 	out := &Response{
 		ID:    r.ID,
 		Type:  TypeMessage,
@@ -135,7 +140,9 @@ func EncodeResponse(r *canonical.Response, opt *ResponseOptions) (*EncodedRespon
 		// stop_sequence is null on the adapter path (COMPATIBILITY 6.5). The
 		// field is present and null, not absent.
 		StopSequence: nil,
-		Extra:        r.Extra,
+	}
+	if same {
+		out.Extra = r.Extra
 	}
 	if opt != nil {
 		if opt.ID != "" {
@@ -150,6 +157,9 @@ func EncodeResponse(r *canonical.Response, opt *ResponseOptions) (*EncodedRespon
 	}
 	if r.Usage != nil {
 		out.Usage = EncodeUsage(*r.Usage, opt.totalMode())
+		if same && r.UsageExtra != nil {
+			out.Usage.Extra = r.UsageExtra.Usage
+		}
 	}
 
 	enc := &EncodedResponse{Response: out}
@@ -293,10 +303,16 @@ func EncodeUsage(u canonical.Usage, mode TotalTokensMode) *Usage {
 		InputTokens:  ptr(ExclusiveInputTokens(u)),
 		OutputTokens: ptr(u.OutputTokens),
 	}
-	if u.CacheWriteTokens > 0 {
+	// COMPATIBILITY 6.7's ">0 only" rule still governs a count dorang produced
+	// itself, which reports nothing. A count the BACKEND stated is emitted as
+	// stated, zero included: 6.7 records that the vendor emits explicit zeros
+	// and that a golden captured from the vendor therefore will not match one
+	// captured from a proxy — this is that gap, and dropping a measured zero was
+	// the wrong half of it to keep.
+	if u.CacheWriteTokens > 0 || u.Reports(canonical.UsageCacheWrite) {
 		w.CacheCreationInputTokens = ptr(u.CacheWriteTokens)
 	}
-	if u.CacheReadTokens > 0 {
+	if u.CacheReadTokens > 0 || u.Reports(canonical.UsageCacheRead) {
 		w.CacheReadInputTokens = ptr(u.CacheReadTokens)
 	}
 	if mode != TotalTokensOmit {

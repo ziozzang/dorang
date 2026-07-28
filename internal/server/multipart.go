@@ -44,12 +44,12 @@ func parseMultipart(r *http.Request, body []byte) (*canonical.Form, *Error) {
 	mt, params, err := mime.ParseMediaType(ct)
 	if err != nil || !strings.HasPrefix(mt, "multipart/") {
 		return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-			"expected a multipart/form-data body").WithCode("invalid_body")
+			"expected a multipart/form-data body").WithCode(CodeInvalidRequest)
 	}
 	boundary := params["boundary"]
 	if boundary == "" {
 		return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-			"the multipart Content-Type carried no boundary").WithCode("invalid_body")
+			"the multipart Content-Type carried no boundary").WithCode(CodeInvalidRequest)
 	}
 
 	mr := multipart.NewReader(bytes.NewReader(body), boundary)
@@ -57,7 +57,7 @@ func parseMultipart(r *http.Request, body []byte) (*canonical.Form, *Error) {
 	for n := 0; ; n++ {
 		if n >= maxFormParts {
 			return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-				"the multipart body carried too many parts").WithCode("invalid_body")
+				"the multipart body carried too many parts").WithCode(CodeInvalidRequest)
 		}
 		part, err := mr.NextPart()
 		if err != nil {
@@ -65,7 +65,7 @@ func parseMultipart(r *http.Request, body []byte) (*canonical.Form, *Error) {
 				break
 			}
 			return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-				"the multipart body could not be parsed").WithCode("invalid_body")
+				"the multipart body could not be parsed").WithCode(CodeInvalidRequest)
 		}
 		name := part.FormName()
 		if name == "" {
@@ -118,7 +118,7 @@ func readAllLimited(r io.Reader, limit int64) ([]byte, *Error) {
 				return buf, nil
 			}
 			return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
-				"the multipart body could not be read").WithCode("invalid_body")
+				"the multipart body could not be read").WithCode(CodeInvalidRequest)
 		}
 	}
 }

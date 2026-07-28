@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -96,6 +97,38 @@ func knownKeys(names ...string) map[string]struct{} {
 		m[n] = struct{}{}
 	}
 	return m
+}
+
+// splitExtraFold is splitExtra for a RESPONSE type, which is decoded with plain
+// json.Unmarshal rather than through [strictBytes].
+//
+// encoding/json matches field names case-INSENSITIVELY, so a backend that sends
+// "Usage" populates the Usage field; an exact-match split then leaves "Usage" in
+// the map as well and the re-serialized answer carries the object twice under
+// two spellings. Folding loses nothing — the value was already read into the
+// struct — and hands the client one key instead of two.
+//
+// Request types must not use it: they are filtered by [strictBytes] first, so a
+// cased key is dropped from the struct decode and from the map together, and
+// folding would accept a key the authorization gate never saw
+// (COMPATIBILITY 2.0).
+func splitExtraFold(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
+	raw, err := splitExtra(b, known)
+	if err != nil || len(raw) == 0 {
+		return raw, err
+	}
+	for k := range raw {
+		for want := range known {
+			if strings.EqualFold(k, want) {
+				delete(raw, k)
+				break
+			}
+		}
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return raw, nil
 }
 
 // splitExtra returns the members of a JSON object that are not in known.

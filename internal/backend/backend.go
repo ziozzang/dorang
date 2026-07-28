@@ -460,12 +460,22 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	}
 
 	if x.call.Stream {
-		usage, err := b.relay(x, resp, w)
+		usage, sent, err := b.relay(x, resp, w)
 		res.Total = b.now().Sub(start)
 		res.Usage = usage
-		res.FirstByteSent = true
+		// From the bytes that actually reached the client, not from the fact that
+		// this was a stream. The flag closes fail-back for good (§7.6), and it
+		// used to be set unconditionally — so an upstream that answered 200 and
+		// then wrote nothing at all committed a response that had no content,
+		// could never be retried, and reported success.
+		res.FirstByteSent = sent > 0
 		if err != nil {
 			res.Err = streamError(err)
+			// Another DEPLOYMENT may be tried precisely while nothing has been
+			// written. Once a byte is out, FirstByteSent forbids the hop on its
+			// own; saying "retryable" as well would be describing a hop that
+			// cannot happen.
+			res.Retryable = sent == 0
 			b.report(&res, *x.target, x.call)
 		}
 		return res

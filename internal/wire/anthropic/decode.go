@@ -347,12 +347,20 @@ func ResponseToCanonical(w *Response, opt *DecodeOptions) (*canonical.Response, 
 		ID:    w.ID,
 		Model: w.Model,
 		Extra: w.Extra,
+		// Tagging the shape is what keeps these members OUT of a chat
+		// completion. Before the tag existed only this family produced them and
+		// only this family read them; now that every adapter does, an untagged
+		// map would be spliced by whichever encoder ran (DESIGN §10.7).
+		ExtraFamily: canonical.FamilyAnthropicMessages,
 	}
 	if opt != nil && opt.Model != "" {
 		out.Model = opt.Model
 	}
 	if w.Usage != nil {
 		out.Usage = UsageToCanonical(w.Usage)
+		if len(w.Usage.Extra) > 0 {
+			out.UsageExtra = &canonical.UsageExtra{Usage: w.Usage.Extra}
+		}
 	}
 
 	msg := canonical.Message{Role: canonical.RoleAssistant}
@@ -399,15 +407,23 @@ func UsageToCanonical(u *Usage) *canonical.Usage {
 	out := &canonical.Usage{}
 	if u.OutputTokens != nil {
 		out.OutputTokens = *u.OutputTokens
+		out.Report(canonical.UsageOutput)
 	}
 	if u.CacheReadInputTokens != nil {
 		out.CacheReadTokens = *u.CacheReadInputTokens
+		// The vendor emits explicit zeros here (COMPATIBILITY 6.7). Recording
+		// that it did is what lets the encoder put them back, so a capture from
+		// dorang matches a capture from the vendor instead of differing by two
+		// keys on every uncached request.
+		out.Report(canonical.UsageCacheRead)
 	}
 	if u.CacheCreationInputTokens != nil {
 		out.CacheWriteTokens = *u.CacheCreationInputTokens
+		out.Report(canonical.UsageCacheWrite)
 	}
 	if u.InputTokens != nil {
 		out.InputTokens = *u.InputTokens + out.CacheReadTokens + out.CacheWriteTokens
+		out.Report(canonical.UsageInput)
 	}
 	// total_tokens, when a backend sent COMPATIBILITY 6.8's non-spec field, is
 	// deliberately ignored: canonical.Usage derives it, and trusting a

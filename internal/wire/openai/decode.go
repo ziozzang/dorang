@@ -362,6 +362,10 @@ func ResponseToCanonical(w *Response, opt *DecodeOptions) (*canonical.Response, 
 		ID:      w.ID,
 		Model:   w.Model,
 		Created: w.Created,
+		// Everything unmodelled that follows is tagged with the shape it came
+		// from, so only an encoder for that shape forwards it (DESIGN §10.7).
+		Extra:       w.Extra,
+		ExtraFamily: canonical.FamilyOpenAIChat,
 	}
 	if opt != nil && opt.Model != "" {
 		out.Model = opt.Model
@@ -374,14 +378,17 @@ func ResponseToCanonical(w *Response, opt *DecodeOptions) (*canonical.Response, 
 	}
 	if w.Usage != nil {
 		out.Usage = usageToCanonical(w.Usage)
+		out.UsageExtra = usageExtraOf(w.Usage)
 	}
 	out.Choices = make([]canonical.Choice, 0, len(w.Choices))
 	for i := range w.Choices {
 		c := &w.Choices[i]
 		cc := canonical.Choice{
-			Index:    c.Index,
-			Message:  messageToCanonical(&c.Message, opt.names()),
-			Logprobs: c.Logprobs,
+			Index:          c.Index,
+			Message:        messageToCanonical(&c.Message, opt.names()),
+			Logprobs:       c.Logprobs,
+			Extra:          c.Extra,
+			ProviderFields: c.ProviderSpecificFields,
 		}
 		cc.StopReason, cc.NativeStopReason = stopReasonOfChoice(c.FinishReason, c.ProviderSpecificFields, opt.warn())
 		out.Choices = append(out.Choices, cc)
@@ -414,19 +421,51 @@ func stopReasonOfChoice(finish *string, psf map[string]json.RawMessage, warn War
 	return canonical.StopEndTurn, *finish
 }
 
+// usageToCanonical converts wire counts to neutral counts, recording WHICH ones
+// the backend actually stated.
+//
+// The presence half is not bookkeeping. `prompt_tokens_details: {cached_tokens:
+// 0}` and no prompt_tokens_details at all are different facts — the first says
+// the cache returned nothing on this request, the second says nothing about a
+// cache — and an encoder with only the integer to look at cannot tell them
+// apart, so it omits the measured zero and a customer's cache accounting loses
+// the row that says the cache was consulted.
 func usageToCanonical(u *Usage) *canonical.Usage {
 	out := &canonical.Usage{
 		InputTokens:  u.PromptTokens,
 		OutputTokens: u.CompletionTokens,
+		Reported:     canonical.UsageInput | canonical.UsageOutput,
 	}
 	if u.PromptTokensDetails != nil {
 		out.CacheReadTokens = u.PromptTokensDetails.CachedTokens
+		out.Report(canonical.UsageCacheRead)
 	}
 	if u.CompletionTokensDetails != nil {
 		out.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+		out.Report(canonical.UsageReasoning)
 	}
 	if u.CacheCreationInputTokens != nil {
 		out.CacheWriteTokens = *u.CacheCreationInputTokens
+		out.Report(canonical.UsageCacheWrite)
+	}
+	return out
+}
+
+// usageExtraOf collects the members of the usage object, and of its two detail
+// sub-objects, that no canonical counter names.
+func usageExtraOf(u *Usage) *canonical.UsageExtra {
+	if u == nil {
+		return nil
+	}
+	out := &canonical.UsageExtra{Usage: u.Extra}
+	if u.PromptTokensDetails != nil {
+		out.PromptDetails = u.PromptTokensDetails.Extra
+	}
+	if u.CompletionTokensDetails != nil {
+		out.CompletionDetails = u.CompletionTokensDetails.Extra
+	}
+	if out.Empty() {
+		return nil
 	}
 	return out
 }

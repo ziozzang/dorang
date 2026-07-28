@@ -66,13 +66,14 @@ func TestErrorEnvelopeGolden(t *testing.T) {
 // out of band, not in the body.
 func TestNormalizeEveryUpstreamShape(t *testing.T) {
 	cases := []struct {
-		name      string
-		status    int
-		body      string
-		want      string
-		shape     Shape
-		native    string
-		nativeMsg string
+		name       string
+		status     int
+		body       string
+		want       string
+		shape      Shape
+		native     string
+		nativeMsg  string
+		nativeCode string
 	}{
 		{
 			name:      "openai nested",
@@ -86,34 +87,37 @@ func TestNormalizeEveryUpstreamShape(t *testing.T) {
 			// vLLM: integer code, Python exception name as the type. An OpenAI
 			// SDK branching on a string code raises before the message is ever
 			// surfaced.
-			name:      "nested with an integer code and a python type",
-			status:    400,
-			body:      `{"error":{"message":"bad request","type":"BadRequestError","param":null,"code":400}}`,
-			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:     ShapeNested,
-			native:    "BadRequestError",
-			nativeMsg: "bad request",
+			name:       "nested with an integer code and a python type",
+			status:     400,
+			body:       `{"error":{"message":"bad request","type":"BadRequestError","param":null,"code":400}}`,
+			want:       `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:      ShapeNested,
+			native:     "BadRequestError",
+			nativeMsg:  "bad request",
+			nativeCode: "400",
 		},
 		{
 			// SGLang shape (a): flat. An OpenAI SDK reads
 			// body["error"]["message"]; against this, that key does not exist.
-			name:      "flat with object=error",
-			status:    400,
-			body:      `{"object":"error","message":"flat message","type":"BadRequest","param":null,"code":400}`,
-			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:     ShapeFlat,
-			native:    "BadRequest",
-			nativeMsg: "flat message",
+			name:       "flat with object=error",
+			status:     400,
+			body:       `{"object":"error","message":"flat message","type":"BadRequest","param":null,"code":400}`,
+			want:       `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:      ShapeFlat,
+			native:     "BadRequest",
+			nativeMsg:  "flat message",
+			nativeCode: "400",
 		},
 		{
 			// The same server, streaming: nested. Two shapes, one process.
-			name:      "flat and nested agree after normalization",
-			status:    400,
-			body:      `{"error":{"message":"flat message","type":"Bad Request","param":null,"code":400}}`,
-			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:     ShapeNested,
-			native:    "Bad Request",
-			nativeMsg: "flat message",
+			name:       "flat and nested agree after normalization",
+			status:     400,
+			body:       `{"error":{"message":"flat message","type":"Bad Request","param":null,"code":400}}`,
+			want:       `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:      ShapeNested,
+			native:     "Bad Request",
+			nativeMsg:  "flat message",
+			nativeCode: "400",
 		},
 		{
 			// SGLang shape (d): Anthropic-shaped, from /v1/messages on the
@@ -183,12 +187,18 @@ func TestNormalizeEveryUpstreamShape(t *testing.T) {
 			nativeMsg: `{"result":"surprise"}`,
 		},
 		{
-			name:      "code as an object is carried rather than dropped",
-			status:    400,
-			body:      `{"error":{"message":"m","type":"invalid_request_error","code":{"inner":"x"}}}`,
-			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"{\"inner\":\"x\"}"}}`,
-			shape:     ShapeNested,
-			nativeMsg: "m",
+			// The envelope gets a code that satisfies §7.1; the backend's own
+			// spelling is carried out of band on x-dorang-native-error-code
+			// (§11.3), which is what TestNativeErrorCodeReachesTheHeader checks.
+			// It used to be pasted into the envelope, so a client switching on
+			// `code` saw a JSON document there.
+			name:       "code as an object is carried out of band, not in the envelope",
+			status:     400,
+			body:       `{"error":{"message":"m","type":"invalid_request_error","code":{"inner":"x"}}}`,
+			want:       `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:      ShapeNested,
+			nativeMsg:  "m",
+			nativeCode: `{"inner":"x"}`,
 		},
 	}
 	for _, c := range cases {
@@ -205,6 +215,9 @@ func TestNormalizeEveryUpstreamShape(t *testing.T) {
 			}
 			if e.NativeMessage != c.nativeMsg {
 				t.Errorf("native message %q, want %q", e.NativeMessage, c.nativeMsg)
+			}
+			if e.NativeCode != c.nativeCode {
+				t.Errorf("native code %q, want %q", e.NativeCode, c.nativeCode)
 			}
 			if e.Status != c.status {
 				t.Errorf("status %d, want %d", e.Status, c.status)

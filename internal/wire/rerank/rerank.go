@@ -141,22 +141,137 @@ type Response struct {
 
 	Usage *Usage `json:"usage,omitempty"`
 	Meta  *Meta  `json:"meta,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var responseKnown = wirejson.KnownKeys("id", "model", "results", "usage", "meta")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (r Response) MarshalJSON() ([]byte, error) {
+	type alias Response
+	return wirejson.MarshalWithExtra(alias(r), r.Extra, responseKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only, so
+// json.Unmarshal rather than the strict filter: nothing is authorized against
+// an answer.
+func (r *Response) UnmarshalJSON(b []byte) error {
+	type alias Response
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := wirejson.SplitExtraFold(b, responseKnown)
+	if err != nil {
+		return err
+	}
+	*r = Response(a)
+	r.Extra = extra
+	return nil
 }
 
 // Usage is the token-billing block.
 type Usage struct {
 	TotalTokens  int `json:"total_tokens"`
 	PromptTokens int `json:"prompt_tokens,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var usageKnown = wirejson.KnownKeys("total_tokens", "prompt_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u Usage) MarshalJSON() ([]byte, error) {
+	type alias Usage
+	return wirejson.MarshalWithExtra(alias(u), u.Extra, usageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *Usage) UnmarshalJSON(b []byte) error {
+	type alias Usage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := wirejson.SplitExtraFold(b, usageKnown)
+	if err != nil {
+		return err
+	}
+	*u = Usage(a)
+	u.Extra = extra
+	return nil
 }
 
 // Meta is the search-unit billing block.
+//
+// api_version, warnings and tokens all live here on the vendor surface and none
+// of them is modelled, so Extra is the difference between relaying a
+// deprecation warning to the client and swallowing it.
 type Meta struct {
 	BilledUnits *BilledUnits `json:"billed_units,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var metaKnown = wirejson.KnownKeys("billed_units")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (m Meta) MarshalJSON() ([]byte, error) {
+	type alias Meta
+	return wirejson.MarshalWithExtra(alias(m), m.Extra, metaKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (m *Meta) UnmarshalJSON(b []byte) error {
+	type alias Meta
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := wirejson.SplitExtraFold(b, metaKnown)
+	if err != nil {
+		return err
+	}
+	*m = Meta(a)
+	m.Extra = extra
+	return nil
 }
 
 // BilledUnits is what the vendor charged for.
+//
+// search_units is the only member dorang prices from, and it is the only one
+// modelled. The rest — input_tokens, output_tokens, classifications, whatever
+// the vendor adds — are equally real line items and ride through Extra rather
+// than being deleted for not being interesting to the router.
 type BilledUnits struct {
 	SearchUnits int `json:"search_units"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var billedUnitsKnown = wirejson.KnownKeys("search_units")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (b BilledUnits) MarshalJSON() ([]byte, error) {
+	type alias BilledUnits
+	return wirejson.MarshalWithExtra(alias(b), b.Extra, billedUnitsKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *BilledUnits) UnmarshalJSON(b []byte) error {
+	type alias BilledUnits
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := wirejson.SplitExtraFold(b, billedUnitsKnown)
+	if err != nil {
+		return err
+	}
+	*u = BilledUnits(a)
+	u.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -217,11 +332,11 @@ func ResponseToCanonical(w *Response, flavor Flavor, model string) (*canonical.R
 	if w == nil {
 		return nil, errors.New("rerank: nil response")
 	}
-	out := &canonical.RerankResponse{ID: w.ID, Model: w.Model}
+	out := &canonical.RerankResponse{ID: w.ID, Model: w.Model, Extra: w.Extra}
 	if model != "" {
 		out.Model = model
 	}
-	if w.Usage != nil && (w.Usage.TotalTokens > 0 || w.Usage.PromptTokens > 0) {
+	if w.Usage != nil {
 		// Inclusive input accounting, like every other surface (DESIGN §10.7).
 		// A rerank backend reports one number; it is the whole prompt, so it is
 		// InputTokens and the total derives from it rather than the other way
@@ -230,10 +345,16 @@ func ResponseToCanonical(w *Response, flavor Flavor, model string) (*canonical.R
 		if in == 0 {
 			in = w.Usage.TotalTokens
 		}
-		out.Usage = &canonical.Usage{InputTokens: in}
+		out.Usage = &canonical.Usage{InputTokens: in, Reported: canonical.UsageInput}
+		out.UsageExtra = w.Usage.Extra
 	}
-	if w.Meta != nil && w.Meta.BilledUnits != nil {
-		out.SearchUnits = w.Meta.BilledUnits.SearchUnits
+	if w.Meta != nil {
+		out.MetaExtra = w.Meta.Extra
+		if w.Meta.BilledUnits != nil {
+			out.SearchUnits = w.Meta.BilledUnits.SearchUnits
+			out.SearchUnitsReported = true
+			out.BilledUnitsExtra = w.Meta.BilledUnits.Extra
+		}
 	}
 	_ = flavor // the dialects differ in which block they fill, not in how it reads
 	out.Results = make([]canonical.RerankResult, 0, len(w.Results))
@@ -329,11 +450,29 @@ func EncodeResponse(r *canonical.RerankResponse) (*Response, error) {
 		}
 		out.Results = append(out.Results, wr)
 	}
-	if r.Usage != nil && r.Usage.InputTokens > 0 {
-		out.Usage = &Usage{TotalTokens: r.Usage.InputTokens, PromptTokens: r.Usage.InputTokens}
+	out.Extra = r.Extra
+	// "Only when the backend actually reported it" is what the [Response] doc
+	// comment always said and what an `> 0` test cannot express: it collapses a
+	// backend that billed nothing into a backend that said nothing. The presence
+	// flags carry the difference; a count dorang produced itself still reports
+	// nothing and is still omitted.
+	if r.Usage != nil && (r.Usage.InputTokens > 0 || r.Usage.Reports(canonical.UsageInput)) {
+		out.Usage = &Usage{
+			TotalTokens:  r.Usage.InputTokens,
+			PromptTokens: r.Usage.InputTokens,
+			Extra:        r.UsageExtra,
+		}
 	}
-	if r.SearchUnits > 0 {
-		out.Meta = &Meta{BilledUnits: &BilledUnits{SearchUnits: r.SearchUnits}}
+	if r.SearchUnits > 0 || r.SearchUnitsReported {
+		out.Meta = &Meta{
+			BilledUnits: &BilledUnits{SearchUnits: r.SearchUnits, Extra: r.BilledUnitsExtra},
+			Extra:       r.MetaExtra,
+		}
+	} else if len(r.MetaExtra) > 0 {
+		// meta carried something other than a billing block — an api_version, a
+		// deprecation warning. Dropping it because there were no search units
+		// loses the part the client was most likely to act on.
+		out.Meta = &Meta{Extra: r.MetaExtra}
 	}
 	return out, nil
 }

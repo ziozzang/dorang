@@ -26,9 +26,17 @@ import (
 type Error struct {
 	// Message is the human-readable text. Never empty on the wire.
 	Message string
-	// Type is one of the canonical vocabulary in [KnownTypes]. A native type
-	// outside it is replaced and preserved in NativeType.
+	// Type is one of the canonical vocabulary in [KnownTypes], in the ANTHROPIC
+	// family's spelling. A native type outside it is replaced and preserved in
+	// NativeType. [Error.forFamily] projects it onto the caller's family before
+	// it goes on the wire, so this is the value a raiser sets and not
+	// necessarily the value a client reads.
 	Type string
+	// AltType is the Anthropic family's spelling when it cannot be derived from
+	// the status — COMPATIBILITY §11.2's two capacity rows, where a 429 is
+	// `rate_limit_error` to an OpenAI client and `overloaded_error` to an
+	// Anthropic one. Empty means the status decides, which is the ordinary case.
+	AltType string
 	// Param names the offending request field, or is nil for "not about a
 	// parameter". The distinction is on the wire as null and clients read it,
 	// so it is a pointer rather than an empty string.
@@ -63,6 +71,21 @@ type Error struct {
 	// scrubber, and internal/app applies it with the exact secret that request
 	// carried.
 	NativeMessage string
+	// NativeCode is the upstream's own code when it could not become the
+	// envelope's code — a number where §7.1 requires a string, or a JSON object
+	// or array where it requires a scalar. It is surfaced as
+	// x-dorang-native-error-code and never in the envelope.
+	//
+	// It is empty when the upstream sent a usable string code, because that code
+	// IS the envelope's code: a header that repeated it would be present on
+	// every error and so would signal nothing.
+	//
+	// Unlike NativeMessage this is safe to put on a response header. A code is a
+	// short token in every backend anyone has observed, and the credential-echo
+	// problem NativeMessage's comment describes is a property of free-text
+	// message fields, not of an enumerated one. It is clamped and CTL-checked at
+	// the header anyway, because "no backend does that" is not a control.
+	NativeCode string
 	// NativeCodeWasNumeric records that the upstream sent a number where the
 	// contract requires a string. Diagnostic only.
 	NativeCodeWasNumeric bool
@@ -155,6 +178,31 @@ const (
 	TypeServiceUnavailable = "service_unavailable_error"
 )
 
+// The error codes COMPATIBILITY §11.2 pins by name, for the conditions this
+// package raises. They are constants rather than literals because §11.2 is a
+// contract with clients and a literal is how the code and the table drifted
+// apart in the first place — `invalid_body` sat where §11.2 says
+// `invalid_request` through two audits.
+//
+// Codes for conditions raised elsewhere live with the condition:
+// internal/router's routing refusals, internal/auth's credential refusals.
+const (
+	// CodeInvalidRequest is §11.2's "Malformed request body". Every way a body
+	// fails to parse — not an object, not multipart, unreadable — is that one
+	// condition, and a client that branches on it should not have to know which.
+	CodeInvalidRequest = "invalid_request"
+	// CodeRequestTooLarge is §11.2's "Body over the size cap".
+	CodeRequestTooLarge = "request_too_large"
+	// CodeModelNotFound is §11.2's "Unknown model".
+	CodeModelNotFound = "model_not_found"
+	// CodeRouteNotImplemented is §11.2's "Route declared but unimplemented".
+	CodeRouteNotImplemented = "route_not_implemented"
+	// CodeTimeout is §11.2's "Upstream timeout".
+	CodeTimeout = "timeout"
+	// CodeInternalError is §11.2's "Gateway fault".
+	CodeInternalError = "internal_error"
+)
+
 // knownTypes is the set a native type is checked against.
 var knownTypes = map[string]struct{}{
 	TypeInvalidRequest:     {},
@@ -173,7 +221,16 @@ var knownTypes = map[string]struct{}{
 // KnownTypes reports whether t is in the canonical vocabulary.
 func KnownTypes(t string) bool { _, ok := knownTypes[t]; return ok }
 
-// TypeForStatus is the canonical type for an HTTP status.
+// TypeForStatus is the canonical type for an HTTP status, in the ANTHROPIC
+// family's spelling.
+//
+// COMPATIBILITY §11.2 gives one type per condition PER FAMILY, and the two
+// columns are not the same function: a 404 is `not_found_error` to an Anthropic
+// client and `invalid_request_error` to an OpenAI one, and a 413 is
+// `request_too_large` and `invalid_request_error` respectively. This function
+// answers the Anthropic column because that is the one that is a function of the
+// status alone; [TypeForFamily] projects it onto whichever family is asking, and
+// is what the response path calls.
 //
 // 429 for "no healthy deployment" rather than 503 is COMPATIBILITY §7.2's rule
 // and lives at the call sites, not here; this function only maps a status that
@@ -201,6 +258,101 @@ func TypeForStatus(status int) string {
 	default:
 		return TypeAPIError
 	}
+}
+
+// TypeForFamily is the type family f spells for a condition whose Anthropic
+// spelling is t. It is the projection COMPATIBILITY §11's opening paragraph
+// requires: "dorang emits the vendor's own error vocabulary, chosen by which
+// family the caller is speaking".
+//
+// The columns of §11.2 differ only where the OpenAI family has no separate type
+// for a condition the Anthropic family names:
+//
+//	Unknown model / unknown resource   404   not_found_error    → invalid_request_error
+//	Body over the size cap             413   request_too_large  → invalid_request_error
+//	Overloaded / unavailable           503   overloaded_error   → api_error
+//
+// `overloaded_error` is in no OpenAI column of §11.2 — the two 429 rows that
+// spell it in the Anthropic column read `rate_limit_error` in the OpenAI one —
+// so it is Anthropic vocabulary and an OpenAI client branching on it lands in a
+// default case. §11.2 has no 503 row at all, and `api_error` is what the rest of
+// its 5xx rows use.
+//
+// Everything else is spelled the same in both columns, so this is a three-entry
+// fold rather than a table. It is idempotent: an error that already carries the
+// OpenAI spelling passes through, which is what lets a handler that knows its own
+// family set the type directly (`handleModelRetrieve` does) without this
+// undoing it.
+//
+// The 429 rows of §11.2 that read `overloaded_error` in the Anthropic column —
+// no healthy deployment, capacity wait timed out — are NOT folded here, because
+// they are chosen by condition rather than by status: a 429 is `rate_limit_error`
+// to both families when it is an actual rate limit. Those two set [Error.AltType]
+// at the point they are raised.
+//
+// Three types fold on BOTH families. `timeout_error`, `not_implemented_error`
+// and `service_unavailable_error` are in dorang's own [knownTypes] and in
+// NEITHER vendor's vocabulary; §11.2's rows for those conditions — upstream
+// timeout, route declared but unimplemented — read `api_error` in both columns.
+// §11 opens by saying that a gateway which invents its own vocabulary "is as
+// incompatible as one that changes a field name", so they do not go on the wire.
+// Nothing is lost: what a client acts on for a 501 is the CODE
+// (`route_not_implemented` versus `route_unknown`, DESIGN §0.2), and the status
+// carries the rest.
+//
+// They stay in [knownTypes] because that set decides whether an UPSTREAM's type
+// needs preserving on x-dorang-native-error-type, which is a different question.
+func TypeForFamily(f Family, t string) string {
+	switch t {
+	case TypeTimeout, TypeNotImplemented, TypeServiceUnavailable:
+		return TypeAPIError
+	}
+	if f.Anthropic() {
+		return t
+	}
+	switch t {
+	case TypeNotFound, TypeRequestTooLarge:
+		return TypeInvalidRequest
+	case TypeOverloaded:
+		return TypeAPIError
+	}
+	return t
+}
+
+// compat11Types is the type vocabulary of COMPATIBILITY §11.2, as data.
+//
+// It exists so that "dorang never emits a `type` outside this table" is a
+// checkable statement rather than a promise; TestEveryTypeOnTheWireIsInTheTable
+// walks every status and both families through [TypeForFamily] and requires the
+// answer to be in here.
+var compat11Types = map[string]struct{}{
+	TypeInvalidRequest:  {},
+	TypeAuthentication:  {},
+	TypePermission:      {},
+	TypeNotFound:        {},
+	TypeRequestTooLarge: {},
+	TypeRateLimit:       {},
+	TypeAPIError:        {},
+	TypeOverloaded:      {},
+}
+
+// ForFamily resolves the type for the family the caller is speaking and returns
+// e, for chaining. It is what the response path calls, and it is the only place
+// a family reaches an envelope.
+//
+// It is exported so that a compatibility test can assert the bytes a client of
+// each family receives for a given condition. §11.2 is a per-family contract,
+// and a test that can only see one family's column can only check half of it.
+func (e *Error) ForFamily(f Family) *Error {
+	if e == nil {
+		return nil
+	}
+	if f.Anthropic() && e.AltType != "" {
+		e.Type = e.AltType
+		return e
+	}
+	e.Type = TypeForFamily(f, e.Type)
+	return e
 }
 
 // Errorf is deliberately absent. Constructing an error message with a format
@@ -317,7 +469,7 @@ func Normalize(status int, body []byte) *Error {
 		e.NativeMessage = in.Message
 		e.Param = in.Param
 		e.Type, e.NativeType = canonicalType(rawString(in.Type), status)
-		e.Code, e.NativeCodeWasNumeric = canonicalCode(in.Code, status)
+		e.Code, e.NativeCode, e.NativeCodeWasNumeric = canonicalCode(in.Code, status)
 		return finishError(e, status)
 
 	case len(bytes.TrimSpace(probe.Detail)) > 0:
@@ -345,7 +497,7 @@ func Normalize(status int, body []byte) *Error {
 		e.NativeMessage = probe.Message
 		e.Param = probe.Param
 		e.Type, e.NativeType = canonicalType(rawString(probe.Type), status)
-		e.Code, e.NativeCodeWasNumeric = canonicalCode(probe.Code, status)
+		e.Code, e.NativeCode, e.NativeCodeWasNumeric = canonicalCode(probe.Code, status)
 		return finishError(e, status)
 
 	default:
@@ -353,7 +505,7 @@ func Normalize(status int, body []byte) *Error {
 	}
 
 	e.Type, e.NativeType = canonicalType("", status)
-	e.Code, e.NativeCodeWasNumeric = canonicalCode(nil, status)
+	e.Code, e.NativeCode, e.NativeCodeWasNumeric = canonicalCode(nil, status)
 	return finishError(e, status)
 }
 
@@ -388,7 +540,7 @@ func opaqueError(status int, body []byte) *Error {
 		e.NativeMessage = string(b)
 	}
 	e.Type, _ = canonicalType("", status)
-	e.Code, _ = canonicalCode(nil, status)
+	e.Code, _, _ = canonicalCode(nil, status)
 	return finishError(e, status)
 }
 
@@ -399,6 +551,12 @@ func opaqueError(status int, body []byte) *Error {
 // row — the confidentiality question is answered by the text not being relayed
 // at all, and by internal/redact scrubbing what is kept.
 const nativeMessageLimit = 512
+
+// nativeCodeHeaderLimit bounds the x-dorang-native-error-code header value, and
+// bounds what canonicalCode retains from a code that is a JSON object or array.
+// Same reasoning as nativeTypeHeaderLimit: a code is a short token, and a
+// megabyte one is a body pretending to be one.
+const nativeCodeHeaderLimit = 128
 
 // nativeTypeHeaderLimit bounds the x-dorang-native-error-type header value.
 // A type string is a short token in every backend anyone has observed; this is
@@ -487,27 +645,36 @@ func canonicalType(native string, status int) (canonical, keep string) {
 	return TypeForStatus(status), native
 }
 
-// canonicalCode turns whatever the backend put in "code" into a string.
+// canonicalCode turns whatever the backend put in "code" into a string, and
+// says what the backend actually sent when the two differ.
 //
 // This is the defensive half of §7.1. dorang cannot stop a backend sending
-// {"code": 429}; it can stop that reaching a client. A code that is an object or
-// an array is carried as its raw text rather than dropped, because losing it
-// entirely is worse than carrying something odd.
-func canonicalCode(raw json.RawMessage, status int) (code string, wasNumeric bool) {
+// {"code": 429}; it can stop that reaching a client. The envelope gets a code
+// that satisfies the contract and `native` gets the upstream's own spelling,
+// which [WriteError] puts on x-dorang-native-error-code — §11.3's rule that the
+// native code is preserved out of band rather than dropped or forwarded.
+//
+// The previous arrangement put the raw text in the envelope: a numeric code
+// arrived as "429" and a JSON object arrived as its own source text, up to 256
+// bytes of it, in a field clients switch on. Both are now canonical in the body
+// and intact on the header.
+func canonicalCode(raw json.RawMessage, status int) (code, native string, wasNumeric bool) {
 	raw = bytes.TrimSpace(raw)
 	switch {
 	case len(raw) == 0, bytes.Equal(raw, []byte("null")):
-		return strconv.Itoa(status), false
+		return strconv.Itoa(status), "", false
 	case raw[0] == '"':
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil || s == "" {
-			return strconv.Itoa(status), false
+			return strconv.Itoa(status), "", false
 		}
-		return s, false
+		// A string code already satisfies the contract, so it IS the envelope's
+		// code and there is nothing left over to carry out of band.
+		return s, "", false
 	case raw[0] == '-' || (raw[0] >= '0' && raw[0] <= '9'):
-		return string(raw), true
+		return strconv.Itoa(status), string(clampBytes(raw, nativeCodeHeaderLimit)), true
 	default:
-		return string(clampBytes(raw, excerptLimit)), true
+		return strconv.Itoa(status), string(clampBytes(raw, nativeCodeHeaderLimit)), false
 	}
 }
 
@@ -569,6 +736,12 @@ func WriteError(w http.ResponseWriter, e *Error) {
 	// response header is a denial of service against whatever parses it.
 	if nt := clampString(e.NativeType, nativeTypeHeaderLimit); nt != "" && safeHeaderValue(nt) {
 		h.Set(HeaderNativeErrorType, nt)
+	}
+	// The other half of §11.3, and the half that was never built: the envelope
+	// carries a code that satisfies §7.1 and this carries the one the backend
+	// actually sent. Same clamp and same CTL check, for the same reason.
+	if nc := clampString(e.NativeCode, nativeCodeHeaderLimit); nc != "" && safeHeaderValue(nc) {
+		h.Set(HeaderNativeErrorCode, nc)
 	}
 	w.WriteHeader(e.StatusCode())
 	_, _ = w.Write(*buf)

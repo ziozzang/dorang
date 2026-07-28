@@ -109,6 +109,14 @@ type FunctionDelta struct {
 // ---------------------------------------------------------------------------
 
 // Response is a complete chat completion.
+//
+// Extra is what makes a same-family non-streaming answer a PASS-THROUGH rather
+// than a filter. Without it dorang re-serializes from this struct and every
+// member it does not model disappears — llama.cpp's `timings`, a vendor's
+// `citations`, whatever ships next month — while the streaming path, which
+// forwards frames, keeps them. One request losing data or not depending on
+// whether the caller asked for a stream is not a defect anyone debugs
+// successfully.
 type Response struct {
 	ID      string   `json:"id"`
 	Object  string   `json:"object"`
@@ -119,6 +127,37 @@ type Response struct {
 
 	SystemFingerprint *string `json:"system_fingerprint,omitempty"`
 	ServiceTier       *string `json:"service_tier,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var responseKnown = knownKeys("id", "object", "created", "model", "choices",
+	"usage", "system_fingerprint", "service_tier")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (r Response) MarshalJSON() ([]byte, error) {
+	type alias Response
+	return marshalWithExtra(alias(r), r.Extra, responseKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+//
+// Response-only type: json.Unmarshal, not strictBytes. See [strictUnmarshal] —
+// these bytes are a backend's, not a caller's, and nothing is authorized
+// against a response.
+func (r *Response) UnmarshalJSON(b []byte) error {
+	type alias Response
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, responseKnown)
+	if err != nil {
+		return err
+	}
+	*r = Response(a)
+	r.Extra = extra
+	return nil
 }
 
 // Choice is one completed choice.
@@ -128,6 +167,35 @@ type Choice struct {
 	FinishReason           *string                    `json:"finish_reason,omitempty"`
 	Logprobs               json.RawMessage            `json:"logprobs,omitempty"`
 	ProviderSpecificFields map[string]json.RawMessage `json:"provider_specific_fields,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var choiceKnown = knownKeys("index", "message", "finish_reason", "logprobs",
+	"provider_specific_fields")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (c Choice) MarshalJSON() ([]byte, error) {
+	type alias Choice
+	return marshalWithExtra(alias(c), c.Extra, choiceKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
+// json.Unmarshal rather than the strict filter — but [Message] inside it is
+// still strict, because that type also decodes request messages.
+func (c *Choice) UnmarshalJSON(b []byte) error {
+	type alias Choice
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, choiceKnown)
+	if err != nil {
+		return err
+	}
+	*c = Choice(a)
+	c.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +204,14 @@ type Choice struct {
 
 // Usage is the token accounting object.
 //
-// The detail sub-objects are pointers and are attached only when they carry a
-// non-zero count, following the same rule as the Anthropic cache fields
-// (COMPATIBILITY 6.7): a zeroed detail object on every response is noise that
-// some clients render as "0 cached tokens" on a backend that has no cache.
+// The detail sub-objects are pointers, and a detail object is attached when the
+// backend REPORTED that breakdown — not when the number happens to be positive.
+// The distinction is the whole of DESIGN §10.7's "token accounting is the part
+// that must be exactly right": `cached_tokens: 0` means the cache returned
+// nothing on this request, an absent `prompt_tokens_details` means the
+// deployment never mentioned a cache, and a billing integration prices those
+// differently. dorang's own synthesized usage reports nothing, so a count it
+// invented still emits no breakdown at all.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
@@ -152,16 +224,101 @@ type Usage struct {
 	// (COMPATIBILITY 3.5). OpenAI has no such field; the clients that care about
 	// cache cost read this name.
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var usageKnown = knownKeys("prompt_tokens", "completion_tokens", "total_tokens",
+	"prompt_tokens_details", "completion_tokens_details", "cache_creation_input_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u Usage) MarshalJSON() ([]byte, error) {
+	type alias Usage
+	return marshalWithExtra(alias(u), u.Extra, usageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *Usage) UnmarshalJSON(b []byte) error {
+	type alias Usage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, usageKnown)
+	if err != nil {
+		return err
+	}
+	*u = Usage(a)
+	u.Extra = extra
+	return nil
 }
 
 // PromptTokensDetails breaks down the prompt count.
+//
+// CachedTokens has NO omitempty. A zero here is a measurement — see [Usage].
 type PromptTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
+
+	// Extra carries audio_tokens and every other breakdown member dorang does
+	// not model. They are counts on somebody's invoice, not decoration.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var promptDetailsKnown = knownKeys("cached_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (d PromptTokensDetails) MarshalJSON() ([]byte, error) {
+	type alias PromptTokensDetails
+	return marshalWithExtra(alias(d), d.Extra, promptDetailsKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (d *PromptTokensDetails) UnmarshalJSON(b []byte) error {
+	type alias PromptTokensDetails
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, promptDetailsKnown)
+	if err != nil {
+		return err
+	}
+	*d = PromptTokensDetails(a)
+	d.Extra = extra
+	return nil
 }
 
 // CompletionTokensDetails breaks down the completion count.
 type CompletionTokensDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
+
+	// Extra carries accepted_prediction_tokens, rejected_prediction_tokens,
+	// audio_tokens and anything else the backend broke out.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var completionDetailsKnown = knownKeys("reasoning_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (d CompletionTokensDetails) MarshalJSON() ([]byte, error) {
+	type alias CompletionTokensDetails
+	return marshalWithExtra(alias(d), d.Extra, completionDetailsKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (d *CompletionTokensDetails) UnmarshalJSON(b []byte) error {
+	type alias CompletionTokensDetails
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, completionDetailsKnown)
+	if err != nil {
+		return err
+	}
+	*d = CompletionTokensDetails(a)
+	d.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -605,9 +762,18 @@ type ModelList struct {
 
 func knownKeys(names ...string) map[string]struct{} { return wirejson.KnownKeys(names...) }
 
-// splitExtra returns the members of a JSON object that are not in known.
+// splitExtra returns the members of a JSON object that are not in known. It is
+// for types filtered by [strictBytes] first — every REQUEST type.
 func splitExtra(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
 	return wirejson.SplitExtra(b, known)
+}
+
+// splitExtraFold is splitExtra for a RESPONSE type, which is decoded with plain
+// json.Unmarshal. See [wirejson.SplitExtraFold]: without the fold, a backend
+// that spells a modelled key "Usage" gets it read into the struct AND left in
+// the map, and the client receives the object twice.
+func splitExtraFold(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
+	return wirejson.SplitExtraFold(b, known)
 }
 
 // marshalWithExtra marshals v and splices extra's members into the resulting

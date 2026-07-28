@@ -34,6 +34,69 @@ func (s StopReason) Expressible() bool {
 	return false
 }
 
+// Family names the wire shape a response arrived in.
+//
+// It exists so that an encoder can tell a SAME-family crossing from a
+// conversion. Unknown members of an upstream answer are safe to forward when
+// the answer is going back out in the shape it arrived in, and are not safe
+// otherwise: splicing a llama.cpp `timings` object into an Anthropic message,
+// or an Anthropic `container` into a chat completion, invents a field the
+// target protocol does not have, which is its own compatibility break. DESIGN
+// §10.7 governs what a conversion may carry, and it carries only what the table
+// names.
+//
+// The values match the catalog's API identifiers where one exists. They are
+// spelled out here rather than imported because internal/canonical is the
+// bottom of the dependency graph and must stay that way.
+type Family string
+
+// The wire shapes. Two of these are both "OpenAI" and neither can pass the
+// other's unknown members: a chat completion and a text completion disagree
+// about the shape of a choice, and Responses disagrees with both.
+const (
+	// FamilyUnknown means nothing recorded where the members came from, so
+	// nothing may be spliced anywhere.
+	FamilyUnknown Family = ""
+	// FamilyOpenAIChat is the chat.completion shape.
+	FamilyOpenAIChat Family = "openai-chat"
+	// FamilyOpenAICompletions is the legacy text_completion shape.
+	FamilyOpenAICompletions Family = "openai-completions"
+	// FamilyOpenAIResponses is the Responses shape.
+	FamilyOpenAIResponses Family = "openai-responses"
+	// FamilyAnthropicMessages is the Messages shape.
+	FamilyAnthropicMessages Family = "anthropic-messages"
+)
+
+// UsageField names one counter of [Usage].
+//
+// It exists because a token counter has THREE states on the wire and an int
+// holds two: the backend said 7, the backend said 0, or the backend said
+// nothing at all. A billing integration reads those last two differently —
+// "the cache returned nothing this time" is a measurement, "this deployment has
+// no cache" is a capability — and an encoder that omits a measured zero makes
+// them indistinguishable, so a customer's cache savings vanish from their own
+// accounting with no error anywhere.
+//
+// Presence rides beside the value instead of turning every counter into a
+// pointer. That keeps [Usage] a comparable value type, which matters: the
+// streaming accumulators copy it by value on every frame, and a pointer or a
+// map inside it would be aliased by every copy.
+type UsageField uint8
+
+// The counters whose presence is tracked.
+const (
+	// UsageInput — prompt_tokens / input_tokens was stated.
+	UsageInput UsageField = 1 << iota
+	// UsageOutput — completion_tokens / output_tokens was stated.
+	UsageOutput
+	// UsageCacheRead — the cache-read breakdown was stated, even as zero.
+	UsageCacheRead
+	// UsageCacheWrite — the cache-write breakdown was stated, even as zero.
+	UsageCacheWrite
+	// UsageReasoning — the reasoning breakdown was stated, even as zero.
+	UsageReasoning
+)
+
 // Usage counts tokens.
 //
 // InputTokens is the FULL prompt count including anything served from or
@@ -47,6 +110,13 @@ type Usage struct {
 	CacheReadTokens  int
 	CacheWriteTokens int
 	ReasoningTokens  int
+
+	// Reported is the set of counters the backend actually stated. A decoder
+	// sets it; an encoder consults it to decide whether a zero is a measurement
+	// worth emitting. Zero — nothing reported — is the value every
+	// hand-constructed Usage has, so a Usage that was never decoded from a wire
+	// behaves exactly as it did before this field existed.
+	Reported UsageField
 }
 
 // TotalTokens is input plus output. Cache counts are a breakdown of the input
@@ -54,16 +124,51 @@ type Usage struct {
 func (u Usage) TotalTokens() int { return u.InputTokens + u.OutputTokens }
 
 // Empty reports whether nothing was counted.
+//
+// A backend that explicitly reported zeroes is NOT empty: it measured, and the
+// measurement is what the client asked for.
 func (u Usage) Empty() bool { return u == Usage{} }
 
+// Reports whether every field of want was stated by the backend.
+func (u Usage) Reports(want UsageField) bool { return u.Reported&want == want }
+
+// Report marks fields as stated by the backend.
+func (u *Usage) Report(f UsageField) { u.Reported |= f }
+
 // Add accumulates, which is what a streaming accumulator needs when a backend
-// reports usage incrementally.
+// reports usage incrementally. Presence unions: a field stated in any increment
+// was stated.
 func (u *Usage) Add(o Usage) {
 	u.InputTokens += o.InputTokens
 	u.OutputTokens += o.OutputTokens
 	u.CacheReadTokens += o.CacheReadTokens
 	u.CacheWriteTokens += o.CacheWriteTokens
 	u.ReasoningTokens += o.ReasoningTokens
+	u.Reported |= o.Reported
+}
+
+// UsageExtra carries the members of an upstream usage object that no canonical
+// counter names.
+//
+// It hangs off [Response] rather than off [Usage] for the reason [UsageField]
+// gives: Usage is copied by value on the streaming path and a map inside it
+// would be shared by every copy. The three maps mirror the three nesting levels
+// the OpenAI shape actually has, because flattening them loses which object a
+// member belonged to and there is no way to put it back.
+type UsageExtra struct {
+	// Usage is the unmodelled members of the usage object itself.
+	Usage map[string]json.RawMessage
+	// PromptDetails is the unmodelled members of the prompt-token breakdown —
+	// audio_tokens and the rest, which are real counts on a real invoice.
+	PromptDetails map[string]json.RawMessage
+	// CompletionDetails is the unmodelled members of the completion-token
+	// breakdown, including accepted_prediction_tokens.
+	CompletionDetails map[string]json.RawMessage
+}
+
+// Empty reports whether nothing unmodelled was carried.
+func (u *UsageExtra) Empty() bool {
+	return u == nil || (len(u.Usage) == 0 && len(u.PromptDetails) == 0 && len(u.CompletionDetails) == 0)
 }
 
 // Response is a complete non-streaming response.
@@ -77,7 +182,27 @@ type Response struct {
 	Usage             *Usage
 	SystemFingerprint string
 	ServiceTier       string
-	Extra             map[string]json.RawMessage
+	// Extra carries members of the response object dorang does not model, keyed
+	// by wire name. It is forwarded only by an encoder for [ExtraFamily].
+	Extra map[string]json.RawMessage
+	// UsageExtra carries the unmodelled members of the usage object, under the
+	// same family rule as Extra.
+	UsageExtra *UsageExtra
+	// ExtraFamily names the shape Extra, UsageExtra and the per-choice Extra and
+	// ProviderFields were read from. An encoder for any other shape must ignore
+	// them; see [Family].
+	ExtraFamily Family
+}
+
+// SameFamily reports whether an encoder for f may forward the unmodelled
+// members this response carries.
+//
+// It is deliberately false for [FamilyUnknown] on both sides: a response that
+// did not record where its members came from cannot have them spliced anywhere,
+// and an encoder that does not name its own shape cannot be trusted to receive
+// them.
+func (r *Response) SameFamily(f Family) bool {
+	return r != nil && f != FamilyUnknown && r.ExtraFamily == f
 }
 
 // Choice is one completion.
@@ -93,6 +218,15 @@ type Choice struct {
 	// Logprobs is kept raw; dorang does not model it and per-backend fidelity is
 	// explicitly unverified (COMPATIBILITY 10).
 	Logprobs json.RawMessage
+	// Extra carries members of the choice object dorang does not model, under
+	// [Response.ExtraFamily]'s rule.
+	Extra map[string]json.RawMessage
+	// ProviderFields is the choice's provider_specific_fields as the backend
+	// sent it, INCLUDING its native_finish_reason if there was one. dorang
+	// writes its own native_finish_reason over that key on the way out
+	// (COMPATIBILITY 4.3) and leaves every other member alone, which is the only
+	// way a second gateway in the chain does not erase the first one's context.
+	ProviderFields map[string]json.RawMessage
 }
 
 // EventType discriminates a [StreamEvent].

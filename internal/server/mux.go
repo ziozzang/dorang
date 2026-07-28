@@ -153,6 +153,23 @@ func (f Family) String() string {
 	return "none"
 }
 
+// Anthropic reports whether the caller is speaking the Anthropic protocol,
+// which decides the error vocabulary they get back (COMPATIBILITY §11.2's two
+// type columns).
+//
+// It is a whitelist rather than "not one of the OpenAI ones" because every
+// family that is neither — models, health, metrics, admin, passthrough, and the
+// zero value a route that never matched carries — is served an OpenAI-shaped
+// envelope today, and a new family must be classified deliberately rather than
+// inherit an answer from where it happened to be appended.
+func (f Family) Anthropic() bool {
+	switch f {
+	case FamilyAnthropicMessages, FamilyAnthropicCountTokens:
+		return true
+	}
+	return false
+}
+
 // Inference reports whether a family ends in an upstream model call, which is
 // what decides whether a request is priced and metered as one.
 func (f Family) Inference() bool {

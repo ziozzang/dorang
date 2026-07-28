@@ -527,7 +527,7 @@ func (r *Response) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
-	extra, err := splitExtra(b, responseKnown)
+	extra, err := splitExtraFold(b, responseKnown)
 	if err != nil {
 		return err
 	}
@@ -556,6 +556,39 @@ type Usage struct {
 	// streaming, so the two shapes differ by one field. dorang reproduces the
 	// asymmetry behind compat.anthropic_total_tokens.
 	TotalTokens *int `json:"total_tokens,omitempty"`
+
+	// Extra carries the usage members dorang does not model. This family keeps
+	// adding them and every one is a number somebody is billed for:
+	// cache_creation's per-TTL breakdown, server_tool_use's web-search request
+	// count, service_tier. Re-serializing from the fields above without this
+	// map returns 200 having deleted them.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var usageKnown = knownKeys("input_tokens", "cache_creation_input_tokens",
+	"cache_read_input_tokens", "output_tokens", "total_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u Usage) MarshalJSON() ([]byte, error) {
+	type alias Usage
+	return marshalWithExtra(alias(u), u.Extra, usageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
+// json.Unmarshal rather than the strict filter — see [strictUnmarshal].
+func (u *Usage) UnmarshalJSON(b []byte) error {
+	type alias Usage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, usageKnown)
+	if err != nil {
+		return err
+	}
+	*u = Usage(a)
+	u.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
