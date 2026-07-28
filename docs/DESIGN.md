@@ -1053,6 +1053,7 @@ Revision 2 gives each class its own winner, and composes across classes:
 | `marginal_usage` | per-token, per-request, per-character, per-second | most specific rule wins |
 | `fixed_subscription` | plan cost independent of this request | most specific wins; amortized |
 | `adjustment` | discounts, margins, taxes | all applicable rules apply in order |
+| `notional_rate` | **what this traffic would have cost at list price** — never billed | most specific wins; §8.5 |
 
 ```
 cost = marginal(winner) + amortized(subscription winner) then adjustments applied in order
@@ -1062,6 +1063,63 @@ cost = marginal(winner) + amortized(subscription winner) then adjustments applie
 falling back to elapsed-fraction when marginal is zero. It is computed for **accounting**
 only. Routing uses `marginal_usage` alone, because a sunk subscription cost must not make a
 saturated plan look cheap. The two are separate fields, never conflated.
+
+### 8.5 Notional cost — what a subscription is actually worth
+
+A subscription plan bills a flat amount, so its marginal cost per request is zero. That is
+correct for billing and useless for everything else: it cannot answer whether the plan is
+worth renewing, which team consumes the value, or what the bill would look like after
+outgrowing it. Those are the questions an operator on a subscription actually has.
+
+So dorang computes a fourth figure alongside the three billing ones: **what this exact traffic
+would have cost at the provider's pay-as-you-go list rate**.
+
+```yaml
+rules:
+  - id: plan-a-subscription
+    class: fixed_subscription
+    match: { credential: plan-a-1 }
+    unit: subscription
+    amount_per_period: "20.00"
+    period: monthly
+
+  - id: plan-a-list-rate
+    class: notional_rate                     # never billed, never budgeted
+    match: { provider: plan-a, model: model-x }
+    unit: per_1m_tokens
+    input:  "0.85"
+    output: "3.40"
+    cache_read: "0.19"
+    source: "vendor public price page"       # required
+    as_of: 2026-07-28                        # required
+```
+
+**This is an estimate, and the design treats it as one throughout.** Three rules follow from
+that, and each exists because the alternative is a number that looks authoritative and is not:
+
+1. **`source` and `as_of` are required.** A notional rate with no provenance is a guess
+   wearing a currency symbol. Rules missing either are a validation error, not a warning —
+   the same discipline §4.3 applies to model capabilities, for the same reason.
+2. **It never touches billing, budget, quota, or routing.** `NotionalNano` is a separate
+   field and a separate rollup column. It is absent from `TotalNano` by construction, so it
+   cannot leak into a spend check by omission. Routing continues to use marginal cost only
+   (§8.1) — a notional figure is what traffic *would* cost elsewhere, which says nothing about
+   the cost of the choice in front of the router.
+3. **Missing is reported, never zero.** A model with no notional rule reports the figure as
+   unavailable and increments a counter, exactly as §8.3 does for an unpriced model. Silently
+   returning zero would make a subscription look infinitely efficient — the most flattering
+   possible answer, and the one most likely to go unquestioned.
+
+What it buys, stated plainly so the feature is judged on it: `notional ÷ amortized
+subscription` is the plan's realized leverage; `notional` per key or team is who is consuming
+the value a flat bill hides; and `notional` over the period is the number to compare against a
+vendor quote when the plan stops fitting. Extension headers expose it as
+`x-dorang-notional-usd`, and the ledger carries it per request, so the comparison is available
+at any grain rather than only in aggregate.
+
+A subscription's own rate card is also the natural place to notice that a plan has become a
+bad deal. dorang does not act on that — it is not the gateway's decision — but it makes the
+number impossible to miss.
 
 ### 8.2 Matching, pre-indexed **[R1-10]**
 
@@ -1138,6 +1196,7 @@ request_logs(...)            -- ledger; daily partitions (PostgreSQL); retention
 request_traces(request_id, ts, excerpt)   -- separate, sampled, byte-budgeted  [R1-3]
 
 usage_by_key_hour · usage_by_model_hour · usage_by_team_day   -- purpose-built  [R1-13]
+  (each carries notional_nano as its own column, never folded into cost_nano — §8.5)
 
 quota_buckets(scope, scope_key, window, metric, bucket_start, value)
 quota_leases(node_id, scope, scope_key, window, metric, amount, expires_at)   [R1-14]
@@ -1357,6 +1416,7 @@ Every removal is reported.
 | `x-dorang-queue-ms`, `-ttft-ms`, `-latency-ms` | latency breakdown |
 | `x-dorang-tokens-*` | input, output, cache read/write, reasoning |
 | `x-dorang-cost-usd` | this request |
+| `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative |
 | `x-dorang-quota-*-used-pct` | credential quota windows |
 | `x-dorang-dropped-params` | what conversion removed |
