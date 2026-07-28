@@ -1297,6 +1297,64 @@ Clustering later restricts the job to the leader; it does not introduce it.
 
 ---
 
+### 9.6 The write path — what may be deferred, and what may not
+
+Metering is not the only thing that writes. Latency comes from whichever write is *not*
+deferred, so every write is classified here rather than optimized one at a time, and each
+carries a stated memory cost — a buffer with no bound is a leak with a schedule.
+
+| Write | On the request path? | Mechanism | Memory |
+|---|---|---|---|
+| Numeric usage | no | per-CPU counters, merged and flushed on an interval | fixed: shards × cardinality cap |
+| Request trace | no | bounded ring → durable local spool → batched insert | ring bytes + spool file cap |
+| Rollups | no | merged in memory, one upsert per bucket per flush | bounded by live bucket count |
+| Auth lookup | **miss only** | one coalesced read, then a snapshot | snapshot size, bounded by key count |
+| Quota counters | no | minute-ring in memory, periodic upsert | fixed ring per (subject, window) |
+| **Budget reserve/settle** | **yes — necessarily** | see below | small |
+| Response store (stateful Responses) | **yes on write** | insert before the response is returned | bounded by payload cap |
+| Batch state | no | scheduler-owned, checkpointed | bounded by in-flight rows |
+| Capacity, sticky, prefix | never | memory only | prefix budgeted in bytes (§7.4b) |
+
+**Budget is the one write that cannot be deferred, and pretending otherwise is how a budget
+gets exceeded.** Deferring the reservation means two concurrent requests both see the
+pre-spend balance, and §6.4's whole point is that they must not. So the reservation is
+synchronous — but it is made cheap rather than made asynchronous:
+
+- The hot path touches a **per-node in-memory reservation** guarded by an atomic, not the
+  store. Durability comes from the lease the node already holds (§6.3), not from a write per
+  request.
+- The store sees a write when a **lease is taken or renewed**, which is per block of budget
+  rather than per request. Lease size is the knob that trades store traffic against maximum
+  overshoot, and §5.6 already requires that number to be published.
+- Settlement is asynchronous and batched, because settling late is safe: the reservation was
+  an upper bound, so the correction only ever releases budget.
+
+**The response store is the other synchronous write**, and it is unavoidable for a different
+reason: the caller receives a handle and may use it on the very next request, so the row must
+exist before the response leaves. It is bounded by the payload cap and is only on the path for
+stateful Responses traffic — which is why §2.1 treats it as its own surface rather than a
+property of every request.
+
+Three rules that follow, and are testable:
+
+1. **No deferred write may be unbounded.** Every buffer has a byte cap, and reaching it is
+   visible (§12.1's degraded state), never silent. A queue that grows until the process dies
+   has converted a store outage into an outage.
+2. **A deferred write must survive a restart or be counted as lost.** The trace spool is
+   durable for exactly this reason. Quota rings and rollups are reconstructible from their
+   last upsert plus the ledger, so losing the tail costs precision, not correctness — and the
+   window over which that is true is the flush interval, which is why it is short.
+3. **Nothing on the request path waits on a flush.** A flush that back-pressures into the
+   request path defeats the whole arrangement; back-pressure surfaces as a drop with a counter
+   instead. This is the one place where losing data is the correct answer, because the
+   alternative is losing the request.
+
+> **Known gap.** Quota and budget state are currently in-memory only. A restart therefore
+> resets the windows, which is safe for concurrency (nothing is over-granted) but wrong for
+> accounting — a monthly budget would silently start over. Persisting them through the lease
+> mechanism above is required before the clustering milestone, since a lease that does not
+> outlive its node is not a lease.
+
 ## 10. Protocols
 
 ### 10.1 Neutral representation
@@ -1985,3 +2043,4 @@ fixes the neutral representation. M9 and M12 are independent of the core through
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
 | W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **open** — inherent to no-partial-holding; needs a soft-reservation protocol. Not a deadlock and not an overtaking problem, so aging does not close it. Measurable: a waiter that never wins while both its axes stay saturated |
+| W9 | **Quota and budget state is in-memory only** (§9.6) | **open** — a restart resets the windows. Safe for concurrency, wrong for accounting: a monthly budget silently starts over. Must be persisted through the lease mechanism before clustering, since a lease that does not outlive its node is not a lease |
