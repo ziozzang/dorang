@@ -98,6 +98,15 @@
 // which is the one place in dorang where a broken extension stops traffic on
 // purpose.
 //
+// The inversion covers a filter that never *ran* as well as one that ran and
+// returned an error, and the difference is not academic: a masking pass that did
+// not happen leaves the text exactly as the caller sent it, which is the outcome
+// this package exists to prevent and is indistinguishable — from here — from a
+// clean pass over text that contained nothing. Only the caller can tell the two
+// apart, so internal/luaext refuses on behalf of a filter that was configured
+// and did not run at all (a hook switched off, a plugin that registered no
+// handler), rather than returning the decision a clean pass returns.
+//
 // # What is never printed
 //
 // [Session] and [Vault] have no exported fields and implement [fmt.Stringer],

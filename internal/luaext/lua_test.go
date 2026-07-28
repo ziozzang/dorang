@@ -618,6 +618,116 @@ func TestFilterFailsClosed(t *testing.T) {
 	}
 }
 
+// TestATrippedFilterRefusesRatherThanDisappears is the failure this whole file
+// exists to prevent, arriving through the one door nobody had checked.
+//
+// A tripped hook returned the zero [FilterDecision], and the zero value of a
+// masking decision is *no masking and no refusal*: the text goes upstream
+// exactly as the caller sent it. So the trip — a mechanism designed for hooks
+// whose absence is safe — switched off the one hook whose absence is not, and
+// did it silently, permanently and without refusing anything.
+func TestATrippedFilterRefusesRatherThanDisappears(t *testing.T) {
+	e := luaEngine(t, `
+		dorang.register("on_filter_request", function(f)
+			f.doc.set_text(1, (dorang.mask(f.doc.text(1))))
+		end)`)
+
+	// The trip is not reachable through a fail-closed hook any more (see
+	// [Engine.countAbandonment]); it is forced here because what is under test
+	// is what a tripped filter *does*, not how it got there. Defence in depth is
+	// only depth if the second layer is checked.
+	e.trip(HookFilterRequest)
+
+	s := theSecret
+	doc := NewDoc()
+	doc.Add("message[0]", &s)
+	d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+
+	if !d.Refuse {
+		t.Fatalf("a tripped masking filter served the request: %+v", d)
+	}
+	if s != theSecret {
+		t.Fatalf("the text was rewritten by a filter that never ran: %q", s)
+	}
+	if d.Code != FilterDenyCode {
+		t.Fatalf("code = %q, want %q", d.Code, FilterDenyCode)
+	}
+	if !errors.Is(d.Err, ErrFilterUnavailable) {
+		t.Fatalf("err = %v, want ErrFilterUnavailable", d.Err)
+	}
+
+	// A filter declared fail-open is enrichment, and enrichment is skipped.
+	open := luaEngine(t, `dorang.register("on_filter_request", function(f) end)`,
+		func(o *Options) { o.Plugins[0].Fail = FailOpen })
+	open.trip(HookFilterRequest)
+	if d := open.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}}); d.Refuse {
+		t.Fatalf("a tripped fail-open filter refused the request: %+v", d)
+	}
+}
+
+// TestAFilterThisEngineCannotRunRefuses is the same absence arriving from the
+// other side: not a filter switched off, but one that was never there.
+//
+// Configuration checks that `models[].filters[].plugin` names a declared plugin.
+// Nothing checked that the plugin *registers* anything at on_filter_request — a
+// misspelled hook name is enough — and the result was a filter chain that ran
+// zero handlers, returned a clean decision, and sent the identity number
+// upstream. A configured masking filter that does not mask is the one failure
+// this feature must not have.
+func TestAFilterThisEngineCannotRunRefuses(t *testing.T) {
+	s := theSecret
+	doc := func() *Doc {
+		s = theSecret
+		d := NewDoc()
+		d.Add("message[0]", &s)
+		return d
+	}
+
+	// Registers at the wrong hook: it loads, it is named correctly on the model,
+	// and it filters nothing.
+	e := luaEngine(t, `dorang.register("on_request", function(req) end)`)
+	d := e.FilterRequest(context.Background(), &FilterView{
+		Doc: doc(), Mask: staticMasker{}, Plugins: []string{"test"},
+	})
+	if !d.Refuse {
+		t.Fatalf("a model whose filter plugin registers no filter was served: %+v", d)
+	}
+	if !errors.Is(d.Err, ErrFilterUnavailable) {
+		t.Fatalf("err = %v, want ErrFilterUnavailable", d.Err)
+	}
+
+	// A plugin this engine has never heard of: the strictest fail mode wins,
+	// and a plugin that declared nothing here declared nothing.
+	e2 := luaEngine(t, `dorang.register("on_filter_request", function(f) end)`)
+	d = e2.FilterRequest(context.Background(), &FilterView{
+		Doc: doc(), Mask: staticMasker{}, Plugins: []string{"a-plugin-this-build-does-not-have"},
+	})
+	if !d.Refuse {
+		t.Fatalf("a model naming a plugin this engine cannot run was served: %+v", d)
+	}
+	if s != theSecret {
+		t.Fatalf("the text was rewritten by a filter that never ran: %q", s)
+	}
+
+	// And the negative: a caller with no filters on an engine with none is not
+	// a failure, it is a request that needs no filtering.
+	none, err := New(Options{Enabled: true, Limits: Limits{Instructions: 1000, MemoryBytes: 1 << 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := none.FilterRequest(context.Background(), &FilterView{Doc: doc()}); d.Refuse || d.Failed {
+		t.Fatalf("an unfiltered request on an engine with no filters was refused: %+v", d)
+	}
+	var nilEngine *Engine
+	if d := nilEngine.FilterRequest(context.Background(), &FilterView{Doc: doc()}); d.Refuse || d.Failed {
+		t.Fatalf("the disabled engine refused an unfiltered request: %+v", d)
+	}
+}
+
+// theSecret is the value these tests follow. If it appears where it should not,
+// the test that finds it says so by name.
+const theSecret = "900101-1234567"
+
 var errBrokenMask = errors.New("mask unavailable")
 
 type brokenMasker struct{}

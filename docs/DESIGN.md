@@ -2138,6 +2138,34 @@ but a filter that was supposed to remove an identity number and did not must sto
 request. The plugin declares which kind it is; `fail: closed` is the safe declaration and the
 default.
 
+**A filter that did not run is a filter that failed**, and the original text of this rule said
+only "failed", which turned out to be a different sentence. The decision a filter returns is a
+value, and its zero is *no masking and no refusal* — so every way of not running returned what
+a clean pass returns and the text went upstream exactly as the caller sent it. Three of them
+existed, and one was reachable from traffic alone:
+
+1. **The hook had been tripped off.** §11.5's trip is designed for hooks whose absence is
+   safe. Pointed at the one hook whose absence is not, it switched PII masking off for the
+   life of the process — and a burst of 48 large requests was enough to arrange it, in under a
+   second, because a priced match that ignored its context outlived the wall clock, the
+   resulting backlog refusals cost microseconds, and 32 of them in a row is the trip.
+   Measured end to end: the identity number reaching the upstream unmasked and unrefused,
+   permanently, with the burst's own requests refused and every request after them served.
+2. **The plugin registered no `on_filter_request`.** Configuration checks that
+   `models[].filters[].plugin` names a declared plugin; nothing checked that the plugin
+   registers anything, and a misspelled hook name is enough. The chain then ran zero handlers
+   and reported success.
+3. **The engine had never heard of the plugin.** Not reachable through the configuration
+   loader today — a declared plugin turns the engine on by itself — but the same zero decision
+   was waiting behind it.
+
+All three now take the same path as a plugin that ran and failed: the strictest `fail:` among
+the plugins the model named, which for a filter defaults to closed, and a plugin this build
+cannot see declared nothing and is therefore strictest of all. §11.5's trip no longer applies
+to this hook at all, for the reason given there: switching a fail-closed hook off does not stop
+it refusing, it only makes the refusal permanent, and the goroutine bound it was standing in
+for is bounded directly.
+
 Three limits that follow from being honest about the rest of the system, and are refusals
 rather than silences:
 
@@ -2771,6 +2799,32 @@ argument to return a number: 8 KiB of digits ran past **twenty seconds** with no
 firing. Both are now priced by running the match against a budgeted copy of the matcher first,
 and refusing before the real one is asked.
 
+**Charging work bounds CPU and nothing else**, which is the same mistake one level down, and
+it left two holes that the pricing pass looked straight past:
+
+- **The stack is a resource.** The matcher is a recursive VM — one Go frame per branch
+  explored — so a greedy quantifier costs a frame per character it consumes, and the caller
+  chooses how many by choosing how long the text is. `^(.*)=(.*)$` against 800 KiB of a
+  caller's own message text, eight requests at once, took **3 072 MB of goroutine stack** with
+  `limitHits = 0` and no ceiling firing; Go kills the *process* at a 1 GB stack, so a large
+  enough segment was a crash rather than a refusal. Depth is now bounded explicitly inside the
+  matcher — 10 000 frames, about 4 MB per match — and the same bound covers gopher-lua's own
+  copy, because the refusal happens before it is asked. The cost is stated rather than hidden:
+  a quantifier that must carry more than 10 000 characters in one run is refused, and a filter
+  that wants whole documents should ask the host (`dorang.mask` runs Go regexps, which have no
+  stack of their own) rather than backtrack through them in Lua.
+- **A priced call still needs the wall clock.** The pricing run took no context, so it spent
+  its whole step budget on a goroutine nobody was waiting for — the one thing in the sandbox
+  the watchdog could not reach. It now takes the invocation's context and checks it every
+  thousand steps.
+
+`string.gsub` needed a third charge for a third reason: gopher-lua rebuilds the entire subject
+**once per match**, so the work is O(matches × length) and neither the scan charge nor the
+result charge could see it — `gsub(s, "a", "y")` over 400 KiB ran the wall clock out with no
+ceiling counted. The same call written with a *function* replacement was charged one byte per
+position, because the length of what a callback returns does not exist until it returns; it is
+now charged where it does exist, in a wrapper around the callback.
+
 The same reasoning reaches three *operators*, which have the identical problem and no call to
 hang a charge on. `s == s2`, `s < s2` and `t[s]` are single VM instructions that compare or hash
 every byte of a string whose length the **caller** chose, and §10.5b's masking filter is a hook
@@ -2849,12 +2903,39 @@ a limit skips the hook and warns (fail-open), except an explicit deny from `on_r
 which is honored (fail-closed).
 
 A hook is **abandoned, not killed** — Go cannot kill a goroutine — so what is bounded is *how
-many*. A fixed number per hook may be outstanding at once; past that, an invocation is refused
-before a goroutine exists to abandon, and the refusals count toward the same trip that switches
-a misbehaving hook off. Bounding abandonment *over time* is not the same as bounding it *at an
-instant*, and only the second is a bound: without it, a hook stuck inside one uninterruptible
-call pins a core per request and keeps every one of them after being taken out of service —
-the operator then sees hooks disabled and load unexplained.
+many*. Bounding abandonment *over time* is not the same as bounding it *at an instant*, and
+only the second is a bound: without it, a hook stuck inside one uninterruptible call pins a
+core per request and keeps every one of them after being taken out of service — the operator
+then sees hooks disabled and load unexplained.
+
+The instantaneous bound needs **two** supplies, and the first version of this paragraph
+published one. It said "a fixed number per hook may be outstanding at once; past that, an
+invocation is refused before a goroutine exists to abandon", and the check that implemented it
+reads a counter incremented at *abandonment* while refusing at *admission* — so a burst passes
+admission before any of it has been counted. Measured: sixteen simultaneous requests to a
+wedged hook, sixteen abandoned goroutines, against a stated bound of eight, with no trip
+involved and nothing a plugin did wrong. A bound a request rate can exceed is not a bound.
+
+What holds is a reservation taken before the goroutine exists and released when it exits:
+
+- **At most 32 goroutines per hook at any instant**, whatever arrives at once, for the
+  engine's whole life. It binds only on hooks that are already failing — concurrency is
+  arrival rate times duration and duration is capped by the wall clock, so reaching it takes
+  160 invocations a second that each burn the entire 200 ms ceiling, where the shipped masking
+  filter takes 12.8 µs and would need 2.5 M/s.
+- **At most 8 of those abandoned** — timed out, no longer waited for, still running — after
+  which invocations are refused before a goroutine exists. So the steady state past a burst is
+  8, and 32 is what a burst may transiently cost.
+
+Two smaller corrections come with it. A hook that *finishes* as its deadline passes is not
+abandoned: the deadline is followed by a bounded grace, and only a hook that misses that too
+is counted, because counting a leak that did not happen is how thirty-two of them switched a
+working hook off. And the refusals **count toward the trip only for a hook that fails open**.
+That instruction was right for the hook it was written for — a wedged enrichment hook that
+refuses is doing nothing in silence, so switching it off is the honest end state — and wrong
+for §10.5b's masking filter, where a refusal *is* the loud outcome and "switched off" is not a
+state that exists. Refusals cost microseconds, so counting them turned a burst into a
+permanent decision in well under a second; see §10.5b for what that decision then did.
 
 ---
 

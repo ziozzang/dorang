@@ -441,6 +441,200 @@ func TestAbandonedInvocationsAreBounded(t *testing.T) {
 	}
 }
 
+// TestAbandonmentIsBoundedAtABurst is the bound the test above did not make.
+//
+// [maxAbandoned] is checked at admission and counted at abandonment, so a burst
+// passes admission before any of it has been counted: sixteen simultaneous
+// requests to a wedged hook produced sixteen abandoned goroutines against a
+// published bound of eight, with no trip involved and nothing a plugin did
+// wrong. A bound a request rate can exceed is not a bound.
+//
+// What holds now is a reservation taken before the goroutine exists: at most
+// [maxLive] goroutines per hook at any instant, whatever arrives at once.
+func TestAbandonmentIsBoundedAtABurst(t *testing.T) {
+	release := make(chan struct{})
+	var closeOnce sync.Once
+	stop := func() { closeOnce.Do(func() { close(release) }) }
+	t.Cleanup(stop)
+
+	var running, peak atomic.Int64
+	e := newEngine(t, nil, func(o *Options) {
+		o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: 20 * time.Millisecond}
+		o.Native = []Native{{
+			Name: "wedged",
+			Request: func(context.Context, *RequestView, *RequestDecision) {
+				n := running.Add(1)
+				defer running.Add(-1)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
+				}
+				// Ignores its context, as a hook stuck in an uninterruptible
+				// host call does. Only the test can end this.
+				<-release
+			},
+		}}
+	})
+
+	base := settledGoroutines(t)
+	// Larger than the cap, and all at once: the shape the sequential test cannot
+	// produce, because it is the simultaneity that beat the old check.
+	const burst = 4 * maxLive
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if d := e.OnRequest(context.Background(), &RequestView{Model: "gpt-4"}); d.Denied {
+				t.Error("an abandoned hook refused a request; abandonment fails open")
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := peak.Load(); n > maxLive {
+		t.Fatalf("a burst of %d ran %d hooks at once, want at most %d: the bound is one a "+
+			"request rate can raise", burst, n, maxLive)
+	}
+	if n := e.Abandoned(HookRequest); n > maxLive {
+		t.Fatalf("a burst of %d left %d outstanding, want at most %d", burst, n, maxLive)
+	}
+	// The goroutine count is the property that matters; the counters above are
+	// the fix's own bookkeeping and could agree with themselves while leaking.
+	const slack = 8
+	if n := runtime.NumGoroutine(); n > base+maxLive+slack {
+		t.Fatalf("a burst of %d left %d goroutines (baseline %d); at most %d may exist",
+			burst, n, base, maxLive)
+	}
+	if e.Stats().Refused == 0 {
+		t.Error("a burst past the supply must be refused rather than run, and counted")
+	}
+
+	stop()
+	if n, ok := waitForGoroutines(base+slack, 5*time.Second); !ok {
+		t.Fatalf("goroutines settled at %d, baseline %d: abandoned hooks did not exit", n, base)
+	}
+}
+
+// TestALateHookIsNotAnAbandonedOne: a hook that finishes as its deadline passes
+// has leaked nothing, so it counts toward nothing.
+//
+// The distinction is the whole meaning of the trip. "Abandoned" is supposed to
+// name a goroutine nobody is waiting for and nobody can stop; a hook that
+// observes its cancellation and returns is neither, and counting it as one is
+// counting a leak that did not happen — thirty-two of which switch a hook off
+// for the life of the engine. Everything inside the sandbox now observes its
+// cancellation, down to the pattern matcher, so this is the common case rather
+// than the exotic one.
+func TestALateHookIsNotAnAbandonedOne(t *testing.T) {
+	var ran atomic.Int64
+	e := newEngine(t, nil, func(o *Options) {
+		o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: 5 * time.Millisecond}
+		o.Native = []Native{{
+			Name: "late",
+			Request: func(ctx context.Context, _ *RequestView, _ *RequestDecision) {
+				ran.Add(1)
+				// Returns when its context ends, which is the deadline itself:
+				// the finish and the abandonment race, every time.
+				<-ctx.Done()
+			},
+		}}
+	})
+
+	const invocations = maxConsecutiveTimeouts + 4
+	for i := 0; i < invocations; i++ {
+		if d := e.OnRequest(context.Background(), &RequestView{Model: "gpt-4"}); d.Denied {
+			t.Fatalf("invocation %d denied the request", i)
+		}
+	}
+	if st := e.Stats(); st.Timeouts != 0 {
+		t.Fatalf("a hook that always came back was counted as abandoned %d times: %+v",
+			st.Timeouts, st)
+	}
+	if e.Abandoned(HookRequest) != 0 {
+		t.Fatalf("%d outstanding after every invocation returned", e.Abandoned(HookRequest))
+	}
+	if e.Tripped(HookRequest) {
+		t.Fatalf("%d invocations that leaked nothing switched the hook off", invocations)
+	}
+	if n := ran.Load(); n != invocations {
+		t.Fatalf("the hook ran %d times, want %d: invocations were refused for a backlog "+
+			"that never existed", n, invocations)
+	}
+}
+
+// TestABacklogRefusalDoesNotTripAFailClosedHook is the correction to a rule that
+// was right for the hook it was written for.
+//
+// Refusals at the abandonment bound count toward the trip so that a wedged
+// *enrichment* hook is switched off rather than left refusing in silence. A
+// masking filter has no such silence: a fail-closed refusal stops the request,
+// which is the loudest thing the gateway does. Counting them there meant a
+// refusal costing microseconds could reach maxConsecutiveTimeouts in a burst,
+// and the trip is for the life of the engine.
+func TestABacklogRefusalDoesNotTripAFailClosedHook(t *testing.T) {
+	if !HookFilterRequest.failsClosed() {
+		t.Fatal("the filter hook is the fail-closed one; this test is about that")
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	e := luaEngine(t, `dorang.register("on_filter_request", function(f) f.doc.text(1) end)`,
+		func(o *Options) {
+			o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: time.Millisecond}
+		})
+	// Saturate the abandonment supply by hand: what is under test is what the
+	// refusals do, not how the backlog arose.
+	e.abandoned[HookFilterRequest].Store(maxAbandoned)
+
+	s := "900101-1234567"
+	for i := 0; i < 4*maxConsecutiveTimeouts; i++ {
+		doc := NewDoc()
+		doc.Add("m0", &s)
+		d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+		if !d.Refuse {
+			t.Fatalf("refusal %d: a filter that did not run served the request: %+v", i, d)
+		}
+	}
+	if e.Tripped(HookFilterRequest) {
+		t.Fatalf("%d cheap refusals switched a masking filter off for the life of the engine",
+			4*maxConsecutiveTimeouts)
+	}
+	if e.Stats().Refused == 0 {
+		t.Error("the refusals were not counted")
+	}
+
+	// And the drain recovers: the same hook serves again once the backlog does.
+	e.abandoned[HookFilterRequest].Store(0)
+	doc := NewDoc()
+	doc.Add("m0", &s)
+	if d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}}); d.Refuse {
+		t.Fatalf("the filter did not recover when its backlog drained: %+v", d)
+	}
+}
+
+// TestABacklogRefusalStillTripsAFailOpenHook is the other half: the instruction
+// the correction above narrows is still in force where it was right.
+func TestABacklogRefusalStillTripsAFailOpenHook(t *testing.T) {
+	e := newEngine(t, nil, func(o *Options) {
+		o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: time.Millisecond}
+		o.Native = []Native{{
+			Name:    "enrich",
+			Request: func(context.Context, *RequestView, *RequestDecision) {},
+		}}
+	})
+	e.abandoned[HookRequest].Store(maxAbandoned)
+
+	for i := 0; i < maxConsecutiveTimeouts+1 && !e.Tripped(HookRequest); i++ {
+		e.OnRequest(context.Background(), &RequestView{Model: "gpt-4"})
+	}
+	if !e.Tripped(HookRequest) {
+		t.Fatal("a wedged enrichment hook that refuses in silence must still be switched off")
+	}
+}
+
 // TestASearchThatBlewItsCeilingDoesNotOutliveTheRequest is the other half of the
 // same failure, and the half the bound above cannot fix.
 //

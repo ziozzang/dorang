@@ -55,6 +55,21 @@ func (h Hook) String() string {
 	return hookNames[h]
 }
 
+// failsClosed reports whether a hook refuses the request when it cannot run.
+//
+// Exactly one hook does. DESIGN §10.5b: "a filter that cannot enrich a request
+// should be skipped, but a filter that was supposed to remove an identity number
+// and did not must stop the request." The distinction is a property of the hook
+// *point*, not of the plugin's own `fail:` declaration, because it decides what
+// the host does when there is no plugin left to ask — a trip, an abandonment
+// backlog, a filter this engine never loaded. In each of those the strictest
+// declaration in play wins, and for a filter the default declaration is closed.
+//
+// It matters in two places, and both used to get it wrong in the same direction:
+// a fail-closed hook must not have its cheap refusals counted toward a trip, and
+// a fail-closed hook that *is* tripped must refuse rather than return nothing.
+func (h Hook) failsClosed() bool { return h == HookFilterRequest }
+
 // ParseHook resolves a configuration spelling.
 func ParseHook(s string) (Hook, bool) {
 	for i, n := range hookNames {
@@ -112,6 +127,11 @@ var (
 	ErrInstructionLimit = errors.New("luaext: instruction ceiling exceeded")
 	// ErrMemoryLimit reports an exhausted memory budget.
 	ErrMemoryLimit = errors.New("luaext: memory ceiling exceeded")
+	// ErrPatternTooDeep reports a pattern match that would have recursed past
+	// [luapat.MaxDepth]. It is a ceiling like the other two — the resource is
+	// the goroutine's *stack*, which the instruction budget never saw — and it
+	// ends the invocation the same way.
+	ErrPatternTooDeep = errors.New("luaext: pattern match recursed past the stack ceiling")
 	// ErrTimeout reports that the wall-clock ceiling elapsed with the hook
 	// still running. The hook is abandoned, not waited for.
 	ErrTimeout = errors.New("luaext: wall-clock ceiling exceeded")
@@ -122,6 +142,11 @@ var (
 	// earlier invocations timed out and are still running. It is the cheap end
 	// of the wall-clock ceiling: nothing was started, so nothing was leaked.
 	ErrAbandonBacklog = errors.New("luaext: hook not run; its abandoned invocations are still running")
+	// ErrLiveBacklog reports that a hook was not run because it already owns
+	// [maxLive] goroutines. It is separate from [ErrAbandonBacklog] because it
+	// says something different to an operator: those invocations are still being
+	// waited for, so the hook is slow rather than wedged.
+	ErrLiveBacklog = errors.New("luaext: hook not run; it already has the most invocations it may run at once")
 	// ErrLuaSource reports a .lua file under the *policy* directory. Lua is
 	// executable here, but only when an operator names the file in the
 	// configuration: a plugin picked up from a writable directory is the

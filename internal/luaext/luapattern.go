@@ -1,6 +1,7 @@
 package luaext
 
 import (
+	"context"
 	"errors"
 
 	lua "github.com/yuin/gopher-lua"
@@ -71,30 +72,48 @@ const matchDataBytes = 64
 // price runs the match against the step-counted matcher and charges what it
 // cost, aborting the invocation if the budget could not cover it.
 //
+// It returns the matches it found, because the search is only half of what the
+// caller is about to do: gsub replaces at every one of them, and the replacement
+// is priced from this set rather than guessed at. A nil return means the price
+// is not known — the operator turned the instruction ceiling off — and a caller
+// that would have charged per match must then charge nothing, because there is
+// no budget for it to come out of.
+//
 // A malformed pattern is *not* reported here. gopher-lua raises its own error
 // for that a moment later, with the message a plugin author has seen before;
 // duplicating it here would mean two spellings of the same mistake.
-func price(v *vmState, subject, pattern string, offset, limit int) {
+func price(v *vmState, subject, pattern string, offset, limit int) []*luapat.MatchData {
 	if v.noGas {
 		// The operator turned the instruction ceiling off. Pricing a call
 		// against a budget that does not exist would only pay the double cost
 		// and buy nothing.
-		return
+		return nil
 	}
-	budget := v.gasLeft
-	left := budget
-	mds, err := luapat.Find(pattern, []byte(subject), offset, limit, &left)
-	// left is what the matcher did not spend; it goes negative by exactly the
-	// step that ran out, so this is the true cost either way and v.gas is what
-	// decides whether it was affordable.
-	v.gas(budget - left)
-	if errors.Is(err, luapat.ErrBudget) {
+	run := luapat.Run{Budget: v.gasLeft, Done: v.done}
+	mds, err := luapat.Find(pattern, []byte(subject), offset, limit, &run)
+	// run.Budget is what the matcher did not spend; it goes negative by exactly
+	// the step that ran out, so this is the true cost either way and v.gas is
+	// what decides whether it was affordable.
+	v.gas(v.gasLeft - run.Budget)
+	switch {
+	case errors.Is(err, luapat.ErrBudget):
 		// Unreachable while the ceiling is on — the charge above already
 		// exceeded the budget it came from — but a ceiling that depends on
 		// arithmetic staying in one order is a claim, not a guarantee.
 		v.abort(ErrInstructionLimit)
+	case errors.Is(err, luapat.ErrDepth):
+		// The stack ceiling, and the reason it must abort rather than fall
+		// through: gopher-lua's own matcher would recurse exactly as deep, so
+		// letting the real call proceed is letting the stack grow that far.
+		v.abort(ErrPatternTooDeep)
+	case errors.Is(err, context.Canceled):
+		// Nobody is waiting for this answer. Ending here is what keeps a priced
+		// match from outliving the request that asked for it — the whole reason
+		// the matcher is handed the invocation's context.
+		v.abort(context.Canceled)
 	}
 	v.charge(int64(len(mds)) * matchDataBytes)
+	return mds
 }
 
 // preFind prices string.find(s, pattern [, init [, plain]]).

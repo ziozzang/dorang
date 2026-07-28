@@ -20,10 +20,27 @@
 // It is a copy rather than a rewrite on purpose. The semantics of Lua patterns
 // are what a plugin author expects, and a hand-written matcher would be a
 // second, subtly different dialect. Everything below is upstream's except the
-// budget and one one-line lint fix marked where it occurs, and it should be
-// re-copied — not re-derived — when gopher-lua is upgraded.
+// [Run] additions and one one-line lint fix marked where it occurs, and it
+// should be re-copied — not re-derived — when gopher-lua is upgraded.
 // TestBudgetedMatcherMatchesUpstream compares this against the real thing and is
 // what makes "copy" checkable rather than aspirational.
+//
+// # Steps are not the only resource
+//
+// Counting steps bounds CPU and bounds nothing else. The VM is *recursive* —
+// one Go frame per branch explored — so a greedy quantifier recurses once per
+// character it consumes, and a step counter watches that happen without
+// objecting: 800 KiB of caller text against `^(.*)=(.*)$` cost 800 K steps out
+// of five million and **3 GB of goroutine stack**, eight concurrent requests at
+// a time, with no ceiling firing. Go grows a goroutine stack to 1 GB before
+// killing the *process*, so a large enough segment is a crash rather than a
+// refusal.
+//
+// So [Run] carries three things, not one: the step budget, a depth ceiling
+// ([MaxDepth]) that bounds the stack the same way, and the invocation's context,
+// checked often enough that a match cannot outlive the wall clock that is
+// supposed to bound it. All three are the copy's; none of them changes which
+// strings match.
 //
 // Derived from github.com/yuin/gopher-lua/pm at v1.1.2.
 //
@@ -50,20 +67,97 @@
 package luapat
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
 
 const (
-	EOS               = -1
-	_UNKNOWN          = -2
-	maxRecursionLevel = 1000000
+	EOS      = -1
+	_UNKNOWN = -2
 )
+
+// MaxDepth is how deep the matcher may recurse before a match is refused.
+//
+// The VM explores a branch by calling itself, so depth is not an exotic
+// property of an exotic pattern: `(.*)` recurses once per character it consumes,
+// which makes the depth the *caller's* to choose exactly as the step count was.
+// A frame measures about 400 bytes on the machine this was written on, so this
+// ceiling is about 4 MB of goroutine stack per match — a number an operator can
+// multiply by their concurrency, which is the property the old
+// `maxRecursionLevel = 1000000` did not have: it was 400 MB per match, and Go
+// kills the process at 1 GB. Measured at eight concurrent matches over 800 KiB
+// of caller text: 3 072 MB before, 31 MB after.
+//
+// The cost of the ceiling is stated rather than hidden: a quantifier that has to
+// carry more than this many characters in one run — `^%s*(.-)%s*$` over a
+// segment larger than MaxDepth, say — is refused instead of served. That is a
+// real restriction on long subjects, and it is the same restriction the step
+// budget already imposes on expensive ones; a filter that needs to work on
+// whole documents should ask the host for it (`dorang.mask` runs Go regexps
+// with no stack of its own) rather than backtrack through them in Lua.
+const MaxDepth = 10000
 
 // ErrBudget reports that a match was stopped because it had spent everything
 // the caller was willing to pay for. It is not a pattern error: the pattern was
 // valid and the subject was valid, and the answer is simply not affordable.
 var ErrBudget = errors.New("luapat: pattern match exceeded its step budget")
+
+// ErrDepth reports that a match recursed deeper than [MaxDepth]. It is separate
+// from [ErrBudget] because the resource is different — stack, not CPU — and an
+// operator reading a diagnostic needs to know which ceiling to raise.
+var ErrDepth = errors.New("luapat: pattern match recursed deeper than the sandbox allows")
+
+// ctxCheckSteps is how many matcher steps run between two cancellation checks.
+//
+// A step is about 22 ns, so this is roughly 22 µs of matching between checks:
+// far below any wall clock worth configuring, and far above the cost of the
+// check itself, which is a non-blocking channel receive.
+const ctxCheckSteps = 1024
+
+// Run is what one match may spend.
+//
+// It is the whole of this copy's addition to upstream, gathered into one value
+// so the recursive VM carries one extra pointer rather than three.
+type Run struct {
+	// Budget is the step allowance. It is decremented as the match proceeds and
+	// is left holding whatever was not spent, so the caller learns the exact
+	// cost of the call rather than an estimate of it. It goes negative by
+	// exactly the step that ran out.
+	Budget int64
+	// Done is the invocation's cancellation channel, or nil for a match that
+	// nothing may interrupt. A nil channel is only right where there is no
+	// invocation — a test, or the comparison harness.
+	//
+	// It exists because the wall-clock watchdog cannot stop a host call: before
+	// this, a priced match ran to its step budget after the request it belonged
+	// to had been answered, abandoned and forgotten, and the watchdog's promise
+	// that "a hook that ignores its context delays the request by the ceiling
+	// and no more" was true of the hook and false of the matcher underneath it.
+	Done <-chan struct{}
+
+	// next counts down to the next cancellation check.
+	next int64
+}
+
+// spend charges one step and, every [ctxCheckSteps], asks whether anyone is
+// still waiting for the answer.
+func (r *Run) spend() {
+	r.Budget--
+	if r.Budget < 0 {
+		panic(errBudgetExhausted{})
+	}
+	r.next--
+	if r.next > 0 {
+		return
+	}
+	r.next = ctxCheckSteps
+	select {
+	case <-r.Done:
+		panic(errCancelled{})
+	default:
+	}
+}
 
 // MatchCost is charged for each match added to the result set, on top of the
 // steps the match itself took.
@@ -75,10 +169,14 @@ var ErrBudget = errors.New("luapat: pattern match exceeded its step budget")
 // match set occupies bounded by the same budget.
 const MatchCost = 16
 
-// errBudgetExhausted is the panic value used to unwind out of the recursive VM.
-// It is converted to [ErrBudget] by Find's recover, in the same style as the
-// pattern errors upstream already unwinds this way.
-type errBudgetExhausted struct{}
+// The panic values used to unwind out of the recursive VM. Each is converted to
+// its error by Find's recover, in the same style as the pattern errors upstream
+// already unwinds this way.
+type (
+	errBudgetExhausted struct{}
+	errTooDeep         struct{}
+	errCancelled       struct{}
+)
 
 /* Error {{{ */
 
@@ -599,10 +697,16 @@ func compilePattern(p pattern, ps ...*iptr) []inst {
 
 // Simple recursive virtual machine based on the
 // "Regular Expression Matching: the Virtual Machine Approach" (https://swtch.com/~rsc/regexp/regexp2.html)
-func recursiveVM(src []byte, insts []inst, pc, sp, recLevel int, budget *int64, ms ...*MatchData) (bool, int, *MatchData) {
+func recursiveVM(src []byte, insts []inst, pc, sp, recLevel int, r *Run, ms ...*MatchData) (bool, int, *MatchData) {
 	recLevel++
-	if recLevel > maxRecursionLevel {
-		panic(newError(_UNKNOWN, "pattern/input too complex"))
+	if recLevel > MaxDepth {
+		// Upstream raises "pattern/input too complex" at a million frames, which
+		// is a limit on nothing an operator can afford: a million frames is
+		// nearly half a gigabyte of stack, and the caller chooses the depth by
+		// choosing the length of the text. The ceiling is lowered and the
+		// unwind is the copy's own, so a depth breach is reported as the
+		// resource it is rather than as a malformed pattern.
+		panic(errTooDeep{})
 	}
 	var m *MatchData
 	if len(ms) == 0 {
@@ -611,14 +715,12 @@ func recursiveVM(src []byte, insts []inst, pc, sp, recLevel int, budget *int64, 
 		m = ms[0]
 	}
 redo:
-	// The one addition to upstream's VM: every dispatch costs a step. `goto
+	// The one addition to upstream's dispatch: every step costs a step. `goto
 	// redo` jumps here, so a long run of opChar is charged per character and a
 	// backtracking explosion is charged per branch explored — which is the
 	// whole point, because the explosion is what the ceiling could not see.
-	*budget--
-	if *budget < 0 {
-		panic(errBudgetExhausted{})
-	}
+	// Every so often it also asks whether the request is still there.
+	r.spend()
 	inst := insts[pc]
 	switch inst.OpCode {
 	case opChar:
@@ -636,14 +738,14 @@ redo:
 		pc = inst.Operand1
 		goto redo
 	case opSplit:
-		if ok, nsp, _ := recursiveVM(src, insts, inst.Operand1, sp, recLevel, budget, m); ok {
+		if ok, nsp, _ := recursiveVM(src, insts, inst.Operand1, sp, recLevel, r, m); ok {
 			return true, nsp, m
 		}
 		pc = inst.Operand2
 		goto redo
 	case opSave:
 		s := m.setCapture(inst.Operand1, sp)
-		if ok, nsp, _ := recursiveVM(src, insts, pc+1, sp, recLevel, budget, m); ok {
+		if ok, nsp, _ := recursiveVM(src, insts, pc+1, sp, recLevel, r, m); ok {
 			return true, nsp, m
 		}
 		m.restoreCapture(inst.Operand1, s)
@@ -693,17 +795,20 @@ redo:
 
 /* API {{{ */
 
-// Find matches p against src, spending at most *budget steps.
+// Find matches p against src, spending at most r.Budget steps and at most
+// [MaxDepth] frames, and stopping if r.Done closes.
 //
-// budget is decremented as the match proceeds and is left holding whatever was
+// r.Budget is decremented as the match proceeds and is left holding whatever was
 // not spent, so the caller learns the exact cost of the call rather than an
 // estimate of it. When it runs out the match stops and the error is [ErrBudget];
-// the partial matches are not returned, because a truncated answer is a wrong
-// answer and the caller's job is to refuse, not to guess.
+// when the depth ceiling is reached the error is [ErrDepth]; when the context is
+// done it is [context.Canceled]. In all three the partial matches are *not*
+// returned, because a truncated answer is a wrong answer and the caller's job is
+// to refuse, not to guess.
 //
-// Passing a budget large enough never to be reached reproduces upstream's
-// behaviour exactly.
-func Find(p string, src []byte, offset, limit int, budget *int64) (matches []*MatchData, err error) {
+// Passing a budget large enough never to be reached, a subject that does not
+// reach [MaxDepth] and a nil Done reproduces upstream's behaviour exactly.
+func Find(p string, src []byte, offset, limit int, r *Run) (matches []*MatchData, err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			switch pv := v.(type) {
@@ -711,30 +816,37 @@ func Find(p string, src []byte, offset, limit int, budget *int64) (matches []*Ma
 				err = pv
 			case errBudgetExhausted:
 				matches, err = nil, ErrBudget
+			case errTooDeep:
+				matches, err = nil, ErrDepth
+			case errCancelled:
+				matches, err = nil, context.Canceled
 			default:
 				panic(v)
 			}
 		}
 	}()
+	if r.next <= 0 {
+		r.next = ctxCheckSteps
+	}
 	// Parsing and compiling the pattern is linear in the pattern, and a plugin
 	// can build a pattern as long as its memory ceiling allows, so it is
 	// charged too rather than being a free prologue on every call.
-	*budget -= int64(len(p))
-	if *budget < 0 {
+	r.Budget -= int64(len(p))
+	if r.Budget < 0 {
 		return nil, ErrBudget
 	}
 	pat := parsePattern(newScanner([]byte(p)), true)
 	insts := compilePattern(pat)
 	matches = []*MatchData{}
 	for sp := offset; sp <= len(src); {
-		ok, nsp, ms := recursiveVM(src, insts, 0, sp, 0, budget)
+		ok, nsp, ms := recursiveVM(src, insts, 0, sp, 0, r)
 		sp++
 		if ok {
 			if sp < nsp {
 				sp = nsp
 			}
-			*budget -= MatchCost
-			if *budget < 0 {
+			r.Budget -= MatchCost
+			if r.Budget < 0 {
 				return nil, ErrBudget
 			}
 			matches = append(matches, ms)

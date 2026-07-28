@@ -369,8 +369,14 @@ func TestMetamethodComparisonIsChargedByItsOwnBody(t *testing.T) {
 // and a builtin: gopher-lua checks the context *between instructions*, so a loop
 // of them is interruptible where one `string.find` was not. The hook is stopped
 // at its deadline and the goroutine notices within one instruction, which is
-// what this asserts — the request returns on time and the abandoned goroutine
-// goes away rather than pinning a core after it.
+// what this asserts — the request returns on time and the goroutine goes away
+// rather than pinning a core after it.
+//
+// It used to assert one *timeout* here. It no longer is one: a hook that notices
+// its cancellation finishes inside [abandonGrace] and is never abandoned, so
+// there is no leaked goroutine to count and nothing for the trip to switch off.
+// That is the point of the loop being interruptible, and counting it as an
+// abandonment counted a leak that did not happen.
 func TestAnOperatorLoopExitsWhenItsDeadlinePasses(t *testing.T) {
 	e := luaEngine(t, `
 		dorang.register("on_request", function(req)
@@ -394,13 +400,14 @@ func TestAnOperatorLoopExitsWhenItsDeadlinePasses(t *testing.T) {
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("the request waited %v for a hook with a 50 ms ceiling", elapsed)
 	}
-	if st := e.Stats(); st.Timeouts != 1 {
-		t.Fatalf("stats = %+v, want one timeout", st)
+	if st := e.Stats(); st.Timeouts != 0 || st.Skipped != 1 {
+		t.Fatalf("stats = %+v, want one skipped invocation and no abandonment: the loop is "+
+			"interruptible, so it ended itself", st)
 	}
 
-	// The goroutine is abandoned, not killed. What must be true is that it
-	// notices: a hook still spinning after its request is gone is the cost this
-	// bound exists to cap.
+	// The goroutine is never killed. What must be true is that it notices: a
+	// hook still spinning after its request is gone is the cost this bound
+	// exists to cap.
 	deadline := time.Now().Add(5 * time.Second)
 	for e.Abandoned(HookRequest) > 0 {
 		if time.Now().After(deadline) {

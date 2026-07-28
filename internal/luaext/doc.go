@@ -37,6 +37,7 @@
 //     and the rewritten AST is compiled. Those are the only three ways *Lua
 //     source* can execute an unbounded number of instructions; everything else
 //     is straight-line code whose length is fixed at load. See luagas.go.
+//
 //   - **Instructions, the other half.** Counting instructions bounds how many
 //     builtins a plugin may call and says nothing about what one call does. A
 //     builtin is host code the counter cannot see into, so any builtin whose
@@ -44,6 +45,25 @@
 //     the search family (find, match, gmatch, gsub), whose backtracking is
 //     superlinear in a subject the *caller* supplies, and tonumber, which reads
 //     every byte of its argument to return a number. See luapattern.go.
+//
+//     gsub is charged three times over, because it goes wrong three ways: the
+//     scan, the result — and the *rebuild*, which gopher-lua does once per match
+//     over the whole subject. The third was invisible to the first two, and it
+//     is why `gsub(s, "a", "y")` over 400 KiB ran the wall clock out with no
+//     ceiling counted, and why the same call spelled with a function replacement
+//     was charged one byte per position where the string spelling was charged
+//     its true length.
+//
+//   - **The stack.** Charging work bounds CPU and not memory-that-is-not-heap.
+//     The pattern matcher is a recursive VM, one Go frame per branch explored,
+//     so a greedy quantifier costs a frame per character it consumes and the
+//     caller chooses how many: `^(.*)=(.*)$` over 800 KiB of a caller's own
+//     message text cost 800 K frames and **3 GB** of goroutine stack across
+//     eight concurrent requests, with every ceiling above reporting nothing and
+//     Go's 1 GB per-goroutine limit — a process kill — the next thing it would
+//     have reached. Depth is bounded explicitly at luapat.MaxDepth, inside the
+//     matcher, which is the only place it is visible.
+//
 //   - **Instructions, the third half.** Three *operators* have the same problem
 //     and no call to hang a charge on: `a == b`, `a < b` and `t[k]` are single
 //     VM instructions that walk or hash every byte of a string whose length the
@@ -52,6 +72,7 @@
 //     VM, which is what keeps `__eq`, `__lt`, `__le` and `__index` exact. Their
 //     spelled-out twins are priced the same way: rawequal, rawget, rawset, next,
 //     pairs and table.sort without a comparator. See luagas.go.
+//
 //   - **Memory.** Every allocation a plugin can cause is either O(1) per charge
 //     — hence bounded by the instruction ceiling — or is charged explicitly
 //     before it happens. String concatenation is rewritten into a charged host
@@ -70,18 +91,28 @@
 //     the whole process in reach. Only the wall clock and the panic guard do.
 //
 //   - A hook that ignores its context is **abandoned, not killed**. Go cannot
-//     kill a goroutine. The request proceeds on time; the goroutine runs until it
-//     notices the cancelled context or exhausts a ceiling, and repeated
-//     abandonment trips the hook off entirely ([Engine.Tripped]).
+//     kill a goroutine. The request proceeds on time — after the ceiling and a
+//     short grace for a hook that is merely finishing — and the goroutine runs
+//     until it notices the cancelled context or exhausts a ceiling. Repeated
+//     abandonment trips a fail-*open* hook off entirely ([Engine.Tripped]); a
+//     fail-closed one is never tripped, because switching it off would not stop
+//     it refusing, only make the refusal permanent.
 //
-//     What is bounded is *how many* — at most eight per hook, forty for an
-//     engine, at any instant and for its whole life; past that, invocations are
-//     refused before a goroutine exists to abandon ([Engine.Abandoned],
-//     [ErrAbandonBacklog]). That bound is what makes the leak affordable: the
-//     trip alone bounded abandonment over time and not at an instant, so a hook
-//     stuck in one uninterruptible builtin could pin a core per request and keep
-//     them all after being switched off. A Lua hook now also exits on its own,
-//     because there is no builtin left that can outrun its ceilings; a [Native]
+//     What is bounded is *how many*, by two supplies rather than one:
+//
+//     at most 32 goroutines per hook at any instant, whatever arrives at once,
+//     because the reservation is taken before the goroutine exists; and at most
+//     8 of them abandoned — no longer waited for, still running — after which
+//     invocations are refused before a goroutine exists to abandon
+//     ([Engine.Abandoned], [ErrAbandonBacklog], [ErrLiveBacklog]).
+//
+//     The second bound alone was published as "at most eight per hook, and
+//     nothing a plugin or a request rate can do raises it", and it was not one:
+//     it is checked at admission and counted at abandonment, so sixteen
+//     simultaneous requests to a wedged hook produced sixteen. The first bound
+//     is what makes the sentence true. A Lua hook also exits on its own, because
+//     there is no builtin left that can outrun its ceilings — including the
+//     priced pattern match, which takes the invocation's context; a [Native]
 //     that blocks forever holds one of the eight forever.
 //
 //   - A **metatable chain** makes one instruction do up to a hundred table
@@ -146,6 +177,14 @@
 // enrich a request should be skipped, but a filter that was supposed to remove
 // an identity number and did not must stop the request." A filter plugin
 // declares which kind it is; [FailClosed] is the default.
+//
+// The inversion covers a filter that did not *run* as well as one that ran and
+// failed, and that distinction was where the rule leaked. The zero
+// [FilterDecision] is no masking and no refusal, so every way of not running —
+// a tripped hook, a plugin that registered no handler, a plugin this engine
+// never loaded — returned the same value as a clean pass and sent the text
+// upstream untouched. A masking filter that does not run is a masking filter
+// that failed, and it refuses.
 //
 // # Secrets
 //

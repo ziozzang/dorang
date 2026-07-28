@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/config"
@@ -420,6 +421,122 @@ func TestAFailedMaskStopsTheRequest(t *testing.T) {
 	spy.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("the upstream was called %d times despite the failed mask", n)
+	}
+}
+
+// TestABurstCannotTurnTheMaskOff is the end-to-end form of a chain of three
+// separately reasonable decisions that added up to no masking at all.
+//
+// The links, in order:
+//
+//  1. The priced pattern match took no context, so it outlived the wall clock
+//     that was supposed to bound it. Under a burst — the same work, contending
+//     for the same cores — every invocation exceeded the ceiling.
+//  2. Backlog refusals counted toward the trip. They cost microseconds, so
+//     thirty-two consecutive ones arrived almost instantly.
+//  3. A tripped filter returned the zero decision, and the zero value of a
+//     masking decision is no masking and no refusal.
+//
+// So a burst of large requests switched PII masking off, permanently, silently,
+// and without refusing anything. The assertion is deliberately not about a
+// decision struct: it is what the *upstream* was sent, before, during and after
+// the burst, because that is the only thing a decision struct is a claim about.
+func TestABurstCannotTurnTheMaskOff(t *testing.T) {
+	var logs safeLog
+	spy := &upstreamSpy{}
+	spy.reply = func(string) (int, string, string) {
+		return http.StatusOK, "application/json", chatReply("ok")
+	}
+	t.Setenv("DORANG_APP_TEST_FILTER_SECRET", "a-cluster-wide-filter-seed") // pragma: allowlist secret — test fixture
+	url := spy.start(t)
+
+	// A filter that searches the caller's own text before masking it — an
+	// operator-written pattern over a segment whose length the caller chose,
+	// which is exactly the shape §11.5 prices. The search is affordable on
+	// ordinary text and not on the burst's.
+	dir := t.TempDir()
+	plugin := filepath.Join(dir, "search_then_mask.lua")
+	if err := os.WriteFile(plugin, []byte(`
+		dorang.require_api(1)
+		dorang.register("on_filter_request", function(req)
+			for i = 1, req.count do
+				local text = req.doc.text(i)
+				if #text > 0 then
+					string.find(text, ".-.-.-@")
+					local out, n = dorang.mask(text)
+					if n > 0 then req.doc.set_text(i, out) end
+				end
+			end
+		end)
+	`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	yaml := strings.Replace(filterYAML(t, url), pluginPath(t), plugin, 1)
+	a := newFilterApp(t, yaml, &logs, func(c *config.Config) {
+		// The shipped default wall clock, scaled down so the burst is a burst
+		// rather than a benchmark. The instruction budget is the real one.
+		c.Extensions.Lua.Limits.Timeout = config.Duration(50 * time.Millisecond)
+	})
+	secret := issueKey(t, a, nil)
+
+	body := func(text string) string {
+		b, err := json.Marshal(map[string]any{
+			"model":    "m1",
+			"messages": []any{map[string]any{"role": "user", "content": text}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	// Before: the mask works, and the test knows what working looks like.
+	if w := callWith(a, secret, http.MethodPost, "/v1/chat/completions",
+		body("제 번호는 "+theRRN+" 입니다")); w.Code != http.StatusOK {
+		t.Fatalf("the filter did not work before the burst: %d %s", w.Code, w.Body.String())
+	}
+	placeholderIn(t, spy.lastBody(t))
+
+	// The burst: large segments, all at once. 48 is the measured number — eight
+	// abandoned invocations and enough refusals behind them to reach the trip.
+	const burst = 48
+	large := strings.Repeat("a", 200<<10) + " " + theRRN
+	var wg sync.WaitGroup
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := callWith(a, secret, http.MethodPost, "/v1/chat/completions", body(large))
+			if w.Code == http.StatusOK {
+				// Not a failure by itself — an affordable request may complete —
+				// but it must have been masked, which the upstream check below
+				// covers for every request this test makes.
+				return
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After: the same request that worked before must still work, and must
+	// still be masked. A filter that answers "no" for the life of the process is
+	// not the fix; the mask being off is the failure.
+	w := callWith(a, secret, http.MethodPost, "/v1/chat/completions",
+		body("제 번호는 "+theRRN+" 입니다"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("after a burst the model refuses every request: %d %s\n%s",
+			w.Code, w.Body.String(), logs.String())
+	}
+	placeholderIn(t, spy.lastBody(t))
+
+	// The assertion that matters: nothing the upstream was ever sent contains
+	// the identity number, over every request this test made.
+	spy.mu.Lock()
+	defer spy.mu.Unlock()
+	for i, sent := range spy.bodies {
+		if strings.Contains(sent, theRRN) {
+			t.Fatalf("upstream request %d of %d carried the identity number unmasked:\n%.400s\n\nlog:\n%s",
+				i+1, len(spy.bodies), sent, logs.String())
+		}
 	}
 }
 

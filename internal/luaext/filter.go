@@ -3,6 +3,7 @@ package luaext
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	lua "github.com/yuin/gopher-lua"
 )
@@ -154,6 +155,10 @@ const FilterDenyCode = "filter_failed"
 
 // EnabledFilter reports whether a filter plugin will run. Like [Engine.Enabled]
 // it is the branch the hot path takes, and it allocates nothing.
+//
+// It is not a permission to skip. [Engine.FilterRequest] calls it and then
+// refuses when it is false, because "this filter will not run" and "this request
+// needs no filter" are different facts and only the caller knows the second one.
 func (e *Engine) EnabledFilter() bool {
 	if e == nil || e.lua == nil || !e.lua.filter {
 		return false
@@ -161,24 +166,97 @@ func (e *Engine) EnabledFilter() bool {
 	return e.tripped.Load()&(1<<uint(HookFilterRequest)) == 0
 }
 
+// ErrFilterUnavailable reports that the filters a request was configured with
+// could not be run at all: the hook has been tripped off, or this engine has no
+// handler for one of the plugins the model named. It is not a plugin failure —
+// nothing ran — and it fails closed for the same reason a plugin failure does.
+var ErrFilterUnavailable = errors.New("luaext: the request's filters could not be run")
+
 // FilterRequest runs the transform filters over a request.
 //
 // It inverts the package's usual asymmetry, and deliberately: a hook that breaks
 // is skipped, but a *masking* filter that breaks refuses the request. The plugin
 // declares which kind it is; `closed` is the default.
+//
+// # A filter that does not run is a filter that failed
+//
+// This used to return the zero [FilterDecision] whenever the hook was not going
+// to run, and the zero value of a masking decision is *no masking and no
+// refusal* — the request goes upstream carrying whatever it carried. Every way
+// of not running therefore silently downgraded the one security control in the
+// package into its own absence:
+//
+//   - The hook had been tripped off after repeated abandonment. A burst was
+//     enough to arrange that, permanently, in under a second, and the trip was
+//     designed for hooks whose absence is *safe*.
+//   - The engine has no handler for the plugin the model named — a plugin that
+//     loaded but registered nothing at on_filter_request, say. Configuration
+//     checks that the *name* is declared; only this can check that it runs.
+//
+// So the absence is treated exactly as a failure: [applyFailMode] with
+// the strictest declaration among the plugins in play, which for a filter
+// defaults to closed. The one case that still returns nothing is the one that
+// means nothing: a caller with no filters, on an engine with no filters.
 func (e *Engine) FilterRequest(ctx context.Context, v *FilterView) FilterDecision {
 	if !e.EnabledFilter() {
-		return FilterDecision{}
+		var out FilterDecision
+		if len(v.Plugins) == 0 && !e.hasFilters() {
+			// Nothing was configured and nothing is missing: a caller with no
+			// filters, on an engine with none. This is the branch the hot path
+			// takes when the feature is off, and it still costs one nil check
+			// and no allocation.
+			return out
+		}
+		out.Failed = true
+		out.Err = ErrFilterUnavailable
+		if e != nil {
+			e.skip(HookFilterRequest, "invocation", ErrFilterUnavailable)
+		}
+		applyFailMode(&out, e.failModeFor(v.Plugins))
+		return out
+	}
+	if missing := e.lua.unregistered(v.Plugins); missing != "" {
+		var out FilterDecision
+		out.Failed = true
+		out.Err = fmt.Errorf("%w: %q registers no on_filter_request", ErrFilterUnavailable, missing)
+		e.skip(HookFilterRequest, missing, out.Err)
+		applyFailMode(&out, e.failModeFor(v.Plugins))
+		return out
 	}
 	j := &filterJob{e: e, v: v}
 	if err := e.watch(ctx, HookFilterRequest, j.run); err != nil {
-		j.out.Failed = true
-		j.out.Err = err
+		// The job's own decision is deliberately neither read nor written here.
+		// An invocation that failed by being *abandoned* is still running, and
+		// still writing into it: this used to fold the failure into j.out and
+		// return it, which is two goroutines and one struct. The other four
+		// hooks avoid it by returning their zero decision; a filter cannot
+		// return its zero decision, so it returns a fresh one.
+		var out FilterDecision
+		out.Failed = true
+		out.Err = err
 		e.skip(HookFilterRequest, "invocation", err)
-		e.applyFailMode(&j.out, e.lua.strictestFail(v.Plugins))
-		return j.out
+		applyFailMode(&out, e.failModeFor(v.Plugins))
+		return out
 	}
+	// Safe to read: watch returned only after the goroutine's send, which is the
+	// happens-before edge.
 	return j.out
+}
+
+// hasFilters reports whether any filter plugin is registered at all, tripped or
+// not. It is the difference between "this engine has no filters" and "this
+// engine's filters are not running".
+func (e *Engine) hasFilters() bool { return e != nil && e.lua != nil && e.lua.filter }
+
+// failModeFor is [luaRuntime.strictestFail] with an answer for the engine that
+// has no runtime to ask. A filter this engine cannot see cannot have declared
+// itself fail-open, and guessing open is how an identity number reaches an
+// upstream, so the unknown is closed.
+func (e *Engine) failModeFor(only []string) FailMode {
+	if e == nil || e.lua == nil {
+		return FailClosed
+	}
+	return e.lua.strictestFail(only)
 }
 
 // strictestFail returns the strictest fail mode among the plugins in play.
@@ -186,8 +264,15 @@ func (e *Engine) FilterRequest(ctx context.Context, v *FilterView) FilterDecisio
 // When the invocation itself fails — a wall-clock breach, say — the host cannot
 // tell which plugin was responsible, and guessing wrong in the permissive
 // direction is how an identity number reaches an upstream. So the strictest
-// declaration in the set wins.
+// declaration in the set wins, and a plugin the caller named that this engine
+// has never heard of is strictest of all: it declared nothing here, and an
+// undeclared filter is the default, which is closed.
 func (rt *luaRuntime) strictestFail(only []string) FailMode {
+	for _, name := range only {
+		if rt.byName(name) == nil {
+			return FailClosed
+		}
+	}
 	for _, p := range rt.plugins {
 		if !selected(only, p.name) {
 			continue
@@ -197,6 +282,33 @@ func (rt *luaRuntime) strictestFail(only []string) FailMode {
 		}
 	}
 	return FailOpen
+}
+
+func (rt *luaRuntime) byName(name string) *loadedPlugin {
+	for _, p := range rt.plugins {
+		if p.name == name {
+			return p
+		}
+	}
+	return nil
+}
+
+// unregistered names a plugin the caller asked for that has no
+// on_filter_request handler, or "" when every one of them has one.
+//
+// A plugin can load cleanly, be named correctly on a model, and register at no
+// hook at all — a typo in the hook name is enough. Configuration can check that
+// the plugin exists; only the runtime knows whether it registered anything, and
+// before this the answer was a filter chain that ran zero handlers and reported
+// a clean pass.
+func (rt *luaRuntime) unregistered(only []string) string {
+	for _, name := range only {
+		p := rt.byName(name)
+		if p == nil || !p.filter {
+			return name
+		}
+	}
+	return ""
 }
 
 // selected reports whether a plugin is in the caller's list. An empty list means
@@ -213,7 +325,7 @@ func selected(only []string, name string) bool {
 	return false
 }
 
-func (e *Engine) applyFailMode(out *FilterDecision, mode FailMode) {
+func applyFailMode(out *FilterDecision, mode FailMode) {
 	if mode != FailClosed {
 		return
 	}
@@ -276,7 +388,7 @@ func (j *filterJob) run(ctx context.Context) error {
 			j.out.Failed = true
 			j.out.Err = cl
 			e.skip(HookFilterRequest, hd.plugin.name, cl)
-			e.applyFailMode(&j.out, hd.plugin.fail)
+			applyFailMode(&j.out, hd.plugin.fail)
 			if j.out.Refuse {
 				j.out.tagset = res.tags
 				return nil

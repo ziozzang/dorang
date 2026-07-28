@@ -1163,9 +1163,16 @@ extensions:
 | `lua.limits.{instructions,memory_mb,timeout}` | int/int/duration | `5000000` / `32` / `200ms` | Per-hook ceilings | Negative is refused. **An enabled hook with any of the three at zero is refused** — an unbounded hook on the hot path is not a hook, it is an outage waiting for a bad program |
 
 Semantics: exceeding a ceiling skips the hook and warns (**fail-open**), except an explicit deny
-from `on_request`, which is honoured (**fail-closed**). A panic in a hook is contained. No hook
-can see a secret — the views handed to them are constructed without key material rather than
-filtered afterwards.
+from `on_request`, which is honoured (**fail-closed**), and except §10.5b's masking filter,
+which refuses when it cannot run at all. A panic in a hook is contained. No hook can see a
+secret — the views handed to them are constructed without key material rather than filtered
+afterwards.
+
+A hook that repeatedly ignores its deadline is switched off for the life of the process, and
+that applies to the four fail-*open* hooks only: switching a masking filter off would not stop
+it refusing, it would only make the refusal permanent. What bounds the goroutines either way is
+a fixed supply per hook — at most 32 running at once and at most 8 of those abandoned, after
+which invocations are refused before a goroutine exists.
 
 **Three ways to write an extension, one contract.** `extensions.lua.dir` holds `*.policy`
 files: a total policy language with no loops, no calls and no string building, so a program
@@ -1200,6 +1207,15 @@ top rather than withdrawn.
   `rawequal`, `rawget`, `rawset`, `next`, `pairs` and `table.sort` without a comparator are priced
   to match. See DESIGN §11.5 for the measurements and for the one bounded residual, a plugin-built
   `__index` chain.
+- *The stack* is bounded separately, because charging work bounds CPU and not the goroutine
+  stack a recursive host call grows. The pattern matcher explores one branch per Go frame, so a
+  greedy quantifier costs a frame per character it consumes: `^(.*)=(.*)$` over 800 KiB of a
+  caller's message text took 3 GB across eight concurrent requests with no ceiling firing.
+  Recursion is capped at 10 000 frames — about 4 MB per match — and the consequence is worth
+  knowing before you meet it: **a Lua pattern whose quantifier must carry more than 10 000
+  characters in one run is refused**, so a filter that scans whole documents should use
+  `dorang.mask` (Go regexps, no recursion) rather than backtracking through them in Lua.
+  A priced match also takes the invocation's context, so `timeout` bounds it as well.
 - *Memory* is charged allocation. Every allocation is either O(1) per charge — hence bounded by
   the instruction ceiling — or is charged before it happens: string concatenation is rewritten
   into a charged host call, and `string.rep`, `string.format`, `string.gsub`, `string.byte`,
@@ -1253,7 +1269,7 @@ models:
 | `secret` | secret ref | — | The cluster-wide seed a placeholder is derived from | **Required unless every filter uses `scope: request`.** It must be the same on every node and across restarts: a per-process seed masks the same text differently everywhere, so the bodies reaching a backend differ byte for byte and every prefix cache cold-starts (§7.4b). Rotating it invalidates every cache on the fleet — a staged, announced operation |
 | `plugins[].name` | string | — | How a model refers to the plugin | Must be unique; a model naming a plugin that is not declared is refused at load |
 | `plugins[].path` | path | — | The Lua file. Named explicitly, never scanned for | A missing file is a startup failure, not a filter that quietly does nothing |
-| `plugins[].fail` | `closed` \| `open` | `closed` | What happens when the plugin does not complete | `closed` refuses the request. This inverts §11.5's fail-open on purpose: a filter that cannot *enrich* should be skipped, but one that was supposed to remove an identity number and did not must stop the request |
+| `plugins[].fail` | `closed` \| `open` | `closed` | What happens when the plugin does not complete **or does not run** | `closed` refuses the request. This inverts §11.5's fail-open on purpose: a filter that cannot *enrich* should be skipped, but one that was supposed to remove an identity number and did not must stop the request. "Did not run" counts: a plugin that registers no `on_filter_request` handler, or a hook switched off, refuses exactly as a plugin that failed halfway does — the alternative is a configured masking filter that silently sends the text upstream |
 | `plugins[].config` | map[string]string | `{}` | Handed to the plugin as `dorang.config` while it loads | It holds no secret; it is readable by untrusted code |
 | `models[].filters[].plugin` | string | — | Which declared plugin runs | A dangling name is refused |
 | `models[].filters[].on` | []string | `[request, response]` | Which halves run | `[response]` alone is refused: there is nothing to unmask if nothing was masked |

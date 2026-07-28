@@ -88,6 +88,11 @@ type loadedPlugin struct {
 	proto  *lua.FunctionProto
 	config map[string]string
 	fail   FailMode
+	// filter records that this plugin registered an on_filter_request handler.
+	// A model may name a plugin that registers nothing; see
+	// [luaRuntime.unregistered] for why that has to be an error rather than an
+	// empty chain.
+	filter bool
 }
 
 // handler is one registered Lua function.
@@ -182,6 +187,9 @@ func newLuaRuntime(plugins []Plugin, limits Limits, logf func(string, ...any)) (
 		if len(v.handlers[h]) > 0 {
 			rt.hookMask |= 1 << uint(h)
 		}
+	}
+	for _, hd := range v.handlers[HookFilterRequest] {
+		hd.plugin.filter = true
 	}
 	rt.filter = len(v.handlers[HookFilterRequest]) > 0
 	rt.release(v)
@@ -287,6 +295,11 @@ type vmState struct {
 	noGas   bool
 	noMem   bool
 	aborted error
+	// done is the invocation context's cancellation channel. gopher-lua checks
+	// the context itself between VM instructions; this is the same signal in the
+	// form a *host* call can check, and it is what stops a priced pattern match
+	// from running on after the request has gone.
+	done <-chan struct{}
 
 	dorang   *lua.LTable
 	docTable *lua.LTable
@@ -319,13 +332,16 @@ func (v *vmState) begin(ctx context.Context, l Limits) {
 	v.noGas = l.Instructions <= 0
 	v.noMem = l.MemoryBytes <= 0
 	v.aborted = nil
+	v.done = nil
 	if ctx != nil {
+		v.done = ctx.Done()
 		v.L.SetContext(ctx)
 	}
 }
 
 func (v *vmState) end() {
 	v.L.RemoveContext()
+	v.done = nil
 	v.inv = invocation{}
 }
 

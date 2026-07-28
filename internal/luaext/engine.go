@@ -68,6 +68,11 @@ type Options struct {
 // number of them to keep serving traffic is the trade DESIGN §11.5 asks for;
 // leaking one per request until the process dies is not, and would convert a
 // broken extension into exactly the outage fail-open exists to prevent.
+//
+// Only an invocation that was *actually* abandoned counts. A hook that returned
+// a microsecond after its deadline leaked nothing, so there is nothing to switch
+// off — and its answer is used rather than discarded, because throwing away a
+// completed masking pass is throwing away the mask.
 const maxConsecutiveTimeouts = 32
 
 // maxAbandoned is how many invocations of one hook may be *outstanding* — timed
@@ -83,14 +88,48 @@ const maxConsecutiveTimeouts = 32
 // So abandonment is treated as a resource with a fixed supply. Once a hook has
 // this many invocations outstanding it stops being run at all — the invocation
 // is refused before the goroutine is created, which is cheaper than running it
-// and fails open exactly as a timeout does. A refusal counts toward the trip
-// like the abandonment it stands in for, so a hook that stays wedged is switched
-// off rather than refusing forever in silence.
-//
-// The bound this states: at most maxAbandoned goroutines per hook, so at most
-// numHooks × maxAbandoned for an engine, at any instant and for its whole life.
-// Nothing a plugin or a request rate can do raises it.
+// and fails open exactly as a timeout does.
 const maxAbandoned = 8
+
+// maxLive is how many invocations of one hook may be *running* at the same
+// time, abandoned or not.
+//
+// It exists because [maxAbandoned] alone is not the bound it was published as.
+// That check is made at admission and the counter it reads is incremented at
+// abandonment, so a burst passes admission before any of it has been counted:
+// sixteen simultaneous requests to a wedged hook produced sixteen abandoned
+// goroutines against a stated bound of eight, with no trip involved and nothing
+// a plugin did wrong. "At most eight, and nothing a request rate can raise" was
+// false by exactly the request rate.
+//
+// A goroutine holds one of these from the moment before it is created to the
+// moment it exits, so the count is a fact about goroutines rather than a
+// prediction about them, and the bound holds at every instant:
+//
+//	at most maxLive goroutines per hook, so at most numHooks × maxLive for an
+//	engine, at any instant and for its whole life — and once maxAbandoned of
+//	them have been abandoned, no new one is created at all, so the steady state
+//	past a burst is maxAbandoned rather than maxLive.
+//
+// The number is chosen so that it binds only on hooks that are already failing.
+// Concurrency is arrival rate times duration, and duration is bounded by the
+// wall clock: reaching maxLive with the default 200 ms ceiling takes 160
+// invocations a second that each run the *entire* ceiling, where the shipped
+// masking filter takes 12.8 µs and would need 2.5 M/s. A hook slow enough to
+// reach this is a hook whose invocations are being abandoned anyway.
+const maxLive = 4 * maxAbandoned
+
+// abandonGrace is how long after the wall clock a hook has to finish unwinding
+// before it is abandoned rather than waited for.
+//
+// It is not a second ceiling: nothing new is allowed to run in it, and a hook
+// that ignores its context still delays the request by the ceiling *and this*,
+// which is 2.5% of the default 200 ms. What it buys is that "abandoned" means a
+// goroutine that really did not come back, rather than one that came back a
+// microsecond late — the difference between counting a leak that happened and
+// counting one that did not, and, for a masking filter, between using a
+// completed masking pass and throwing it away to refuse the request.
+const abandonGrace = 5 * time.Millisecond
 
 // Engine holds the compiled programs and registered natives for all four hooks.
 //
@@ -118,6 +157,9 @@ type Engine struct {
 	// abandoned counts invocations of each hook that timed out and are still
 	// running. See [maxAbandoned].
 	abandoned [numHooks]atomic.Int64
+	// live counts the goroutines each hook currently owns, abandoned or not.
+	// See [maxLive].
+	live [numHooks]atomic.Int64
 
 	st stats
 }
@@ -324,10 +366,13 @@ func (e *Engine) Limits() Limits {
 // The ceiling is enforced on this side of the call, not inside it: fn runs on
 // its own goroutine and this function stops waiting when the deadline passes,
 // whether or not fn noticed. A hook that ignores its context delays the request
-// by the ceiling and no more. The goroutine is left running — there is no way to
+// by the ceiling plus [abandonGrace] and no more — the grace being what
+// separates a hook that came back late from one that did not come back. The
+// goroutine is left running — there is no way to
 // kill a goroutine in Go — so what the host can promise is not that it stops but
-// that there are never more than [maxAbandoned] of them per hook: past that,
-// invocations are refused before a goroutine exists to abandon.
+// that there are never more than [maxLive] of them per hook, of which never more
+// than [maxAbandoned] are ones nobody is waiting for: past either, invocations
+// are refused before a goroutine exists to abandon.
 func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) error) error {
 	e.st.invocations.Add(1)
 
@@ -339,17 +384,16 @@ func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) err
 		// The hook already owns every goroutine it is allowed to lose. Starting
 		// another would be the leak this bound exists to refuse, and the answer
 		// would be thrown away at the deadline anyway.
-		e.st.refused.Add(1)
-		if err := ctx.Err(); err != nil {
-			// Same exemption as the timeout path below: a request that is
-			// already going away must not be able to trip an extension off,
-			// or a disconnect storm becomes a permanent outage of the hook.
-			return err
-		}
-		if e.consecTMO[h].Add(1) >= maxConsecutiveTimeouts {
-			e.trip(h)
-		}
-		return ErrAbandonBacklog
+		return e.refuse(ctx, h, ErrAbandonBacklog)
+	}
+	// The reservation is taken before the goroutine exists and released when it
+	// exits, which is what makes the count a fact about goroutines rather than
+	// an estimate of them. Add-then-check rather than load-then-add: a burst
+	// that all read the same zero is exactly how the abandonment bound came to
+	// be exceeded.
+	if e.live[h].Add(1) > maxLive {
+		e.live[h].Add(-1)
+		return e.refuse(ctx, h, ErrLiveBacklog)
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, e.limits.Timeout)
@@ -370,6 +414,30 @@ func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) err
 		e.consecTMO[h].Store(0)
 		return err
 	case <-cctx.Done():
+		// The deadline fired. A hook that *observes* its cancellation — which,
+		// inside the sandbox, is now everything down to the pattern matcher —
+		// still has to unwind before it can say so, and abandoning it in that
+		// moment is wrong twice over: it counts a leak that did not happen
+		// toward switching the hook off, and it throws away a masking pass that
+		// completed, turning a filtered request into a refused one. So the
+		// deadline is followed by a bounded grace, and only a hook that misses
+		// that too is abandoned.
+		grace := time.NewTimer(abandonGrace)
+		defer grace.Stop()
+		select {
+		case err := <-done:
+			e.consecTMO[h].Store(0)
+			return err
+		case <-grace.C:
+		}
+		if !run.abandon() {
+			// It finished in the moment between the grace expiring and this
+			// claim. The send is buffered and comes immediately after the
+			// finish this lost to, so it is already there or a hair away.
+			err := <-done
+			e.consecTMO[h].Store(0)
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			// The *request* is going away, not the hook. Counting this would
 			// trip a perfectly good extension off during a client disconnect
@@ -379,41 +447,91 @@ func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) err
 			// waiting for it, so it is registered as one: a disconnect storm
 			// against a wedged hook leaks exactly as fast as anything else
 			// does, which is to say not at all past the bound.
-			run.abandon()
 			return err
 		}
-		run.abandon()
 		e.st.timeouts.Add(1)
-		if e.consecTMO[h].Add(1) >= maxConsecutiveTimeouts {
-			e.trip(h)
-		}
+		e.countAbandonment(h)
 		return ErrTimeout
 	}
+}
+
+// countAbandonment records one abandoned invocation and switches the hook off
+// once [maxConsecutiveTimeouts] of them have happened in a row.
+//
+// It does nothing for a hook that fails closed, and that is the same correction
+// [Engine.refuse] makes for the same reason. The trip is a *fail-open*
+// mechanism: it converts a hook that leaks a goroutine per request into a hook
+// that is not run, which is safe precisely because not running it is safe. For
+// the one hook where not running it is a refusal, the trip buys nothing —
+// every request refuses either way — and costs the difference between a state
+// that clears when the backlog drains and one that lasts until the process is
+// restarted. A transient overload must not be able to decide that a model is
+// dead until someone notices.
+//
+// What bounds the leak for that hook instead is [maxLive] and [maxAbandoned],
+// which bound it for every hook and do not need the request to be refused
+// forever to do it.
+func (e *Engine) countAbandonment(h Hook) {
+	if h.failsClosed() {
+		return
+	}
+	if e.consecTMO[h].Add(1) >= maxConsecutiveTimeouts {
+		e.trip(h)
+	}
+}
+
+// refuse records an invocation that was not run because the hook had no supply
+// left, and decides whether it counts toward the trip.
+//
+// It counts for a hook that fails *open*, and that was the instruction: a wedged
+// enrichment hook that refuses is a hook doing nothing in silence, so switching
+// it off is the honest end state. It does not count for a hook that fails
+// *closed*, and that is the correction. A fail-closed refusal is the loudest
+// thing the gateway does — the request stops — so there is no silence to end,
+// and switching a masking filter "off" is not a state that exists: the nearest
+// one is refusing every request on that model for the life of the process,
+// which no operator asked for and no backlog draining undoes. Refusals here cost
+// microseconds, so counting them turned a burst into a permanent decision in
+// well under a second.
+func (e *Engine) refuse(ctx context.Context, h Hook, err error) error {
+	e.st.refused.Add(1)
+	if cerr := ctx.Err(); cerr != nil {
+		// A request that is already going away must not be able to trip an
+		// extension off, or a disconnect storm becomes a permanent outage.
+		return cerr
+	}
+	e.countAbandonment(h)
+	return err
 }
 
 // inflight is the handshake between a watchdog that has stopped waiting and the
 // goroutine it stopped waiting for.
 //
-// Exactly one of the two wins, and the counter is only touched when abandon
-// wins, so a hook that returns a microsecond after its deadline costs nothing.
-// abandon increments *before* claiming the state, so finish can never observe
-// the claim without also observing the increment and can never drive the count
-// below zero.
+// Exactly one of the two wins, and the abandonment counter is only touched when
+// abandon wins, so a hook that returns a microsecond after its deadline costs
+// nothing. abandon increments *before* claiming the state, so finish can never
+// observe the claim without also observing the increment and can never drive the
+// count below zero. The [maxLive] reservation is released by whichever call the
+// goroutine itself makes, which is always finish.
 type inflight struct {
 	e     *Engine
 	h     Hook
 	state atomic.Uint32 // 0 running, 1 finished, 2 abandoned
 }
 
-func (r *inflight) abandon() {
+// abandon reports whether it claimed the invocation. False means the goroutine
+// finished first and there is nothing to abandon.
+func (r *inflight) abandon() bool {
 	r.e.abandoned[r.h].Add(1)
 	if r.state.CompareAndSwap(0, 2) {
-		return
+		return true
 	}
 	r.e.abandoned[r.h].Add(-1)
+	return false
 }
 
 func (r *inflight) finish() {
+	r.e.live[r.h].Add(-1)
 	if r.state.CompareAndSwap(0, 1) {
 		return
 	}
@@ -455,7 +573,8 @@ func guard(h Hook, unit string, fn func() error) (err error) {
 // unit. The ceilings are shared across units, so exhausting one ends everything;
 // a panic is one unit's problem.
 func fatal(err error) bool {
-	return errors.Is(err, ErrInstructionLimit) || errors.Is(err, ErrMemoryLimit)
+	return errors.Is(err, ErrInstructionLimit) || errors.Is(err, ErrMemoryLimit) ||
+		errors.Is(err, ErrPatternTooDeep)
 }
 
 // skip counts and warns about a failed hook. Every path through it fails open.

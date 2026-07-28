@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/ziozzang/dorang/internal/luaext/luapat"
 )
 
 // The sandbox: what a plugin can reach, and what it is charged for.
@@ -167,9 +169,19 @@ var preflight = map[string]map[string]preFn{
 func newSandbox(v *vmState) *lua.LState {
 	L := lua.NewState(lua.Options{
 		SkipOpenLibs: true,
-		// A bounded call stack is the recursion ceiling. Deep recursion is
-		// charged like everything else, but the frames themselves are host
-		// memory the budget cannot see, so they are bounded structurally.
+		// A bounded call stack is the recursion ceiling for *Lua* frames. Deep
+		// recursion is charged like everything else, but the frames themselves
+		// are host memory the budget cannot see, so they are bounded by count
+		// instead.
+		//
+		// This used to say the frames were "bounded structurally", full stop,
+		// and that was a claim about the wrong stack. A builtin recurses on the
+		// *Go* stack, where this number has no effect at all: gopher-lua's
+		// pattern matcher explores one branch per frame, so `^(.*)=(.*)$`
+		// against 800 KiB of caller text took 800 000 frames and three
+		// gigabytes, eight requests at a time, with every ceiling in this file
+		// reporting nothing. Host recursion is bounded in the only place it can
+		// be seen from — inside the matcher, at [luapat.MaxDepth].
 		CallStackSize: 200,
 		RegistrySize:  1024,
 	})
@@ -626,9 +638,46 @@ func maxFormatWidth(f string) int {
 	return max
 }
 
-// preGsub bounds string.gsub twice over, because it can go wrong twice over: it
-// allocates a result that can exceed its input, and it *searches*, which the
-// memory charge alone never saw.
+// gsubCopyBytesPerGas is how many bytes of gsub's rebuild cost one unit of the
+// instruction budget.
+//
+// gopher-lua's strGsubDoReplace rebuilds the *whole* subject once per match — it
+// allocates a new prefix, appends the replacement and appends the tail, for
+// every replacement in the list — so the work is O(matches × length) and neither
+// of the two things gsub was already charged for could see it. The memory charge
+// bounds the *result*, and the result is the same size whether it took one copy
+// or a hundred thousand; the search charge bounds the *scan*, and the scan is
+// over before the first byte is copied. Measured: `gsub(s, "a", "y")` against
+// 400 KiB with 200 K matches ran the full wall clock with limitHits = 0, while
+// the same call with a longer replacement string was refused in 79 µs by the
+// memory ceiling — the difference was not the work, only which of the two
+// charges happened to notice.
+//
+// The rate is the same kind of arithmetic as [cmpBytesPerGas]: memmove moves
+// about 10 GB/s and a charged instruction costs about 22 ns, so 256 bytes of
+// copying buy about one instruction.
+const gsubCopyBytesPerGas = 256
+
+// replCallGas is charged per call to a function replacement, for the call frame
+// gopher-lua builds and tears down around it. The function's own body is
+// instrumented Lua and charges itself.
+const replCallGas = 4
+
+// preGsub bounds string.gsub, which can go wrong in three ways and was charged
+// for two of them.
+//
+//   - It allocates a result that can exceed its input. Charged below, and only
+//     soundly for a *string* replacement: with a function or a table the
+//     replacement's length is not known until it is produced, so it is charged
+//     where it is produced (see [vmState.chargedReplacement]) rather than
+//     guessed at here. That is the hole this closes: `per` was 1 for a function,
+//     so a call whose string spelling was refused in 79 µs ran to the wall clock
+//     when spelled with a callback that returned exactly the same bytes.
+//   - It *searches*, which the memory charge alone never saw. Priced by running
+//     the match first, as everywhere else in this file.
+//   - It *rebuilds the subject once per match*, which neither of the other two
+//     charges saw. Priced from the match set the search just produced, which is
+//     why price returns it.
 func preGsub(v *vmState, L *lua.LState, n int) {
 	s := lua.LVAsString(L.Get(1))
 	repl := L.Get(3)
@@ -638,8 +687,87 @@ func preGsub(v *vmState, L *lua.LState, n int) {
 	}
 	v.charge(saturate(int64(len(s))+1, per) + stringOverhead)
 
-	if _, pat, ok := subjectAndPattern(L); ok {
-		price(v, s, pat, 0, optIndex(L, 4, -1))
+	_, pat, ok := subjectAndPattern(L)
+	if !ok {
+		return
+	}
+	mds := price(v, s, pat, 0, optIndex(L, 4, -1))
+	if len(mds) == 0 {
+		return
+	}
+	// The rebuild: one pass over the subject per replacement.
+	v.gas(saturate(int64(len(mds)), int64(len(s))+1) / gsubCopyBytesPerGas)
+
+	switch r := repl.(type) {
+	case *lua.LFunction:
+		// One call per match, each handed the captures as fresh strings. Both
+		// are charged here; what the callback *returns* is charged in the
+		// wrapper, because that is the first moment its length exists.
+		v.gas(saturate(int64(len(mds)), replCallGas))
+		v.charge(saturate(int64(len(mds)), stringOverhead) + captureBytes(mds))
+		L.Replace(3, L.NewFunction(v.chargedReplacement(r)))
+	case *lua.LTable:
+		// One lookup per match, hashing the capture, and one substitution whose
+		// length is bounded by the widest string the table holds. The table cost
+		// its own gas to build, so walking it once more is affordable and the
+		// bound is a real one rather than an unbounded promise.
+		v.gas(captureBytes(mds) / cmpBytesPerGas)
+		var widest int64
+		r.ForEach(func(_, val lua.LValue) {
+			if str, ok := val.(lua.LString); ok && int64(len(str)) > widest {
+				widest = int64(len(str))
+			}
+		})
+		v.charge(saturate(int64(len(mds)), widest+stringOverhead))
+	}
+}
+
+// captureBytes is how many bytes of subject the captures of a match set cover.
+// It is what gsub materialises as Lua strings to hand to a function or to hash
+// against a table.
+func captureBytes(mds []*luapat.MatchData) int64 {
+	var total int64
+	for _, m := range mds {
+		n := m.CaptureLength()
+		if n <= 2 {
+			// No explicit captures: the whole match is the argument.
+			if n == 2 && !m.IsPosCapture(0) {
+				total += int64(m.Capture(1) - m.Capture(0))
+			}
+			continue
+		}
+		for i := 2; i+1 < n; i += 2 {
+			if !m.IsPosCapture(i) {
+				total += int64(m.Capture(i+1) - m.Capture(i))
+			}
+		}
+	}
+	return total
+}
+
+// chargedReplacement wraps a gsub function replacement.
+//
+// It is the missing half of the search pricing: gsub's *scan* was charged and
+// its *replacement callback* was not, so the more expensive spelling of the same
+// call was the cheaper one to make. The wrapper charges the one thing the
+// pre-flight cannot know — how long the string the callback returns is — at the
+// moment it becomes known, which is also the moment before gsub copies it into
+// a buffer proportional to the subject.
+//
+// It does not charge the callback's *body*: that is instrumented Lua and charges
+// itself, exactly like any other function a plugin calls.
+func (v *vmState) chargedReplacement(fn *lua.LFunction) lua.LGFunction {
+	return func(L *lua.LState) int {
+		n := L.GetTop()
+		L.Push(fn)
+		for i := 1; i <= n; i++ {
+			L.Push(L.Get(i))
+		}
+		L.Call(n, 1)
+		if s, ok := L.Get(-1).(lua.LString); ok {
+			v.charge(int64(len(s)) + stringOverhead)
+		}
+		return 1
 	}
 }
 

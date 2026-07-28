@@ -3,7 +3,9 @@ package luaext
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,8 +194,8 @@ func TestBudgetedMatcherMatchesUpstream(t *testing.T) {
 	for _, p := range patterns {
 		for _, s := range subjects {
 			for _, limit := range []int{1, -1, 3} {
-				budget := int64(1 << 40)
-				got, gerr := luapat.Find(p, []byte(s), 0, limit, &budget)
+				run := luapat.Run{Budget: 1 << 40}
+				got, gerr := luapat.Find(p, []byte(s), 0, limit, &run)
 				want, werr := pm.Find(p, []byte(s), 0, limit)
 				if (gerr == nil) != (werr == nil) {
 					t.Fatalf("Find(%q, %q, %d): err %v, upstream %v", p, s, limit, gerr, werr)
@@ -215,7 +217,7 @@ func TestBudgetedMatcherMatchesUpstream(t *testing.T) {
 						}
 					}
 				}
-				if budget >= 1<<40 {
+				if run.Budget >= 1<<40 {
 					t.Fatalf("Find(%q, %q, %d) charged nothing", p, s, limit)
 				}
 			}
@@ -227,16 +229,277 @@ func TestBudgetedMatcherMatchesUpstream(t *testing.T) {
 // like "no match". A truncated answer is a wrong answer, and a masking filter
 // that believes there was nothing to mask is the failure §10.5b exists to stop.
 func TestBudgetedMatcherStopsRatherThanTruncates(t *testing.T) {
-	budget := int64(1000)
-	mds, err := luapat.Find(".-.-.-@", []byte(strings.Repeat("a", 256)), 0, 1, &budget)
+	run := luapat.Run{Budget: 1000}
+	mds, err := luapat.Find(".-.-.-@", []byte(strings.Repeat("a", 256)), 0, 1, &run)
 	if !errors.Is(err, luapat.ErrBudget) {
 		t.Fatalf("err = %v, want ErrBudget", err)
 	}
 	if mds != nil {
 		t.Fatalf("a stopped match returned %d matches; a partial answer is a wrong answer", len(mds))
 	}
-	if budget >= 0 {
-		t.Fatalf("budget = %d, want it spent", budget)
+	if run.Budget >= 0 {
+		t.Fatalf("budget = %d, want it spent", run.Budget)
+	}
+}
+
+// --- the stack is a resource too -------------------------------------------
+
+// TestAGreedyPatternCannotEatTheStack is the ceiling the step counter did not
+// give.
+//
+// The matcher is recursive: one Go frame per branch explored, so `(.*)` costs a
+// frame per character it consumes and the *caller* chooses how many by choosing
+// how long the text is. Charging steps bounded the CPU and watched the stack
+// grow — 800 KiB of caller text through the filter's own view cost 800 K frames
+// and **3 072 MB** of goroutine stack across eight concurrent requests, with
+// limitHits = 0 and no ceiling firing. Go kills the process at a 1 GB stack, so
+// a large enough segment was a crash rather than a refusal.
+//
+// The shape is the reachable one: FilterView.Doc is the caller's own message
+// text, and the pattern is a plausible operator-written one.
+func TestAGreedyPatternCannotEatTheStack(t *testing.T) {
+	e := luaEngine(t, `
+		dorang.register("on_filter_request", function(f)
+			string.find(f.doc.text(1), "^(.*)=(.*)$")
+		end)`, patternLimits)
+
+	const concurrency = 8
+	subject := strings.Repeat("a", 800<<10)
+
+	stop := make(chan struct{})
+	peak := make(chan uint64, 1)
+	go func() {
+		var m runtime.MemStats
+		var max uint64
+		for {
+			runtime.ReadMemStats(&m)
+			if m.StackInuse > max {
+				max = m.StackInuse
+			}
+			select {
+			case <-stop:
+				peak <- max
+				return
+			default:
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	var base runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&base)
+
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := subject
+			doc := NewDoc()
+			doc.Add("message[0]", &s)
+			d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+			if !d.Refuse {
+				t.Errorf("a match that cannot be afforded was served: %+v", d)
+			}
+			if !errors.Is(d.Err, ErrPatternTooDeep) {
+				t.Errorf("err = %v, want the stack ceiling", d.Err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+
+	// The bound: [luapat.MaxDepth] frames of about 480 bytes each, per match,
+	// and one match at a time per goroutine. The slack is for the harness's own
+	// stacks and for Go's stack doubling, and it is still two orders of
+	// magnitude below what this used to reach.
+	const perMatch = luapat.MaxDepth * 512
+	limit := uint64(concurrency*perMatch) + base.StackInuse + (4 << 20)
+	if got := <-peak; got > limit {
+		t.Fatalf("peak goroutine stack %d MB (baseline %d MB), want at most %d MB: "+
+			"%d concurrent matches over %d KiB are not bounded by the depth ceiling",
+			got>>20, base.StackInuse>>20, limit>>20, concurrency, len(subject)>>10)
+	}
+	if e.Stats().LimitHits != concurrency {
+		t.Fatalf("limitHits = %d, want %d: a ceiling that fires must be counted as one",
+			e.Stats().LimitHits, concurrency)
+	}
+}
+
+// TestAPricedMatchStopsWhenTheRequestDoes: the priced run takes the invocation's
+// context, so the wall clock still bounds it.
+//
+// Without it the pricing run was the one thing in the package the watchdog could
+// not reach: it spent its whole step budget on a goroutine nobody was waiting
+// for, which is how a burst of large requests turned into a backlog of abandoned
+// goroutines and — through the trip — into a filter that was switched off.
+func TestAPricedMatchStopsWhenTheRequestDoes(t *testing.T) {
+	// A long scan with no deep backtracking: every start position costs the
+	// pattern's length and recurses two frames, so neither the step budget nor
+	// the depth ceiling ends this — 4 MiB of subject against a 30-byte literal
+	// is 130 M steps and 1.1 s, and the budget covers all of it. The only thing
+	// that can stop it is the wall clock, and the wall clock could not reach
+	// inside a host call.
+	const wall = 20 * time.Millisecond
+	e := luaEngine(t, `
+		dorang.register("on_filter_request", function(f)
+			string.find(f.doc.text(1), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+		end)`, func(o *Options) {
+		o.Limits = Limits{Instructions: 500_000_000, MemoryBytes: 64 << 20, Timeout: wall}
+	})
+
+	base := settledGoroutines(t)
+	s := strings.Repeat("a", 4<<20)
+	doc := NewDoc()
+	doc.Add("message[0]", &s)
+
+	start := time.Now()
+	d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+	elapsed := time.Since(start)
+
+	if !d.Refuse {
+		t.Fatalf("a filter that did not complete must refuse: %+v", d)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("the request waited %v for a %v ceiling", elapsed, wall)
+	}
+	// The property, and the one a caller-side stopwatch cannot see: the match
+	// ended itself, so there is no abandoned goroutine matching on after the
+	// request. Without the context it ran for 1.1 s on a core nobody was
+	// waiting for — and that is what a burst turned into a trip.
+	if st := e.Stats(); st.Timeouts != 0 {
+		t.Fatalf("stats = %+v: the match outlived its ceiling and was abandoned", st)
+	}
+	if n := e.Abandoned(HookFilterRequest); n != 0 {
+		t.Fatalf("%d invocations outstanding: the priced run ignores its context", n)
+	}
+	if n, ok := waitForGoroutines(base+2, time.Second); !ok {
+		t.Fatalf("goroutines settled at %d, baseline %d: a match is still running", n, base)
+	}
+}
+
+// TestGsubIsPricedWhicheverWayItIsSpelled is the A/B that found the hole.
+//
+// Identical output, two spellings: `gsub(s, "a", "y")` and the same call with a
+// function returning "y". The string form was refused by the memory charge in
+// 48 µs when the replacement was long; the function form was charged **one byte
+// per position** — `per = 1` — so the memory bound never fired, and it ran the
+// full wall clock with limitHits = 0. The pricing covered the pattern scan and
+// missed both the replacement callback and the rebuild underneath it, which
+// gopher-lua does once per match over the whole subject.
+func TestGsubIsPricedWhicheverWayItIsSpelled(t *testing.T) {
+	subject := strings.Repeat("ab", 200<<10) // 400 KiB, 200 K matches
+
+	run := func(t *testing.T, src string) (time.Duration, FilterDecision, Stats) {
+		t.Helper()
+		e := luaEngine(t, src, patternLimits)
+		s := subject
+		doc := NewDoc()
+		doc.Add("message[0]", &s)
+		start := time.Now()
+		d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+		return time.Since(start), d, e.Stats()
+	}
+
+	const str = `dorang.register("on_filter_request", function(f)
+		f.doc.set_text(1, string.gsub(f.doc.text(1), "a", "y"))
+	end)`
+	const fn = `dorang.register("on_filter_request", function(f)
+		f.doc.set_text(1, string.gsub(f.doc.text(1), "a", function() return "y" end))
+	end)`
+
+	strTime, strDec, strStats := run(t, str)
+	fnTime, fnDec, fnStats := run(t, fn)
+
+	for _, tc := range []struct {
+		name  string
+		took  time.Duration
+		dec   FilterDecision
+		stats Stats
+	}{{"string", strTime, strDec, strStats}, {"function", fnTime, fnDec, fnStats}} {
+		if !tc.dec.Refuse {
+			t.Fatalf("%s: a gsub that rebuilds 400 KiB two hundred thousand times was served: %+v",
+				tc.name, tc.dec)
+		}
+		if tc.stats.LimitHits == 0 {
+			t.Fatalf("%s: refused with no ceiling counted (%+v); the wall clock is not a price",
+				tc.name, tc.stats)
+		}
+		if tc.stats.Timeouts != 0 {
+			t.Fatalf("%s: the wall clock stopped it, not a ceiling: %+v", tc.name, tc.stats)
+		}
+	}
+	// Comparable, not identical: the function form cannot be refused before the
+	// scan that counts its matches, because the length of what a callback
+	// returns does not exist until it returns. Within a small multiple is the
+	// property; a thousandfold was the defect.
+	if fnTime > 4*strTime+50*time.Millisecond {
+		t.Fatalf("the function form took %v against the string form's %v", fnTime, strTime)
+	}
+}
+
+// TestGsubStillProducesGopherLuaResults guards what pricing a call must never
+// do: change its answer.
+//
+// The function form is now called through a wrapper that charges what the
+// callback returns, so every part of gsub's contract that runs through that
+// wrapper is checked here — captures as arguments, a `nil` return meaning "keep
+// the original", the replacement count, and the table form beside both.
+func TestGsubStillProducesGopherLuaResults(t *testing.T) {
+	e := luaEngine(t, `
+		dorang.register("on_request", function(req)
+			local s = req.path
+			local a, na = s:gsub("(%a+)/(%a+)", "%2-%1")
+			local b, nb = s:gsub("(%a+)/(%a+)", function(x, y) return y .. "-" .. x end)
+			local c, nc = s:gsub("%a+", function(w) if w == "chat" then return "CHAT" end end)
+			local d, nd = s:gsub("%a+", {chat = "CHAT", v1 = false})
+			dorang.tag("s", a .. "|" .. tostring(na))
+			dorang.tag("f", b .. "|" .. tostring(nb))
+			dorang.tag("n", c .. "|" .. tostring(nc))
+			dorang.tag("t", d .. "|" .. tostring(nd))
+		end)`, patternLimits)
+
+	d := e.OnRequest(context.Background(), &RequestView{Path: "v1/chat/completions"})
+	str, _ := d.Tag("s")
+	fn, _ := d.Tag("f")
+	if str != fn {
+		t.Fatalf("the two spellings of one gsub disagree:\n string %q\n func   %q", str, fn)
+	}
+	if str != "v1/completions-chat|1" {
+		t.Fatalf("gsub with captures = %q", str)
+	}
+	if got, _ := d.Tag("n"); got != "v1/CHAT/completions|3" {
+		t.Fatalf("a callback returning nil must keep the original: %q", got)
+	}
+	if got, _ := d.Tag("t"); got != "v1/CHAT/completions|3" {
+		t.Fatalf("table replacement = %q", got)
+	}
+	if st := e.Stats(); st.Skipped != 0 || st.LimitHits != 0 {
+		t.Fatalf("an affordable gsub hit a ceiling: %+v", st)
+	}
+}
+
+// TestGsubWithALongReplacementIsRefusedBeforeItRuns keeps the cheap end of the
+// same charge: when the replacement's length *is* known, the memory bound still
+// fires before any matching happens.
+func TestGsubWithALongReplacementIsRefusedBeforeItRuns(t *testing.T) {
+	e := luaEngine(t, `
+		local wide = string.rep("y", 100)
+		dorang.register("on_filter_request", function(f)
+			f.doc.set_text(1, string.gsub(f.doc.text(1), "a", wide))
+		end)`, patternLimits)
+
+	s := strings.Repeat("ab", 200<<10)
+	doc := NewDoc()
+	doc.Add("message[0]", &s)
+	start := time.Now()
+	d := e.FilterRequest(context.Background(), &FilterView{Doc: doc, Mask: staticMasker{}})
+	if !d.Refuse || !errors.Is(d.Err, ErrMemoryLimit) {
+		t.Fatalf("decision = %+v, want a memory refusal", d)
+	}
+	if took := time.Since(start); took > 20*time.Millisecond {
+		t.Fatalf("a bound that is known before the call took %v to apply", took)
 	}
 }
 
