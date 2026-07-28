@@ -2,6 +2,7 @@ package luaext
 
 import (
 	"math"
+	"math/bits"
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
@@ -119,20 +120,22 @@ type preFn func(v *vmState, L *lua.LState, nargs int)
 //   - Bounded by what they return, and so soundly charged after the fact:
 //     len, lower, upper, reverse, sub and tostring each allocate one result
 //     linear in their input; all of math is arithmetic on numbers; assert,
-//     error, type, getmetatable, setmetatable, select and next are O(1); pairs
-//     and ipairs return an iterator whose every step is a charged loop body;
-//     table.insert, remove, maxn and sort do work linear or n·log n in a table
-//     the plugin was charged to build, with a comparator that is charged Lua.
+//     error, type, getmetatable, setmetatable and select are O(1); ipairs
+//     returns an iterator over integer keys whose every step is a charged loop
+//     body; table.insert, remove and maxn do work linear in a table the plugin
+//     was charged to build.
 //   - Not bounded by what they return, and so charged before the call: the
 //     search family — find, match, gmatch and gsub — whose output is two
 //     integers and whose work is a backtracking search superlinear in a subject
 //     the caller supplies (see luapattern.go for the measurements), and
 //     tonumber, which reads every byte of its argument to return a number.
-//   - Known and *not* charged: rawequal, rawget and rawset do O(len) work on a
-//     string operand for an O(1) charge. They are left alone because `a == b`
-//     and `t[k]` are VM operators with the same cost and no wrapper to hang a
-//     charge on, so pricing only the spelled-out forms would buy nothing. The
-//     package documentation states the exposure and the fix.
+//   - Not bounded by what they return either, and the spelled-out twins of the
+//     VM operators [sizeGlobal] prices: rawequal compares two strings, rawget,
+//     rawset and next hash one, table.sort compares n·log n times with
+//     gopher-lua's byte-at-a-time strCmp when no comparator is given, and pairs
+//     hashes every key in the table it walks. Charging the operators and leaving
+//     these would have bought nothing, which is exactly why the operators had to
+//     be charged first: neither half is worth doing alone.
 var preflight = map[string]map[string]preFn{
 	"string": {
 		"rep":    preRep,
@@ -146,10 +149,16 @@ var preflight = map[string]map[string]preFn{
 	},
 	"table": {
 		"concat": preTableConcat,
+		"sort":   preSort,
 	},
 	"": {
 		"unpack":   preUnpack,
 		"tonumber": preToNumber,
+		"rawequal": preRawEqual,
+		"rawget":   preKeyed,
+		"rawset":   preKeyed,
+		"next":     preKeyed,
+		"pairs":    prePairs,
 	},
 }
 
@@ -183,6 +192,7 @@ func newSandbox(v *vmState) *lua.LState {
 	// it cannot reach them through the globals table either.
 	L.SetGlobal(gasGlobal, L.NewFunction(v.gasFn))
 	L.SetGlobal(catGlobal, L.NewFunction(v.catFn))
+	L.SetGlobal(sizeGlobal, L.NewFunction(v.sizeFn))
 	return L
 }
 
@@ -345,6 +355,21 @@ func (v *vmState) remaining() int64 {
 	return v.memLeft
 }
 
+// sizeFn is `<size>(v)`: the instruction ceiling's answer to the O(length)
+// operators. It charges for a string's length and returns the value untouched,
+// so the VM instruction that follows it is the one the plugin wrote.
+//
+// A non-string costs nothing: comparing or indexing by a number, a boolean, a
+// table or a function is a machine word's work whatever the other side is.
+func (v *vmState) sizeFn(L *lua.LState) int {
+	lv := L.Get(1)
+	if s, ok := lv.(lua.LString); ok {
+		v.gas(int64(len(s)) / cmpBytesPerGas)
+	}
+	L.Push(lv)
+	return 1
+}
+
 // catFn is `<cat>(a, b)`: the memory ceiling's most important customer.
 func (v *vmState) catFn(L *lua.LState) int {
 	a, b := L.Get(1), L.Get(2)
@@ -452,6 +477,82 @@ func preToNumber(v *vmState, L *lua.LState, n int) {
 	if s, ok := L.Get(1).(lua.LString); ok {
 		v.gas(int64(len(s)))
 	}
+}
+
+// preRawEqual charges rawequal for the bytes it may compare. Both operands are
+// here, so the charge is the true bound rather than the over-approximation the
+// operator wrapper has to settle for.
+func preRawEqual(v *vmState, L *lua.LState, n int) {
+	a, aok := L.Get(1).(lua.LString)
+	b, bok := L.Get(2).(lua.LString)
+	if !aok || !bok {
+		return
+	}
+	v.gas(int64(min(len(a), len(b))) / cmpBytesPerGas)
+}
+
+// preKeyed charges rawget, rawset and next for hashing a string key. All three
+// take the key second.
+func preKeyed(v *vmState, L *lua.LState, n int) {
+	if s, ok := L.Get(2).(lua.LString); ok {
+		v.gas(int64(len(s)) / cmpBytesPerGas)
+	}
+}
+
+// prePairs charges a table walk for every key it will hash.
+//
+// gopher-lua's `next` finds its place with a map lookup on the key it was handed
+// — so a `pairs` loop over a table with long string keys hashes one of them per
+// step, and the loop body's tick is the only thing that was charged. The whole
+// traversal is priced here instead of per step, which costs one O(n) pass over
+// the table and leaves the iteration itself at the speed it was.
+//
+// The keys are read through ForEach rather than Next because ForEach walks the
+// underlying maps directly: reading the lengths must not cost what it is
+// measuring.
+func prePairs(v *vmState, L *lua.LState, n int) {
+	t, ok := L.Get(1).(*lua.LTable)
+	if !ok {
+		return
+	}
+	var count, bytes int64
+	t.ForEach(func(k, _ lua.LValue) {
+		count++
+		if s, ok := k.(lua.LString); ok {
+			bytes += int64(len(s))
+		}
+	})
+	v.gas(count + bytes/cmpBytesPerGas)
+}
+
+// preSort charges table.sort for its comparisons.
+//
+// Only when it has no comparator: a Lua comparator is charged Lua, and the
+// comparison inside it is charged like any other. Without one gopher-lua uses
+// strCmp, which is the most expensive of the three operations this file prices
+// and the one with no instruction of its own to hang a charge on.
+func preSort(v *vmState, L *lua.LState, n int) {
+	t, ok := L.Get(1).(*lua.LTable)
+	if !ok {
+		return
+	}
+	if n >= 2 {
+		if _, isFn := L.Get(2).(*lua.LFunction); isFn {
+			return
+		}
+	}
+	size := int64(t.Len())
+	// The walk is work, and work is charged; a table long enough to make the
+	// sort expensive cost this much gas to build.
+	v.gas(size)
+	var widest int64
+	for i := int64(1); i <= size; i++ {
+		if s, ok := t.RawGetInt(int(i)).(lua.LString); ok && int64(len(s)) > widest {
+			widest = int64(len(s))
+		}
+	}
+	// n·log2(n) comparisons, each bounded by the widest operand in the table.
+	v.gas(saturate(saturate(size, int64(bits.Len64(uint64(size)))+1), widest/cmpBytesPerGas))
 }
 
 func preUnpack(v *vmState, L *lua.LState, n int) {

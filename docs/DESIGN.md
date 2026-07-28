@@ -2709,13 +2709,46 @@ argument to return a number: 8 KiB of digits ran past **twenty seconds** with no
 firing. Both are now priced by running the match against a budgeted copy of the matcher first,
 and refusing before the real one is asked.
 
-Still open, and named rather than left to be discovered: string *comparison* and string-keyed
-*indexing* are O(length) per O(1) charge, so `s == s2`, `s < s2` and `t[s]` on a long
-caller-supplied string are unbounded the same way. They are VM operators rather than builtins,
-so closing them means extending the rewrite that already covers `..` to every comparison and
-every dynamic index in every plugin — carrying `__eq`, `__lt` and `__index` with it. The cost
-is charged to every plugin; the exposure needs an operator to write such a comparison against
-request text. That trade is open, not settled.
+The same reasoning reaches three *operators*, which have the identical problem and no call to
+hang a charge on. `s == s2`, `s < s2` and `t[s]` are single VM instructions that compare or hash
+every byte of a string whose length the **caller** chose, and §10.5b's masking filter is a hook
+that exists to look at caller text — so no exotic plugin was required, only one that compares or
+indexes by something a caller sent. Measured against 64 KiB operands with a hook spending its
+whole 5 M-instruction budget, against **130 ms** for the same budget of ordinary Lua:
+
+| | unpriced | priced |
+|---|---|---|
+| `s == s2` | 753 ms | 1 ms |
+| `s < s2` | **40.1 s** | 68 ms |
+| `t[s]` | 3.16 s | 2 ms |
+| `t[s] = 1` | 7.17 s | 4 ms |
+| `rawequal(s, s2)` | 803 ms | 1 ms |
+
+The fix is *not* the one the `..` rewrite suggests. Replacing the operator with a host call would
+mean reimplementing `__eq`, `__lt`, `__le` and `__index` — gopher-lua exports no entry point for
+`<=` at all, so one of the four would have been a guess — and it could not have covered `t[k] = v`
+in any case, because an assignment target cannot become a call. Instead the *operand* is wrapped
+in a charge for its length and the operator stays in the VM, so every metamethod keeps its exact
+semantics and reads, writes and table constructors are all covered by one wrapper.
+
+**The cost is small because most sites are not wrapped.** A site is charged only where neither
+side's cost is already fixed at load: a literal on either side bounds the work by its own length,
+and so does an operand that cannot be a string (`#x`, `not x`, a comparison, a constructor). That
+leaves `req.model == "gpt-4"`, `t.field`, `t[i]` and `i <= n` untouched — and leaves the shipped
+`pii_mask.lua` filter with **no charged site at all**, its per-request cost unchanged at 12.8 µs
+with identical allocations. An ordinary policy hook pays about 130 ns per request for the two
+dynamic lookups it does make; one charged site costs about 64 ns and allocates nothing. The
+spelled-out twins are priced alongside the operators — `rawequal`, `rawget`, `rawset`, `next`,
+`pairs`, and `table.sort` without a comparator — because pricing either half alone would have
+bought nothing.
+
+What is left is bounded rather than open. `t[k]` walks an `__index` chain and `t[k] = v` walks
+`__newindex`, so one instruction can probe up to gopher-lua's hundred tables; no caller string
+changes that depth, because it is a shape the plugin built. A hook spending its whole budget on ninety-deep lookups measures **3.6 s**,
+and the default 200 ms wall clock stops it there. That backstop is real here where it was not for
+the pattern family, and for the reason that made these operators chargeable in the first place: a
+context check runs between VM instructions, so a *loop* of operators is interruptible where one
+`string.find` was not.
 
 The memory ceiling is charged allocation: every allocation is either O(1) per charge, and so
 bounded by the instruction ceiling, or is charged before it happens.

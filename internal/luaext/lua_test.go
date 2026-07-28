@@ -363,12 +363,13 @@ func TestGlobalSurfaceIsExactlyTheAllowlist(t *testing.T) {
 	} {
 		want["dorang."+n] = true
 	}
-	// The two charge functions are in the globals table by construction — the
+	// The three charge functions are in the globals table by construction — the
 	// instrumented code calls them by name. What matters is that no plugin can
 	// write that name, which is asserted below with the lexer rather than
 	// assumed here.
 	want[gasGlobal] = true
 	want[catGlobal] = true
+	want[sizeGlobal] = true
 
 	var extra, missing []string
 	for n := range got {
@@ -394,7 +395,7 @@ func TestGlobalSurfaceIsExactlyTheAllowlist(t *testing.T) {
 	// identifier containing a control byte, so a plugin can neither call them
 	// nor shadow them — and with _G, getfenv and setfenv pruned there is no way
 	// to reach the globals table by value either.
-	for _, n := range []string{gasGlobal, catGlobal} {
+	for _, n := range []string{gasGlobal, catGlobal, sizeGlobal} {
 		for _, src := range []string{n + " = nil", "local x = " + n, n + "(1)"} {
 			if _, err := New(Options{
 				Enabled: true,

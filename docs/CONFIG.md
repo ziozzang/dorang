@@ -1138,8 +1138,14 @@ top rather than withdrawn.
   is not bounded by what it returns is charged for that work before it runs. The pattern family
   (`find`, `match`, `gmatch`, `gsub`) backtracks superlinearly in a subject the caller supplies,
   and `tonumber` reads its whole argument to return a number; both are priced by running against
-  a budgeted copy of the matcher first. See DESIGN §11.5 for what remains open — string
-  comparison and string-keyed indexing are O(length) per O(1) charge.
+  a budgeted copy of the matcher first. Three *operators* have the same problem and no call to
+  charge — `a == b`, `a < b` and `t[k]` walk or hash every byte of a string the caller sized — so
+  the rewrite also wraps a comparison operand and a dynamic table key in a charge for their
+  length, leaving the operator itself in the VM. A site is charged only where neither side's cost
+  is fixed at load, so comparisons against literals, `t.field`, `t[i]` and `i <= n` cost nothing;
+  `rawequal`, `rawget`, `rawset`, `next`, `pairs` and `table.sort` without a comparator are priced
+  to match. See DESIGN §11.5 for the measurements and for the one bounded residual, a plugin-built
+  `__index` chain.
 - *Memory* is charged allocation. Every allocation is either O(1) per charge — hence bounded by
   the instruction ceiling — or is charged before it happens: string concatenation is rewritten
   into a charged host call, and `string.rep`, `string.format`, `string.gsub`, `string.byte`,

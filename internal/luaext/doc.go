@@ -44,6 +44,14 @@
 //     the search family (find, match, gmatch, gsub), whose backtracking is
 //     superlinear in a subject the *caller* supplies, and tonumber, which reads
 //     every byte of its argument to return a number. See luapattern.go.
+//   - **Instructions, the third half.** Three *operators* have the same problem
+//     and no call to hang a charge on: `a == b`, `a < b` and `t[k]` are single
+//     VM instructions that walk or hash every byte of a string whose length the
+//     caller chose. So a comparison operand and a dynamic table key are wrapped
+//     at load in a charge for their length — the operator itself stays in the
+//     VM, which is what keeps `__eq`, `__lt`, `__le` and `__index` exact. Their
+//     spelled-out twins are priced the same way: rawequal, rawget, rawset, next,
+//     pairs and table.sort without a comparator. See luagas.go.
 //   - **Memory.** Every allocation a plugin can cause is either O(1) per charge
 //     — hence bounded by the instruction ceiling — or is charged explicitly
 //     before it happens. String concatenation is rewritten into a charged host
@@ -76,17 +84,21 @@
 //     because there is no builtin left that can outrun its ceilings; a [Native]
 //     that blocks forever holds one of the eight forever.
 //
-//   - **String comparison and string-keyed indexing are charged O(1) and cost
-//     O(len).** `a == b`, `a < b` and `t[k]` are VM operators rather than
-//     builtins, so they are charged once by the enclosing block's tick while Go
-//     compares or hashes every byte. Measured against 64 KiB operands and the 5 M
-//     default budget: `a == b` 1.8 s, `t[k]` 1.9 s, `a < b` past a minute, where
-//     the same budget of ordinary Lua is 110 ms. The fix is the one already used
-//     for `..` — rewrite the expression into a charged host call — and it is not
-//     done here because it puts a host call on every comparison and every dynamic
-//     index in every plugin and has to carry __eq, __lt and __index with it. Only
-//     a plugin handed a long string can reach it, which today means §10.5b's
-//     document text and the request path.
+//   - A **metatable chain** makes one instruction do up to a hundred table
+//     probes, because `t[k]` walks `__index` — and `t[k] = v` walks
+//     `__newindex` — until it finds the key, and gopher-lua stops at
+//     MaxTableGetLoop = 100. Unlike everything above, no
+//     string a caller sends changes the depth — it is a shape the plugin built —
+//     so this is an O(1) charge with a constant of a hundred rather than an
+//     O(caller's length) one. Bounded, and the bound is stated: a hook that
+//     spends its whole 5 M budget on ninety-deep lookups measured **3.6 s**
+//     against 130 ms for ordinary Lua, and under the default 200 ms wall clock
+//     it is stopped there instead. That backstop works here and did not work for
+//     the pattern family, and the reason is the same one that made these
+//     operators charge-able at all: gopher-lua checks the context between VM
+//     instructions, so a *loop* of them is interruptible where one long
+//     `string.find` was not. TestAnOperatorLoopExitsWhenItsDeadlinePasses
+//     asserts the goroutine goes away rather than pinning a core.
 //
 //   - Plugin globals **persist across requests** inside one pooled VM instance,
 //     exactly as in any long-running Lua program. Nothing can leave — there is
