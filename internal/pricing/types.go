@@ -17,6 +17,10 @@ const (
 	ClassSubscription
 	// ClassAdjustment is a discount, margin or tax. Every matching rule applies, in order.
 	ClassAdjustment
+	// ClassNotional is a pay-as-you-go list rate that is never billed (§8.5). The most
+	// specific matching rule wins, exactly as for ClassMarginal, but the result lands in
+	// Cost.NotionalNano and is absent from Cost.TotalNano by construction.
+	ClassNotional
 	numClasses
 )
 
@@ -28,6 +32,8 @@ func (c Class) String() string {
 		return "fixed_subscription"
 	case ClassAdjustment:
 		return "adjustment"
+	case ClassNotional:
+		return "notional_rate"
 	}
 	return "unknown"
 }
@@ -40,8 +46,10 @@ func parseClass(s string) (Class, error) {
 		return ClassSubscription, nil
 	case "adjustment":
 		return ClassAdjustment, nil
+	case "notional_rate":
+		return ClassNotional, nil
 	}
-	return 0, fmt.Errorf("unknown class %q (want marginal_usage, fixed_subscription or adjustment)", s)
+	return 0, fmt.Errorf("unknown class %q (want marginal_usage, fixed_subscription, adjustment or notional_rate)", s)
 }
 
 // Level is a rule's specificity. Higher is more specific; the order is exactly the one
@@ -363,7 +371,16 @@ type Cost struct {
 	// AdjustmentNano is the net effect of all adjustment rules; negative for a discount.
 	AdjustmentNano int64
 	// TotalNano is MarginalNano + SubscriptionNano + AdjustmentNano, exactly.
+	//
+	// NotionalNano is deliberately not a term here. It is not omitted by convention that
+	// a later edit could forget: the sum is formed from the three billing classes and
+	// there is no code path that adds a notional amount to it (§8.5).
 	TotalNano int64
+
+	// NotionalNano is what this traffic would have cost at pay-as-you-go list rates.
+	// It is an estimate for traceability and prediction, and it must never reach billing,
+	// budget, quota or routing. Routing compares MarginalNano (§8.1).
+	NotionalNano int64
 
 	Components   []Component
 	AppliedRules []Applied
@@ -372,6 +389,14 @@ type Cost struct {
 	// caller is expected to increment a counter and warn (§8.3): silent zero-cost
 	// accounting is the failure mode this package exists to avoid.
 	Missing bool
+
+	// NotionalMissing reports that no notional_rate rule matched, so NotionalNano is
+	// unavailable rather than zero (§8.5). It is a separate flag from Missing because the
+	// two have different consequences: Missing means the request cannot be billed, this
+	// means it cannot be estimated. A zero here would make a subscription look infinitely
+	// efficient, which is the most flattering answer and the least likely to be
+	// questioned, so the caller is expected to increment its own counter and warn.
+	NotionalMissing bool
 }
 
 // Considered is one rule that was examined for a class, and what became of it.
@@ -391,6 +416,25 @@ type ClassTrace struct {
 	Considered []Considered
 }
 
+// NotionalDetail is the audit trail of a notional figure (§8.5). An estimate that cannot
+// be traced to a source and a date is a guess wearing a currency symbol, so the rule id,
+// the operator-declared source and the as-of date travel with the number.
+type NotionalDetail struct {
+	RuleID string
+	Source string
+	// AsOf is the date the operator recorded the rate on.
+	AsOf time.Time
+	// AsOfText is the as_of value exactly as written in the catalog.
+	AsOfText string
+	// Age is how stale the rate was at the priced instant.
+	Age time.Duration
+
+	Nano       int64
+	Components []Component
+	// Missing reports that no notional rule matched; Nano is then unavailable, not zero.
+	Missing bool
+}
+
 // Explanation powers the preview endpoint, the admin calculator and the CLI (§8.4): one
 // engine, one answer. It reports the applied rule chain per class, each component's rate
 // and quantity, the subtotal and the final amount, and why each rule was selected.
@@ -399,6 +443,9 @@ type Explanation struct {
 	Request  Request
 	Cost     Cost
 	Classes  []ClassTrace
+	// Notional carries the provenance of the notional figure, so an estimate can be
+	// audited rather than merely displayed (§8.5).
+	Notional NotionalDetail
 	Notes    []string
 	Err      string
 }

@@ -127,6 +127,11 @@ type rule struct {
 	adjAmount decimal
 	adjAtto   u128
 	appliesTo AdjBase
+
+	// Provenance, required on a notional_rate rule and rejected on every other class.
+	source   string
+	asOf     time.Time
+	asOfText string
 }
 
 // staticMatches tests the dimensions that are known at configuration time. The index
@@ -198,6 +203,9 @@ type Catalog struct {
 	loc   *time.Location
 	rules []*rule
 	idx   [numClasses]classIndex
+	// appliedCap sizes Cost.AppliedRules in one allocation: one marginal winner plus a
+	// subscription and a notional winner if this catalog can produce them.
+	appliedCap int
 
 	// subs is fixed at load: one entry per fixed_subscription rule, so the map itself is
 	// never written after construction and Price only takes that rule's read lock.
@@ -213,6 +221,7 @@ type carrySet struct {
 	marginal     int64
 	subscription int64
 	adjustment   int64
+	notional     int64
 }
 
 // subState is a subscription rule's accumulator for the period in progress.
@@ -305,6 +314,9 @@ type rawRule struct {
 	Amount    string `yaml:"amount"`
 	AppliesTo string `yaml:"applies_to"`
 	Order     int    `yaml:"order"`
+
+	Source string `yaml:"source"`
+	AsOf   string `yaml:"as_of"`
 }
 
 func (r rawRule) rateStrings() [numComponents]string {
@@ -399,10 +411,19 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 		}
 	}
 
+	if class != ClassNotional && (raw.Source != "" || raw.AsOf != "") {
+		return nil, errors.New("source/as_of belong to a notional_rate rule")
+	}
+
 	switch class {
-	case ClassMarginal:
-		if err := compileMarginal(raw, r); err != nil {
+	case ClassMarginal, ClassNotional:
+		if err := compileUsage(raw, r); err != nil {
 			return nil, err
+		}
+		if class == ClassNotional {
+			if err := compileProvenance(raw, r); err != nil {
+				return nil, err
+			}
 		}
 	case ClassSubscription:
 		if err := compileSubscription(raw, r); err != nil {
@@ -416,7 +437,30 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 	return r, nil
 }
 
-func compileMarginal(raw *rawRule, r *rule) error {
+// compileProvenance enforces §8.5's first rule: a notional rate without a source and an
+// as-of date is a guess wearing a currency symbol, so it is a load error, not a warning.
+func compileProvenance(raw *rawRule, r *rule) error {
+	r.source = strings.TrimSpace(raw.Source)
+	if r.source == "" {
+		return errors.New("source is required on a notional_rate rule: an estimate without provenance is not auditable")
+	}
+	r.asOfText = strings.TrimSpace(raw.AsOf)
+	if r.asOfText == "" {
+		return errors.New("as_of is required on a notional_rate rule: a rate with no date cannot be judged stale")
+	}
+	for _, layout := range [...]string{"2006-01-02", time.RFC3339} {
+		t, err := time.ParseInLocation(layout, r.asOfText, r.loc)
+		if err == nil {
+			r.asOf = t
+			return nil
+		}
+	}
+	return fmt.Errorf("as_of: %q is not a date (want YYYY-MM-DD or RFC3339)", r.asOfText)
+}
+
+// compileUsage compiles the rate table shared by marginal_usage and notional_rate: the
+// two classes price identically and differ only in where the result lands.
+func compileUsage(raw *rawRule, r *rule) error {
 	if raw.AmountPerPeriod != "" || raw.Period != "" {
 		return errors.New("amount_per_period/period belong to a fixed_subscription rule")
 	}
@@ -680,6 +724,13 @@ func (c *Catalog) buildIndex() {
 		if r.class == ClassSubscription {
 			c.subs[r.id] = &subState{}
 		}
+	}
+	c.appliedCap = 1
+	if c.idx[ClassSubscription].count > 0 {
+		c.appliedCap++
+	}
+	if c.idx[ClassNotional].count > 0 {
+		c.appliedCap++
 	}
 	for cl := range c.idx {
 		ix := &c.idx[cl]

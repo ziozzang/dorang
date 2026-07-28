@@ -72,6 +72,8 @@ func benchCatalog(nRules, nCandidates int, extraClasses bool) string {
 		b.WriteString("  - { id: sub-plan, class: fixed_subscription, match: { credential: cred-0 }, amount_per_period: \"20.00\" }\n")
 		b.WriteString("  - { id: adj-margin, class: adjustment, match: {}, op: percent, amount: \"15\", order: 10 }\n")
 		b.WriteString("  - { id: adj-tax, class: adjustment, match: {}, op: percent, amount: \"10\", order: 20 }\n")
+		b.WriteString("  - { id: list-rate-0, class: notional_rate, match: { credential: cred-0 }, unit: per_1m_tokens, input: \"0.85\", output: \"3.40\", cache_read: \"0.19\", source: \"vendor price page\", as_of: 2026-07-28 }\n")
+		b.WriteString("  - { id: list-rate-all, class: notional_rate, match: {}, unit: per_1m_tokens, input: \"0.90\", output: \"3.60\", cache_read: \"0.20\", source: \"vendor price page\", as_of: 2026-07-28 }\n")
 	}
 	return b.String()
 }
@@ -129,6 +131,43 @@ func BenchmarkPriceAllClasses(b *testing.B) {
 	}
 }
 
+// BenchmarkPriceNotionalOnly isolates the cost of the fourth class: the same workload as
+// BenchmarkPrice plus one notional rule per candidate. §8.5 must not make the hot path
+// slower for catalogs that do not use it, and must stay cheap for those that do.
+func BenchmarkPriceNotionalOnly(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString(benchCatalog(100, 10, false))
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, "  - { id: list-%d, class: notional_rate, match: { credential: cred-%d }, "+
+			"unit: per_1m_tokens, input: \"0.85\", output: \"3.40\", cache_read: \"0.19\", "+
+			"source: \"vendor price page\", as_of: 2026-07-28 }\n", i, i)
+	}
+	c, err := ParseCatalog([]byte(sb.String()))
+	if err != nil {
+		b.Fatal(err)
+	}
+	cands := benchCandidates(10)
+	for _, req := range cands {
+		cost, err := c.Price(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if cost.NotionalMissing {
+			b.Fatalf("candidate %s has no notional rule", req.Credential)
+		}
+		if cost.TotalNano != cost.MarginalNano+cost.SubscriptionNano+cost.AdjustmentNano {
+			b.Fatal("the notional figure leaked into TotalNano")
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Price(cands[i%len(cands)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkRouteTenCandidates is what cost-based routing actually does: price every
 // candidate for one incoming request, through one memoizing Evaluator.
 func BenchmarkRouteTenCandidates(b *testing.B) {
@@ -162,8 +201,8 @@ func TestIndexKeepsWorkIndependentOfCatalogSize(t *testing.T) {
 	var counts []int
 	for _, n := range []int{100, 1000} {
 		c := mustCatalog(t, benchCatalog(n, 10, true))
-		if got := len(c.Rules()); got != n+3 {
-			t.Fatalf("catalog has %d rules, want %d", got, n+3)
+		if got := len(c.Rules()); got != n+5 {
+			t.Fatalf("catalog has %d rules, want %d", got, n+5)
 		}
 		ev := c.NewEvaluator()
 		for _, req := range cands {

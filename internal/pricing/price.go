@@ -95,7 +95,8 @@ func (c *Catalog) Settle(req Request) (Cost, error) {
 func (c *Catalog) Explain(req Request) Explanation {
 	ex := Explanation{Currency: c.Currency, Request: req}
 	ex.Classes = []ClassTrace{
-		{Class: ClassMarginal}, {Class: ClassSubscription}, {Class: ClassAdjustment},
+		{Class: ClassMarginal}, {Class: ClassSubscription},
+		{Class: ClassAdjustment}, {Class: ClassNotional},
 	}
 	ev := Evaluator{c: c}
 	cost, err := c.compute(&req, &ev, false, &ex)
@@ -111,6 +112,14 @@ func (c *Catalog) Explain(req Request) Explanation {
 	if cost.SubscriptionNano != 0 {
 		ex.Notes = append(ex.Notes,
 			"the subscription share is imputed for accounting; routing compares MarginalNano only")
+	}
+	if cost.NotionalMissing {
+		ex.Notes = append(ex.Notes,
+			"no notional_rate rule matched: the list-rate estimate is unavailable, not zero")
+	} else {
+		ex.Notes = append(ex.Notes, "notional cost is an estimate at list rates from "+
+			ex.Notional.Source+" as of "+ex.Notional.AsOfText+
+			"; it is excluded from TotalNano and never reaches billing, budget, quota or routing")
 	}
 	return ex
 }
@@ -139,8 +148,8 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		if winner.maxComponents > 0 {
 			cost.Components = make([]Component, 0, winner.maxComponents)
 		}
-		cost.AppliedRules = make([]Applied, 0, 2)
-		m, err := evalMarginal(winner, req, &cost.Components)
+		cost.AppliedRules = make([]Applied, 0, c.appliedCap)
+		m, err := evalUsage(winner, req, &cost.Components)
 		if err != nil {
 			return Cost{}, err
 		}
@@ -177,8 +186,38 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		return Cost{}, err
 	}
 
+	// notional_rate: what this traffic would have cost at list rates. Never billed.
+	if ex != nil {
+		trace = &ex.Classes[ClassNotional]
+	}
+	var (
+		notional      amt
+		notionalRule  *rule
+		notionalComps []Component
+	)
+	cost.NotionalMissing = true
+	if n := c.idx[ClassNotional].selectWinner(req, at, &ev.examined, trace); n != nil {
+		var sink *[]Component
+		if ex != nil {
+			// Notional components stay out of Cost.Components: a caller that sums the
+			// component breakdown must get the billed figure, never the estimate.
+			notionalComps = make([]Component, 0, n.maxComponents)
+			sink = &notionalComps
+		}
+		v, err := evalUsage(n, req, sink)
+		if err != nil {
+			return Cost{}, err
+		}
+		notional, notionalRule = v, n
+		cost.NotionalMissing = false
+		cost.AppliedRules = append(cost.AppliedRules, Applied{
+			RuleID: n.id, Class: ClassNotional, Level: n.level,
+			Priority: n.priority, Reason: ReasonMostSpecific,
+		})
+	}
+
 	// Round once, at the end, half-to-even, carrying the sub-nano remainder.
-	mNano, sNano, aNano, err := c.roundOut(req, settle, marginal, subscription, adjustment)
+	mNano, sNano, aNano, nNano, err := c.roundOut(req, settle, marginal, subscription, adjustment, notional)
 	if err != nil {
 		return Cost{}, err
 	}
@@ -192,7 +231,22 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 	cost.MarginalNano = mNano
 	cost.SubscriptionNano = sNano
 	cost.AdjustmentNano = aNano
+	// TotalNano is the sum of the three billing classes. nNano is not a term and there is
+	// no branch in which it becomes one (§8.5).
 	cost.TotalNano = total
+	cost.NotionalNano = nNano
+	if ex != nil {
+		ex.Notional = NotionalDetail{
+			Nano: nNano, Components: notionalComps, Missing: cost.NotionalMissing,
+		}
+		if notionalRule != nil {
+			ex.Notional.RuleID = notionalRule.id
+			ex.Notional.Source = notionalRule.source
+			ex.Notional.AsOf = notionalRule.asOf
+			ex.Notional.AsOfText = notionalRule.asOfText
+			ex.Notional.Age = at.Sub(notionalRule.asOf)
+		}
+	}
 	return cost, nil
 }
 
@@ -202,7 +256,7 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 // sum of the three reported fields and reconciliation cannot drift by a stray nano. When
 // settling, each class keeps its own carried remainder, so a stream of sub-nano requests
 // accumulates to the exact amount instead of rounding to zero forever.
-func (c *Catalog) roundOut(req *Request, settle bool, m, s, a amt) (int64, int64, int64, error) {
+func (c *Catalog) roundOut(req *Request, settle bool, m, s, a, n amt) (int64, int64, int64, int64, error) {
 	var carry carrySet
 	var slot *carrySet
 	if settle {
@@ -221,20 +275,26 @@ func (c *Catalog) roundOut(req *Request, settle bool, m, s, a amt) (int64, int64
 	}
 	mNano, mCarry, err := roundToNano(m, carry.marginal)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	sNano, sCarry, err := roundToNano(s, carry.subscription)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	aNano, aCarry, err := roundToNano(a, carry.adjustment)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
+	}
+	// The notional figure carries its own remainder, so a sub-nano list rate accumulates
+	// to the right estimate instead of rounding to zero on every request.
+	nNano, nCarry, err := roundToNano(n, carry.notional)
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
 	if slot != nil {
-		*slot = carrySet{marginal: mCarry, subscription: sCarry, adjustment: aCarry}
+		*slot = carrySet{marginal: mCarry, subscription: sCarry, adjustment: aCarry, notional: nCarry}
 	}
-	return mNano, sNano, aNano, nil
+	return mNano, sNano, aNano, nNano, nil
 }
 
 func settlementBucket(req *Request) string {
@@ -274,8 +334,10 @@ func quantityOf(i int, req *Request) (int64, error) {
 	return q, nil
 }
 
-// evalMarginal prices every component the winning rule declares a rate for.
-func evalMarginal(r *rule, req *Request, comps *[]Component) (amt, error) {
+// evalUsage prices every component the winning rule declares a rate for. It serves
+// marginal_usage and notional_rate alike: the two classes price identically and differ only
+// in where the result is reported. comps may be nil, which skips the component breakdown.
+func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 	rates := r.rates
 	if len(r.tiers) > 0 {
 		rates = selectTier(r, req.InputTokens).rates
@@ -330,6 +392,9 @@ func componentValue(rateAtto u128, qty int64, divisor uint64) (amt, error) {
 }
 
 func appendComponent(comps *[]Component, r *rule, i int, rate string, qty int64, v amt) error {
+	if comps == nil {
+		return nil // the hot path does not build a breakdown it will not read
+	}
 	nano, _, err := roundToNano(v, 0)
 	if err != nil {
 		return err

@@ -1105,13 +1105,27 @@ that, and each exists because the alternative is a number that looks authoritati
    cannot leak into a spend check by omission. Routing continues to use marginal cost only
    (§8.1) — a notional figure is what traffic *would* cost elsewhere, which says nothing about
    the cost of the choice in front of the router.
-3. **Missing is reported, never zero.** A model with no notional rule reports the figure as
+3. **Adjustments do not apply to it.** A discount or margin is a billing construct, and the
+   notional figure is by definition the vendor's list price — discounting the estimate of what
+   someone else would charge defeats the point of computing it. There is deliberately no way
+   to target it.
+
+4. **Notional lines stay out of the cost component breakdown.** A caller who sums components
+   instead of reading the total must still get the billed figure. Keeping the exclusion true
+   for both access paths is what makes "structurally impossible" mean it.
+
+5. **Missing is reported, never zero.** A model with no notional rule reports the figure as
    unavailable and increments a counter, exactly as §8.3 does for an unpriced model. Silently
    returning zero would make a subscription look infinitely efficient — the most flattering
    possible answer, and the one most likely to go unquestioned.
 
 What it buys, stated plainly so the feature is judged on it: `notional ÷ amortized
-subscription` is the plan's realized leverage; `notional` per key or team is who is consuming
+subscription` is the plan's realized leverage — **with one caveat that matters when reading it
+per request**. A flat plan usually has no `marginal_usage` rule at all, so §8.1's amortization
+falls back to elapsed-fraction, and the denominator is apportioned by *time* rather than by
+usage. Over a full period the ratio is exactly right; within a period a quiet hour reads as
+poor leverage and a busy one as excellent, when neither is a fact about the plan. Read it
+per period, or against the notional total, not per request; `notional` per key or team is who is consuming
 the value a flat bill hides; and `notional` over the period is the number to compare against a
 vendor quote when the plan stops fitting. Extension headers expose it as
 `x-dorang-notional-usd`, and the ledger carries it per request, so the comparison is available

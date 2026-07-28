@@ -3,7 +3,7 @@
 // It implements DESIGN.md §8 as revised by REVIEW.md findings 9, 10 and 11. Three
 // properties are load-bearing and every change to this package must preserve them:
 //
-//  1. Rules carry a class (§8.1). A subscription and a per-token price are different
+//  1. Rules carry a class (§8.1, §8.5). A subscription and a per-token price are different
 //     kinds of cost, not competing descriptions of one cost. Each class elects its own
 //     winner and the results compose:
 //
@@ -11,6 +11,13 @@
 //
 //     [Cost.MarginalNano] is the only field routing may read. [Cost.SubscriptionNano] is
 //     imputed accounting: a sunk plan cost must never make a saturated plan look cheap.
+//
+//     A fourth class, notional_rate, prices the same traffic at pay-as-you-go list rates
+//     so an operator on a flat-billed plan can still see what the traffic is worth (§8.5).
+//     It lands in [Cost.NotionalNano], which is not a term of [Cost.TotalNano] and reaches
+//     no billing, budget, quota or routing decision. Its rules must declare a source and an
+//     as-of date or the catalog fails to load, and an absent rule sets
+//     [Cost.NotionalMissing] rather than reporting a flattering zero.
 //
 //  2. Rules are indexed by their static dimensions when the catalog loads (§8.2), so a
 //     request evaluates only the handful of rules that can possibly apply to it. Only
