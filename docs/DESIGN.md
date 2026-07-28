@@ -649,14 +649,39 @@ one is a place a plausible reading produces broken behavior.
    epsilon is required. And `floor(1 × 0.7) = 0` makes an axis unsatisfiable rather than
    merely contended — that returns an error immediately instead of blocking forever.
 
-5. ⚠️ **Aging prevents overtaking, not starvation. This is an open hole.** §5.3 forbids
-   holding one slot while queuing for another, which is what makes deadlock structurally
-   impossible. The cost is that a waiter needing axes A and B can ping-pong indefinitely
-   while both stay saturated: it is always at the head of both queues, yet never finds both
-   free at the same instant. Aging does not fix this, because the waiter is never overtaken —
-   it simply never wins. Closing it needs a **soft reservation**: when the oldest waiter on A
-   is blocked on B, bar new grants on A until it is served, accepting a small throughput loss
-   for a liveness guarantee. That protocol is not yet designed; see §18 W8.
+5. **Aging prevents overtaking, not starvation** — a waiter needing two saturated axes is
+   never overtaken and never wins. **Closed by soft reservation**, and four things this
+   correction said about it were wrong:
+
+   - **"Bar new grants on A" is too strong.** The waiter needs one *unit*, not the axis.
+     Barring the axis idles all of L; reserving one unit idles 1/L. A claim is therefore one
+     unit of one axis key, counted into the in-use total so everyone except the claimant
+     simply sees a fuller axis — which means the existing `inUse <= limit` invariant is the
+     entire correctness argument, and nothing new is held across a wait.
+   - **"It is always at the head of both queues" is not what happens.** A waiter is queued
+     only on the axes that blocked it, and leaves a queue as soon as that axis has room. The
+     starvation is real; the mechanism described was not.
+   - **A dropped claim must be given back *and re-offered*.** Releasing one on cancellation
+     without serving its bucket's queue is a lost wakeup with no time bound — a defect the
+     naive reading introduces. It has its own test.
+   - **The guarantee cannot cover batch work under an interactive reserve** (§11.1). A batch
+     ceiling is `floor(limit × (1−reserve))` while interactive's is the full limit, so a claim
+     — which occupies one unit against everybody — cannot protect a unit below the batch
+     ceiling from interactive traffic entitled to sit above it. Making it bite would invert
+     §11.1's protection. The exclusion is exactly that narrow: with no reserve configured,
+     batch claims like anything else.
+
+   **Deadlock freedom is a total order, and it is enforced.** Claims are taken as a *prefix*
+   of the §5.7 axis order, which is total within a candidate and identical for every waiter
+   because it is a property of the axis rather than the request — so the cycle a mutual
+   soft-reservation would need cannot form.
+
+   **Bounds.** Once oldest, a waiter is served within `SoftReserveAfter + axes` releases —
+   11 in the worst case, against a hole that was previously unbounded. Cost is one idled unit
+   per claimed axis key, and measured **+5.3%** on the mixed contended workload that provokes
+   it, nil on single-axis contention (which never claims). On by default; capacity acquisition
+   is ~450 ns against §15.1's 200 µs budget, so the trade is a liveness guarantee for a
+   fraction of a percent of the gateway.
 
 6. **Check order.** §5.3 and §5.7 stated different orders. §5.7's is authoritative because it
    has a stated rationale. Under one lock the outcome is identical; only the reported
@@ -2377,6 +2402,6 @@ done when something end to end exercises it and asserts an observable outside it
 | W5 | Cross-protocol conversion loss | **open** — enumerated in headers; may need per-pair fidelity tests beyond golden |
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
-| W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **open** — inherent to no-partial-holding; needs a soft-reservation protocol. Not a deadlock and not an overtaking problem, so aging does not close it. Measurable: a waiter that never wins while both its axes stay saturated |
+| W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **closed** — soft reservation as a prefix-ordered claim on one unit per axis key; deadlock excluded by the §5.7 axis order; the oldest waiter is served within `SoftReserveAfter + axes` releases. Measured +5.3% on the mixed contended benchmark, nil on single-axis. On by default, with an off switch |
 | W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
 | W9 | **Quota and budget state is in-memory only** (§9.6) | **closed** — the request path reserves against the durable ledger. The gate holds an upper bound before every upstream call, settles with the actual cost, and refuses an exhausted budget as a terminal `400` (§6.4); a restart re-reads the counter rather than starting the period over, and a graceful stop returns the unspent part so a planned restart costs nothing. The hold is taken after the routing decision rather than at the gate, because §6.4's estimate prices output at `max_tokens` and there is no price before a deployment is chosen — the property that mattered (concurrent requests cannot both see the pre-spend balance, and anything that never reaches an upstream is refunded in full) is unaffected. No in-memory path is kept beside it: `quota.Budget` serializes on one mutex where the ledger takes an atomic compare-and-swap on a block it already holds, so the durable path is also the cheaper one. Was **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Was **open** — a restart resets the windows |

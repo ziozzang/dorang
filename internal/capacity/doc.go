@@ -77,8 +77,8 @@
 // The third line is the whole protocol: a claimant can *always* take its claimed
 // axis, so once a waiter holds claims on every axis it needs, its next check
 // succeeds unconditionally. Note that it holds because a claimant's ceiling is
-// the raw limit — which is why batch work, whose ceiling is lower, cannot have
-// one; see below.
+// the raw limit — which is why batch work under an interactive reserve, whose
+// ceiling is lower, cannot hold a claim; see below.
 //
 // Observability reports occupancy net of the claim, so a soft reservation shows
 // up as AxisState.SoftReserved and never as a phantom reservation.
@@ -94,9 +94,8 @@
 // probes. A soft reservation is a remedy for a demonstrated failure to make
 // progress, and most blocked waiters are served on their first or second probe
 // without ever needing one; arming on the first failure would idle capacity for
-// waiters that were never in trouble, at a measured cost of four times the
-// throughput. The threshold shifts the liveness bound below by a constant and
-// nothing else.
+// waiters that were never in trouble, at roughly four times the measured cost.
+// The threshold shifts the liveness bound below by a constant and nothing else.
 //
 // On a probe that fails, the waiter walks the axes of its claim candidate — the
 // first candidate in attempt order, which under OnCapacity == Wait is the only
@@ -180,28 +179,35 @@
 //     no difference. The axes fill and drain together, so a waiter that reaches
 //     the head of one finds the other free and is simply granted.
 //   - mixed, a minority of two-axis requests against single-axis streams on each
-//     axis: +3.1% ns/op at the default threshold. This is the workload W8
+//     axis: +5.3% ns/op at the default threshold. This is the workload W8
 //     describes and the honest number to quote.
 //
-// The knob exists because that 3% is a real trade, and because the worst case —
+// The knob exists because that 5% is a real trade, and because the worst case —
 // two axes of limit 1, where the claimed axis idles for a whole release interval
-// — is worse than 3%. See SoftReservationMode and Config.SoftReserveAfter.
+// — is worse than 5%. See SoftReservationMode and Config.SoftReserveAfter, whose
+// documentation carries the measured cost of each threshold.
 //
 // # Soft reservations: batch work is deliberately excluded
 //
-// Batch waiters never claim, and this is not an omission. Under the interactive
-// reserve a batch request's ceiling is floor(limit * (1 - reserve)) while an
-// interactive request's is limit. A claim reduces the ceiling of *other*
-// requests by one, which cannot protect a slot below the batch ceiling from
-// interactive traffic entitled to sit above it: with limit 10 and reserve 0.3,
-// interactive may legitimately drive inUse to 9 while a batch claimant needs
-// inUse < 7. Making the claim bite would require barring interactive from the
-// reserve itself, inverting the guarantee DESIGN §11.1 exists to provide.
+// A batch waiter never claims when an interactive reserve is configured, and
+// this is not an omission. Under the reserve a batch request's ceiling is
+// floor(limit * (1 - reserve)) while an interactive request's is limit. A claim
+// occupies one unit against *everybody*, which cannot protect a unit below the
+// batch ceiling from interactive traffic entitled to sit above it: with limit 10
+// and reserve 0.3, interactive may legitimately drive inUse to 9 while a batch
+// claimant needs inUse < 7, and its claim is one of those 9. Making the claim
+// bite would mean barring interactive from the reserve itself, inverting the
+// guarantee DESIGN §11.1 exists to provide.
 //
-// So the liveness guarantee is stated for interactive work only. Batch work
-// keeps what it had: aging, so it is never overtaken, and the parking rule of
-// DESIGN §5.4 correction 3, so it never head-of-line blocks interactive. A batch
-// waiter blocked by interactive demand is the reserve working as designed.
+// The exclusion is exactly as narrow as that argument. With no reserve
+// configured there is no gap between the two ceilings and batch claims like
+// anything else.
+//
+// So under a reserve the liveness guarantee is stated for interactive work only.
+// Batch work keeps what it had: aging, so it is never overtaken, and the parking
+// rule of DESIGN §5.4 correction 3, so it never head-of-line blocks interactive.
+// A batch waiter blocked by interactive demand is the reserve working as
+// designed, not a starvation bug.
 //
 // # Expiry
 //

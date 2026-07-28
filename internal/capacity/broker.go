@@ -471,23 +471,21 @@ func (b *Broker) effLimit(limit int, batch bool) int {
 // — where nothing is full — reaches it never, and w is a sentinel rather than
 // nil so that it is one pointer compare when it does run.
 //
-// The interactive reserve is handled by a separate loop rather than by calling
-// effLimit per axis. This function is the innermost loop of every acquisition
-// and has to stay inlinable into tryLocked; before soft reservations it fitted
-// the budget with one node to spare, and losing the inline costs about 7% of an
-// uncontended acquire. Splitting the batch case out pays for the claim test with
-// room over, and it takes the reserve's floating-point work off the interactive
-// path, which never needed it: for interactive work the effective ceiling is
-// always the raw limit, and every axis in needs has a positive one, so the
-// interactive path cannot be permanently blocked either.
+// The interactive reserve is not handled here at all; tryLocked routes batch
+// work under a reserve to checkReservedLocked instead. This function is the
+// innermost loop of every acquisition and has to stay inlinable into tryLocked:
+// before soft reservations it fitted the budget with a single node to spare, and
+// losing the inline costs about 7% of an uncontended acquire. Splitting the
+// reserve out pays for the claim test with room over, and it takes the reserve's
+// floating-point work off the interactive path, which never needed it. For
+// interactive work the effective ceiling is always the raw limit, and needs only
+// ever contains axes with a positive one, so this path also cannot report a
+// permanent block.
 //
 // A non-permanent block always has a bucket, because a bucket exists as soon as
 // anything has committed on or claimed that key, and a positive ceiling can only
 // be reached by something having committed.
-func (b *Broker) checkLocked(needs []axisNeed, batch bool, w *waiter) (blocking *bucket, ok bool, permanent bool) {
-	if batch && b.reserve > 0 {
-		return b.checkReservedLocked(needs, w)
-	}
+func (b *Broker) checkLocked(needs []axisNeed, w *waiter) (blocking *bucket, ok bool, permanent bool) {
 	for _, n := range needs {
 		bk := b.buckets[n.key]
 		if bk == nil || bk.inUse < n.limit {
@@ -504,10 +502,11 @@ func (b *Broker) checkLocked(needs []axisNeed, batch bool, w *waiter) (blocking 
 // reserve, where the effective ceiling is below the configured one and can even
 // be zero, which is the only way a request becomes permanently unsatisfiable.
 //
-// It carries no claim test because batch work never holds a soft reservation
-// (see doc.go): a claim is already counted as occupancy, which is the whole
-// effect batch needs to see.
-func (b *Broker) checkReservedLocked(needs []axisNeed, w *waiter) (blocking *bucket, ok bool, permanent bool) {
+// It carries no claim test because batch work under a reserve is exactly the
+// work that never holds a soft reservation (see doc.go). It still sees other
+// waiters' claims, because a claim is counted as occupancy — which is the whole
+// effect batch needs from one.
+func (b *Broker) checkReservedLocked(needs []axisNeed) (blocking *bucket, ok bool, permanent bool) {
 	for _, n := range needs {
 		eff := b.effLimit(n.limit, true)
 		if eff <= 0 {
@@ -600,7 +599,7 @@ func candidateCount(req *Request) int {
 // incremented and it returns the axes to wait on, deduplicated in attempt
 // order, plus whether every candidate was permanently blocked.
 //
-// w is the waiter this attempt is made on behalf of, or nil for a fresh
+// w is the waiter this attempt is made on behalf of, or noClaimant for a fresh
 // Acquire/TryAcquire. It only affects how soft reservations are counted.
 func (b *Broker) tryLocked(req *Request, blockBuf []*bucket, w *waiter) (*Reservation, []*bucket, bool) {
 	var needBuf [numAxes]axisNeed
@@ -609,6 +608,10 @@ func (b *Broker) tryLocked(req *Request, blockBuf []*bucket, w *waiter) (*Reserv
 	blocking := blockBuf[:0]
 	permanent := true
 	n := candidateCount(req)
+	// Only batch work under a non-zero reserve sees an effective ceiling below
+	// the configured one, and it is the only work that can be permanently
+	// blocked. Deciding once here keeps that whole case out of checkLocked.
+	reserved := req.Batch && b.reserve > 0
 
 	for i := 0; i < n; i++ {
 		c := candidateAt(req, i)
@@ -616,7 +619,16 @@ func (b *Broker) tryLocked(req *Request, blockBuf []*bucket, w *waiter) (*Reserv
 			break
 		}
 		needs = b.needs(req, c, needs)
-		blk, ok, perm := b.checkLocked(needs, req.Batch, w)
+		var (
+			blk  *bucket
+			ok   bool
+			perm bool
+		)
+		if reserved {
+			blk, ok, perm = b.checkReservedLocked(needs)
+		} else {
+			blk, ok, perm = b.checkLocked(needs, w)
+		}
 		if ok {
 			id := ""
 			if c != nil {
