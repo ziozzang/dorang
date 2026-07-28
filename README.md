@@ -51,11 +51,14 @@ Routing to the backend that still holds your KV cache requires knowing the conve
 prefix matched *in order*. dorang chains the hashes:
 
 ```
-h₀ = H(group)                        hᵢ = H(hᵢ₋₁ ‖ len(cᵢ) ‖ cᵢ)
+h₀ = H(group)                        hᵢ = H(hᵢ₋₁ ‖ cᵢ ‖ len(cᵢ))
 ```
 
 A match at depth *i* proves chunks `c₁..cᵢ` are byte-identical **and in that order**.
-Reordering, insertion, or deletion all produce a different value.
+Reordering, insertion, or deletion all produce a different value. The length is mixed in
+*after* the chunk, not before, because a trailing partial segment's length is not known
+until it ends — that ordering is what lets the chain be computed in a single streaming
+pass over the body instead of requiring it buffered.
 
 ### Telemetry you never have to turn off
 
@@ -88,10 +91,21 @@ changing configuration, not by changing deployment model.
 
 ## Status
 
-🚧 **Design stage.** Implementation has not started; there is no runnable code yet.
+Under construction, and it builds and passes. 33 packages, roughly 148,000 lines of Go,
+with 1,390 tests, 60 benchmarks and 7 fuzz targets green under `-race`. It ships as a
+static binary and as a container image.
+
+Parts of it are not finished. **The current defect list lives in
+[docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)** and only there — a checklist
+duplicated into this README guarantees one of the two copies is wrong. The most common
+defect found in this codebase, by a wide margin, is *a control that exists and is not
+reached*: a limit that validates, stores, and is never consulted. Design §17.1 records
+the instances and the rule they produced.
 
 - [Design](docs/DESIGN.md) — architecture, configuration schema, algorithms, milestones
+- [Compatibility](docs/COMPATIBILITY.md) — wire contracts pinned as golden tests, and the error taxonomy
 - [Adversarial review](docs/REVIEW.md) — findings against this design and their dispositions
+- [Security review](docs/SECURITY-REVIEW.md) — findings and their current state
 
 ## License
 
