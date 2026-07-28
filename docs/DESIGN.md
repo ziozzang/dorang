@@ -1316,6 +1316,9 @@ responses_store(response_id, created_at, expires_at, owner_key_id,
                 previous_response_id, model_group, items, reasoning_blobs)   [R1-C7]
 
 nodes · capacity_leases · files · batches · batch_requests · audit_logs
+
+  batches         also: errors (why a failed batch failed, after a restart), expired_at
+  batch_requests  also: response_body, input_offset, input_length
 ```
 
 **`responses_store` is not optional [R1-C7].** The Responses API carries server-side
@@ -1325,6 +1328,13 @@ runtime options, both of which break the promise: reject the request, or ignore 
 reference and answer from a truncated conversation. `reasoning_blobs` holds the opaque
 integrity-bearing reasoning handles of §10.2, keyed by response id, so they can be replayed
 byte-identically. Entries expire; retention is configurable per tier.
+
+**Three batch columns exist for reasons worth stating.** `batches.errors` is where a failed
+batch records *why*, which is otherwise unavailable after a restart. `batch_requests.response_body`
+is required for resume: the ledger stores no bodies, so without it a resumed batch has nothing
+to rebuild its output file from and **every already-finished row would be paid for a second
+time**. And `input_offset`/`input_length` let the scheduler seek into the input file rather
+than hold a 200 MiB upload in memory for the life of the batch.
 
 **Message excerpts are not inline in the ledger [R1-3].** At the top of the scale range an
 inline excerpt column dominates storage and drags ledger writes down with it. Excerpts live
@@ -1841,14 +1851,38 @@ endpoint, because that cannot be assumed across backends. A native batch path is
 
 ```
 upload → validate (JSONL, unique custom ids, known models, size and line ceilings)
-create → queued → in_progress
-  rows grouped by prefix hash (§7.4b) so cache-adjacent work runs together
-  each row is an ordinary request at batch priority (§7.5)
+create → validating → in_progress → finalizing → completed
+  rows grouped by prefix hash of the BODY (see below) so cache-adjacent work runs together
+  each row is an ordinary request marked batch (§5.2), so the reserve applies on every axis
   everything flows through §5, so batch cannot exceed configured capacity
   retries with backoff on retryable statuses; partial failure is expected
 complete → output JSONL + error JSONL
 cancel → cancelling → in-flight drains → cancelled, partial results preserved
 ```
+
+> **Grouping must hash the request body, not the JSONL line — otherwise it is a no-op that
+> looks implemented.** A batch line begins with its `custom_id`, which is unique by
+> construction, so a chain over the raw line diverges at the very first segment for every row
+> and every group has exactly one member. Nothing fails; the cache benefit simply never
+> materializes.
+>
+> The segment size differs too. §7.4b's 4 KiB base is chosen for routing, where bodies are
+> large; most batch rows are shorter than that, so a single segment swallows the differing
+> tail and again groups nothing. Grouping uses a smaller base (512 B default). **Routing and
+> grouping cannot share the segment size**, and treating one constant as serving both is how
+> this stays broken while appearing correct.
+
+> **Status names follow the vendor enum, not this document's internal vocabulary.** An earlier
+> draft named a `queued` state; no such value exists in the published batch object, and a
+> strict SDK rejects an unknown literal. It is kept internally and rendered as `validating`.
+> `finalizing` and `expired` do exist in the vendor shape and were missing here.
+
+> **What "batch priority" actually buys is admission control, not backend scheduling.** On a
+> self-hosted engine the priority field is silently ignored unless the operator enabled the
+> policy (VLLM.md §1.2), and the two engines order it in opposite directions (§7.5). dorang's
+> own reserve is the protection that always works. Priority passthrough is a bonus where it is
+> configured, and describing it as the mechanism would be describing something that is off by
+> default.
 
 **Interactive work is protected on every axis [R1-12].** Revision 1 capped batch at a share
 of *credential* concurrency, which does not protect the *model* axis — batch could take a
