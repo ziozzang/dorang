@@ -26,7 +26,19 @@ func TestValidationRules(t *testing.T) {
 		},
 		{
 			name: "cluster enabled with a shared mode is fine",
+			f:    fragments{top: "cluster: {enabled: true, capacity_mode: shared-pg}\n"},
+		},
+		{
+			name: "shared-redis is refused: this build ships no client",
 			f:    fragments{top: "cluster: {enabled: true, capacity_mode: shared-redis}\n"},
+			path: "cluster.capacity_mode",
+			want: "does not ship",
+		},
+		{
+			name: "shared-redis is refused on one node too",
+			f:    fragments{top: "cluster: {enabled: false, capacity_mode: shared-redis}\n"},
+			path: "cluster.capacity_mode",
+			want: "does not ship",
 		},
 		{
 			name: "unknown capacity mode",
@@ -902,6 +914,12 @@ func TestClusterLocalMessage(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message does not mention %q:\n%s", want, msg)
 		}
+	}
+	// It must not send the reader to a mode that is itself refused. Advice
+	// that fails on the next load is worse than none: the operator changes the
+	// line the message named and gets a second error about the same line.
+	if strings.Contains(msg, `to "shared-redis"`) {
+		t.Errorf("the message recommends shared-redis, which this build refuses:\n%s", msg)
 	}
 }
 

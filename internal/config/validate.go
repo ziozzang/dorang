@@ -236,6 +236,31 @@ func (c *Config) validateStorage(col *collector) {
 
 func (c *Config) validateCluster(col *collector) {
 	mustBeOneOf(col, "cluster.capacity_mode", c.Cluster.CapacityMode, capacityModes)
+
+	// A mode this build cannot honour is refused where it is written down, not
+	// quietly downgraded at construction. dorang ships the shared-redis
+	// protocol -- the client interface and the Lua scripts -- and no client
+	// that speaks it, so that the mode costs no dependency (§5.6). The failure
+	// this refusal prevents is not "Redis is missing": it is a coordinator
+	// that answers shared-redis, publishes "exact, +1 RTT to Redis", and
+	// coordinates through the SQL lease table instead. Those figures are what
+	// an operator sizes a cluster against.
+	//
+	// Refused whether or not cluster.enabled is set, because capacity_mode
+	// selects the coordinator either way and a single-node deployment that
+	// later flips `enabled: true` would otherwise discover this on the day it
+	// scales out.
+	if c.Cluster.CapacityMode == CapacityModeSharedRedis {
+		col.add("cluster.capacity_mode",
+			"capacity_mode %q needs a Redis client, which this build does not ship: the mode's "+
+				"protocol is implemented and no client speaks it, so cluster.redis_url_env names "+
+				"a URL nothing dials. Accepting it would give you a coordinator that reports "+
+				"%q and publishes its accuracy while coordinating through the store instead. "+
+				"Use %q, which is exact and has the same published overshoot of 0, or %q (§5.6)",
+			CapacityModeSharedRedis, CapacityModeSharedRedis,
+			CapacityModeSharedPG, CapacityModeLeased)
+	}
+
 	if !c.Cluster.Enabled {
 		return
 	}
@@ -247,13 +272,15 @@ func (c *Config) validateCluster(col *collector) {
 				"counted N times over and the provider sees up to N-fold the configured limit. "+
 				"The upstream 429s that follow cascade into the fallback chain (§7.6) and consume "+
 				"the capacity of unrelated models in the same class, so the failure surfaces far "+
-				"from its cause. Set capacity_mode to %q, %q or %q (§5.6)",
-			CapacityModeSharedRedis, CapacityModeSharedPG, CapacityModeLeased)
+				"from its cause. Set capacity_mode to %q or %q; %q is the fourth mode and this "+
+				"build ships no client for it (§5.6)",
+			CapacityModeSharedPG, CapacityModeLeased, CapacityModeSharedRedis)
 	}
-	if c.Cluster.CapacityMode == CapacityModeSharedRedis && c.Cluster.RedisURLEnv == "" {
-		col.add("cluster.redis_url_env", "must name the environment variable holding the Redis URL "+
-			"when capacity_mode is %q", CapacityModeSharedRedis)
-	}
+	// cluster.redis_url_env is deliberately not checked here any more. The only
+	// mode that would have read it is refused above, so requiring it would be a
+	// second problem reported about the same line, and the key is kept loadable
+	// so that a configuration imported from LiteLLM (import.go) still parses
+	// rather than failing on an unknown field.
 	if c.Cluster.MinLeasable <= 0 {
 		col.add("cluster.min_leasable", "must be greater than zero")
 	}

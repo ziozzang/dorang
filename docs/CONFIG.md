@@ -146,7 +146,8 @@ cluster:
 ```
 
 **The rule.** `cluster.enabled: true` with `capacity_mode: local` refuses to start. Use
-`shared-redis`, `shared-pg` or `leased`.
+`shared-pg` or `leased`. (`shared-redis` is the fourth mode and is refused by this build for
+a different reason: the protocol ships and no client speaks it.)
 
 **Why it is not a recommendation.** Node-local counting is *exact* on one node. On N nodes
 every ceiling is counted N times over, so a provider ceiling of 7 admits up to 7N concurrent
@@ -311,8 +312,8 @@ cluster:
 |---|---|---|---|---|
 | `enabled` | bool | `false` | Turns on multi-node behaviour: leader election, leased coordination, and the §1.1 guard | Leaving it `false` on a fleet gives you N independent gateways each counting its own ceilings — the exact overshoot §1.1 refuses, arrived at by omission instead of by configuration |
 | `node_id` | string | `""` | Names this process in its lease rows | Empty derives one **per process**. A restarted node then cannot reclaim its own leases and must wait for them to expire. Set it on every clustered node |
-| `redis_url_env` | string | `DORANG_REDIS_URL` | Names the variable holding the Redis URL | Required to be non-empty when `capacity_mode: shared-redis` |
-| `capacity_mode` | `local` \| `shared-redis` \| `shared-pg` \| `leased` | `local` | How capacity **and quota** are coordinated across nodes. One accuracy vocabulary, not two | See §1.1. `local` with `enabled: true` refuses to start |
+| `redis_url_env` | string | `DORANG_REDIS_URL` | Names the variable holding the Redis URL | Nothing dials it. The only mode that would read it is refused at load (below), and the key is kept loadable so an imported LiteLLM configuration still parses |
+| `capacity_mode` | `local` \| `shared-redis` \| `shared-pg` \| `leased` | `local` | How capacity **and quota** are coordinated across nodes. One accuracy vocabulary, not two | See §1.1. `local` with `enabled: true` refuses to start. `shared-redis` is refused outright: this build ships the mode's protocol and no Redis client, and accepting it would give you a coordinator that reports `shared-redis` and its published accuracy while coordinating through the store. Use `shared-pg`, which is also exact |
 | `min_leasable` | int | `16` | The smallest ceiling `leased` mode will divide across nodes | Zero or negative is refused. Any `max_concurrency` below this value, anywhere in the file, is rejected under `leased` — a single-digit limit cannot be usefully divided, and pretending it can produces a fleet where most nodes hold a block of zero |
 
 Under `leased`, the validator checks `min_leasable` against `providers[].max_concurrency`,
@@ -1371,7 +1372,7 @@ Every cross-reference is checked at load, by name, with the YAML path:
 | `DORANG_MASTER_KEY` | server | `server.master_key_env` | The out-of-band administrative credential |
 | `DORANG_KEY_PEPPER` | server, `dorangctl key` | `server.key_pepper_env` | HMAC pepper. Unset generates one beside the database — see §2 |
 | `DORANG_DATABASE_URL` | server | `storage.postgres.url_env` | Only when `driver: postgres` |
-| `DORANG_REDIS_URL` | server | `cluster.redis_url_env` | Only when `capacity_mode: shared-redis` |
+| `DORANG_REDIS_URL` | server | `cluster.redis_url_env` | Never read; `capacity_mode: shared-redis` is refused at load |
 | `DORANG_CATALOG_PATH` | server, `dorangctl` | — | PATH-separated model-catalog layers, applied **last**. A missing layer is an **error**, not a skip: a silently dropped layer is exactly the question the catalog exists to answer |
 
 `dorangctl key create` and `dorangctl migrate` resolve the pepper the same way the server does.
@@ -1403,7 +1404,7 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 | `models[].deployments[].stream_timeout` | Only the non-stream timeout reaches the upstream call |
 | `key_rotation.providers[].affinity_group` | Not read, and not validated either |
 | `key_rotation.providers[].stickiness.scope` | Not read; the session key comes from `routing.sticky.key` |
-| `cluster.redis_url_env` | Required for `capacity_mode: shared-redis` and no Redis client is constructed anywhere |
+| `cluster.redis_url_env` | Nothing dials it. `capacity_mode: shared-redis` is refused at load because no Redis client is constructed anywhere, so the key is kept only so an imported configuration still parses |
 | `observability.otlp_endpoint` | No exporter is wired |
 | `observability.log_level`, `.log_format` | No logger reads either; diagnostics go through the `Logf` hook the embedder supplies |
 
@@ -1653,7 +1654,7 @@ cluster:
   enabled: true
   node_id: ""                    # set per node from the orchestrator, e.g. the pod name
   redis_url_env: DORANG_REDIS_URL
-  capacity_mode: shared-redis    # exact; +1 RTT on the hot path, deliberately
+  capacity_mode: shared-pg       # exact; +1 RTT on the hot path, deliberately
   min_leasable: 16
 
 providers:
@@ -1718,10 +1719,12 @@ Notes that matter at this tier:
 
 - **`node_id` must be distinct and stable per node.** An empty value derives one per *process*,
   so a restarted node cannot reclaim its own leases and waits for them to expire instead.
-- `capacity_mode: shared-redis` costs one round trip on the hot path, against a p99 target of
+- `capacity_mode: shared-pg` costs one round trip on the hot path, against a p99 target of
   5 ms for that profile. It is the price of exact accounting; `leased` trades it for a published
-  overshoot of `block × (nodes − 1)`.
-- `min_leasable: 16` is inert under `shared-redis` and becomes load-bearing the moment you
+  overshoot of `block × (nodes − 1)`. `shared-redis` would be cheaper per round trip and is
+  **refused**: this build ships the mode's protocol and no client, and a coordinator that
+  reported `shared-redis` while using the store would misprice exactly this decision.
+- `min_leasable: 16` is inert under `shared-pg` and becomes load-bearing the moment you
   switch to `leased` — at which point every `max_concurrency` under 16 in this file is refused.
 - `store_messages: hash` with `sample_rate: 0.01` at ~2 k req/s keeps roughly 880 MB/day of the
   ~88 GB/day that full excerpts would cost.

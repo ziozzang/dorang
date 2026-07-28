@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"slices"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/cluster"
@@ -155,7 +156,34 @@ type ClusterCollector struct {
 	// Mode is the configured coordination mode.
 	Mode cluster.Mode
 	// Params describe the deployment the published figures are about.
+	//
+	// Params.Nodes is the fallback, used when Nodes is nil. It is a
+	// configured or assumed count; every overshoot figure here is
+	// proportional to it, so a wrong one is a wrong bound rather than a
+	// missing one.
 	Params cluster.Params
+	// Nodes reports how many nodes are alive right now. Nil keeps
+	// Params.Nodes, which is what an unclustered process publishes because
+	// there it is not an assumption — there is one node.
+	//
+	// It exists because every figure below is `something × (nodes − 1)`: at a
+	// hardcoded 1 they are all exactly 0, and a bound of "exact" published by
+	// a four-node cluster is not a conservative error, it is the wrong number
+	// in the direction an operator sizes against.
+	Nodes func() int
+	// Unavailable are modes this deployment cannot switch to, whatever their
+	// arithmetic says, with the reason. They are published as refused rather
+	// than dropped, because the comparison set exists so that the cost of a
+	// different choice is visible without making it — and a mode listed as
+	// exact and cheap that the loader will reject is the most expensive kind
+	// of visible.
+	//
+	// cluster.PublishAll deliberately does not know about this. It answers for
+	// the arithmetic of a mode, which is a property of the mode; whether this
+	// build can select it from a configuration file is a property of the
+	// build, and a Go embedder that supplies its own client is not subject to
+	// it.
+	Unavailable map[cluster.Mode]error
 	// Leader reports whether this node currently holds leadership; nil when
 	// there is no election (the unclustered case), in which case the gauge is
 	// absent rather than 0 — an unclustered process is not "not the leader".
@@ -164,18 +192,34 @@ type ClusterCollector struct {
 	Term func() uint64
 }
 
+// params is the deployment description this scrape publishes against, with the
+// live node count substituted when one is available.
+func (c *ClusterCollector) params() cluster.Params {
+	p := c.Params
+	if c.Nodes != nil {
+		if n := c.Nodes(); n > 0 {
+			p.Nodes = n
+		}
+	}
+	return p
+}
+
 // CollectorName implements [Collector].
 func (c *ClusterCollector) CollectorName() string { return "cluster" }
 
 // Collect implements [Collector].
 func (c *ClusterCollector) Collect(w *Writer) {
+	p := c.params()
+
 	w.Metric("dorang_cluster_enabled", Gauge,
 		"1 when this process runs as part of a cluster (DESIGN §13).")
 	w.Bool(c.Enabled)
 
 	w.Metric("dorang_cluster_expected_nodes", Gauge,
-		"Nodes the published overshoot figures are computed for.")
-	w.Int(int64(max(c.Params.Nodes, 1)))
+		"Nodes the published overshoot figures are computed for. In a cluster this is "+
+			"the live registry count, so the figures below describe the deployment that "+
+			"exists rather than the one the configuration imagined.")
+	w.Int(int64(max(p.Nodes, 1)))
 
 	if c.Leader != nil {
 		w.Metric("dorang_cluster_is_leader", Gauge,
@@ -201,7 +245,14 @@ func (c *ClusterCollector) Collect(w *Writer) {
 	// them is entitled to see what each would cost before switching, and a mode
 	// that cannot serve this deployment says so by being absent from the
 	// published set and present in the refused one.
-	ok, refused := cluster.PublishAll(c.Params)
+	ok, refused := cluster.PublishAll(p)
+	for m, err := range c.Unavailable {
+		if _, already := refused[m]; already {
+			continue
+		}
+		refused[m] = err
+		ok = slices.DeleteFunc(ok, func(a cluster.Accuracy) bool { return a.Mode == m })
+	}
 
 	w.Metric("dorang_coordination_max_overshoot", Gauge,
 		"Maximum units all nodes together can admit beyond a ceiling, per mode "+
@@ -228,7 +279,7 @@ func (c *ClusterCollector) Collect(w *Writer) {
 
 	w.Metric("dorang_coordination_limit", Gauge,
 		"The ceiling the published overshoot figures are computed against.")
-	w.Int(c.Params.Limit)
+	w.Int(p.Limit)
 }
 
 func boolLabel(v bool) string {

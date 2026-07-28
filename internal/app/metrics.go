@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"time"
@@ -64,7 +65,7 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 			reg.Register(a.dispatch.filterMetrics())
 		}
 	}
-	reg.Register(clusterCollector(cfg))
+	reg.Register(a.clusterCollector(cfg))
 	if a.Auth != nil {
 		reg.Register(metrics.NewAuthCollector(a.Auth, cfg.Auth.RehashesOnUse(),
 			legacySunset(cfg), a.now))
@@ -178,12 +179,19 @@ func quotaCollector(qs *quotaSet, now func() time.Time) *metrics.QuotaCollector 
 // it against the tightest limit would understate the fleet-wide risk, and
 // against an arbitrary one would be meaningless, so it is the widest ceiling —
 // the one whose overshoot costs the most.
-func clusterCollector(cfg *config.Config) *metrics.ClusterCollector {
+//
+// The node count is READ, not assumed. Every figure here is
+// `something × (nodes − 1)`, so the 1 this used to hardcode published a
+// maximum overshoot of 0 — "exact" — from every node of every cluster,
+// including the deployments the mode exists for. An operator sizes against
+// that number; a bound that is wrong in the multi-node case is worse than no
+// bound, because no bound is not acted on.
+func (a *App) clusterCollector(cfg *config.Config) *metrics.ClusterCollector {
 	mode, err := cluster.ParseMode(cfg.Cluster.CapacityMode)
 	if err != nil {
 		mode = cluster.ModeLocal
 	}
-	return &metrics.ClusterCollector{
+	c := &metrics.ClusterCollector{
 		Enabled: cfg.Cluster.Enabled,
 		NodeID:  nodeID(cfg),
 		Mode:    mode,
@@ -194,6 +202,32 @@ func clusterCollector(cfg *config.Config) *metrics.ClusterCollector {
 			Clustered:   cfg.Cluster.Enabled,
 		},
 	}
+	// shared-redis is refused by internal/config, so the comparison set must
+	// not offer it. The whole reason every mode is published rather than only
+	// the configured one is that an operator can see the cost of a different
+	// choice before making it — and "exact, one round trip to Redis" next to a
+	// loader that rejects the value is worse than not showing the row.
+	c.Unavailable = map[cluster.Mode]error{cluster.ModeSharedRedis: cluster.ErrNoRedisClient}
+
+	if a.Node == nil {
+		return c
+	}
+	// The block the leased figure multiplies is the node's, so the published
+	// number is the one the coordinator would actually overshoot by rather
+	// than internal/cluster's default standing in for it.
+	if p, perr := a.Node.AccuracyParams(context.Background(), c.Params.Limit); perr == nil {
+		c.Params.Block = p.Block
+	}
+	if !a.Node.Enabled() {
+		// No election and no peers. Leader and Term stay nil so the gauges are
+		// absent: an unclustered process is not "not the leader", and a term of
+		// 0 is a claim about an election that never happened.
+		return c
+	}
+	c.Nodes = a.nodes.get
+	c.Leader = a.Node.IsLeader
+	c.Term = a.Node.Election().Term
+	return c
 }
 
 // widestCapacityLimit is the largest configured concurrency ceiling, or 0 when

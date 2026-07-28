@@ -118,6 +118,12 @@ var readExempt = map[string]bool{
 	"Config.Capacity.Global.TPM":           true,
 	"Config.Capacity.Principals.RPM":       true,
 	"Config.Capacity.Principals.TPM":       true,
+	// §13. The one mode that would have read it — `capacity_mode:
+	// shared-redis` — is refused at load, because this build ships the
+	// protocol and no client that speaks it. The key stays loadable so that a
+	// configuration imported from LiteLLM, which carries redis settings,
+	// parses rather than failing on an unknown field.
+	"Config.Cluster.RedisURLEnv": true,
 	// Same, for the vault reference this build ships no resolver for.
 	"Config.Credentials.Key.Ref":                   true,
 	"Config.KeyRotation.Providers.Keys.Key.Ref":    true,
@@ -172,9 +178,6 @@ var knownUnwired = map[string]bool{
 	// §5.3 key affinity. Not validated either — the only occurrence in the tree
 	// is the struct tag.
 	"Config.KeyRotation.Providers.AffinityGroup": true,
-	// §13. Named, defaulted, and validated as required for `capacity_mode:
-	// shared-redis`; no Redis client is constructed anywhere.
-	"Config.Cluster.RedisURLEnv": true,
 	// §12. No OTLP exporter is wired, and no logger reads the level or the
 	// format — diagnostics go through the Logf hook the caller supplies.
 	"Config.Observability.OTLPEndpoint": true,

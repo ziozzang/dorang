@@ -179,3 +179,61 @@ func TestClosedNodeRefusesWork(t *testing.T) {
 		}
 	})
 }
+
+// TestSharedRedisIsNotSilentlySharedPG is the second guard on the mode that
+// this build cannot honour.
+//
+// The two shared modes are one coordinator over different stores, so the
+// substitution is one line and produces something that works. That is exactly
+// what makes it dangerous: the result reports Mode() == "shared-redis" and
+// publishes "exact, one round trip to Redis per acquire" (DESIGN 5.6) while
+// every acquire goes to the SQL lease table. An operator picks a mode by
+// reading those figures, and picks a store size and a latency budget from the
+// hot-path cost. internal/config refuses the configuration at load; this is the
+// second entry point, because one guard is not a guard.
+func TestSharedRedisIsNotSilentlySharedPG(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *store.Store, clk *clock) {
+		n := testNode(t, s, "node-a", clk, func(c *Config) { c.Mode = ModeSharedRedis })
+
+		c, err := n.Coordinator(quota.CoordinatorConfig{})
+		if err == nil {
+			_ = c.Close()
+			t.Fatal("shared-redis built a coordinator with no Redis client; it is " +
+				"coordinating through the store while claiming to use Redis")
+		}
+		if !errors.Is(err, ErrNoRedisClient) {
+			t.Fatalf("Coordinator refused with %v, want ErrNoRedisClient", err)
+		}
+
+		// A caller that HAS a client is served. The refusal is about the
+		// missing dependency, not about the mode being unimplemented — the
+		// protocol ships, and MemRedis is a complete implementation of it.
+		shared, err := NewRedisShared(NewMemRedis(clk.Now))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err = n.Coordinator(quota.CoordinatorConfig{Shared: shared})
+		if err != nil {
+			t.Fatalf("Coordinator with a Redis client: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if c.Mode() != ModeSharedRedis {
+			t.Fatalf("the coordinator came back in %s mode", c.Mode())
+		}
+
+		// And the units really went to Redis rather than to the lease table.
+		// Mode() is a label; this is the thing the label is about.
+		ctx := context.Background()
+		key := quota.NewKey("credential", "c1", quota.Daily, quota.MetricRequests, clk.Now())
+		if _, err := c.Charge(ctx, key, 64, 8, clk.Now()); err != nil {
+			t.Fatal(err)
+		}
+		held, err := n.Leases().Held(ctx, key.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held != 0 {
+			t.Errorf("a shared-redis charge put %d units in the SQL lease table", held)
+		}
+	})
+}

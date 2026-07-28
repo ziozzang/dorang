@@ -19,7 +19,27 @@ var (
 	// is a guard that a second entry point walks around.
 	ErrLocalInCluster = errors.New(
 		"cluster: cluster.enabled with capacity_mode \"local\" refuses to start: " +
-			"every node would carry the whole limit; use \"leased\", \"shared-redis\" or \"shared-pg\" (DESIGN 5.6)")
+			"every node would carry the whole limit; use \"leased\" or \"shared-pg\" " +
+			"(\"shared-redis\" is the fourth mode and needs a client this build does not ship) (DESIGN 5.6)")
+
+	// ErrNoRedisClient refuses capacity_mode "shared-redis" when no Redis
+	// client was supplied.
+	//
+	// This build ships the shared-redis PROTOCOL -- [RedisClient], the Lua each
+	// script stands for, and [NewRedisShared] -- and no client that speaks it,
+	// so that the mode costs no dependency. What it must never do is fall back
+	// to the SQL lease table: that would be a coordinator reporting
+	// Mode() == "shared-redis" and publishing "one round trip to Redis per
+	// acquire" (DESIGN 5.6) while touching PostgreSQL. The figures are what an
+	// operator sizes a cluster against, so a mode that is not the mode it
+	// claims is worse than a mode that refuses.
+	//
+	// internal/config refuses the same configuration at load, for the reason
+	// [ErrLocalInCluster] is refused twice: one entry point is not a guard.
+	ErrNoRedisClient = errors.New(
+		"cluster: capacity_mode \"shared-redis\" needs a Redis client, which this build does not ship: " +
+			"use \"shared-pg\" or \"leased\", or supply one through quota.CoordinatorConfig.Shared " +
+			"with cluster.NewRedisShared (DESIGN 5.6)")
 
 	// ErrNotLeader reports an operation that only the leader may perform,
 	// attempted by a node that does not hold the lease.

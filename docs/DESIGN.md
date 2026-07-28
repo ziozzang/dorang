@@ -2842,12 +2842,28 @@ zero-downtime for a tier that is not serving production traffic, at the cost of 
 process-lifecycle mechanism on the one path that is meant to have no moving parts. Stated
 here rather than discovered in production.
 
-> **Not wired.** Nothing in the shipped binary constructs a `cluster.Node`. internal/app
-> builds the ledger, key invalidator, key control and key loader directly, so the `nodes`
-> table is never written or read: no heartbeat, no registration, no deregistration, no leader
-> election, and none of the leader jobs — maintenance, reservation sweep, lease reclaim — ever
-> run. `cluster.enabled: true` today selects the capacity mode and nothing else. Every piece
-> exists, is tested, and has no caller; wiring it is an assembly change in internal/app.
+**Wiring.** internal/app constructs exactly one `cluster.Node` per process and takes its
+ledger from it rather than building a second one — two ledgers under one node id would be two
+in-memory block caches over the same rows. The node is built whether or not clustering is on,
+because the durable budget (§9.6) is on the request path either way; `cluster.enabled` decides
+whether it **joins**. With it false nothing registers, nothing campaigns, no goroutine of that
+package runs and the `nodes` table is never touched, which is what §0.2's "no required
+dependencies" costs in a package about coordination. With it true the node registers,
+heartbeats, campaigns, and runs the leader jobs — partition maintenance, the reservation sweep
+of §5.3 and §6.4, and lease reclaim.
+
+Lease reclaim is the one whose absence cost money: a node that crashes holding quota leases
+never returns them, so the quota is leaked until someone notices and clears it by hand.
+
+> **Still not wired, after that change.** The request path does not route quota through
+> `cluster.Node.Coordinator` — internal/capacity still counts concurrency per node, so the
+> coordinator owns the leases and publishes the accuracy without admitting or refusing
+> anything. `RollupCompactionJob` and `BatchAssignmentJob` have no caller, so rollup
+> compaction and batch assignment still run on every node instead of on the leader. And
+> `capacity_mode: shared-redis` is refused at load: this build ships the protocol
+> (`cluster.RedisClient`, the Lua scripts, `NewRedisShared`) and no client that speaks it, so
+> accepting it would give an operator a coordinator reporting `shared-redis` while
+> coordinating through the store.
 
 ---
 
