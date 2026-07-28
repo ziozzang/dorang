@@ -198,8 +198,12 @@ restarted; conflating the two turns a graceful drain into a kill. Liveness stays
 {"status":"alive"}` for the whole drain, and readiness flips to `503 {"status":"draining"}` the
 instant the drain begins.
 
-`terminationGracePeriodSeconds` must exceed `server.shutdown_grace` plus the post-drain teardown,
-which is bounded by the same value. Budget `2 × shutdown_grace + 5s`.
+The readiness probe's period and failure threshold are what `server.pre_stop_delay` must be sized
+against — see §10, and `deploy/kubernetes.yaml` for probe settings the default already covers.
+
+`terminationGracePeriodSeconds` must exceed the pre-stop delay plus the drain plus the post-drain
+teardown, the last two each bounded by `server.shutdown_grace`. Budget
+`pre_stop_delay + 2 × shutdown_grace + 10s`.
 
 ---
 
@@ -601,7 +605,7 @@ Each row is a condition worth paging on, what it actually means, and the first a
 | Gateway erroring | `rate(dorang_responses_total{class="5xx"}[5m]) > 0` | A gateway fault or an upstream 5xx that survived the fallback chain. `502` is upstream-after-fallback; `500` is dorang's own fault | Check `dorang_handler_panics_total` first. A non-zero panic counter is a bug, not a capacity problem |
 | Panics | `increase(dorang_handler_panics_total[15m]) > 0` | A handler panicked and was recovered. The request failed; the process did not | Capture the log line and the request id. This is always a defect |
 | Late errors | `rate(dorang_late_errors_total[5m]) > 0` | An error had to be delivered **in band** because the response had already started. The client saw HTTP 200 followed by an error event | Correlate with upstream health. This is the boundary fallback deliberately will not cross — duplicated output is worse than a visible failure |
-| Not ready | `dorang_ready == 0` for > `shutdown_grace` | The node is draining, or the drain did not finish | If no deploy is in progress, the process is stuck draining. See §10 |
+| Not ready | `dorang_ready == 0` for > `pre_stop_delay + shutdown_grace` | The node is draining, or the drain did not finish | If no deploy is in progress, the process is stuck draining. See §10 |
 | 501 storm | `rate(dorang_unimplemented_total[5m])` rising | A client is calling a route this build does not serve — very often `/v1/responses` or an admin path (§0.2) | Read `X-Dorang-Unimplemented` from a sample response. It names the path |
 | Auth failures | `rate(dorang_auth_failures_total[5m])` rising | Expired keys, a revoked key still in a client's config, or a key issued under a different pepper | `dorangctl key list` shows state per key. If *every* key fails, suspect the pepper (§2.3) |
 | Replay refusals | `rate(dorang_replay_refused_total[5m]) > 0` | The process-wide replay budget is full, so bodies are no longer retained and those requests cannot fall back | Large bodies plus high concurrency. Either is fine alone. Watch `dorang_replay_bytes` |
@@ -758,13 +762,18 @@ now requires.
 `SIGTERM` or `SIGINT` starts a drain. The sequence:
 
 1. **Readiness flips to `503` immediately.** `dorang_ready` goes to 0. Liveness stays `200`.
-2. The listener closes at once, so **new connections are refused at TCP level** — there is no
-   "reject new work with 503 while still listening" mode. Take the node out of the load
-   balancer *before* signalling if you want new requests to be routed away rather than refused.
-3. In-flight requests **run to completion and get their normal status**. No 503 is injected into
+2. **The process keeps serving for `server.pre_stop_delay` (default 10s).** The listener stays
+   open and requests are answered in full — this is the window in which your load balancer
+   notices the readiness failure and stops routing here. Nothing else changes during it.
+3. The listener closes, so new connections are refused at TCP level.
+4. In-flight requests **run to completion and get their normal status**. No 503 is injected into
    a request already being served.
-4. When they finish, or when `server.shutdown_grace` expires, the server hard-closes.
-5. The process then tears down in reverse order of construction, bounded by the same grace:
+5. When they finish, or when `server.shutdown_grace` expires, every request still running is
+   cancelled and told why. A **stream ends with an in-band error frame** carrying code
+   `gateway_shutting_down` followed by `data: [DONE]`, not a TCP reset — so a client can tell
+   "the gateway is restarting, retry" from "something broke". Each cancelled request is still
+   metered before the connection closes.
+6. The process then tears down in reverse order of construction, bounded by the same grace:
    the shadow worker pool, the meter (which drains to disk and makes one final flush attempt),
    then the store. **Unspent budget lease blocks are returned**, so a planned restart is exact
    — the durable counter ends up holding precisely what was spent. A crash skips this, and that
@@ -778,19 +787,42 @@ dorang: drain grace expired with requests still in flight
 
 That is a real signal, not noise: something was still running after the window you configured.
 
-**The pre-stop pattern.** Readiness can be flipped ahead of the shutdown itself, so a load
-balancer stops sending work while requests still succeed. In Kubernetes, a `preStop` sleep longer
-than the readiness probe's detection window achieves the same thing without any dorang-side
-configuration:
+**Sizing the pre-stop delay.** This is the one number you must compute from your own
+infrastructure, because it describes your *balancer*, not dorang. Every balancer discovers
+unreadiness by polling, and if the listener closes before the poll that notices it, the balancer
+is still routing to a socket that no longer accepts — connection-refused on every rolling
+restart, which is the exact failure the drain exists to prevent.
 
-```yaml
-lifecycle:
-  preStop: {exec: {command: ["/bin/sleep", "10"]}}
-terminationGracePeriodSeconds: 130      # 2 × shutdown_grace + margin
+```
+pre_stop_delay  >=  probe period × failure threshold
+                  + probe timeout
+                  + however long the balancer takes to withdraw the endpoint
 ```
 
-Sizing rule: `terminationGracePeriodSeconds > 2 × server.shutdown_grace`, because the drain and
-the teardown each get the full grace.
+`deploy/kubernetes.yaml` ships `periodSeconds: 2`, `failureThreshold: 2`, `timeoutSeconds: 1` —
+five seconds of detection — against the default `pre_stop_delay: 10s`. **Change a probe and you
+must change the config with it.** No `preStop` hook is needed or wanted: the wait happens inside
+the process, and the shipped image is distroless, so there is no `/bin/sleep` to exec.
+
+Set `pre_stop_delay: 0` where nothing is routing to the process — a single node, a workstation.
+An *absent* key takes the default, so writing `0` really does mean none. A second `SIGTERM` also
+skips the wait, so `Ctrl-C` never appears to hang.
+
+```yaml
+terminationGracePeriodSeconds: 80       # pre_stop_delay + 2 × shutdown_grace + 10s
+```
+
+Sizing rule: `terminationGracePeriodSeconds > server.pre_stop_delay + 2 × server.shutdown_grace`,
+because the drain and the teardown each get the full grace and the pre-stop delay comes on top of
+both. Below it, `SIGTERM` becomes `SIGKILL` part way through the drain — which skips returning
+the unspent quota blocks and makes the restart inexact.
+
+**A single node cannot restart without a gap, and this is accepted.** dorang has no socket
+handoff and no `SO_REUSEPORT`: between the old process closing its listener and the new one
+binding, there is nothing listening, and a client that connects in that window is refused. Two
+nodes behind a balancer remove it entirely, which is what `deploy/kubernetes.yaml` ships and what
+requirement R14 asks for. **On the notebook and single-node tiers, plan for a sub-second outage
+on every restart** — it is not something a longer grace or a larger `pre_stop_delay` can close.
 
 **In a cluster**, the leader's work — rollup compaction, partition maintenance, capacity and
 budget reservation sweeps, batch assignment, lease rebalancing — moves on election when the

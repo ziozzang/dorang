@@ -123,6 +123,25 @@
 //     caller, and every test here, can drive the loop instead of sleeping
 //     through it.
 //
+// # What is not wired
+//
+// Nothing in the shipped binary constructs a [Node]. internal/app builds
+// [Ledger], [KeyInvalidator], [KeyControl] and [KeyLoader] directly and never
+// calls [New], so in a running gateway the `nodes` table is never written and
+// never read: no heartbeat, no registration, no [Registry.Deregister], no
+// leader election, and none of the leader jobs -- maintenance, reservation
+// sweep, lease reclaim -- ever run. `cluster.enabled: true` today buys the
+// capacity mode and nothing else.
+//
+// That is stated here rather than left to be discovered because the shape of
+// the omission is invisible from inside this package: every piece is built,
+// tested and correct, and the drain order of [Node.Close] is reasoned about in
+// detail. It simply has no caller. Wiring it is an assembly change in
+// internal/app -- construct the node, [Node.Start] it after the store opens,
+// [Node.Close] it in App.Close after the ledger -- and until that happens, a
+// two-node deployment coordinates through the store's leases alone and nobody
+// reclaims the leases of a node that dies.
+//
 // # Storage
 //
 // Four tables, all already in internal/store's schema: nodes, capacity_leases

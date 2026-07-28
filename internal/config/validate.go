@@ -213,6 +213,7 @@ func (c *Config) validateServer(col *collector) {
 		col.add("server.request_timeout", "must be greater than zero")
 	}
 	nonNegative(col, "server.shutdown_grace", int64(c.Server.ShutdownGrace))
+	nonNegative(col, "server.pre_stop_delay", int64(c.Server.PreStop()))
 }
 
 func (c *Config) validateStorage(col *collector) {

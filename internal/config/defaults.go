@@ -12,6 +12,13 @@ const (
 	defaultKeyPepperEnv   = "DORANG_KEY_PEPPER"
 	defaultRequestTimeout = 600 * time.Second
 	defaultShutdownGrace  = 30 * time.Second
+	// defaultPreStopDelay covers the readiness-probe detection window of the
+	// manifests this repository ships (deploy/kubernetes.yaml): two failures at
+	// a two-second period plus a one-second probe timeout is five seconds of
+	// detection, and the remaining five are for the balancer to stop routing.
+	// An operator whose probes are slower must raise this; §13 states the
+	// arithmetic.
+	defaultPreStopDelay = 10 * time.Second
 
 	defaultStorageDriver = "sqlite"
 	defaultSQLitePath    = "~/.dorang/dorang.db"
@@ -188,6 +195,8 @@ var defaultFallbackChains = map[string][]string{
 func boolPtr(b bool) *bool        { return &b }
 func floatPtr(f float64) *float64 { return &f }
 
+func durPtr(d time.Duration) *Duration { v := Duration(d); return &v }
+
 // ApplyDefaults fills every unset field with its documented default. It is
 // idempotent, and it never overwrites a value the file set — fields where an
 // explicit zero differs from "unset" are pointers for exactly that reason.
@@ -203,6 +212,9 @@ func (c *Config) ApplyDefaults() {
 	setStr(&c.Server.KeyPepperEnv, defaultKeyPepperEnv)
 	setDur(&c.Server.RequestTimeout, defaultRequestTimeout)
 	setDur(&c.Server.ShutdownGrace, defaultShutdownGrace)
+	if c.Server.PreStopDelay == nil {
+		c.Server.PreStopDelay = durPtr(defaultPreStopDelay)
+	}
 
 	// storage
 	setStr(&c.Storage.Driver, defaultStorageDriver)

@@ -456,6 +456,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics, guard: a.Guard},
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
+		PreStopDelay:      cfg.Server.PreStop().Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),
 		Routes:            a.extraRoutes(),

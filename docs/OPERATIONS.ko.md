@@ -164,8 +164,11 @@ readinessProbe:
 둘을 혼동하면 graceful drain이 kill이 된다. liveness는 드레인 내내 `200 {"status":"alive"}`를 유지하고,
 readiness는 드레인이 시작되는 순간 `503 {"status":"draining"}`으로 뒤집힌다.
 
-`terminationGracePeriodSeconds`는 `server.shutdown_grace`에 드레인 이후 해체(같은 값으로 제한)를 더한 것보다
-커야 한다. `2 × shutdown_grace + 5s`로 잡을 것.
+readiness 프로브의 주기와 실패 임계치가 `server.pre_stop_delay`를 잡는 기준이다 — §10과, 기본값이 이미
+커버하는 프로브 설정은 `deploy/kubernetes.yaml`을 볼 것.
+
+`terminationGracePeriodSeconds`는 pre-stop 지연에 드레인과 드레인 이후 해체(뒤 둘은 각각
+`server.shutdown_grace`로 제한)를 더한 것보다 커야 한다. `pre_stop_delay + 2 × shutdown_grace + 10s`로 잡을 것.
 
 ---
 
@@ -494,7 +497,7 @@ shadow가 켜져 있으면 본문이 게이트 판정을 담은 `"shadow"` 객�
 | 게이트웨이 에러 | `rate(dorang_responses_total{class="5xx"}[5m]) > 0` | 게이트웨이 결함이거나 폴백 체인을 살아남은 업스트림 5xx. `502`는 폴백 이후 업스트림, `500`은 dorang 자신의 결함 | 먼저 `dorang_handler_panics_total`을 볼 것. 0이 아니면 capacity 문제가 아니라 버그다 |
 | Panic | `increase(dorang_handler_panics_total[15m]) > 0` | 핸들러가 panic했고 복구됐다. 요청은 실패했고 프로세스는 아니다 | 로그 줄과 request id를 확보할 것. 언제나 결함이다 |
 | Late error | `rate(dorang_late_errors_total[5m]) > 0` | 응답이 이미 시작돼 에러를 **인밴드**로 전달해야 했다. 클라이언트는 HTTP 200 뒤 에러 이벤트를 봤다 | 업스트림 상태와 상관 확인. 이것이 폴백이 의도적으로 넘지 않는 경계다 — 중복 출력은 가시적 실패보다 나쁘다 |
-| Not ready | `dorang_ready == 0`이 `shutdown_grace`보다 오래 | 노드가 드레인 중이거나 드레인이 끝나지 않았다 | 배포가 진행 중이 아니라면 프로세스가 드레인에 걸려 있다. §10 |
+| Not ready | `dorang_ready == 0`이 `pre_stop_delay + shutdown_grace`보다 오래 | 노드가 드레인 중이거나 드레인이 끝나지 않았다 | 배포가 진행 중이 아니라면 프로세스가 드레인에 걸려 있다. §10 |
 | 501 폭주 | `rate(dorang_unimplemented_total[5m])` 상승 | 클라이언트가 이 빌드가 서빙하지 않는 라우트를 호출 중 — 흔히 `/v1/responses`나 관리 경로(§0.2) | 샘플 응답의 `X-Dorang-Unimplemented`를 읽을 것. 경로를 명시한다 |
 | 인증 실패 | `rate(dorang_auth_failures_total[5m])` 상승 | 만료된 키, 클라이언트 설정에 남은 폐기된 키, 또는 다른 pepper로 발급된 키 | `dorangctl key list`가 키별 상태를 보여준다. *모든* 키가 실패하면 pepper를 의심할 것(§2.3) |
 | 재생 거부 | `rate(dorang_replay_refused_total[5m]) > 0` | 프로세스 전역 재생 예산이 가득 차 본문이 더 이상 보유되지 않고 그 요청들은 폴백할 수 없다 | 큰 본문 + 높은 동시성. 각각 하나만이면 괜찮다. `dorang_replay_bytes`를 볼 것 |
@@ -636,12 +639,16 @@ systemctl restart dorang
 `SIGTERM` 또는 `SIGINT`가 드레인을 시작한다. 순서:
 
 1. **readiness가 즉시 `503`으로 뒤집힌다.** `dorang_ready`가 0이 된다. liveness는 `200`을 유지한다.
-2. 리스너가 즉시 닫히므로 **새 연결은 TCP 수준에서 거부된다** — "리슨은 유지한 채 새 작업을 503으로
-   거부"하는 모드는 없다. 새 요청이 거부되는 대신 다른 곳으로 라우팅되기를 원한다면 시그널 *전에* 노드를
-   로드밸런서에서 빼야 한다.
-3. 진행 중 요청은 **완료까지 실행되고 정상 상태를 받는다.** 이미 서빙 중인 요청에 503이 주입되지 않는다.
-4. 그것들이 끝나거나 `server.shutdown_grace`가 만료되면 서버가 하드 종료한다.
-5. 그 뒤 프로세스가 구성의 역순으로, 같은 grace로 제한되어 해체된다: shadow 워커 풀, meter(디스크로
+2. **`server.pre_stop_delay`(기본 10s) 동안 계속 서빙한다.** 리스너는 열려 있고 요청은 온전히 응답된다 —
+   로드밸런서가 readiness 실패를 감지하고 이쪽으로의 라우팅을 멈추는 창이다. 그동안 그 외에는 아무것도
+   달라지지 않는다.
+3. 리스너가 닫히므로 새 연결은 TCP 수준에서 거부된다.
+4. 진행 중 요청은 **완료까지 실행되고 정상 상태를 받는다.** 이미 서빙 중인 요청에 503이 주입되지 않는다.
+5. 그것들이 끝나거나 `server.shutdown_grace`가 만료되면, 아직 도는 모든 요청이 이유와 함께 취소된다.
+   **스트림은 TCP 리셋이 아니라 코드 `gateway_shutting_down`을 담은 in-band 에러 프레임과 `data: [DONE]`로
+   끝난다** — 클라이언트가 "게이트웨이 재시작이니 재시도"와 "무언가 깨졌다"를 구분할 수 있다. 취소된 요청도
+   연결이 닫히기 전에 계량된다.
+6. 그 뒤 프로세스가 구성의 역순으로, 같은 grace로 제한되어 해체된다: shadow 워커 풀, meter(디스크로
    드레인하고 마지막 flush를 한 번 시도), 그다음 스토어. **쓰이지 않은 예산 리스 블록이 반환되므로** 계획된
    재시작은 정확하다 — 내구 카운터가 정확히 쓴 만큼을 담는다. 크래시는 이 단계를 건너뛰고, 그 차이가 공표된
    초과분 전부다.
@@ -654,18 +661,39 @@ dorang: drain grace expired with requests still in flight
 
 노이즈가 아니라 진짜 신호다: 설정한 창 이후에도 무언가가 돌고 있었다.
 
-**pre-stop 패턴.** readiness를 종료 자체보다 먼저 뒤집을 수 있어, 요청이 여전히 성공하는 동안 로드밸런서가
-작업 전송을 멈춘다. Kubernetes에서는 readiness 프로브 탐지 창보다 긴 `preStop` sleep이 dorang 쪽 설정 없이
-같은 효과를 낸다:
+**pre-stop 지연 크기 잡기.** 이 값 하나만은 자기 인프라에서 계산해야 한다. dorang이 아니라 *로드밸런서*를
+기술하는 값이기 때문이다. 모든 밸런서는 폴링으로 unready를 감지하며, 그 폴이 오기 전에 리스너가 닫히면
+밸런서는 더 이상 accept하지 않는 소켓으로 계속 라우팅한다 — 롤링 재시작마다 connection-refused, 곧 드레인이
+막으려던 바로 그 실패다.
 
-```yaml
-lifecycle:
-  preStop: {exec: {command: ["/bin/sleep", "10"]}}
-terminationGracePeriodSeconds: 130      # 2 × shutdown_grace + 여유
+```
+pre_stop_delay  >=  프로브 주기 × 실패 임계치
+                  + 프로브 타임아웃
+                  + 밸런서가 엔드포인트를 철회하는 데 걸리는 시간
 ```
 
-크기 규칙: `terminationGracePeriodSeconds > 2 × server.shutdown_grace`. 드레인과 해체가 각각 grace 전부를
-받기 때문이다.
+`deploy/kubernetes.yaml`은 `periodSeconds: 2`, `failureThreshold: 2`, `timeoutSeconds: 1` — 감지에 5초 —
+를 기본값 `pre_stop_delay: 10s`에 대해 싣는다. **프로브를 바꾸면 설정도 함께 바꿔야 한다.** `preStop` 훅은
+필요 없다: 대기는 프로세스 안에서 일어나고, 배포 이미지는 distroless라 exec할 `/bin/sleep`도 없다.
+
+이 프로세스로 라우팅하는 주체가 없는 곳 — 단일 노드, 워크스테이션 — 에서는 `pre_stop_delay: 0`으로 둘 것.
+키가 *없으면* 기본값이 적용되므로 `0`이라고 쓰면 정말 없음을 뜻한다. 두 번째 `SIGTERM`도 이 대기를 건너뛰므로
+`Ctrl-C`가 멈춘 것처럼 보이는 일은 없다.
+
+```yaml
+terminationGracePeriodSeconds: 80       # pre_stop_delay + 2 × shutdown_grace + 10s
+```
+
+크기 규칙: `terminationGracePeriodSeconds > server.pre_stop_delay + 2 × server.shutdown_grace`. 드레인과
+해체가 각각 grace 전부를 받고, pre-stop 지연이 그 위에 더해지기 때문이다. 이보다 작으면 `SIGTERM`이 드레인
+도중 `SIGKILL`이 되고 — 쓰이지 않은 쿼터 블록 반환을 건너뛰어 재시작이 부정확해진다.
+
+**단일 노드는 간극 없이 재시작할 수 없고, 이는 받아들인 결정이다.** dorang에는 소켓 핸드오프도
+`SO_REUSEPORT`도 없다. 옛 프로세스가 리스너를 닫고 새 프로세스가 바인드하기까지 아무것도 리슨하지 않으며, 그
+창에 연결한 클라이언트는 거부된다. 밸런서 뒤의 두 노드가 이를 완전히 없애며, 그것이
+`deploy/kubernetes.yaml`이 싣는 구성이자 요구사항 R14가 요구하는 바다. **노트북·단일 노드 티어에서는 재시작
+마다 1초 미만의 단절을 계획에 넣을 것** — grace를 늘리거나 `pre_stop_delay`를 키워서 닫을 수 있는 종류가
+아니다.
 
 **클러스터에서는** 리더의 일 — 롤업 압축, 파티션 유지보수, capacity·예산 예약 sweep, batch 할당, 리스
 재분배 — 이 리더가 떠날 때 선출로 옮겨간다. 리스와 예약은 드레인의 일부로 반환된다. `cluster.node_id`가

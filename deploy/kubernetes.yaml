@@ -1,0 +1,168 @@
+# dorang on Kubernetes — a two-node deployment that restarts without dropping a
+# request (DESIGN §13, requirement R14).
+#
+# The numbers in this file and the numbers in `server.pre_stop_delay` are ONE
+# setting expressed twice, and they have to agree. The relationship is:
+#
+#   pre_stop_delay >= readiness periodSeconds x failureThreshold
+#                     + readiness timeoutSeconds
+#                     + however long the balancer takes to stop routing
+#
+# Here that reads 2 x 2 + 1 = 5 seconds of detection, and dorang's default
+# `pre_stop_delay: 10s` leaves five more for kube-proxy and any ingress in front
+# of it to withdraw the endpoint. Change a probe below and the config must move
+# with it; the failure if they disagree is not subtle, it is connection-refused
+# on every rolling restart.
+#
+# There is deliberately NO preStop hook. The pre-stop wait happens inside the
+# process: readiness goes false, the listener stays open for pre_stop_delay, and
+# only then does the drain proper begin. A `preStop: exec sleep` would need a
+# shell, and the shipped image is distroless — it does not have one.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dorang
+  labels: {app: dorang}
+spec:
+  type: ClusterIP
+  selector: {app: dorang}
+  ports:
+    - name: http
+      port: 4100
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dorang
+spec:
+  # R14 is "two or more, highly available". Without this, a node drain can take
+  # both replicas at once and the rolling-update settings below count for
+  # nothing.
+  minAvailable: 1
+  selector:
+    matchLabels: {app: dorang}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dorang
+  labels: {app: dorang}
+spec:
+  # Two, not one. A single node cannot restart without a gap: dorang has no
+  # socket handoff and no SO_REUSEPORT, so between the old process closing its
+  # listener and the new one binding, there is nothing listening. That is
+  # accepted rather than solved (§13); the answer is a second replica.
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {app: dorang}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Zero unavailable: bring the replacement up and let it pass readiness
+      # before anything is taken away. maxUnavailable: 1 with two replicas would
+      # put the entire load on one node during every deploy.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels: {app: dorang}
+    spec:
+      # pre_stop_delay (10) + shutdown_grace (30) for the drain + two one-second
+      # cut-over waits + the post-drain teardown, which internal/app bounds by
+      # shutdown_grace again. That is 72s; 80 leaves a margin. The sizing rule
+      # is `pre_stop_delay + 2 x shutdown_grace + 10s`, and a value below it
+      # turns a SIGTERM into a SIGKILL part way through the drain — which skips
+      # returning the unspent quota blocks and makes the restart inexact.
+      terminationGracePeriodSeconds: 80
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: dorang
+          image: ghcr.io/ziozzang/dorang:latest # pin a digest for a real deployment
+          args: ["--config", "/etc/dorang/dorang.yaml"]
+          ports:
+            - name: http
+              containerPort: 4100
+          env:
+            - name: DORANG_STATE_DIR
+              value: /var/lib/dorang
+            - name: DORANG_MASTER_KEY
+              valueFrom: {secretKeyRef: {name: dorang, key: master-key}}
+            - name: DORANG_KEY_PEPPER
+              # Required with more than one replica: a generated pepper is
+              # per-process, and two processes with different peppers cannot
+              # verify each other's keys.
+              valueFrom: {secretKeyRef: {name: dorang, key: key-pepper}}
+            - name: DORANG_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: dorang, key: database-url}}
+          readinessProbe:
+            # This probe is the load balancer's only view of the drain. Its
+            # period and threshold are what pre_stop_delay is sized against.
+            httpGet: {path: /health/readiness, port: http}
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 1
+            successThreshold: 1
+            failureThreshold: 2
+          livenessProbe:
+            # A DIFFERENT endpoint, and that is the point: /health/liveness
+            # stays 200 for the whole drain. Pointing liveness at readiness
+            # would make the kubelet restart every pod that is draining
+            # normally, turning a graceful shutdown into a kill (§13).
+            httpGet: {path: /health/liveness, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits: {memory: "2Gi"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/dorang, readOnly: true}
+            - {name: state, mountPath: /var/lib/dorang}
+      volumes:
+        - name: config
+          configMap: {name: dorang}
+        - name: state
+          # Node-local scratch only: the trace spool and batch blobs. With more
+          # than one replica the ledger lives in Postgres
+          # (storage.driver: postgres), because two nodes cannot share a SQLite
+          # file.
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dorang
+data:
+  dorang.yaml: |
+    version: 1
+
+    server:
+      listen: ":4100"
+      env: production
+      shutdown_grace: 30s
+      # Must cover the readinessProbe window above: 2s x 2 + 1s = 5s of
+      # detection, plus time for the endpoint withdrawal to propagate.
+      pre_stop_delay: 10s
+
+    storage:
+      driver: postgres
+      postgres:
+        url_env: DORANG_DATABASE_URL
+
+    cluster:
+      enabled: true
+      # `local` is exact on one node and overshoots N-fold on N nodes, so
+      # `enabled: true` with `capacity_mode: local` refuses to start (§5.6).
+      capacity_mode: shared-pg
+
+    # providers, credentials and models: see deploy/config.example.yaml.

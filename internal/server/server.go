@@ -117,6 +117,17 @@ type Options struct {
 	RequestTimeout time.Duration
 	// ShutdownGrace bounds the drain; 0 uses [DefaultShutdownGrace].
 	ShutdownGrace time.Duration
+	// PreStopDelay is how long [Server.Serve] keeps serving after readiness
+	// goes false and before the listener closes, so that a polling load
+	// balancer has time to notice (DESIGN §13).
+	//
+	// Zero means none, and is NOT defaulted. A zero grace would mean "cut every
+	// request instantly", which nobody wants and which is why ShutdownGrace
+	// treats it as absence; a zero pre-stop delay means "there is no balancer to
+	// wait for", which is the right answer for a single node and for every
+	// embedder that did not ask for one. internal/config supplies the
+	// deployment default (`server.pre_stop_delay`, 10s).
+	PreStopDelay time.Duration
 
 	// AlwaysFullHeaders attaches the full extension-header set to every
 	// response without the caller asking (observability.always_full_headers).
@@ -165,6 +176,7 @@ type snapshot struct {
 	maxBody        int64
 	requestTimeout time.Duration
 	shutdownGrace  time.Duration
+	preStopDelay   time.Duration
 
 	alwaysFull    bool
 	legacyHeaders bool
@@ -229,6 +241,7 @@ func (s *Server) Reload(opts Options) error {
 		maxBody:        opts.MaxBodyBytes,
 		requestTimeout: opts.RequestTimeout,
 		shutdownGrace:  opts.ShutdownGrace,
+		preStopDelay:   opts.PreStopDelay,
 		alwaysFull:     opts.AlwaysFullHeaders,
 		legacyHeaders:  opts.LegacyHeaders,
 		now:            opts.Now,
@@ -253,6 +266,9 @@ func (s *Server) Reload(opts Options) error {
 	}
 	if snap.shutdownGrace <= 0 {
 		snap.shutdownGrace = DefaultShutdownGrace
+	}
+	if snap.preStopDelay < 0 {
+		snap.preStopDelay = 0
 	}
 	if snap.now == nil {
 		snap.now = time.Now
@@ -510,6 +526,15 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 // there is nothing to do but stop writing.
 func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 	e := asError(err, http.StatusInternalServerError, TypeAPIError)
+	// A drain that reached its grace boundary cancelled this request on
+	// purpose, and it is the only party that knows that. Whatever the handler
+	// reported on the way out — a context error, a broken pipe, an upstream
+	// read that ended — the answer the client needs is "the gateway is
+	// restarting, retry", not a generic 500 and not a TCP reset. For a stream
+	// this replaces the last frame the client will ever see (DESIGN §13).
+	if se := shutdownError(rq.ctx); se != nil {
+		e = se
+	}
 	rw.errShape = e.Shape
 	if !rw.wrote {
 		WriteError(rw, e)

@@ -59,6 +59,30 @@ type Server struct {
 	KeyPepperEnv   string   `yaml:"key_pepper_env,omitempty"`
 	RequestTimeout Duration `yaml:"request_timeout,omitempty"`
 	ShutdownGrace  Duration `yaml:"shutdown_grace,omitempty"`
+
+	// PreStopDelay is how long the process keeps serving AFTER readiness has
+	// gone false and BEFORE the listener closes (§13).
+	//
+	// It exists because every load balancer discovers unreadiness by polling.
+	// Closing the listener in the same instant readiness flips means the
+	// balancer is still routing to a socket that no longer accepts, which is
+	// connection-refused on every rolling restart — the exact failure a
+	// graceful drain exists to prevent. The delay must therefore cover the
+	// balancer's own detection window:
+	//
+	//	pre_stop_delay >= probe period x failure threshold
+	//	                + probe timeout
+	//	                + however long the balancer takes to stop routing
+	//
+	// which is a property of the deployment, not of dorang — so it is
+	// configuration, and deploy/kubernetes.yaml ships probe settings whose
+	// arithmetic the default satisfies.
+	//
+	// It is a pointer because zero is a MEANING here and not an absence: a
+	// single node, a notebook, or anything not behind a balancer wants the
+	// listener closed at once, and `pre_stop_delay: 0` must say that rather
+	// than silently re-acquiring the default.
+	PreStopDelay *Duration `yaml:"pre_stop_delay,omitempty"`
 }
 
 // Storage selects the ledger and control-plane store (§9).
@@ -223,6 +247,16 @@ type TokenGuardTrigger struct {
 // RehashesOnUse reports whether a successful legacy verification schedules an
 // upgrade to the current scheme.
 func (a Auth) RehashesOnUse() bool { return a.RehashOnUse == nil || *a.RehashOnUse }
+
+// PreStop returns the pre-stop delay, answering for a Config that never went
+// through [Config.ApplyDefaults] as well as for one that did. An explicit zero
+// is honoured; only an absent key takes the default.
+func (s Server) PreStop() Duration {
+	if s.PreStopDelay == nil {
+		return Duration(defaultPreStopDelay)
+	}
+	return *s.PreStopDelay
+}
 
 // LegacyAuth enables the unsalted single-round digest scheme for a migration
 // window. It is a window, not an architecture: it requires an end date.

@@ -1024,3 +1024,62 @@ func TestVersionMustMatch(t *testing.T) {
 		t.Errorf("want an unsupported-version problem, got %v", err)
 	}
 }
+
+// TestPreStopDelayZeroIsNotAbsence pins the three-way distinction the pre-stop
+// delay needs and that a plain Duration cannot express (§13).
+//
+// The setting exists because a rolling restart must not close the listener
+// before the balancer has noticed the readiness flip. But `0` is a legitimate
+// answer — a single node, a workstation, anything with nothing routing to it —
+// and it is a DIFFERENT answer from "the file did not say", which must take the
+// default. Every other duration in this block treats zero as absence, which is
+// right when a zero would be nonsense and wrong here.
+func TestPreStopDelayZeroIsNotAbsence(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want time.Duration
+	}{
+		{"absent takes the default", "version: 1\n", defaultPreStopDelay},
+		{"an explicit zero is honoured", "version: 1\nserver: {pre_stop_delay: 0s}\n", 0},
+		{"a value is kept", "version: 1\nserver: {pre_stop_delay: 25s}\n", 25 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := LoadBytes([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if got := c.Server.PreStop().Duration(); got != tc.want {
+				t.Errorf("pre_stop_delay = %v, want %v", got, tc.want)
+			}
+			// ApplyDefaults must also have MATERIALISED the value, not merely
+			// left PreStop() to answer for a nil. `dorangctl config` renders the
+			// loaded Config as YAML, and a nil pointer is `omitempty` — the
+			// operator would read a rendered configuration with no
+			// pre_stop_delay in it and conclude there was none.
+			if c.Server.PreStopDelay == nil {
+				t.Error("the loaded configuration leaves pre_stop_delay unset, so a " +
+					"rendered configuration omits the value that is in effect")
+			}
+		})
+	}
+}
+
+// TestPreStopDelayRefusesNegative: a negative delay is not "no delay", it is a
+// typo, and it would silently skip the step that makes a rolling restart quiet.
+//
+// The refusal comes from the scalar parser rather than from validateServer,
+// which is why this asserts the outcome and not the message: validateServer
+// checks it too, and that check is the one that still holds for a Config a Go
+// caller assembled without going through YAML.
+func TestPreStopDelayRefusesNegative(t *testing.T) {
+	if _, err := LoadBytes([]byte("version: 1\nserver: {pre_stop_delay: -5s}\n")); err == nil {
+		t.Error("a negative pre_stop_delay loaded")
+	}
+	c := &Config{Version: Version}
+	c.Server.PreStopDelay = durPtr(-5 * time.Second)
+	c.ApplyDefaults()
+	if err := c.Validate(); err == nil {
+		t.Error("validateServer accepted a negative pre_stop_delay")
+	}
+}

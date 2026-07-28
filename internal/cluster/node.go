@@ -449,6 +449,32 @@ func (n *Node) Close(ctx context.Context) error {
 	if err := n.leases.Close(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	// Deregistration is LAST, and not beside the readiness flip at the top of
+	// the drain. That looks wrong -- the node advertises itself as live for the
+	// whole drain -- so here is why it is not, because the next reader will ask.
+	//
+	// Nothing routes off this table. DESIGN 13 makes the request path stateless
+	// and any node able to serve any request; what stops traffic arriving is the
+	// balancer reading /health/readiness, which went false at the start of the
+	// drain. The registry's readers are all coordination:
+	//
+	//   - [LeaseReclaimJob] walks [Registry.Dead] to reclaim the leases of a
+	//     node that stopped beating. The ROW is the handle for that. Deleting it
+	//     first would mean a drain interrupted between here and the top -- a
+	//     SIGKILL after the grace, a machine that goes away -- leaves leases the
+	//     leader can no longer attribute, recoverable only on their own TTL
+	//     through [Ledger.ReclaimExpired] rather than promptly.
+	//   - [Node.Accuracy] divides a limit by [Registry.Count], the number of
+	//     LIVE nodes, to publish the overshoot of DESIGN 5.6. A node that
+	//     deregistered while still holding its leases and still serving makes
+	//     every peer size its share as if it were gone, on top of a share it has
+	//     not yet returned. The published figure would then understate the real
+	//     overshoot, which is the one number 5.6 exists to keep honest.
+	//
+	// Both arguments say the same thing: readiness is the signal to the
+	// balancer and the registry row is the signal to the cluster, they answer
+	// different questions, and they correctly stop being true at different
+	// moments. The row goes away only once this node holds nothing.
 	if err := n.reg.Deregister(ctx); err != nil {
 		errs = append(errs, err)
 	}

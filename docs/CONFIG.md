@@ -252,6 +252,7 @@ server:
   key_pepper_env: DORANG_KEY_PEPPER
   request_timeout: 600s
   shutdown_grace: 30s
+  pre_stop_delay: 10s
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
@@ -262,6 +263,7 @@ server:
 | `key_pepper_env` | string | `DORANG_KEY_PEPPER` | Names the variable holding the HMAC pepper for `dorang_v1` key hashing | Empty is refused. **If the variable is unset, a pepper is generated once and written beside the SQLite database.** That keeps the zero-dependency notebook tier working, but the pepper travels with the database file — a multi-node deployment that does not set the variable will find each node issuing keys the others cannot verify |
 | `request_timeout` | duration | `600s` | The whole-request deadline. It also sets the capacity reservation's expiry (`request_timeout + 30s`), so a leaked goroutine cannot hold a slot forever | Zero or negative is refused. Too short truncates long generations; too long lets a wedged upstream hold a reservation for the whole window |
 | `shutdown_grace` | duration | `30s` | How long a drain waits for in-flight requests, and separately how long the post-drain teardown may take | Negative is refused. Shorter than your p99 request turns a rolling restart into visible errors: the process hard-closes and returns exit code 1 with `drain grace expired with requests still in flight` |
+| `pre_stop_delay` | duration | `10s` | How long the process keeps serving **after** readiness goes false and **before** the listener closes, so a polling load balancer has time to stop routing here (§13). Size it as `probe period × failure threshold + probe timeout + endpoint-withdrawal propagation`; `deploy/kubernetes.yaml`'s probes need 5s and the default leaves 5s of margin | Negative is refused. Too short and every rolling restart is connection-refused at the client for as long as the balancer takes to notice — the failure a graceful drain exists to prevent. `0` is explicit and legitimate: nothing is routing to a single node or a workstation, and an absent key takes the default rather than zero, so writing `0` really does mean none. A second SIGTERM also skips the wait |
 
 ---
 
