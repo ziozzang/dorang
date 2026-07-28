@@ -528,10 +528,13 @@ func (c *Config) validateCredentials(col *collector, providers map[string]*Provi
 	}
 }
 
-// oauthSources and oauthFormats are what `auth: oauth` accepts. They are spelled
-// here rather than imported from internal/auth because internal/config imports
-// no sibling (DESIGN §1); the two lists are held together by
-// TestConfigOAuthSpellingsMatchAuth, which fails when either side moves.
+// oauthSources, oauthFormats and oauthEncodes are what `auth: oauth` accepts.
+//
+// They are spelled here rather than imported from internal/auth because
+// internal/config imports no sibling (DESIGN §1). Two lists that can drift are
+// one list that is wrong, so they are held together by an executable check —
+// TestConfigAndAuthAgreeOnOAuthSpellings in internal/app, which is the place
+// both packages are already imported. It fails when either side moves.
 var (
 	oauthSources = []string{"file", "exec", "env"}
 	oauthFormats = []string{"claude", "codex", "gemini", "generic"}

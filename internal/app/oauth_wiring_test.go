@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/redact"
+	"github.com/ziozzang/dorang/internal/store"
 )
 
 // These are the assembled-stack assertions for DESIGN §11.2b.
@@ -99,6 +101,18 @@ func fakeTokenEndpoint(t *testing.T) (url string, calls func() int) {
 	}
 }
 
+// ownSpool keeps a test's trace spool in its own temporary directory.
+//
+// metering.spool.dir defaults to ~/.dorang/spool, so without this every
+// assembled-gateway test in this package writes its traces under the developer's
+// home directory and they accumulate there. It also makes the spool READABLE by
+// the artifact sweep below: a trace that has not reached the store yet is still
+// a record dorang wrote to disk.
+func ownSpool(t *testing.T) func(*config.Config) {
+	dir := t.TempDir()
+	return func(c *config.Config) { c.Metering.Spool.Dir = dir }
+}
+
 // oauthYAMLFor renders a one-credential gateway whose only credential
 // authenticates by OAuth.
 func oauthYAMLFor(upstream, store, tokenURL string) string {
@@ -146,7 +160,7 @@ func TestAnOAuthCredentialAuthorizesAnUpstreamRequest(t *testing.T) {
 	defer up.Close()
 
 	store := writeTokenStore(t, staleAccess, staleRefresh, time.Now().Add(time.Hour))
-	a := newWiringApp(t, oauthYAMLFor(up.URL, store, ""), nil,
+	a := newWiringApp(t, oauthYAMLFor(up.URL, store, ""), ownSpool(t),
 		func(o *Options) { o.Upstream = up.Client() })
 	secret := issueKey(t, a, nil)
 
@@ -187,7 +201,7 @@ func TestATokenIsRefreshedAheadOfExpiryAndTheNextRequestCarriesIt(t *testing.T) 
 	// is the point. A refresh that only happens after a token dies is the 401
 	// fallback, not the mechanism.
 	store := writeTokenStore(t, staleAccess, staleRefresh, time.Now().Add(30*time.Second))
-	a := newWiringApp(t, oauthYAMLFor(up.URL, store, tokenURL), nil,
+	a := newWiringApp(t, oauthYAMLFor(up.URL, store, tokenURL), ownSpool(t),
 		func(o *Options) { o.Upstream = up.Client() })
 	secret := issueKey(t, a, nil)
 
@@ -240,11 +254,19 @@ func TestATokenIsRefreshedAheadOfExpiryAndTheNextRequestCarriesIt(t *testing.T) 
 // collectSecrets reads the outbound HEADERS rather than the credential table. A
 // test that planted only the stored token would pass with that read broken.
 func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
+	var calls atomic.Int64
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The upstream echoes the credential it was given. Several
-		// OpenAI-compatible servers do exactly this on a 401, and it is the
-		// channel DESIGN §10.6 rule 4 exists for.
 		w.Header().Set("Content-Type", "application/json")
+		// The first request succeeds, so the ledger ends up with a settled row
+		// that names the credential — an artifact with something in it, rather
+		// than an empty table a sweep passes over.
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, chatOK)
+			return
+		}
+		// The second is refused with the credential echoed back. Several
+		// OpenAI-compatible servers do exactly this, and it is the channel
+		// DESIGN §10.6 rule 4 exists for.
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = fmt.Fprintf(w, `{"error":{"message":"Invalid credentials: %s","type":"invalid_request_error"}}`,
 			r.Header.Get("Authorization"))
@@ -256,7 +278,7 @@ func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
 
 	var logMu sync.Mutex
 	var logs strings.Builder
-	a := newWiringApp(t, oauthYAMLFor(up.URL, store, tokenURL), nil, func(o *Options) {
+	a := newWiringApp(t, oauthYAMLFor(up.URL, store, tokenURL), ownSpool(t), func(o *Options) {
 		o.Upstream = up.Client()
 		o.Logf = func(format string, args ...any) {
 			logMu.Lock()
@@ -269,6 +291,9 @@ func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
 	c, _ := a.OAuth.Credential("oauth-1")
 	waitFor(t, "the token to be renewed", func() bool { return c.Refreshes() >= 1 })
 
+	if ok := callWith(a, secret, http.MethodPost, "/v1/chat/completions", chatReq); ok.Code != http.StatusOK {
+		t.Fatalf("the first request answered %d: %s", ok.Code, ok.Body.String())
+	}
 	w := callWith(a, secret, http.MethodPost, "/v1/chat/completions", chatReq)
 	if w.Code == http.StatusOK {
 		t.Fatalf("the upstream 401 was served as a success")
@@ -282,7 +307,15 @@ func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
 	if err := a.Meter.Flush(context.Background()); err != nil {
 		t.Logf("meter flush: %v", err)
 	}
+	// A trace reaches the ledger through the spool on the meter's own schedule,
+	// not on Flush. The sweep waits for it rather than reading an empty database
+	// and calling it clean.
+	waitFor(t, "both requests' traces to reach the ledger", func() bool {
+		return a.Meter.Stats().TracesFlushed >= 2
+	})
 	dbBytes := readAll(t, a.Config().Storage.SQLite.Path)
+	spoolBytes := readDir(t, a.Config().Metering.Spool.Dir)
+	ledgerRows := readLedger(t, a, "key-"+secret)
 
 	snapshot := fmt.Sprintf("%v", a.OAuth.Snapshot())
 	manager := fmt.Sprintf("%v %+v %#v %s", a.OAuth, a.OAuth, a.OAuth, a.OAuth)
@@ -300,6 +333,8 @@ func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
 		{"a formatted CredentialHealth", health},
 		{"the metrics page", metricsPage},
 		{"the ledger database", dbBytes},
+		{"the trace spool", spoolBytes},
+		{"the ledger rows themselves", ledgerRows},
 	} {
 		for _, tok := range []string{freshAccess, freshRefresh, staleAccess, staleRefresh} {
 			if redact.Contains(artifact.body, tok) {
@@ -318,10 +353,84 @@ func TestAnOAuthTokenReachesNoArtifact(t *testing.T) {
 			t.Errorf("the snapshot does not report the credential at all")
 		}
 	}
+	// The metric family has to be published, or grepping the page for a token
+	// asserts nothing: an absent family carries no labels at all.
+	if !strings.Contains(metricsPage, "dorang_oauth") {
+		t.Errorf("the metrics page publishes no oauth family, so the label sweep above is " +
+			"vacuous: a deployment with OAuth credentials has no way to see a refresh loop " +
+			"that has been failing for three days")
+	}
+	if !strings.Contains(metricsPage, "oauth-1") {
+		t.Errorf("the metrics page does not carry the credential's opaque id, which is what " +
+			"an alert has to be keyed on")
+	}
+	// The ledger has to hold a row naming this credential, or grepping the
+	// database for a token is grepping an empty table.
+	//
+	// What that row does NOT contain is the upstream's own error text:
+	// internal/server puts it on Result.NativeErrorMessage and nothing in this
+	// package reads it, so today no upstream message reaches a ledger row at
+	// all. The live channel for a relayed upstream body is internal/backend's
+	// ErrorBody, which the batch path writes into a file the client downloads,
+	// and the refreshed token is asserted absent from THAT where it lives — see
+	// TestARefreshedOAuthTokenIsScrubbedFromARelayedErrorBody in internal/backend.
+	// Saying so beats an assertion that passes because the artifact is empty.
+	if !strings.Contains(ledgerRows, "oauth-1") {
+		t.Errorf("no ledger row names the credential, so the ledger sweep above is vacuous:\n%s",
+			ledgerRows)
+	}
 	if !strings.Contains(snapshot, "oauth-1") {
 		t.Errorf("the snapshot does not carry the credential's opaque id, which is the one "+
 			"thing that is supposed to leave the subsystem: %s", snapshot)
 	}
+}
+
+// readLedger renders every ledger row of the last hour, read back through the
+// store's own query rather than by grepping the database file: a column dorang
+// wrote is only an artifact if something can read it out again.
+func readLedger(t *testing.T, a *App, keyID string) string {
+	t.Helper()
+	now := a.now()
+	page, err := a.Store.ListRequestsByKey(context.Background(), keyID,
+		store.TimeRange{Start: now.Add(-time.Hour), End: now.Add(time.Hour)}, store.Page{Limit: 50})
+	if err != nil {
+		t.Fatalf("ListRequestsByKey: %v", err)
+	}
+	var b strings.Builder
+	for _, row := range page.Rows {
+		fmt.Fprintf(&b, "%+v\n", row)
+	}
+	if b.Len() == 0 {
+		t.Fatal("the ledger holds no row for a request that completed, so the sweep over " +
+			"it would pass vacuously")
+	}
+	return b.String()
+}
+
+// readDir returns every file in a directory concatenated, so a sweep can grep a
+// spool without knowing its segment naming.
+func readDir(t *testing.T, dir string) string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("the trace spool at %s cannot be read: %v", dir, err)
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		b.Write(data)
+	}
+	// An empty spool is not a failure here: the meter drains it into the ledger,
+	// which is the artifact the assertion below actually requires to be
+	// populated. This one is swept because a trace that has not been drained yet
+	// is still a record dorang wrote to disk.
+	return b.String()
 }
 
 // readAll returns a file's bytes as a string, and every sibling SQLite writes
@@ -374,9 +483,14 @@ func TestAffinitySurvivesARefresh(t *testing.T) {
 		return srv.URL
 	}
 
+	// round_robin, so that the credential the router would choose on its OWN
+	// advances between requests. Without it both requests land on the first
+	// credential whatever the pin says, and "the pin survived" is unobservable —
+	// a test that passes with the pin's credential thrown away entirely.
 	yaml := fmt.Sprintf(`
 version: 1
 observability: {always_full_headers: true}
+key_rotation: {strategy: round_robin}
 routing:
   sticky: {enabled: true, ttl: 10m}
 providers:
@@ -405,7 +519,7 @@ models:
       - {provider: p1, upstream_model: m1-upstream, credentials: [oauth-a, oauth-b]}
 `, up.URL, storeA, mint("oauth-a"), storeB, mint("oauth-b"))
 
-	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	a := newWiringApp(t, yaml, ownSpool(t), func(o *Options) { o.Upstream = up.Client() })
 	secret := issueKey(t, a, nil)
 
 	call := func() *httptest.ResponseRecorder {
@@ -422,6 +536,21 @@ models:
 		t.Fatalf("first request: %d %s", first.Code, first.Body.String())
 	}
 	pinned := first.Header().Get("X-Dorang-Credential")
+
+	// An unpinned session on the same gateway moves, which is what makes the
+	// pinned one's stability a claim about the pin rather than about the router
+	// happening to be deterministic.
+	unpinned := func() string {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatReq))
+		r.Header.Set("Authorization", "Bearer "+secret)
+		w := httptest.NewRecorder()
+		a.Server.ServeHTTP(w, r)
+		return w.Header().Get("X-Dorang-Credential")
+	}
+	if a1, a2 := unpinned(), unpinned(); a1 == a2 {
+		t.Fatalf("two sessionless requests both chose credential %q, so the rotation is not "+
+			"moving and this test cannot tell a pin from a coincidence", a1)
+	}
 	if pinned == "" {
 		t.Fatalf("the response does not report which credential served, so this test "+
 			"cannot observe a pin at all\n%v", first.Header())
@@ -454,15 +583,16 @@ models:
 	mu.Lock()
 	got := append([]string(nil), seen...)
 	mu.Unlock()
-	if len(got) != 2 {
-		t.Fatalf("the upstream saw %d requests, want 2", len(got))
+	if len(got) == 0 {
+		t.Fatal("the upstream saw nothing")
 	}
-	if got[0] == got[1] {
-		t.Fatalf("the second request carried the same token as the first, so nothing was "+
-			"actually renewed and this test proves nothing: %q", got[0])
+	last := got[len(got)-1]
+	if last == got[0] {
+		t.Fatalf("the request after the refresh carried the same token as the first, so "+
+			"nothing was actually renewed and this test proves nothing: %q", last)
 	}
-	if want := "Bearer " + pinned + "-renewed-access-token"; got[1] != want {
-		t.Fatalf("after the refresh the upstream received %q, want %q", got[1], want)
+	if want := "Bearer " + pinned + "-renewed-access-token"; last != want {
+		t.Fatalf("after the refresh the upstream received %q, want %q", last, want)
 	}
 }
 
@@ -479,7 +609,7 @@ func TestTheOAuthCredentialSetIsNotHotReloaded(t *testing.T) {
 
 	store := writeTokenStore(t, staleAccess, staleRefresh, time.Now().Add(time.Hour))
 	yaml := oauthYAMLFor(up.URL, store, "")
-	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	a := newWiringApp(t, yaml, ownSpool(t), func(o *Options) { o.Upstream = up.Client() })
 
 	// An unrelated edit still reloads.
 	same, err := config.LoadBytes([]byte(yaml))

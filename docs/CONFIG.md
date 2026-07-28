@@ -87,7 +87,7 @@ absence, and the validator treats it as one.
 
 The shortest working file is `version: 1` plus `providers`, `credentials` and `models`.
 
-### 0.5 Hot reload — and the one section that does not
+### 0.5 Hot reload — and the two sections that do not
 
 The configuration reloads on a change to the file, on `SIGHUP`, and through the admin reload
 endpoint. The file is stat'ed every 2 seconds; a rename-into-place — which is how most editors
@@ -111,6 +111,13 @@ Three properties worth relying on:
 its report handle are per-process state. Rebuilding them re-arms the ceiling, which turns
 "$5 per day" into "$5 per `SIGHUP`". A changed `shadow` section is **refused**, and the running
 configuration is kept.
+
+⚠️ **The set of `auth: oauth` credentials does not hot-reload either**, for the same class of
+reason (§7.2). Each one holds an access token in memory, the consecutive-failure count that
+paces its backoff, and one background refresh loop started once. Rebuilding them on `SIGHUP`
+would re-read every store and re-arm the backoff of any account that is already failing. A
+reload that adds, removes or moves one is **refused** with a message saying to restart; a reload
+that leaves the set alone applies normally.
 
 ### 0.6 Checking a file before it serves anything
 
@@ -439,7 +446,9 @@ credentials:
 |---|---|---|---|---|
 | `id` | string | — | The credential's identity. It is **not secret**: it appears in routing decisions, metrics, headers and errors | Empty or duplicate is refused |
 | `provider` | string | — | Which provider this identity authenticates at | Must name a declared provider. A deployment that lists a credential belonging to another provider is refused, by name |
+| `auth` | `key` \| `oauth` | `key` | How this credential authenticates | Anything else is refused. `oauth` without an `oauth` block is refused, and so is an `oauth` block without `auth: oauth` |
 | `key_env` / `key_file` / `key` | secret ref | — | Where the secret comes from (§0.3) | Zero or two or more sources is refused. `key_ref` is refused outright |
+| `oauth` | block | — | §7.2. Only for `auth: oauth` | A credential that sets **both** a key and an `oauth` block is refused: they are alternatives, and resolving them by precedence is how a deployment sends the wrong credential with nothing in the file to explain it |
 | `capacity_group` | string | `""` | Membership in the `credential_group` axis — per account, across every model that account can serve | A group not declared under `capacity.credential_groups` is refused |
 
 > **Key material may be declared twice and the schema does not say which wins.** The same
@@ -448,6 +457,76 @@ credentials:
 > what makes the example configuration's split — provider binding in one place, concurrency
 > ceiling in the other — mean what it says. If both carry a *different* secret, the resolution
 > order is unspecified. Declare the secret once.
+
+### 7.2 `oauth` — an account that authenticates with a token, not a key
+
+Some providers sell a subscription rather than an API key, and the thing that authenticates is
+an OAuth access token that expires in under an hour. The token already exists on any machine
+running the vendor's own CLI, so a credential **points at that CLI's store** rather than
+starting a second authorization flow on a server.
+
+```yaml
+credentials:
+  - id: plan-oauth-1
+    provider: plan-a
+    auth: oauth
+    oauth:
+      source: file                          # file | exec | env
+      path: /path/to/the/vendor/auth.json   # the CLI's own store; a leading ~/ expands
+      format: codex                         # generic | codex | claude | gemini
+      account_header: chatgpt-account-id    # where the provider wants the account id
+      refresh_margin: 5m
+      refresh:                              # OPTIONAL — see below
+        token_url: https://auth.example.com/oauth/token
+        client_id: the-cli-s-published-client-id
+        key_env: DORANG_PLAN_A_CLIENT_SECRET   # omit for a public (PKCE) client
+        encoding: form                      # form | json
+```
+
+| Key | Type | Default | What it does | What breaks if it is wrong |
+|---|---|---|---|---|
+| `source` | `file` \| `exec` \| `env` | `file` | Where the token is read from. `file` is the only one dorang can write back to | An unknown source is refused. A `file` source with no `path`, an `exec` with no `command`, an `env` with no `env_var` are each refused by name |
+| `path` | path | — | The store, for `source: file`. It is a **reference**: no token is ever written into the configuration | Unreadable at start-up marks the credential unhealthy rather than failing the start — one account's missing file must not take the other accounts down |
+| `command` | list | — | The argv, for `source: exec` | Read-only: the command owns the token |
+| `env_var` | string | — | The variable, for `source: env` | Read-only: the environment owns the token |
+| `format` | `generic` \| `codex` \| `claude` \| `gemini` | `generic` | The store's key layout | An unknown format is refused, naming the ones this build understands |
+| `access_token_field` / `refresh_token_field` / `expires_at_field` / `account_id_field` | string | the format's | Override one of the format's key names. A dotted path — `tokens.access_token` — reaches into a nested object | A name that resolves to nothing is a field the store does not have, not an error |
+| `account_header` | header name | `""` | Where the account id travels, for providers that want one alongside the token | Empty means it is not sent |
+| `refresh_margin` | duration | `5m` | How far ahead of expiry the token is renewed | A refresh that only happens after a token dies is the 401 fallback, not the mechanism |
+| `poll_interval` | duration | `30s` | How often the loop checks the clock. Clamped to a quarter of `refresh_margin` | A poll slower than the margin steps over the whole window |
+| `exec_timeout` | duration | `10s` | Bounds a `source: exec` command | — |
+| `refresh.token_url` | https URL | — | The RFC 6749 token endpoint. **Setting it is what turns refresh on** | Plain `http` is refused: the body of a refresh is a refresh token |
+| `refresh.client_id` | string | — | The OAuth client. Required whenever `token_url` is set | — |
+| `refresh.key_env` / `key_file` / `key` | secret ref | — | The client secret, spelled like every other secret (§0.3). Omit for a public client | Set with no `token_url` is refused |
+| `refresh.scope` | string | `""` | Sent when non-empty | — |
+| `refresh.encoding` | `form` \| `json` | `form` | The request body's spelling. Most endpoints take `form`; some vendors require `json` | An unknown encoding is refused |
+| `refresh.timeout` | duration | `30s` | Bounds one exchange | — |
+
+**Refresh is opt-in, and the default is the safe one.** With no `refresh` block dorang reads the
+store, adopts whatever the vendor's CLI last wrote there, and **never writes**. A refresh token
+is spent only where an operator has said where to spend it. With a `refresh` block, renewal
+happens on a background loop ahead of expiry, the exchange is single-flight per credential, and
+the successor is written back atomically with every key dorang does not own preserved — the file
+belongs to the CLI, and a write that dropped one of its keys would break it in a way nobody
+would attribute to a gateway.
+
+**dorang refreshes credentials; it does not mint them.** Acquiring a *first* refresh token is an
+interactive, browser-bound flow with a redirect dorang has nowhere to host. Sign in with the
+vendor's CLI, then point a credential at the store it wrote.
+
+**A store with no expiry field.** One of the supported layouts carries none at all, and a token
+with no expiry is never renewed ahead of time — which would leave the whole feature resting on
+the 401 fallback. For that layout the expiry is read from the access token's own JWT `exp`
+claim. The claim is read, never verified: dorang is not the audience and holds no key.
+
+**The credential set does not hot-reload.** Each one holds a token, a backoff and a background
+loop established at start-up, so a reload that adds, removes or moves an OAuth credential is
+**refused** with a message saying to restart. Everything else in the file still reloads. See
+§0.5, which lists the other section that cannot.
+
+**Tokens are secrets (§0.3, DESIGN §4.1).** Nothing that leaves this subsystem can carry one:
+the id and the health are the whole of it. What is in the configuration file is a *path* and a
+*client id*, never a token.
 
 ### 7.1 Credential affinity is a correctness constraint, not a cache optimization
 
