@@ -227,8 +227,42 @@ func (s *Service) checkMetadata(md map[string]string) error {
 }
 
 // ownedBy reports whether a caller scoped to owner may see a record owned by
-// recordOwner. An empty owner is an administrative caller and sees everything;
-// an unowned record is visible to anyone who can name it.
+// recordOwner.
+//
+// # The decision, and why it went this way
+//
+// This function used to read `recordOwner == ""` as "visible to anyone who can
+// name it". That is a live cross-tenant access, not a theoretical one: an
+// upload by the master credential produced exactly such a record, because
+// `principalID` returned "" for a credential that by construction has no row.
+// Any ordinary `sk-` key could then read, use and DELETE that file and any
+// batch built from it.
+//
+// There were two ways to close it — treat an unowned record as owned by the
+// master credential and readable only by it, or make uploads always record an
+// owner. Uploads always record an owner. The reasoning:
+//
+//   - It fixes the CAUSE. The first option leaves the write path producing
+//     rows with no owner and adds a rule elsewhere for reading them, which is
+//     one more invariant that has to be remembered at every future call site.
+//     internal/app now names the master credential explicitly, so the row that
+//     used to be unowned is owned by the identity that created it.
+//   - It does not attribute anything falsely. "Unowned means the master
+//     credential's" would relabel every legacy row — imported, hand-inserted,
+//     written by a version that predates this rule — as something the master
+//     credential did. That is a lie in an audit sense, and the audit trail is
+//     one of the things this surface exists to keep honest.
+//
+// What is left is the residue: rows that already have an empty owner. They are
+// now visible only to an ADMINISTRATIVE caller (owner == ""), never to a tenant
+// key. That is the fail-closed reading, and the behaviour change it can cause —
+// a deployment with unowned imported records whose tenants could previously
+// read them — is a deployment where those tenants were reading records that
+// were never theirs.
+//
+// owner == "" still means "an administrative caller, sees everything". It is
+// the internal-call and operator case, and it is a caller this package cannot
+// reach without a deliberate empty argument.
 func ownedBy(recordOwner, owner string) bool {
-	return owner == "" || recordOwner == "" || recordOwner == owner
+	return owner == "" || recordOwner == owner
 }

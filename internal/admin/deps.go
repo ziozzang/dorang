@@ -35,6 +35,14 @@ type Principal interface {
 	// role is not on the key — it is on the owning user (users.role) — so the
 	// join is the adapter's business, not this package's.
 	IsAdmin() bool
+	// AdminScope bounds what this administrator may see and change. It is a
+	// required method rather than an optional interface: an implementation
+	// that does not answer would have to be given a default, and the only
+	// available defaults are "everything" — which is the finding — or
+	// "nothing", which is a surface that silently stops working. Making it
+	// part of the interface means a new Principal cannot compile without an
+	// answer. See [Scope].
+	AdminScope() Scope
 }
 
 // Authenticator resolves a request's credentials to a [Principal].

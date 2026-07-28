@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -463,6 +464,16 @@ func TestOversizedUpstreamResponseIsRefused(t *testing.T) {
 	if res.Err == nil {
 		t.Fatal("a response past the ceiling was buffered and served: the read is unbounded")
 	}
+	// The bound is on the READ, not on what is returned. readUpstreamBody is
+	// checked directly for that, because an implementation that reads the whole
+	// body and then measures it produces the same error and none of the safety.
+	src := &countingReader{r: strings.NewReader(strings.Repeat("z", limit*4))}
+	if _, err := readUpstreamBody(src, limit); err == nil {
+		t.Fatal("readUpstreamBody accepted a body past the ceiling")
+	} else if src.n > limit+1 {
+		t.Fatalf("read %d bytes under a %d byte ceiling: the read is unbounded, "+
+			"the refusal merely happens afterwards", src.n, limit)
+	}
 	if res.Err.Code != CodeUpstreamTooLarge {
 		t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamTooLarge)
 	}
@@ -514,4 +525,16 @@ func TestUnreachableUpstreamDoesNotNameInternalHosts(t *testing.T) {
 	if strings.Contains(string(server.EncodeError(res.Err)), addr) {
 		t.Errorf("the rendered envelope names the upstream address")
 	}
+}
+
+// countingReader records how many bytes a reader was actually asked for.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }

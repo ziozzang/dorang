@@ -51,16 +51,22 @@ type fakePrincipal struct {
 	kind  string
 	id    string
 	admin bool
+	scope Scope
 }
 
 func (p fakePrincipal) ActorKind() string { return p.kind }
 func (p fakePrincipal) ActorID() string   { return p.id }
 func (p fakePrincipal) IsAdmin() bool     { return p.admin }
+func (p fakePrincipal) AdminScope() Scope { return p.scope }
 
 const (
 	masterToken = "master-secret"
 	adminToken  = "sk-admin-key"  // pragma: allowlist secret — test fixture
 	userToken   = "sk-plain-user" // pragma: allowlist secret — test fixture
+	// teamAToken is an administrative key that belongs to team-a. It is a full
+	// administrator by role and a team administrator by scope, which is the
+	// combination every scope test is about.
+	teamAToken = "sk-team-a-admin" // pragma: allowlist secret — test fixture
 )
 
 type fakeAuth struct{}
@@ -72,9 +78,12 @@ func (fakeAuth) AuthenticateHeader(_ context.Context, h http.Header) (Principal,
 	}
 	switch tok {
 	case masterToken:
-		return fakePrincipal{kind: "master", id: "", admin: true}, nil
+		return fakePrincipal{kind: "master", id: "", admin: true, scope: GlobalScope()}, nil
 	case adminToken:
-		return fakePrincipal{kind: "key", id: "key-admin", admin: true}, nil
+		return fakePrincipal{kind: "key", id: "key-admin", admin: true, scope: GlobalScope()}, nil
+	case teamAToken:
+		return fakePrincipal{kind: "key", id: "key-team-a", admin: true,
+			scope: TeamScope("team-a")}, nil
 	case userToken:
 		return fakePrincipal{kind: "key", id: "key-user", admin: false}, nil
 	}

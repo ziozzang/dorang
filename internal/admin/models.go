@@ -162,6 +162,12 @@ func (s *deploymentSpec) apply(d *Deployment) error {
 
 // POST /model/new
 func (c *call) modelNew() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of creating a deployment, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("creating a deployment"); err != nil {
+		return err
+	}
 	reg, err := c.a.models()
 	if err != nil {
 		return err
@@ -217,6 +223,12 @@ func (c *call) modelNew() error {
 // With no id it lists every deployment, which is what the incumbent's
 // /model/info does and what the UI needs; with one it returns that deployment.
 func (c *call) modelInfo() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of reading the deployment table, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("reading the deployment table"); err != nil {
+		return err
+	}
 	reg, err := c.a.models()
 	if err != nil {
 		return err
@@ -254,6 +266,12 @@ func (c *call) modelInfo() error {
 
 // POST /model/update
 func (c *call) modelUpdate() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of changing a deployment, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("changing a deployment"); err != nil {
+		return err
+	}
 	reg, err := c.a.models()
 	if err != nil {
 		return err
@@ -295,6 +313,12 @@ func (c *call) modelUpdate() error {
 
 // POST /model/delete
 func (c *call) modelDelete() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of deleting a deployment, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("deleting a deployment"); err != nil {
+		return err
+	}
 	reg, err := c.a.models()
 	if err != nil {
 		return err
@@ -347,6 +371,12 @@ type modelGroupView struct {
 
 // GET|POST /model_group/info
 func (c *call) modelGroupInfo() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of reading the deployment table, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("reading the deployment table"); err != nil {
+		return err
+	}
 	reg, err := c.a.models()
 	if err != nil {
 		return err

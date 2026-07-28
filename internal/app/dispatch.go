@@ -978,9 +978,31 @@ func (d *dispatcher) defaultMaxTokens(dec *router.Decision) int {
 	return st.catalog.Model(dec.Kind, dec.UpstreamModel).MaxOutputTokens
 }
 
+// MasterOwnerID is the owner recorded for an object the master credential
+// created.
+//
+// The master credential has no api_keys row by construction (DESIGN §2.4), so
+// its KeyID() is "". Writing that into a record's OwnerKeyID produced an
+// UNOWNED object, and batch.ownedBy used to read an unowned object as public —
+// every `sk-` key in the deployment could read, use and delete a file the
+// operator had uploaded. The identity has to be a real string for the ownership
+// comparison to mean anything.
+//
+// The "master:" prefix cannot collide with a key id: key ids are generated
+// identifiers and this one contains a colon, which none of them does.
+const MasterOwnerID = "master:credential"
+
+// principalID names the owner of an object this request creates.
+//
+// A request with no principal returns "" and that is deliberate: it is an
+// internal or unauthenticated path, it creates nothing, and an object it did
+// create would be refused a reader rather than handed to all of them.
 func principalID(rq *server.Request) string {
 	if rq.Principal == nil {
 		return ""
+	}
+	if m, ok := rq.Principal.(interface{ IsMaster() bool }); ok && m.IsMaster() {
+		return MasterOwnerID
 	}
 	return rq.Principal.KeyID()
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -492,13 +493,22 @@ func TestOversizedUpstreamResponseIsRefused(t *testing.T) {
 	const limit = 64 << 10
 	body := strings.Repeat("x", limit*4)
 
-	got, err := readUpstreamBody(strings.NewReader(body), limit)
+	// The reader counts. Asserting only that the call FAILS would pass against
+	// an implementation that reads the whole body and then measures it, which
+	// is not the property: the finding was a remote OOM, so the bytes must not
+	// be read, not merely not returned.
+	src := &countingReader{r: strings.NewReader(body)}
+	got, err := readUpstreamBody(src, limit)
 	if err == nil {
 		t.Fatalf("a %d byte answer was buffered whole under a %d byte ceiling (%d read)",
 			len(body), limit, len(got))
 	}
 	if err != errUpstreamTooLarge {
 		t.Fatalf("err = %v, want errUpstreamTooLarge", err)
+	}
+	if src.n > limit+1 {
+		t.Fatalf("read %d bytes under a %d byte ceiling: the read is unbounded, "+
+			"the refusal merely happens afterwards", src.n, limit)
 	}
 
 	// A body at exactly the ceiling is fine; the bound is not off by one.
@@ -713,4 +723,49 @@ func TestUnreachableUpstreamDoesNotNameInternalHosts(t *testing.T) {
 // can build a *call the dispatcher would have built.
 func openaiDecodeForTest(body []byte) (*canonical.Request, error) {
 	return openai.DecodeRequest(body)
+}
+
+// countingReader records how many bytes a reader was actually asked for. It is
+// how a "bounded read" test tells a bound from a post-hoc length check.
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+// The master credential owns what it creates.
+//
+// The write half of batch.ownedBy's finding. The master credential has no
+// api_keys row, so its KeyID is "" — and principalID wrote that empty string
+// into every file and batch it created. batch.ownedBy read an empty owner as
+// "everyone's", so a master-credential upload was readable, usable and
+// deletable by every `sk-` key in the deployment. Fixing only the read side
+// would have left the write side producing rows that need a special rule
+// somewhere else forever.
+func TestTheMasterCredentialOwnsWhatItCreates(t *testing.T) {
+	master := &principal{p: &auth.Principal{Master: true}}
+	rq := &server.Request{Principal: master}
+	if got := principalID(rq); got != MasterOwnerID {
+		t.Fatalf("principalID for the master credential = %q, want %q: an object it "+
+			"creates is unowned, and batch.ownedBy used to read unowned as public",
+			got, MasterOwnerID)
+	}
+	// The reserved id cannot be a key id: key ids carry no colon.
+	if !strings.Contains(MasterOwnerID, ":") {
+		t.Error("the master owner id must be unforgeable as a key id")
+	}
+	// An ordinary key is unchanged.
+	ord := &principal{p: &auth.Principal{KeyID: "key-7"}}
+	if got := principalID(&server.Request{Principal: ord}); got != "key-7" {
+		t.Errorf("principalID for an ordinary key = %q, want key-7", got)
+	}
+	// No principal is still "", which creates nothing.
+	if got := principalID(&server.Request{}); got != "" {
+		t.Errorf("principalID with no principal = %q, want empty", got)
+	}
 }
