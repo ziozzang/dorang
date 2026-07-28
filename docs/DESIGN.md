@@ -2072,7 +2072,67 @@ browsing, the price calculator, and batch management follow.
 
 Both the shape-compatible paths (§2.3) and a native admin API.
 
-### 11.5 Email and Lua extension
+### 11.5 Events, webhooks, and the Lua plugin surface
+
+#### Events are a bus with sinks, not an email system
+
+The notification surface is an **event bus**; email is one sink and a webhook is another.
+Framing it the other way round produces a design where the webhook is an afterthought with
+weaker guarantees than the mail it was bolted onto.
+
+```yaml
+notifications:
+  events: [key_created, budget_80pct, budget_exceeded, quota_exhausted,
+           credential_unhealthy, batch_completed, invite]
+  sinks:
+    - { kind: webhook, url: …, secret_env: DORANG_WEBHOOK_SECRET, events: [budget_*, quota_exhausted] }
+    - { kind: smtp,    …,                                          events: [invite, key_created] }
+    - { kind: lua,     handler: on_event }
+```
+
+Several sinks may take the same event. Four rules, each closing a way this goes wrong:
+
+1. **A webhook delivery is signed.** HMAC over the body with a per-endpoint secret, in a
+   header. A delivery carrying budget and quota state is an information leak the moment the
+   URL is reachable by anything else, and the receiver otherwise has no way to distinguish a
+   real delivery from a forged one.
+2. **At-least-once with an idempotency key**, bounded retries with backoff, and a visible
+   dead-letter count. A receiver that is down must not become dorang's problem: bounded queue,
+   counted drops, and **never on the request path** — a budget crossing 80% is *discovered*
+   while serving a request; the notification about it is not sent there.
+3. **No secret in a payload.** A `key_created` event carries the key's id and label, never the
+   key. Same rule as §2.4's refusal to copy a display column that leaked trailing characters.
+4. **Deduplicate per subject per period.** `budget_80pct` is true on every request past the
+   threshold, so without this it fires on every request — the difference between an alert and
+   a filter rule someone writes to make it stop.
+
+#### Lua is the extension mechanism, and the reason is plugins
+
+The hooks could have been a fixed set of Go callbacks. Lua is chosen deliberately: it is
+small, fast, and embeds cleanly, and it is what makes a **plugin structure** possible — an
+operator drops in a file that registers handlers, rather than the gateway shipping every
+policy anyone might want.
+
+This is the project's first non-trivial runtime dependency, so the constraint that keeps §0.2
+true is explicit: **the VM must be pure Go**. A cgo interpreter would break the static binary
+that makes the notebook tier's "zero required dependencies" literal rather than aspirational.
+
+Hooks: `on_request`, `on_route`, `on_response`, `on_event`.
+
+- **Loading is explicit configuration**, never a scan of a writable directory. A plugin
+  mechanism that picks up whatever appears in a path is a code-execution primitive.
+- **The value shape is versioned.** A plugin written against today's `on_request` keeps
+  working, or is told plainly that it does not.
+- **A plugin is untrusted code inside the process that holds provider credentials.** No
+  credential, token, or key material is reachable from any hook, and that is tested
+  adversarially rather than assumed — a plugin author need not be hostile for this to matter.
+- Instruction, memory, and wall-clock ceilings are enforced **by the host**, not by
+  cooperation. Disabled by default on the hot path, where the cost must be an untaken branch.
+- **Fail-open on a limit breach; fail-closed only on an explicit deny from `on_request`.**
+  A broken extension must not take the gateway down, and a policy that says no must be obeyed.
+  That asymmetry is the whole safety argument.
+
+### 11.5a Email driver detail
 
 ```yaml
 notifications:
