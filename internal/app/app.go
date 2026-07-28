@@ -30,6 +30,7 @@ import (
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
+	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/health"
 	"github.com/ziozzang/dorang/internal/meter"
@@ -37,6 +38,7 @@ import (
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
+	"github.com/ziozzang/dorang/internal/shadow"
 	"github.com/ziozzang/dorang/internal/store"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
@@ -63,6 +65,11 @@ type Options struct {
 
 	// SkipMigrate opens the store without applying migrations.
 	SkipMigrate bool
+
+	// BudgetBlockNanoUSD is the lease size of the durable budget (DESIGN §9.6).
+	// Zero uses [DefaultBudgetBlockNanoUSD]. It trades store traffic against
+	// the maximum overshoot §5.6 requires to be publishable as a number.
+	BudgetBlockNanoUSD int64
 }
 
 // App is one assembled gateway. Every exported field is the live subsystem, so
@@ -79,6 +86,12 @@ type App struct {
 	Meter    *meter.Meter
 	Server   *server.Server
 	Batch    *batch.Service
+	// Ledger is the durable budget and quota counter of DESIGN §9.6. It is on
+	// the request path: the gate reserves against it before every upstream call.
+	Ledger *cluster.Ledger
+	// Shadow compares a sampled fraction of traffic against a reference gateway
+	// (DESIGN §14.1). Nil when shadow.mode is off, which is the default.
+	Shadow *shadow.Shadower
 
 	opts     Options
 	cfg      atomic.Pointer[config.Config]
@@ -86,6 +99,7 @@ type App struct {
 	targets  *batchResolver
 	models   *modelList
 	quota    *quotaSet
+	budget   *budgetGate
 
 	logf func(string, ...any)
 	now  func() time.Time
@@ -173,6 +187,26 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 	a.quota = qs
 
+	// 3a. The durable budget (DESIGN §9.6, risk W9). It is built before the
+	//     dispatcher because the dispatcher's gate reserves against it, and it
+	//     is built from the store rather than from memory because a budget that
+	//     resets on restart is a budget that is not enforced.
+	block := opts.BudgetBlockNanoUSD
+	if block <= 0 {
+		block = DefaultBudgetBlockNanoUSD
+	}
+	ledger, err := cluster.NewLedger(cluster.LedgerConfig{
+		Store:  st,
+		NodeID: nodeID(cfg),
+		Block:  block,
+		Now:    a.now,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: budget ledger: %w", err)
+	}
+	a.Ledger = ledger
+	a.budget = &budgetGate{ledger: ledger, now: a.now}
+
 	// 4. Gate.
 	master := os.Getenv(cfg.Server.MasterKeyEnv)
 	legacy, err := legacyPolicy(cfg)
@@ -236,6 +270,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		catalog:   cat,
 		upstreams: up,
 		quota:     qs,
+		budget:    a.budget,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -244,6 +279,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	// 7. Batch. Its Store, Blobs, Executor, Reserver and ModelResolver are all
 	//    interfaces internal/batch declares; the adapters are in batch.go.
 	if err := a.startBatch(cfg, up); err != nil {
+		return nil, err
+	}
+
+	// 7b. Shadow comparison (DESIGN §14.1). It is built before the HTTP surface
+	//     because the surface holds it, and it is nil for the default `off`
+	//     mode — a deployment that is not migrating pays nothing for it.
+	if a.Shadow, err = buildShadow(cfg, a.logf); err != nil {
 		return nil, err
 	}
 
@@ -273,9 +315,22 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.Catalog),
 		Routes:            a.batchRoutes(),
+		Observer:          shadowObserver(a.Shadow),
+		CaptureHeadBytes:  int(cfg.Shadow.Capture.HeadBytes.Bytes()),
+		CaptureTailBytes:  int(cfg.Shadow.Capture.TailBytes.Bytes()),
 		Now:               a.now,
 		Logf:              a.logf,
 	}
+}
+
+// shadowObserver hands the server a nil interface rather than a typed nil when
+// shadowing is off. A typed nil in an interface is non-nil, and the server's
+// "is an observer configured" check is a nil test on the hot path.
+func shadowObserver(s *shadow.Shadower) server.Observer {
+	if s == nil {
+		return nil
+	}
+	return s
 }
 
 // Reload swaps in a new configuration (DESIGN §4.1, §13).
@@ -316,6 +371,14 @@ func (a *App) Reload(cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
+	// §4.1 says every section hot-reloads. The shadow section is the one that
+	// cannot: its daily cost ceiling, its sampled set and its report are
+	// per-process state, and rebuilding them on every reload would rearm the
+	// ceiling every reload — turning "five dollars a day" into five dollars per
+	// SIGHUP. A change is refused rather than silently applied wrongly.
+	if err := checkShadowUnchanged(a.cfg.Load(), cfg); err != nil {
+		return err
+	}
 
 	a.dispatch.swap(&dispatchState{
 		router:    rt,
@@ -323,6 +386,7 @@ func (a *App) Reload(cfg *config.Config) error {
 		catalog:   cat,
 		upstreams: up,
 		quota:     qs,
+		budget:    a.budget,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -339,8 +403,8 @@ func (a *App) Reload(cfg *config.Config) error {
 }
 
 // startBackground runs the periodic sweeps that are nobody's request path:
-// expired sticky pins, expired capacity reservations, and — on PostgreSQL —
-// tomorrow's ledger partitions.
+// expired sticky pins, expired capacity reservations, budget-lease renewal, and
+// — on PostgreSQL — tomorrow's ledger partitions.
 func (a *App) startBackground() {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.bgCancel = cancel
@@ -349,14 +413,29 @@ func (a *App) startBackground() {
 	if purge <= 0 {
 		purge = 5 * time.Minute
 	}
+	// The budget lease is renewed on its own, much shorter, schedule. A lease
+	// renewed only as often as a sticky purge would expire between renewals and
+	// be reclaimed out from under a node that is still spending it.
+	maintain := cluster.DefaultRenewBefore / 2
 	go func() {
 		defer close(a.bgDone)
 		t := time.NewTicker(purge)
 		defer t.Stop()
+		m := time.NewTicker(maintain)
+		defer m.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-m.C:
+				if a.Ledger != nil {
+					mctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					err := a.Ledger.Maintain(mctx)
+					cancel()
+					if err != nil {
+						a.logf("app: budget lease maintenance: %v", err)
+					}
+				}
 			case <-t.C:
 				if st := a.dispatch.state(); st != nil {
 					st.router.Purge()
@@ -372,6 +451,23 @@ func (a *App) startBackground() {
 			}
 		}
 	}()
+}
+
+// nodeID names this process in its lease rows.
+//
+// A configured id is used verbatim so that a restarted node reclaims its own
+// leases rather than waiting for them to expire. Without one, an id is generated
+// per process: a single-node deployment never collides, and a multi-node one is
+// required to configure cluster.node_id anyway (§13).
+func nodeID(cfg *config.Config) string {
+	if cfg.Cluster.NodeID != "" {
+		return cfg.Cluster.NodeID
+	}
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "node-local"
+	}
+	return "node-" + hex.EncodeToString(raw[:])
 }
 
 // Close releases everything the app owns, in the reverse order of construction.
@@ -395,11 +491,28 @@ func (a *App) Close(ctx context.Context) error {
 				firstErr = err
 			}
 		}
+		if a.Shadow != nil {
+			// Closed before the meter and the store: it holds no handle on
+			// either, and its own grace period must not extend theirs.
+			if err := a.Shadow.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 		if a.Auth != nil {
 			a.Auth.Close()
 		}
 		if a.Broker != nil {
 			a.Broker.Close()
+		}
+		if a.Ledger != nil {
+			// Returning the unspent part of every block makes a planned restart
+			// exact: the durable counter ends up holding precisely what was
+			// spent, so the next process reads the true figure rather than a
+			// conservative one (DESIGN §9.6). A crash skips this, and the
+			// difference is the whole of the published overshoot.
+			if err := a.Ledger.Close(ctx); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		if a.Store != nil {
 			if err := a.Store.Close(); err != nil && firstErr == nil {

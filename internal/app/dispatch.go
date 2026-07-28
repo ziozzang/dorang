@@ -51,6 +51,9 @@ type dispatchState struct {
 	catalog   *catalog.Catalog
 	upstreams *upstreamTable
 	quota     *quotaSet
+	// budget is the durable spend gate (DESIGN §6.4, §9.6). Nil leaves budgets
+	// unenforced, which is only the case when no store is configured.
+	budget *budgetGate
 
 	prefixOn bool
 	chunk    int
@@ -107,6 +110,20 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 			}
 			return routeError(rerr)
 		}
+		// The budget is held before the request goes upstream and released the
+		// moment it is clear no money was spent (DESIGN §6.4, R1-20). It is
+		// taken per HOP: a fail-back to another deployment is a different
+		// price, so the estimate is retaken rather than carried over.
+		hold, berr := st.budget.reserve(ctx, st, c, dec, rq)
+		if berr != nil {
+			// Exceeding a budget is terminal and is NOT a fallback condition
+			// (§6.4): there is no cheaper deployment that makes the money
+			// reappear, and trying one would spend a different subject's
+			// budget on a model the caller never asked for.
+			st.router.Report(dec, router.Outcome{Err: berr, Cause: router.CauseBudgetExceeded})
+			return berr
+		}
+
 		res := d.attempt(ctx, st, c, dec, rq, w)
 		st.router.Report(dec, res.outcome)
 
@@ -118,11 +135,18 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 			// is why its post-hoc values travel by the opt-in usage event
 			// instead.
 			d.settle(st, c, dec, rq, res)
+			// The estimate was an upper bound, so settlement only ever releases
+			// budget — which is why settling after the answer is safe.
+			hold.settle(rq.Result.CostNanoUSD)
 			if res.body != nil {
 				return writeBody(w, res.body)
 			}
 			return nil
 		}
+		// The attempt produced no answer, so it cost nothing. Refunding in full
+		// is R1-20: a request that never reached an upstream must not consume
+		// budget, and a hop that failed is such a request.
+		hold.release()
 		lastErr = res.err
 		if res.outcome.FirstByteSent || !res.retryable {
 			return res.err

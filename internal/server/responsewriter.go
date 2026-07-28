@@ -34,6 +34,10 @@ type responseWriter struct {
 	usageEmitted bool
 	// errShape records the upstream envelope shape, for the meter event.
 	errShape Shape
+	// cap is the shadow capture tap, non-nil only on a sampled request
+	// (DESIGN §14.1). It is written after the underlying writer has taken the
+	// bytes, so it is never between the client and the response.
+	cap *capture
 }
 
 func (w *responseWriter) reset(under http.ResponseWriter, rq *Request) {
@@ -60,6 +64,13 @@ func (w *responseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(p)
 	w.n += int64(n)
+	if w.cap != nil {
+		// After the write, deliberately: the client already has these bytes,
+		// so the copy cannot delay them. What it can delay is the *next* chunk,
+		// which is why the windows are bounded and why this runs for a sampled
+		// fraction of traffic rather than all of it.
+		w.cap.add(p[:n])
+	}
 	return n, err
 }
 
@@ -89,8 +100,14 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	// A hijacked connection is no longer the server's to write to, so it
 	// counts as written: the deferred error path must not try to send an
-	// envelope down a socket somebody else now owns.
+	// envelope down a socket somebody else now owns. The capture tap goes with
+	// it — everything after this point bypasses Write, and reporting the empty
+	// buffer as "the response" would put a fabricated comparison in the report.
 	w.wrote = true
+	if w.cap != nil {
+		w.cap.abandoned = true
+		w.cap = nil
+	}
 	return hj.Hijack()
 }
 

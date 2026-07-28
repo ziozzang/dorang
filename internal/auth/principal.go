@@ -31,6 +31,15 @@ type Limits struct {
 	MaxBudgetNanoUSD *int64
 	// SpentNanoUSD is the spend recorded for the current budget period.
 	SpentNanoUSD int64
+	// BudgetPeriod is the window the ceiling applies over, in the configuration
+	// spelling ("monthly", "daily", "30d", …). Empty means the deployment's
+	// default.
+	//
+	// It travels with the ceiling because the two are one fact. A limit carried
+	// without its period is a limit whose reset date the gate has to guess, and
+	// a monthly budget guessed as daily is thirty times too permissive on the
+	// second day of the month.
+	BudgetPeriod string
 	// BudgetResetAt is when the current budget period ends. Spend recorded for
 	// a period that has already ended does not refuse anything.
 	BudgetResetAt time.Time

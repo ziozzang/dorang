@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -785,19 +786,94 @@ func (c *Config) validateShadow(col *collector) {
 	}
 	if c.Shadow.Reference.URL == "" {
 		col.add("shadow.reference.url", "must be set when shadow.mode is %q", c.Shadow.Mode)
+	} else if err := checkShadowReferenceURL(c.Shadow.Reference.URL); err != nil {
+		col.add("shadow.reference.url", "%v", err)
 	}
 	if c.Shadow.SampleRate < 0 || c.Shadow.SampleRate > 1 {
 		col.add("shadow.sample_rate", "must be in [0,1] (is %v)", c.Shadow.SampleRate)
 	}
+
+	// Both modes send every sampled request twice, so both need the ceiling.
+	// An earlier revision required it for mirror only, which is backwards:
+	// compare is mirror plus a diff, so it costs at least as much.
 	if !c.Shadow.MaxCostUSDPerDay.IsZero() {
 		if err := checkDecimal(string(c.Shadow.MaxCostUSDPerDay)); err != nil {
 			col.add("shadow.max_cost_usd_per_day", "%v", err)
 		}
-	} else if c.Shadow.Mode == ShadowModeMirror {
+	} else {
 		col.add("shadow.max_cost_usd_per_day",
-			"mirroring sends every sampled request twice and therefore costs twice: "+
-				"set a daily cost ceiling (§14.1)")
+			"%s sends every sampled request twice and therefore costs twice: "+
+				"set a daily cost ceiling (§14.1)", c.Shadow.Mode)
 	}
+	if !c.Shadow.UnpricedEstimateUSD.IsZero() {
+		if err := checkDecimal(string(c.Shadow.UnpricedEstimateUSD)); err != nil {
+			col.add("shadow.unpriced_estimate_usd", "%v", err)
+		}
+	}
+
+	// §14.1 names compare.semantic and defines no comparison for it. Accepting
+	// it silently would mean an operator who asked for semantic comparison gets
+	// structural comparison and an empty diff report, and reads that report as
+	// proof of something it never checked — which is the one failure mode a
+	// cutover gate cannot have.
+	if c.Shadow.Compare.Semantic {
+		col.add("shadow.compare.semantic",
+			"semantic comparison is not implemented: §14.1 names the knob but "+
+				"specifies no comparison for it, and a gate that silently checks "+
+				"less than it was asked to is worse than one that refuses")
+	}
+	if c.Shadow.Mode == ShadowModeCompare && !c.Shadow.Compare.IsStructural() {
+		col.add("shadow.compare.structural",
+			"mode is %q but no comparison is enabled; use mode: mirror instead",
+			ShadowModeCompare)
+	}
+	for i, f := range c.Shadow.Compare.IgnoreFields {
+		if strings.TrimSpace(f) == "" {
+			col.add(fmt.Sprintf("shadow.compare.ignore_fields[%d]", i), "must not be empty")
+		}
+	}
+
+	if c.Shadow.QueueSize <= 0 {
+		col.add("shadow.queue_size", "must be greater than zero")
+	}
+	if c.Shadow.Workers <= 0 {
+		col.add("shadow.workers", "must be greater than zero")
+	}
+	nonNegative(col, "shadow.reference.timeout", int64(c.Shadow.Reference.Timeout))
+	if c.Shadow.Capture.HeadBytes <= 0 {
+		col.add("shadow.capture.head_bytes",
+			"must be greater than zero: a comparison needs the response it compares")
+	}
+	nonNegative(col, "shadow.capture.tail_bytes", int64(c.Shadow.Capture.TailBytes))
+	if c.Shadow.Mode == ShadowModeCompare && c.Shadow.Report.Path == "" {
+		col.add("shadow.report.path",
+			"must be set when shadow.mode is %q: an empty diff report is the "+
+				"completion criterion for taking over traffic (§14.1), and a report "+
+				"that is not written is not empty, it is absent", ShadowModeCompare)
+	}
+	nonNegative(col, "shadow.report.max_bytes", int64(c.Shadow.Report.MaxBytes))
+}
+
+// checkShadowReferenceURL rejects a reference dorang cannot call, and one it
+// must not call.
+func checkShadowReferenceURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid URL %q: no host", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid URL %q: a query or fragment cannot survive "+
+			"being joined with the request path", raw)
+	}
+	return nil
 }
 
 func (c *Config) validateNotifications(col *collector) {

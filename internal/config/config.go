@@ -524,18 +524,51 @@ const (
 )
 
 // Shadow mirrors or compares live traffic against a reference gateway (§14.1).
+//
+// §14.1 writes five keys. The rest of this struct is what enforcing those five
+// safely turned out to require, and every one of them is a bound rather than a
+// feature: a queue that cannot grow without limit, a capture that cannot retain
+// a whole 200 MiB stream, a report that cannot fill a disk, and a cost estimate
+// for the requests dorang could not price. §9.6's first rule — no deferred write
+// may be unbounded — applies to shadowing exactly as it applies to metering.
 type Shadow struct {
 	Mode             string          `yaml:"mode,omitempty"`
 	Reference        ShadowReference `yaml:"reference,omitempty"`
 	SampleRate       float64         `yaml:"sample_rate,omitempty"`
 	Compare          ShadowCompare   `yaml:"compare,omitempty"`
 	MaxCostUSDPerDay Decimal         `yaml:"max_cost_usd_per_day,omitempty"`
+
+	// UnpricedEstimateUSD is what one shadow call is charged against the daily
+	// ceiling when dorang could not price the request it copies. Charging zero
+	// would make the ceiling unenforceable for exactly the traffic whose cost is
+	// unknown, which is the traffic most worth capping.
+	UnpricedEstimateUSD Decimal `yaml:"unpriced_estimate_usd,omitempty"`
+
+	// QueueSize bounds the shadow work queue. Past it, work is dropped and
+	// counted (§9.6 rule 3): a full queue must never push back into the request
+	// path.
+	QueueSize int `yaml:"queue_size,omitempty"`
+	// Workers is how many reference calls may be in flight at once.
+	Workers int `yaml:"workers,omitempty"`
+
+	Capture ShadowCapture `yaml:"capture,omitempty"`
+	Report  ShadowReport  `yaml:"report,omitempty"`
 }
 
 // ShadowReference is the gateway being compared against.
 type ShadowReference struct {
-	URL       string `yaml:"url,omitempty"`
+	URL string `yaml:"url,omitempty"`
+	// APIKeyEnv names the environment variable holding the reference gateway's
+	// own credential. The client's credential is never forwarded there.
+	//
+	// This is the one place in the file that spells a secret reference
+	// `api_key_env` rather than the `key_env`/`key_file`/`key_ref` triple of
+	// §4.1 — §14.1 writes it that way. Deployments that keep secrets in a file
+	// or a vault therefore cannot express a shadow reference credential at all.
 	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	// Timeout bounds one reference call. A reference that hangs must free its
+	// worker rather than hold it for the process lifetime.
+	Timeout Duration `yaml:"timeout,omitempty"`
 }
 
 // ShadowCompare selects what a comparison looks at. Model output is not
@@ -543,11 +576,34 @@ type ShadowReference struct {
 type ShadowCompare struct {
 	Structural *bool `yaml:"structural,omitempty"`
 	Semantic   bool  `yaml:"semantic"`
+	// IgnoreFields are field paths excluded from the structural diff, on top of
+	// the built-in set (ids, timestamps, system_fingerprint, output text, token
+	// counts). A bare name matches that name at any depth; a path beginning
+	// with "$." matches exactly; a trailing "*" matches a prefix.
+	IgnoreFields []string `yaml:"ignore_fields,omitempty"`
 }
 
 // IsStructural reports whether status, field set, types and header keys are
 // compared.
 func (s ShadowCompare) IsStructural() bool { return s.Structural == nil || *s.Structural }
+
+// ShadowCapture bounds what one comparison holds of a response body.
+//
+// Two windows rather than one, because a stream's terminator is the last thing
+// on the wire and a single head buffer loses exactly it — and the terminator is
+// one of the things §14.1 requires the comparison to check.
+type ShadowCapture struct {
+	HeadBytes ByteSize `yaml:"head_bytes,omitempty"`
+	TailBytes ByteSize `yaml:"tail_bytes,omitempty"`
+}
+
+// ShadowReport is the JSONL diff report. An empty report is the completion
+// criterion for taking over traffic (§14.1), which is only meaningful if the
+// report is also the place inconclusive comparisons are recorded.
+type ShadowReport struct {
+	Path     string   `yaml:"path,omitempty"`
+	MaxBytes ByteSize `yaml:"max_bytes,omitempty"`
+}
 
 // Shadow modes (§14.1).
 const (

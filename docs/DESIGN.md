@@ -792,6 +792,23 @@ Two corrections from review:
   gate that becomes a **hard hold only after capacity is acquired**; anything that fails
   before dispatch releases the full amount.
 
+> ⚠️ **R5 was specified, designed, and not enforced.** Assembling the gateway revealed that
+> `quota.Budget` had **no call site anywhere outside its own tests**. The request path
+> performed exactly one spend check — against a stored column that nothing on that path
+> incremented — so a budget could never be exceeded because it was never consulted. The
+> mechanism existed, was tested, and was wired to nothing.
+>
+> This is the failure mode a package-level test suite cannot see: every part worked, and the
+> feature did not. It is also why the assembly step earns its own milestone rather than being
+> treated as glue. The gate now reserves after routing (an estimate needs a deployment to
+> price against), settles on the real cost, releases in full on any failure before an answer,
+> and refuses a spent budget as a terminal `400`.
+>
+> One deviation from the text above: §6.4's soft-hold-then-harden collapses into a single hold
+> taken *after* routing, because the estimate prices output at `max_tokens` and there is no
+> price at all before a deployment is chosen. The soft/hard split protected a window that does
+> not exist.
+
 Budgets attach to a credential, key, user, team, or globally. Exceeding one is **not**
 a fallback condition — failing is the correct outcome, and it surfaces as a terminal `400`
 rather than a `429` **[R1-21]**. A `429` is a rate-limit signal: emitting one here would send
@@ -2179,6 +2196,31 @@ deterministic. Mirroring sends each sampled request twice and therefore costs tw
 sample rate is low and a daily cost ceiling is enforced. An empty diff report is the
 completion criterion for taking over traffic.
 
+Four corrections, the first of which is a defect rather than an omission:
+
+1. ⚠️ **"Send the same request to the reference" is destructive taken literally.** It includes
+   `DELETE /key/…`, which would delete a key on the system still serving production. Replay is
+   **deny-by-default**: reads always, inference `POST`s only, nothing else. And since the
+   served surface is roughly 80% control plane (COMPATIBILITY §0), a clean report necessarily
+   covers materially less than the whole gateway — so the count of *skipped-as-unsafe* is
+   reported beside the verdict rather than left implicit.
+2. **The cost ceiling must stop, not skip.** Refusing the request that does not fit while
+   continuing to admit cheaper ones biases coverage toward cheap traffic while the counter
+   still reads under budget — a report that looks complete and is not. Cost is also reserved
+   before the call and settled after, for the same reason §9.6 gives for budget.
+3. **Two gateways running alongside can be pointed at each other**, which amplifies one
+   request without bound. A marker header is sent and refused on arrival.
+4. **Shadow does not hot-reload**, despite §4.1's rule that everything does. Rebuilding it
+   re-arms the daily ceiling, which turns "$5 per day" into "$5 per `SIGHUP`". A changed
+   shadow section is refused rather than applied.
+
+**A verdict of "clean" means more than "no diffs".** It requires comparisons to have happened,
+with no inconclusive records, no queue drops, no reference errors, and no dropped report
+records. A comparison that cannot decide a dimension writes an inconclusive record naming it,
+counted separately — because the whole value of this mechanism is that an empty report is
+trustworthy, and a comparison that silently skips a case is worse than one that reports a
+difference.
+
 ---
 
 ## 15. Performance
@@ -2304,6 +2346,26 @@ fixes the neutral representation. M9 and M12 are independent of the core through
 
 ---
 
+### 17.1 What the assembly milestone is for
+
+M-assembly is not glue. Two of the defects found so far were invisible to every package's own
+tests and could only appear when the parts were joined:
+
+- **A feature wired to nothing.** Budget enforcement (R5) was specified, implemented, tested,
+  and never called. Every unit test passed; the requirement was not met.
+- **A reservation that named a different target than the dispatch.** Capacity reserved against
+  one credential while the work went to another, because the chosen credential lived inside a
+  reservation the executor never received. No assertion about either side could see it.
+
+Both share a shape: **an interface satisfied on both ends and connected on neither**. A test
+suite organized by package cannot detect that, because there is no package where the defect
+lives. The round-trip test through the assembled stack — real router, real capacity, real
+pricing, real metering, asserting the ledger row and the reserved axis — is the only thing
+that does.
+
+Consequence for the milestone gates in §17: a package is not done when its tests pass. It is
+done when something end to end exercises it and asserts an observable outside it.
+
 ## 18. Open risks
 
 | # | Risk | Status |
@@ -2317,4 +2379,4 @@ fixes the neutral representation. M9 and M12 are independent of the core through
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
 | W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **open** — inherent to no-partial-holding; needs a soft-reservation protocol. Not a deadlock and not an overtaking problem, so aging does not close it. Measurable: a waiter that never wins while both its axes stay saturated |
 | W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
-| W9 | **Quota and budget state is in-memory only** (§9.6) | **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Remaining: the request path still uses the in-memory budget, so switching that call site is the last step. Was **open** — a restart resets the windows. Safe for concurrency, wrong for accounting: a monthly budget silently starts over. Must be persisted through the lease mechanism before clustering, since a lease that does not outlive its node is not a lease |
+| W9 | **Quota and budget state is in-memory only** (§9.6) | **closed** — the request path reserves against the durable ledger. The gate holds an upper bound before every upstream call, settles with the actual cost, and refuses an exhausted budget as a terminal `400` (§6.4); a restart re-reads the counter rather than starting the period over, and a graceful stop returns the unspent part so a planned restart costs nothing. The hold is taken after the routing decision rather than at the gate, because §6.4's estimate prices output at `max_tokens` and there is no price before a deployment is chosen — the property that mattered (concurrent requests cannot both see the pre-spend balance, and anything that never reaches an upstream is refunded in full) is unaffected. No in-memory path is kept beside it: `quota.Budget` serializes on one mutex where the ledger takes an atomic compare-and-swap on a block it already holds, so the durable path is also the cheaper one. Was **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Was **open** — a restart resets the windows |

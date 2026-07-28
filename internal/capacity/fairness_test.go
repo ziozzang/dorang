@@ -503,6 +503,11 @@ func TestStressNeverExceedsAnyLimit(t *testing.T) {
 	if got := b.totalQueueNodes(); got != 0 {
 		t.Fatalf("queue nodes = %d, want 0", got)
 	}
+	// A soft reservation is capacity kept idle on purpose, so one left behind
+	// leaks capacity exactly as a leaked reservation would.
+	if got := b.totalClaims(); got != 0 {
+		t.Fatalf("soft reservations = %d, want 0", got)
+	}
 }
 
 func randomRequest(rng *rand.Rand, worker int) Request {

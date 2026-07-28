@@ -186,7 +186,12 @@ type Event struct {
 	// read; supplying it is cheaper and more accurate.
 	Time time.Time
 
-	APIKeyID     string
+	APIKeyID string
+	// UserID is the owning user. It is carried on the trace path only: the
+	// ledger has a user_id column (DESIGN §9.2) and an index on it, while
+	// §9.4's rollups are keyed by key, model and team. Adding it to [Key] would
+	// multiply rollup cardinality for a materialization nothing queries.
+	UserID       string
 	TeamID       string
 	ModelGroup   string
 	Provider     string
@@ -284,6 +289,7 @@ type Trace struct {
 	Time         time.Time
 
 	APIKeyID      string
+	UserID        string
 	TeamID        string
 	ModelGroup    string
 	Provider      string

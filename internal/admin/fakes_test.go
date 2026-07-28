@@ -59,8 +59,8 @@ func (p fakePrincipal) IsAdmin() bool     { return p.admin }
 
 const (
 	masterToken = "master-secret"
-	adminToken  = "sk-admin-key"
-	userToken   = "sk-plain-user"
+	adminToken  = "sk-admin-key"  // pragma: allowlist secret — test fixture
+	userToken   = "sk-plain-user" // pragma: allowlist secret — test fixture
 )
 
 type fakeAuth struct{}

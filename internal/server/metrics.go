@@ -43,6 +43,9 @@ type metrics struct {
 	wsUpgrades    atomic.Uint64
 	replayRefused atomic.Uint64
 	bodyTooLarge  atomic.Uint64
+
+	observed       atomic.Uint64
+	observerPanics atomic.Uint64
 }
 
 // observe records one finished request.
@@ -132,6 +135,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, rq *Request) error {
 		"Requests marked non-replayable because the replay budget was full.", m.replayRefused.Load())
 	b = counter(b, "dorang_body_too_large_total",
 		"Requests refused for exceeding max_body_bytes.", m.bodyTooLarge.Load())
+	b = counter(b, "dorang_shadow_observed_total",
+		"Requests captured for shadow comparison.", m.observed.Load())
+	b = counter(b, "dorang_observer_panics_total",
+		"Panics recovered in the shadow observer; requests were unaffected.",
+		m.observerPanics.Load())
 
 	b = gauge(b, "dorang_inflight_requests",
 		"Requests currently being served.", s.inflight.Load())
@@ -144,6 +152,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, rq *Request) error {
 	b = gauge(b, "dorang_ready", "1 when the server accepts new work.", ready)
 	b = gauge(b, "dorang_uptime_seconds", "Seconds since start.",
 		int64(time.Since(s.started).Seconds()))
+
+	// The observer's own numbers — sample rate, drops, diffs, and whether the
+	// daily cost ceiling has stopped shadowing — are appended verbatim. They
+	// belong on the same scrape as everything else: an operator watching a
+	// cutover should not need a second endpoint to find out that the gate
+	// stopped running (DESIGN §14.1).
+	if o := rq.srv.snap.Load().observer; o != nil {
+		b = o.Metrics(b)
+	}
 
 	*buf = b
 	h := w.Header()

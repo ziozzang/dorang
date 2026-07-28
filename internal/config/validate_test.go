@@ -422,10 +422,54 @@ func TestValidationRules(t *testing.T) {
 			want: "costs twice",
 		},
 		{
-			name: "shadow comparison configured fully",
-			f: fragments{top: "shadow:\n  mode: compare\n  reference: {url: \"https://ref.invalid\", api_key_env: REF_KEY}\n" +
-				"  sample_rate: 0.05\n  compare: {structural: true, semantic: false}\n" +
+			name: "comparison needs a cost ceiling too",
+			f:    fragments{top: "shadow: {mode: compare, reference: {url: \"https://ref.invalid\"}}\n"},
+			path: "shadow.max_cost_usd_per_day",
+			want: "costs twice",
+		},
+		{
+			name: "semantic comparison is not implemented and is refused",
+			f: fragments{top: "shadow:\n  mode: compare\n  reference: {url: \"https://ref.invalid\"}\n" +
+				"  max_cost_usd_per_day: 5\n  compare: {semantic: true}\n"},
+			path: "shadow.compare.semantic",
+			want: "not implemented",
+		},
+		{
+			name: "compare mode with nothing to compare",
+			f: fragments{top: "shadow:\n  mode: compare\n  reference: {url: \"https://ref.invalid\"}\n" +
+				"  max_cost_usd_per_day: 5\n  compare: {structural: false}\n"},
+			path: "shadow.compare.structural",
+			want: "no comparison is enabled",
+		},
+		{
+			name: "reference url must be http",
+			f: fragments{top: "shadow:\n  mode: mirror\n  reference: {url: \"file:///etc/passwd\"}\n" +
 				"  max_cost_usd_per_day: 5\n"},
+			path: "shadow.reference.url",
+			want: "http or https",
+		},
+		{
+			name: "reference url may not carry a query",
+			f: fragments{top: "shadow:\n  mode: mirror\n  reference: {url: \"https://ref.invalid/v1?x=1\"}\n" +
+				"  max_cost_usd_per_day: 5\n"},
+			path: "shadow.reference.url",
+			want: "query or fragment",
+		},
+		{
+			name: "empty ignore_fields entry",
+			f: fragments{top: "shadow:\n  mode: compare\n  reference: {url: \"https://ref.invalid\"}\n" +
+				"  max_cost_usd_per_day: 5\n  compare: {ignore_fields: [\"  \"]}\n"},
+			path: "shadow.compare.ignore_fields[0]",
+			want: "must not be empty",
+		},
+		{
+			name: "shadow comparison configured fully",
+			f: fragments{top: "shadow:\n  mode: compare\n  reference: {url: \"https://ref.invalid\", api_key_env: REF_KEY, timeout: 30s}\n" +
+				"  sample_rate: 0.05\n  compare: {structural: true, semantic: false, ignore_fields: [system_fingerprint]}\n" +
+				"  max_cost_usd_per_day: 5\n  unpriced_estimate_usd: \"0.01\"\n" +
+				"  queue_size: 128\n  workers: 2\n" +
+				"  capture: {head_bytes: 128KiB, tail_bytes: 8KiB}\n" +
+				"  report: {path: /var/lib/dorang/shadow.jsonl, max_bytes: 64MiB}\n"},
 		},
 		{
 			name: "unknown email driver",

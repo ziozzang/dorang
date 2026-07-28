@@ -208,6 +208,15 @@ type fakeCapacity struct {
 	seen      []CapacityRequest
 	batchSeen int
 	plainSeen int
+
+	// pick chooses which of a provider's credentials the reservation lands on,
+	// exactly as the real broker does when it walks a candidate list. Nil means
+	// the provider offered no candidates, which is "" and the pre-existing
+	// behaviour of every other test here.
+	pick func(CapacityRequest) string
+	// granted records every credential a reservation was actually taken
+	// against, so a test can compare it against what was dispatched.
+	granted []string
 }
 
 func newFakeCapacity(reserve float64, reserveOn ...string) *fakeCapacity {
@@ -288,8 +297,13 @@ func (c *fakeCapacity) Acquire(ctx context.Context, req CapacityRequest) (Reserv
 					c.peak[k] = c.inUse[k]
 				}
 			}
+			cred := ""
+			if c.pick != nil {
+				cred = c.pick(req)
+			}
+			c.granted = append(c.granted, cred)
 			c.mu.Unlock()
-			return &fakeReservation{c: c, keys: keys}, nil
+			return &fakeReservation{c: c, keys: keys, cred: cred}, nil
 		}
 		w := c.wake
 		c.mu.Unlock()
@@ -316,8 +330,11 @@ func (c *fakeCapacity) counts() (batch, plain int) {
 type fakeReservation struct {
 	c    *fakeCapacity
 	keys []string
+	cred string
 	once sync.Once
 }
+
+func (r *fakeReservation) CredentialID() string { return r.cred }
 
 func (r *fakeReservation) Release() {
 	r.once.Do(func() {

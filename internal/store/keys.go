@@ -230,25 +230,58 @@ func (s *Store) RehashKey(ctx context.Context, keyID, token string) error {
 	if KeyLookup(token) == "" {
 		return ErrBadCredential
 	}
+	return s.SetKeyDigest(ctx, keyID, KeyLookup(token), hash, SchemeDorangV1)
+}
+
+// SetKeyDigest performs the same upgrade as [Store.RehashKey] from a digest the
+// caller has ALREADY computed, rather than from the plaintext token.
+//
+// That distinction is the whole reason this method exists. An authenticator
+// verifying a legacy row has computed the dorang_v1 digest as a by-product —
+// verification derives both digests from one pass over the token — so handing it
+// back costs nothing, while handing back the *token* would mean holding a live
+// credential past the moment it was verified, on a queue, off the request path.
+// Without this method rehash-on-use cannot be wired at all: the only upgrade
+// primitive takes a secret its caller must not keep.
+//
+// Only the upgrade direction is accepted. A general "set this row's digest"
+// would let a caller overwrite a live dorang_v1 credential with anything, so
+// scheme must be [SchemeDorangV1] and the row must still be legacy. Both
+// conditions live in the statement, which makes a repeated upgrade and two
+// concurrent upgrades no-ops rather than races.
+//
+// lookup is matched as well as the id. It is immutable, so a digest that does
+// not belong to the row named by keyID can never be written by naming the id
+// alone.
+func (s *Store) SetKeyDigest(ctx context.Context, keyID, lookup, digest string, scheme HashScheme) error {
+	if scheme != SchemeDorangV1 {
+		return fmt.Errorf("store: SetKeyDigest upgrades to %s only, not %q", SchemeDorangV1, scheme)
+	}
+	if keyID == "" || lookup == "" {
+		return ErrBadCredential
+	}
+	if len(digest) != hex.EncodedLen(sha256.Size) {
+		return fmt.Errorf("store: SetKeyDigest wants a %d-character hex digest, got %d",
+			hex.EncodedLen(sha256.Size), len(digest))
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return fmt.Errorf("store: SetKeyDigest digest is not hex: %w", err)
+	}
 	res, err := s.exec(ctx, `
 		UPDATE api_keys
 		   SET token_hash = ?, hash_scheme = ?, updated_at = ?
 		 WHERE id = ? AND lookup = ? AND hash_scheme = ?`,
-		hash, string(SchemeDorangV1), Micros(s.now()),
-		keyID, KeyLookup(token), string(SchemeLegacySHA256))
+		digest, string(SchemeDorangV1), Micros(s.now()),
+		keyID, lookup, string(SchemeLegacySHA256))
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
+	if _, err := res.RowsAffected(); err != nil {
 		return err
 	}
-	if n == 0 {
-		// Either already upgraded by another node, or the token does not
-		// belong to that row. Both are "nothing to do"; the second cannot
-		// succeed later either, because lookup is immutable.
-		return nil
-	}
+	// Zero rows is not an error. Either another node upgraded the row first, or
+	// the (id, lookup) pair names no legacy row — and the second cannot start
+	// succeeding later, because lookup never changes.
 	return nil
 }
 

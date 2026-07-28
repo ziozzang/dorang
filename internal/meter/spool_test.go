@@ -64,9 +64,13 @@ func TestTraceCodecRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{
 		nil,
 		{},
-		{99},                           // wrong version
-		good[:len(good)/2],             // truncated
-		append([]byte{2}, good[1:]...), // version bumped
+		{99},               // wrong version
+		good[:len(good)/2], // truncated
+		// Written against the version this build does NOT speak. Spelled
+		// relative to the constant rather than as a literal, so that bumping
+		// the codec cannot turn this case into "the current version decodes",
+		// which is what a hard-coded neighbour silently became.
+		append([]byte{traceCodecVer + 1}, good[1:]...),
 	} {
 		if _, err := decodeTrace(bad); err == nil {
 			t.Errorf("decodeTrace(%v...) succeeded on garbage", bad[:min(4, len(bad))])

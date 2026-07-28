@@ -111,6 +111,18 @@ type Config struct {
 	// WakeSlack bounds the extra head-of-queue probes a single release may make
 	// beyond the number of slots it freed. Zero selects DefaultWakeSlack.
 	WakeSlack int
+
+	// SoftReservations selects the multi-axis starvation guard (DESIGN §5.4
+	// correction 5, open risk W8). The zero value is on; see
+	// SoftReservationMode and the "Soft reservations" section of the package
+	// documentation.
+	SoftReservations SoftReservationMode
+	// SoftReserveAfter is how many probes a waiter must fail before the guard
+	// arms for it. Zero selects DefaultSoftReserveAfter, which documents the
+	// measured throughput cost of each setting; values below one are clamped to
+	// one, which arms on the first failed probe. It trades a constant on the
+	// rescue latency against the throughput the guard idles.
+	SoftReserveAfter int
 }
 
 // Candidate is one credential a request may use. Together with its provider it
@@ -164,8 +176,27 @@ type Request struct {
 // bucket is one counted axis key and its wait queue.
 type bucket struct {
 	limit int
+	// inUse counts committed reservations *plus* the soft reservation, if any.
+	// Counting the claim as occupancy is what keeps it off the hot path: a
+	// request that is not the claimant needs no extra test at all, because the
+	// unit set aside is already subtracted from what it can see. Only the
+	// claimant subtracts it back out, and only a waiter can be a claimant.
 	inUse int
 	q     waitQueue
+
+	// claimant holds the soft reservation on this key, if any. At most one
+	// exists at a time, which is what bounds the idled capacity to one unit per
+	// axis key. See doc.go, "Soft reservations".
+	claimant *waiter
+}
+
+// committed is inUse minus the unit held idle by a soft reservation: the number
+// of reservations actually outstanding, which is what observability reports.
+func (bk *bucket) committed() int {
+	if bk.claimant != nil {
+		return bk.inUse - 1
+	}
+	return bk.inUse
 }
 
 // Broker admits requests against every axis that constrains them.
@@ -184,6 +215,8 @@ type Broker struct {
 	now         func() time.Time
 	wakeSlack   int
 	hasDefaultP bool
+	soft        bool
+	softAfter   int
 
 	mu      sync.Mutex
 	buckets map[axisKey]*bucket
@@ -194,9 +227,18 @@ type Broker struct {
 	closed  bool
 
 	// Instrumentation, guarded by mu.
-	wakeups uint64
-	grants  uint64
-	expired uint64
+	wakeups    uint64
+	grants     uint64
+	expired    uint64
+	softPlaced uint64
+
+	// pending is the work list of buckets a dropped soft reservation has freed
+	// and that still have to be offered to their queues. It turns what would be
+	// recursion — serving a bucket finishes a waiter, which drops a claim, which
+	// frees a bucket that must itself be served — into a flat loop
+	// (drainPendingLocked). It is guarded by mu and reused, so a release
+	// allocates nothing, and it stays empty on a broker that never claims.
+	pending []*bucket
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -216,6 +258,8 @@ func New(cfg Config) *Broker {
 		reserve:    cfg.InteractiveReserve,
 		now:        cfg.Now,
 		wakeSlack:  cfg.WakeSlack,
+		soft:       cfg.SoftReservations.enabled(),
+		softAfter:  cfg.SoftReserveAfter,
 		buckets:    make(map[axisKey]*bucket),
 		live:       make(map[*Reservation]struct{}),
 		waiters:    make(map[*waiter]struct{}),
@@ -257,6 +301,12 @@ func New(cfg Config) *Broker {
 	case b.wakeSlack < 0:
 		b.wakeSlack = 0
 	}
+	switch {
+	case b.softAfter == 0:
+		b.softAfter = DefaultSoftReserveAfter
+	case b.softAfter < 1:
+		b.softAfter = 1 // a claim can only be placed on a failed probe anyway
+	}
 	_, b.hasDefaultP = b.principals["default"]
 
 	if b.ttl > 0 && b.sweepEvery > 0 {
@@ -290,6 +340,10 @@ func (b *Broker) Close() {
 		b.unqueueLocked(w)
 		b.finishLocked(w, grant{err: ErrClosed}, stateFailed)
 	}
+	// Every waiter has been failed, so every queue is empty and the units their
+	// soft reservations were holding — already given back by finishLocked — have
+	// nobody to be offered to.
+	b.pending = b.pending[:0]
 	b.mu.Unlock()
 
 	b.wg.Wait()
@@ -401,22 +455,65 @@ func (b *Broker) effLimit(limit int, batch bool) int {
 // Acquisition
 // ---------------------------------------------------------------------------
 
-// checkLocked reports whether every axis in needs has room. On failure it
-// returns the bucket that blocked (nil when the block is permanent) and whether
-// the block is permanent: a permanent block means the effective ceiling is zero,
-// so no release can ever help.
+// checkLocked reports whether every axis in needs has room for w, which is nil
+// for a request that is not (yet) a waiter. On failure it returns the bucket
+// that blocked (nil when the block is permanent) and whether the block is
+// permanent: a permanent block means the effective ceiling is zero, so no
+// release can ever help.
+//
+// A soft reservation is already part of bk.inUse, so everyone but its holder
+// sees it as occupancy for free. The holder subtracts it back out, which is
+// exactly what makes a claim a guarantee rather than a hint: inUse <= limit is
+// maintained by every path, so a claimant's own check inUse-1 < limit cannot
+// fail.
+//
+// The claim test only runs on a bucket that is otherwise full, so the fast path
+// — where nothing is full — reaches it never, and w is a sentinel rather than
+// nil so that it is one pointer compare when it does run.
+//
+// The interactive reserve is handled by a separate loop rather than by calling
+// effLimit per axis. This function is the innermost loop of every acquisition
+// and has to stay inlinable into tryLocked; before soft reservations it fitted
+// the budget with one node to spare, and losing the inline costs about 7% of an
+// uncontended acquire. Splitting the batch case out pays for the claim test with
+// room over, and it takes the reserve's floating-point work off the interactive
+// path, which never needed it: for interactive work the effective ceiling is
+// always the raw limit, and every axis in needs has a positive one, so the
+// interactive path cannot be permanently blocked either.
 //
 // A non-permanent block always has a bucket, because a bucket exists as soon as
-// anything has committed on that key, and a positive ceiling can only be reached
-// by something having committed.
-func (b *Broker) checkLocked(needs []axisNeed, batch bool) (blocking *bucket, ok bool, permanent bool) {
+// anything has committed on or claimed that key, and a positive ceiling can only
+// be reached by something having committed.
+func (b *Broker) checkLocked(needs []axisNeed, batch bool, w *waiter) (blocking *bucket, ok bool, permanent bool) {
+	if batch && b.reserve > 0 {
+		return b.checkReservedLocked(needs, w)
+	}
 	for _, n := range needs {
-		eff := b.effLimit(n.limit, batch)
+		bk := b.buckets[n.key]
+		if bk == nil || bk.inUse < n.limit {
+			continue
+		}
+		if bk.claimant != w || bk.inUse-1 >= n.limit {
+			return bk, false, false
+		}
+	}
+	return nil, true, false
+}
+
+// checkReservedLocked is checkLocked for batch work under an interactive
+// reserve, where the effective ceiling is below the configured one and can even
+// be zero, which is the only way a request becomes permanently unsatisfiable.
+//
+// It carries no claim test because batch work never holds a soft reservation
+// (see doc.go): a claim is already counted as occupancy, which is the whole
+// effect batch needs to see.
+func (b *Broker) checkReservedLocked(needs []axisNeed, w *waiter) (blocking *bucket, ok bool, permanent bool) {
+	for _, n := range needs {
+		eff := b.effLimit(n.limit, true)
 		if eff <= 0 {
 			return nil, false, true
 		}
-		bk := b.buckets[n.key]
-		if bk != nil && bk.inUse >= eff {
+		if bk := b.buckets[n.key]; bk != nil && bk.inUse >= eff {
 			return bk, false, false
 		}
 	}
@@ -426,7 +523,11 @@ func (b *Broker) checkLocked(needs []axisNeed, batch bool) (blocking *bucket, ok
 // commitLocked increments every axis at once and returns the reservation.
 // It is only ever reached from a checkLocked that passed, in the same critical
 // section, which is what makes acquisition all-or-nothing.
-func (b *Broker) commitLocked(needs []axisNeed, credID string, ttl time.Duration) *Reservation {
+//
+// A soft reservation held by w on an axis it commits is consumed by the commit:
+// the unit that was already counted as occupancy on w's behalf simply becomes
+// the unit w occupies, so inUse does not move for that axis.
+func (b *Broker) commitLocked(needs []axisNeed, credID string, ttl time.Duration, w *waiter) *Reservation {
 	r := &Reservation{b: b, credID: credID}
 	r.held = r.heldBuf[:0]
 	for _, n := range needs {
@@ -435,7 +536,11 @@ func (b *Broker) commitLocked(needs []axisNeed, credID string, ttl time.Duration
 			bk = &bucket{limit: n.limit}
 			b.buckets[n.key] = bk
 		}
-		bk.inUse++
+		if bk.claimant == w {
+			bk.claimant = nil // the claimed unit is already counted
+		} else {
+			bk.inUse++
+		}
 		r.held = append(r.held, bk)
 	}
 	if ttl == 0 {
@@ -494,7 +599,10 @@ func candidateCount(req *Request) int {
 // that passes, commits all of its axes at once. On failure nothing anywhere was
 // incremented and it returns the axes to wait on, deduplicated in attempt
 // order, plus whether every candidate was permanently blocked.
-func (b *Broker) tryLocked(req *Request, blockBuf []*bucket) (*Reservation, []*bucket, bool) {
+//
+// w is the waiter this attempt is made on behalf of, or nil for a fresh
+// Acquire/TryAcquire. It only affects how soft reservations are counted.
+func (b *Broker) tryLocked(req *Request, blockBuf []*bucket, w *waiter) (*Reservation, []*bucket, bool) {
 	var needBuf [numAxes]axisNeed
 	needs := needBuf[:0]
 
@@ -508,13 +616,13 @@ func (b *Broker) tryLocked(req *Request, blockBuf []*bucket) (*Reservation, []*b
 			break
 		}
 		needs = b.needs(req, c, needs)
-		blk, ok, perm := b.checkLocked(needs, req.Batch)
+		blk, ok, perm := b.checkLocked(needs, req.Batch, w)
 		if ok {
 			id := ""
 			if c != nil {
 				id = c.ID
 			}
-			return b.commitLocked(needs, id, req.TTL), nil, false
+			return b.commitLocked(needs, id, req.TTL, w), nil, false
 		}
 		if perm {
 			// No release can ever unblock this candidate, so queuing on it
@@ -547,7 +655,7 @@ func (b *Broker) TryAcquire(req Request) (*Reservation, bool) {
 		return nil, false
 	}
 	var buf [maxBlockAxes]*bucket
-	res, _, _ := b.tryLocked(&req, buf[:])
+	res, _, _ := b.tryLocked(&req, buf[:], noClaimant)
 	if res == nil {
 		return nil, false
 	}
@@ -573,7 +681,7 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 		return nil, ErrClosed
 	}
 	var buf [maxBlockAxes]*bucket
-	res, blocking, permanent := b.tryLocked(&req, buf[:])
+	res, blocking, permanent := b.tryLocked(&req, buf[:], noClaimant)
 	if res != nil {
 		b.grants++
 		b.mu.Unlock()
@@ -609,6 +717,11 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 			b.unqueueLocked(w)
 			w.state = stateCancelled
 			delete(b.waiters, w)
+			// Any soft reservation this waiter held is capacity that was being
+			// kept idle for it. Give it back and offer it to the queues before
+			// dropping the lock, or it idles until an unrelated release.
+			b.releaseClaimsLocked(w)
+			b.drainPendingLocked()
 			b.mu.Unlock()
 			return nil, ctx.Err()
 		}
@@ -644,6 +757,12 @@ func (b *Broker) unqueueLocked(w *waiter) {
 
 // finishLocked delivers a waiter's single result. It is a no-op if the waiter
 // already finished, which is what makes the grant/cancel race safe.
+//
+// It is the single choke point where a waiter leaves the wait state through the
+// broker, so it is also where soft reservations are given back. On a grant the
+// claims covering the axes just committed are already gone (commitLocked
+// consumed them); what can remain is the prefix of a Spill waiter that was
+// served through a different candidate.
 func (b *Broker) finishLocked(w *waiter, g grant, st waiterState) bool {
 	if w.state != stateWaiting {
 		return false
@@ -651,6 +770,7 @@ func (b *Broker) finishLocked(w *waiter, g grant, st waiterState) bool {
 	w.state = st
 	delete(b.waiters, w)
 	w.ch <- g // buffered with room for exactly this send, never blocks
+	b.releaseClaimsLocked(w)
 	return true
 }
 
@@ -659,7 +779,7 @@ func (b *Broker) finishLocked(w *waiter, g grant, st waiterState) bool {
 // ---------------------------------------------------------------------------
 
 // releaseLocked gives back every axis of one reservation and then serves the
-// queues of exactly those axes.
+// queues of exactly those axes, plus whatever that knocks loose (drainLocked).
 //
 // Every decrement happens before any wakeup. Serving a queue between decrements
 // would test a waiter against a state where some of the freed slots have not
@@ -675,6 +795,48 @@ func (b *Broker) releaseLocked(held []*bucket) {
 	for _, bk := range held {
 		b.serveLocked(bk, 1, pass)
 	}
+	b.drainPendingLocked()
+}
+
+// drainPendingLocked serves whatever giving a soft reservation back knocked
+// loose, and is the only way drainLocked is ever entered.
+//
+// Every path that can drop a claim — a grant that orphaned one, a cancellation,
+// a close — only appends the affected buckets to b.pending, and every top-level
+// entry point ends here. That is what keeps the recursion out without a
+// re-entrancy flag, and it is why the common release, on a broker where nothing
+// is claimed, pays exactly one length test for the whole mechanism.
+func (b *Broker) drainPendingLocked() {
+	if len(b.pending) > 0 {
+		b.drainLocked()
+	}
+}
+
+// drainLocked serves every bucket on the work list, and everything that becomes
+// servable as a knock-on effect, iteratively.
+//
+// The knock-on case is a soft reservation orphaned by a grant or dropped by a
+// cancellation: the unit it was keeping idle is real capacity, so the bucket has
+// to be re-offered to its queue rather than left idle until some unrelated
+// release happens to touch it.
+//
+// Each round of the loop gets its own pass number. Reusing one would let a
+// waiter already probed this release miss capacity that appeared afterwards,
+// which is a lost wakeup. Rounds terminate because every round after the first
+// is caused by a waiter leaving the wait state, and a waiter does that once.
+func (b *Broker) drainLocked() {
+	for len(b.pending) > 0 && !b.closed {
+		n := len(b.pending)
+		b.pass++
+		pass := b.pass
+		for i := 0; i < n; i++ {
+			b.serveLocked(b.pending[i], 1, pass)
+		}
+		// Drop the round just served, keeping anything it appended. The copy
+		// overlaps in place, so no allocation happens after the first release.
+		b.pending = append(b.pending[:0], b.pending[n:]...)
+	}
+	b.pending = b.pending[:0]
 }
 
 // serveLocked hands out at most freed reservations to the head of one axis's
@@ -687,7 +849,7 @@ func (b *Broker) releaseLocked(held []*bucket) {
 // re-enqueued on whatever now blocks it, keeping its original arrival sequence,
 // so it stays ahead of everything that arrived after it.
 func (b *Broker) serveLocked(bk *bucket, freed int, pass uint64) {
-	if bk.q.Len() == 0 {
+	if bk.q.Len() == 0 || b.closed {
 		return
 	}
 	budget := freed + b.wakeSlack
@@ -725,7 +887,7 @@ func (b *Broker) serveLocked(bk *bucket, freed int, pass uint64) {
 		budget--
 		b.wakeups++
 
-		res, blocking, permanent := b.tryLocked(&w.req, buf[:])
+		res, blocking, permanent := b.tryLocked(&w.req, buf[:], w)
 		b.unqueueLocked(w)
 		switch {
 		case res != nil:
@@ -735,6 +897,20 @@ func (b *Broker) serveLocked(bk *bucket, freed int, pass uint64) {
 		case permanent:
 			b.finishLocked(w, grant{err: ErrUnsatisfiable}, stateFailed)
 		default:
+			// The waiter still cannot be served: it reached the head of a queue
+			// and found another axis it needs full. Once it has done that often
+			// enough to be ping-ponging rather than merely queued, set aside
+			// what it can hold, so that the next axis it waits for is the last
+			// one it has to win (DESIGN §5.4 correction 5). This is the only
+			// place a soft reservation is ever placed: w is at the head of this
+			// queue, so a claim can never be a way to overtake.
+			w.bounces++
+			if b.extendClaimsLocked(w, bk) {
+				// The unit this release freed on *this* axis is now set aside
+				// for w. It is spent: nobody behind w in this queue can have
+				// it, so there is nothing left to serve.
+				granted++
+			}
 			b.enqueueLocked(w, blocking)
 			if nd := w.nodeFor(bk); nd != nil && len(park) < cap(park) {
 				bk.q.remove(nd)
@@ -842,6 +1018,11 @@ type AxisState struct {
 	Limit int
 	// Waiting is the queue depth on this key.
 	Waiting int
+	// SoftReserved is set when one unit of this key is being held idle for a
+	// named multi-axis waiter (DESIGN §5.4 correction 5). Every other request
+	// sees Limit-1 while it is set. It is never set for more than one waiter at
+	// a time, which is what bounds the cost to one unit per key.
+	SoftReserved bool
 }
 
 // Snapshot is a consistent view of the broker, safe to publish as metrics.
@@ -862,6 +1043,13 @@ type Snapshot struct {
 	Grants uint64
 	// Expired is the cumulative number of reservations the sweeper reclaimed.
 	Expired uint64
+	// SoftReserved is the number of axis keys currently holding one unit idle
+	// for a waiter. It is the live throughput cost of the starvation guard,
+	// expressed in slots.
+	SoftReserved int
+	// SoftReservations is the cumulative number of soft reservations placed.
+	// Zero on a workload of single-axis requests, which never need one.
+	SoftReservations uint64
 }
 
 // Snapshot returns per-axis occupancy. It allocates and is not for the hot path.
@@ -870,20 +1058,23 @@ func (b *Broker) Snapshot() Snapshot {
 	defer b.mu.Unlock()
 
 	s := Snapshot{
-		Axes:         make([]AxisState, 0, len(b.buckets)),
-		Waiting:      len(b.waiters),
-		Reservations: len(b.live),
-		Wakeups:      b.wakeups,
-		Grants:       b.grants,
-		Expired:      b.expired,
+		Axes:             make([]AxisState, 0, len(b.buckets)),
+		Waiting:          len(b.waiters),
+		Reservations:     len(b.live),
+		Wakeups:          b.wakeups,
+		Grants:           b.grants,
+		Expired:          b.expired,
+		SoftReserved:     b.softReservedLocked(),
+		SoftReservations: b.softPlaced,
 	}
 	for k, bk := range b.buckets {
 		s.Axes = append(s.Axes, AxisState{
-			Axis:    k.axis,
-			Key:     k.String(),
-			InUse:   bk.inUse,
-			Limit:   bk.limit,
-			Waiting: bk.q.Len(),
+			Axis:         k.axis,
+			Key:          k.String(),
+			InUse:        bk.committed(),
+			Limit:        bk.limit,
+			Waiting:      bk.q.Len(),
+			SoftReserved: bk.claimant != nil,
 		})
 	}
 	sort.Slice(s.Axes, func(i, j int) bool {
@@ -896,7 +1087,8 @@ func (b *Broker) Snapshot() Snapshot {
 }
 
 // InUse returns the committed count on one axis key and whether that key is
-// known to the broker. It is a cheap targeted alternative to Snapshot.
+// known to the broker. It is a cheap targeted alternative to Snapshot. A unit
+// held idle by a soft reservation is not committed and is not counted here.
 //
 // Axes keyed by a single value (global, principal, route, pgroup, cgroup) take
 // an empty sub. The model axis takes (provider, upstream model) and the key axis
@@ -908,5 +1100,5 @@ func (b *Broker) InUse(axis Axis, key, sub string) (int, bool) {
 	if bk == nil {
 		return 0, false
 	}
-	return bk.inUse, true
+	return bk.committed(), true
 }

@@ -2,6 +2,7 @@ package capacity
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 )
 
@@ -103,6 +104,159 @@ func BenchmarkAcquireContended(b *testing.B) {
 			res.Release()
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// the price of the W8 starvation guard
+// ---------------------------------------------------------------------------
+
+// softModes is the on/off pair every soft-reservation benchmark runs.
+var softModes = []struct {
+	name string
+	mode SoftReservationMode
+}{
+	{"soft-on", SoftReservationsOn},
+	{"soft-off", SoftReservationsOff},
+}
+
+// BenchmarkAcquireContendedSingleAxisSoft is the control. A single-axis waiter
+// can never place a soft reservation — it fails a probe only when its one axis
+// is full, and a full axis has nothing to set aside — so the two arms should be
+// indistinguishable. If they are not, the guard is charging the common case for
+// a problem the common case does not have.
+func BenchmarkAcquireContendedSingleAxisSoft(b *testing.B) {
+	for _, m := range softModes {
+		m := m
+		b.Run(m.name, func(b *testing.B) {
+			br := New(Config{
+				Models:           []ModelLimit{{Provider: "plan-a", Model: "m1", Max: 4}},
+				SweepInterval:    -1,
+				SoftReservations: m.mode,
+			})
+			defer br.Close()
+			req := Request{Provider: "plan-a", Model: "m1"}
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					res, err := br.Acquire(ctx, req)
+					if err != nil {
+						b.Fatal(err)
+					}
+					res.Release()
+				}
+			})
+			reportSoft(b, br)
+		})
+	}
+}
+
+// BenchmarkAcquireContendedTwoAxis is the worst realistic case for the guard:
+// every request needs two tight axes, so every blocked waiter is a candidate to
+// set one of them aside, and the axis that is set aside runs at limit-1 for as
+// long as the claim stands.
+func BenchmarkAcquireContendedTwoAxis(b *testing.B) {
+	for _, m := range softModes {
+		m := m
+		b.Run(m.name, func(b *testing.B) {
+			br := New(Config{
+				Models:           []ModelLimit{{Provider: "plan-a", Model: "m1", Max: 4}},
+				SweepInterval:    -1,
+				SoftReservations: m.mode,
+			})
+			defer br.Close()
+			req := Request{
+				Provider:   "plan-a",
+				Model:      "m1",
+				Candidates: []Candidate{{ID: "acct-1", MaxConcurrent: 4}},
+			}
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					res, err := br.Acquire(ctx, req)
+					if err != nil {
+						b.Fatal(err)
+					}
+					res.Release()
+				}
+			})
+			reportSoft(b, br)
+		})
+	}
+}
+
+// BenchmarkAcquireContendedMixed is the workload W8 describes: a minority of
+// two-axis requests against a majority of single-axis ones on each of the two
+// axes. It is the shape in which the guard both earns its keep and costs
+// something, so it is the number to quote.
+func BenchmarkAcquireContendedMixed(b *testing.B) {
+	for _, m := range softModes {
+		m := m
+		b.Run(m.name, func(b *testing.B) {
+			br := New(Config{
+				Models:           []ModelLimit{{Provider: "plan-a", Model: "m1", Max: 4}},
+				SweepInterval:    -1,
+				SoftReservations: m.mode,
+			})
+			defer br.Close()
+			modelOnly := Request{Provider: "plan-a", Model: "m1"}
+			keyOnly := Request{
+				Provider:   "plan-a",
+				Candidates: []Candidate{{ID: "acct-1", MaxConcurrent: 4}},
+			}
+			both := Request{
+				Provider:   "plan-a",
+				Model:      "m1",
+				Candidates: []Candidate{{ID: "acct-1", MaxConcurrent: 4}},
+			}
+			ctx := context.Background()
+
+			var seq atomic.Int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				// One goroutine in four issues the two-axis request; the rest
+				// keep one axis each saturated.
+				kind := seq.Add(1) % 4
+				req := modelOnly
+				switch kind {
+				case 1:
+					req = keyOnly
+				case 2:
+					req = both
+				}
+				for pb.Next() {
+					res, err := br.Acquire(ctx, req)
+					if err != nil {
+						b.Fatal(err)
+					}
+					res.Release()
+				}
+			})
+			reportSoft(b, br)
+		})
+	}
+}
+
+// reportSoft publishes how much of the run the guard was actually responsible
+// for, so a difference in ns/op can be attributed rather than guessed at.
+func reportSoft(b *testing.B, br *Broker) {
+	b.Helper()
+	s := br.Snapshot()
+	b.ReportMetric(float64(s.SoftReservations)/float64(b.N), "softres/op")
+	b.ReportMetric(float64(s.Wakeups)/float64(maxU64(s.Grants, 1)), "probes/grant")
+}
+
+func maxU64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // BenchmarkAcquireContendedSpill adds candidate spilling to the contended path.

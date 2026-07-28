@@ -19,12 +19,21 @@ import (
 // A record whose length or CRC does not check out ends the segment: everything
 // before it is intact and everything after is a torn tail from a crash.
 
+// The two versions move together when a trace field is added. The record codec
+// reads positionally, so a segment written by a build with a different field
+// list cannot be decoded field by field -- and a decode failure mid-stream is
+// reported as spool corruption, which is a false alarm for what is really an
+// upgrade. Bumping the SEGMENT version instead makes an old segment fail its
+// header check, and an unrecognised segment is removed at open (see
+// scanSegment): the tail of traces a previous build had not yet flushed is
+// lost, which DESIGN §9.6 rule 2 already prices as "precision, not
+// correctness", and nothing is reported as damage.
 const (
 	spoolMagic     = "DRSP"
-	spoolVersion   = 1
+	spoolVersion   = 2
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 1
+	traceCodecVer  = 2
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -91,6 +100,7 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = binary.AppendVarint(dst, t.Time.UnixMicro())
 
 	dst = appendStr(dst, t.APIKeyID)
+	dst = appendStr(dst, t.UserID)
 	dst = appendStr(dst, t.TeamID)
 	dst = appendStr(dst, t.ModelGroup)
 	dst = appendStr(dst, t.Provider)
@@ -152,8 +162,8 @@ func decodeTrace(p []byte) (Trace, error) {
 	}
 	t.Time = time.UnixMicro(num()).UTC()
 
-	if !str(&t.APIKeyID) || !str(&t.TeamID) || !str(&t.ModelGroup) || !str(&t.Provider) ||
-		!str(&t.CredentialID) || !str(&t.Endpoint) || !str(&t.UpstreamModel) {
+	if !str(&t.APIKeyID) || !str(&t.UserID) || !str(&t.TeamID) || !str(&t.ModelGroup) ||
+		!str(&t.Provider) || !str(&t.CredentialID) || !str(&t.Endpoint) || !str(&t.UpstreamModel) {
 		return t, errCorrupt
 	}
 	t.Status = int(num())

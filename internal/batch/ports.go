@@ -47,6 +47,19 @@ type ExecRequest struct {
 	// dispatch cannot disagree about the target.
 	Provider      string
 	UpstreamModel string
+	// Credential is the credential the reservation was taken against, from
+	// [Reservation.CredentialID]. The executor must authenticate with this one
+	// and no other.
+	//
+	// It exists because the reservation and the dispatch would otherwise be
+	// about different accounts. [Reserver.Acquire] admits the row against the
+	// provider's whole candidate set and the broker picks a credential from it;
+	// without carrying that choice out, the executor has to guess — and a guess
+	// that picks the provider's first credential holds a slot on one account's
+	// axes while sending the request to another. The account limits are then
+	// counted against a credential that is not serving the traffic, which is
+	// exactly the failure DESIGN §5.1's per-account axes exist to prevent.
+	Credential string
 	// Body is the row's request body, verbatim.
 	Body json.RawMessage
 	// PriorityClass is the class this row is admitted and emitted at, always
@@ -82,6 +95,14 @@ type Reserver interface {
 // Reservation is a held slot on every axis the request needed. Release is
 // idempotent and never blocks.
 type Reservation interface {
+	// CredentialID names the credential the reservation was actually taken
+	// against, which is the one the row must be sent to. It is "" only when the
+	// provider offered no candidates at all.
+	//
+	// The choice belongs to the broker, not the caller: which candidate has room
+	// is the question Acquire answers. Leaving it inside the reservation makes
+	// the reserved axes and the dispatched account silently different.
+	CredentialID() string
 	Release()
 }
 

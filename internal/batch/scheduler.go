@@ -488,6 +488,9 @@ func (s *Service) attempt(ctx context.Context, rec *BatchRecord, row *RowRecord,
 		Model:         row.Model,
 		Provider:      tgt.Provider,
 		UpstreamModel: tgt.UpstreamModel,
+		// The broker chose this while admitting the row. Read here rather than
+		// re-derived anywhere else: a second derivation is a second answer.
+		Credential:    resv.CredentialID(),
 		Body:          in.Body,
 		PriorityClass: s.cfg.PriorityClass,
 		PrincipalID:   rec.PrincipalID,

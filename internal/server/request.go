@@ -67,6 +67,12 @@ type Request struct {
 	nparams int
 	idbuf   [32]byte
 	bytesIn int64
+
+	// cap is the shadow capture buffer, non-nil only when this request was
+	// sampled (DESIGN §14.1). It comes from its own pool rather than living
+	// inline, so the 95% of requests that are never sampled do not each retain
+	// a quarter of a megabyte for the life of the request pool.
+	cap *capture
 }
 
 // Context is the request's context, already bounded by the configured request
@@ -122,6 +128,10 @@ func (rq *Request) reset() {
 	rq.rw = responseWriter{}
 	rq.nparams = 0
 	rq.bytesIn = 0
+	if rq.cap != nil {
+		putCapture(rq.cap)
+		rq.cap = nil
+	}
 	for i := range rq.params {
 		rq.params[i] = Param{}
 	}

@@ -17,12 +17,16 @@ import (
 // fakePrincipal is an authenticated caller with a model allow-list.
 type fakePrincipal struct {
 	id      string
+	user    string
+	team    string
 	models  []string // nil allows everything
 	refuse  error
 	nRoutes []string
 }
 
-func (p *fakePrincipal) KeyID() string { return p.id }
+func (p *fakePrincipal) KeyID() string  { return p.id }
+func (p *fakePrincipal) UserID() string { return p.user }
+func (p *fakePrincipal) TeamID() string { return p.team }
 
 func (p *fakePrincipal) Authorize(a Access) error {
 	if p.refuse != nil {

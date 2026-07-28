@@ -141,31 +141,52 @@ func (s *Server) healthHandler(kind healthKind) Handler {
 		}
 		ready := s.Ready()
 		status := http.StatusOK
-		var body []byte
+		var state string
 		switch kind {
 		case healthReady:
 			if !ready {
-				status = http.StatusServiceUnavailable
-				body = []byte(`{"status":"draining"}`)
+				status, state = http.StatusServiceUnavailable, "draining"
 			} else {
-				body = []byte(`{"status":"ready"}`)
+				state = "ready"
 			}
 		case healthOverall:
 			if !ready {
-				status = http.StatusServiceUnavailable
-				body = []byte(`{"status":"draining"}`)
+				status, state = http.StatusServiceUnavailable, "draining"
 			} else {
-				body = []byte(`{"status":"healthy"}`)
+				state = "healthy"
 			}
 		default:
-			body = []byte(`{"status":"alive"}`)
+			state = "alive"
 		}
+
+		buf := getBuf()
+		defer putBuf(buf)
+		b := append(*buf, `{"status":`...)
+		b = appendJSONString(b, state)
+		// The shadow gate reports here as well as in metrics. A daily cost
+		// ceiling that has stopped shadowing is not a serving failure and must
+		// not take the pod out of rotation — so the status stays what it was
+		// and the fact appears beside it (DESIGN §14.1).
+		if kind != healthLive {
+			if o := rq.srv.snap.Load().observer; o != nil {
+				n := len(b)
+				b = append(b, `,"shadow":`...)
+				if grown := o.Health(b); len(grown) > n+10 {
+					b = grown
+				} else {
+					b = b[:n]
+				}
+			}
+		}
+		b = append(b, '}')
+		*buf = b
+
 		h.Set("Content-Type", "application/json")
-		h.Set("Content-Length", strconv.Itoa(len(body)))
+		h.Set("Content-Length", strconv.Itoa(len(b)))
 		h.Set("Cache-Control", "no-store")
 		w.WriteHeader(status)
 		if rq.Method != http.MethodHead {
-			_, _ = w.Write(body)
+			_, _ = w.Write(b)
 		}
 		return nil
 	}

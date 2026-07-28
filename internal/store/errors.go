@@ -7,6 +7,12 @@ var (
 	// ErrNotFound is returned when a lookup by primary key finds nothing.
 	ErrNotFound = errors.New("store: not found")
 
+	// ErrExists is returned when an insert would collide with an existing
+	// primary key. It is separate from a driver's own constraint error so that
+	// a caller can tell "this id is taken" from "the database is unreachable"
+	// without matching on message text.
+	ErrExists = errors.New("store: already exists")
+
 	// ErrUnboundedRange is returned when a ledger query is asked for an
 	// unbounded or improperly ordered time range. DESIGN 9.3: unbounded
 	// search is refused, not answered slowly.

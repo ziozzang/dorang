@@ -63,6 +63,27 @@ const (
 	defaultPassthroughTimeout = 600 * time.Second
 
 	defaultPriorityHeader = "X-Request-Priority"
+
+	// §14.1 leaves everything but the five documented keys open. These are the
+	// numbers the shadow implementation runs with, each chosen as a bound:
+	//
+	//   - the reference timeout is shorter than the request timeout because a
+	//     shadow call that outlives the request it copies is holding a worker
+	//     for a comparison nobody will read;
+	//   - queue × (head + tail) is the memory shadowing may hold, and at these
+	//     values that is 256 × 272 KiB ≈ 68 MiB worst case;
+	//   - the head is large enough that an ordinary chat response is captured
+	//     whole, which is what keeps a comparison conclusive.
+	defaultShadowRefTimeout     = 60 * time.Second
+	defaultShadowQueueSize      = 256
+	defaultShadowWorkers        = 4
+	defaultShadowCaptureHead    = 256 << 10
+	defaultShadowCaptureTail    = 16 << 10
+	defaultShadowReportPath     = "~/.dorang/shadow.jsonl"
+	defaultShadowReportMaxBytes = 256 << 20
+	// defaultShadowUnpricedEstimate is one cent. It is deliberately not zero:
+	// see Shadow.UnpricedEstimateUSD.
+	defaultShadowUnpricedEstimate = "0.01"
 )
 
 // defaultStickyKey is the composite stickiness key of §4.2.
@@ -248,6 +269,22 @@ func (c *Config) ApplyDefaults() {
 	setStr(&c.Shadow.Mode, ShadowModeOff)
 	if c.Shadow.Compare.Structural == nil {
 		c.Shadow.Compare.Structural = boolPtr(true)
+	}
+	setDur(&c.Shadow.Reference.Timeout, defaultShadowRefTimeout)
+	setInt(&c.Shadow.QueueSize, defaultShadowQueueSize)
+	setInt(&c.Shadow.Workers, defaultShadowWorkers)
+	if c.Shadow.Capture.HeadBytes == 0 {
+		c.Shadow.Capture.HeadBytes = defaultShadowCaptureHead
+	}
+	if c.Shadow.Capture.TailBytes == 0 {
+		c.Shadow.Capture.TailBytes = defaultShadowCaptureTail
+	}
+	setStr(&c.Shadow.Report.Path, defaultShadowReportPath)
+	if c.Shadow.Report.MaxBytes == 0 {
+		c.Shadow.Report.MaxBytes = defaultShadowReportMaxBytes
+	}
+	if c.Shadow.UnpricedEstimateUSD == "" {
+		c.Shadow.UnpricedEstimateUSD = defaultShadowUnpricedEstimate
 	}
 
 	// notifications

@@ -15,12 +15,13 @@ func (b *Broker) queueLen(k axisKey) int {
 	return 0
 }
 
-// inUseOf is the committed count on one axis key.
+// inUseOf is the committed count on one axis key, excluding any unit held idle
+// by a soft reservation.
 func (b *Broker) inUseOf(k axisKey) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if bk := b.buckets[k]; bk != nil {
-		return bk.inUse
+		return bk.committed()
 	}
 	return 0
 }
@@ -50,4 +51,24 @@ func (b *Broker) wakeupCount() uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.wakeups
+}
+
+// softReservedOn reports whether one unit of an axis key is being held idle for
+// a waiter. Reading it straight after a Release is deterministic: the grant, or
+// the soft reservation that absorbed the freed unit, happens inside Release
+// under the broker lock.
+func (b *Broker) softReservedOn(k axisKey) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	bk := b.buckets[k]
+	return bk != nil && bk.claimant != nil
+}
+
+// totalClaims is the number of outstanding soft reservations. A drained broker
+// must report zero: a claim is capacity kept idle, and leaking one leaks
+// capacity just as surely as leaking a reservation would.
+func (b *Broker) totalClaims() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.softReservedLocked()
 }

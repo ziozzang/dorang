@@ -56,6 +56,17 @@ type Options struct {
 	Models ModelLister
 	// Meter absorbs finished requests. Nil discards them.
 	Meter Meter
+	// Observer compares a sampled fraction of traffic against a reference
+	// gateway (DESIGN §14.1). Nil captures nothing and costs nothing: the
+	// request path reads one nil pointer and skips the whole mechanism.
+	Observer Observer
+
+	// CaptureHeadBytes and CaptureTailBytes bound what a sampled response
+	// retains for comparison; 0 uses [DefaultCaptureHeadBytes] and
+	// [DefaultCaptureTailBytes]. They are here rather than in the observer
+	// because the server owns the buffer that the tap writes into.
+	CaptureHeadBytes int
+	CaptureTailBytes int
 
 	// MaxBodyBytes caps one request body; 0 uses [DefaultMaxBodyBytes].
 	MaxBodyBytes int64
@@ -105,6 +116,10 @@ type snapshot struct {
 	dispatcher Dispatcher
 	models     ModelLister
 	meter      Meter
+	observer   Observer
+
+	captureHead int
+	captureTail int
 
 	maxBody        int64
 	requestTimeout time.Duration
@@ -165,6 +180,9 @@ func (s *Server) Reload(opts Options) error {
 		dispatcher:     opts.Dispatcher,
 		models:         opts.Models,
 		meter:          opts.Meter,
+		observer:       opts.Observer,
+		captureHead:    opts.CaptureHeadBytes,
+		captureTail:    opts.CaptureTailBytes,
 		maxBody:        opts.MaxBodyBytes,
 		requestTimeout: opts.RequestTimeout,
 		shutdownGrace:  opts.ShutdownGrace,
@@ -175,6 +193,14 @@ func (s *Server) Reload(opts Options) error {
 	}
 	if snap.meter == nil {
 		snap.meter = nopMeter{}
+	}
+	if snap.captureHead <= 0 {
+		snap.captureHead = DefaultCaptureHeadBytes
+	}
+	if snap.captureTail < 0 {
+		snap.captureTail = 0
+	} else if snap.captureTail == 0 {
+		snap.captureTail = DefaultCaptureTailBytes
 	}
 	if snap.maxBody <= 0 {
 		snap.maxBody = DefaultMaxBodyBytes
@@ -316,6 +342,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.finish(cfg, rq, rw)
 	}()
+
+	// The capture tap is armed here: after the recover, so a panicking observer
+	// cannot escape into net/http and kill the connection, and before any
+	// handler can write, because a sampling decision taken later would miss the
+	// response it exists to compare (DESIGN §14.1). The call itself is one hash
+	// of the request id, and only when an observer is configured at all.
+	if cfg.observer != nil && cfg.observer.Sample(rq.ID, r.Header) {
+		rq.cap = getCapture(cfg.captureHead, cfg.captureTail)
+		rw.cap = rq.cap
+	}
 
 	if err := s.serve(cfg, rw, rq); err != nil {
 		s.fail(rw, rq, err)
@@ -498,12 +534,20 @@ func safeHeaderValue(v string) bool {
 	return true
 }
 
-// finish records metrics and hands the request to the meter.
+// finish records metrics, hands the request to the observer, and then to the
+// meter.
 //
 // Metering runs after the client's last byte and never fails the request: a
 // panic in a Meter implementation is counted and swallowed (DESIGN §10.6 step
 // 5, generalized — there is no reason the rest of the surface should be less
 // forgiving than passthrough).
+//
+// The observer runs here too, and exactly once — which is the point. A shadowed
+// request is one request in dorang's ledger, not two (DESIGN §12): the
+// reference call is issued by internal/shadow against the reference gateway's
+// own credential and never re-enters this path, so cost, quota and budget for
+// the sampled fraction stay the numbers they would have been with shadowing
+// off. Metering the copy would make every figure wrong by the sample rate.
 func (s *Server) finish(cfg *snapshot, rq *Request, rw *responseWriter) {
 	status := rw.status
 	if !rw.wrote {
@@ -511,6 +555,11 @@ func (s *Server) finish(cfg *snapshot, rq *Request, rw *responseWriter) {
 	}
 	dur := cfg.now().Sub(rq.Start)
 	s.metrics.observe(status, dur, rq.bytesIn, rw.n)
+
+	if cfg.observer != nil && rq.cap != nil && !rq.cap.abandoned {
+		s.metrics.observed.Add(1)
+		s.observe(cfg, rq, rw, status, dur)
+	}
 
 	defer func() {
 		if v := recover(); v != nil {
@@ -522,9 +571,12 @@ func (s *Server) finish(cfg *snapshot, rq *Request, rw *responseWriter) {
 	if rq.Route != nil {
 		name, family = rq.Route.Name, rq.Route.Family
 	}
+	keyID, userID, teamID := principalIDs(rq.Principal)
 	cfg.meter.Record(Event{
 		RequestID:   rq.ID,
-		KeyID:       principalID(rq.Principal),
+		KeyID:       keyID,
+		UserID:      userID,
+		TeamID:      teamID,
 		Route:       name,
 		Family:      family,
 		Method:      rq.Method,
@@ -544,4 +596,13 @@ func principalID(p Principal) string {
 		return ""
 	}
 	return p.KeyID()
+}
+
+// principalIDs reads the whole identity in one place. A public route has no
+// principal at all, which is three empty strings rather than a nil dereference.
+func principalIDs(p Principal) (keyID, userID, teamID string) {
+	if p == nil {
+		return "", "", ""
+	}
+	return p.KeyID(), p.UserID(), p.TeamID()
 }

@@ -11,12 +11,12 @@ import (
 
 // meterAdapter satisfies server.Meter with the real metering pipeline.
 //
-// The two event shapes are close but not identical, and where they differ the
-// server's is the poorer one: it has no team id, because the HTTP surface never
-// learns one — internal/server.Principal exposes only KeyID. A team-scoped
-// rollup therefore stays empty on this path. Carrying the team would mean
-// widening server.Principal, which is a change to that package's contract and
-// not something the wiring layer gets to decide.
+// The two event shapes map field for field. They did not always: the server's
+// event carried only a key id, so meter.Event.TeamID was always empty and
+// usage_by_team_day (DESIGN §9.4) was a materialization nothing ever wrote.
+// The team and the user cannot be recovered downstream either — that would be a
+// store lookup on the metering path — so server.Principal carries them and this
+// adapter copies them across.
 type meterAdapter struct {
 	m   *meter.Meter
 	now func() time.Time
@@ -29,6 +29,8 @@ func (a *meterAdapter) Record(ev server.Event) {
 	a.m.Record(meter.Event{
 		Time:         a.now(),
 		APIKeyID:     ev.KeyID,
+		UserID:       ev.UserID,
+		TeamID:       ev.TeamID,
 		ModelGroup:   ev.Model,
 		Provider:     r.Provider,
 		CredentialID: r.Credential,
@@ -132,6 +134,7 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			ID:               t.RequestID,
 			TS:               t.Time,
 			APIKeyID:         t.APIKeyID,
+			UserID:           t.UserID,
 			TeamID:           t.TeamID,
 			CredentialID:     t.CredentialID,
 			ProviderID:       t.Provider,

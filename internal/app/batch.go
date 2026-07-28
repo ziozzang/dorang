@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,12 +27,11 @@ import (
 // startBatch builds the batch scheduler and its adapters (DESIGN §11.1).
 //
 // Every dependency internal/batch declares is an interface it defined itself,
-// and the four adapters below are the only place the real implementations meet
-// them. One of the five is NOT adapted: batch.Store. internal/store has no
-// batch, row or file tables — the migration set covers keys, the ledger and
-// rollups — so the shipped in-memory store is used and batches do not survive a
-// restart. Recover is still wired, so the moment a persistent batch.Store
-// exists this becomes durable without another change here.
+// and the adapters here are the only place the real implementations meet them.
+// The Store is the durable one: batches, their rows and their result bodies live
+// in the database (DESIGN §9.2), so [batch.Service.Recover] below resumes work a
+// previous process left in flight instead of resuming nothing. A batch that had
+// finished four hundred of its rows costs four hundred rows less on the way back.
 func (a *App) startBatch(cfg *config.Config, up *upstreamTable) error {
 	dir := filepath.Join(filepath.Dir(config.ExpandPath(cfg.Storage.SQLite.Path)), "blobs")
 	blobs, err := batch.NewDiskBlobs(dir)
@@ -41,7 +42,7 @@ func (a *App) startBatch(cfg *config.Config, up *upstreamTable) error {
 	a.targets.swap(buildTargets(cfg, a.Catalog))
 
 	svc, err := batch.New(batch.Config{
-		Store:    batch.NewMemStore(),
+		Store:    &batchStore{st: a.Store},
 		Blobs:    blobs,
 		Executor: &batchExecutor{d: a.dispatch},
 		Capacity: &batchReserver{broker: a.Broker, table: up},
@@ -127,6 +128,11 @@ type batchReserver struct {
 }
 
 // Acquire implements batch.Reserver.
+//
+// The returned *capacity.Reservation satisfies batch.Reservation directly: the
+// broker already exposes CredentialID, and the batch interface asks for it by
+// the same name. Nothing is wrapped, so the credential the scheduler dispatches
+// with is read from the reservation itself rather than re-derived beside it.
 func (r *batchReserver) Acquire(ctx context.Context, req batch.CapacityRequest) (batch.Reservation, error) {
 	res, err := r.broker.Acquire(ctx, capacity.Request{
 		Provider:      req.Provider,
@@ -143,7 +149,16 @@ func (r *batchReserver) Acquire(ctx context.Context, req batch.CapacityRequest) 
 	return res, nil
 }
 
-// candidates lists a provider's credentials as capacity candidates.
+// candidates lists a provider's credentials as capacity candidates, in a stable
+// order.
+//
+// The sort is not cosmetic. The credentials are held in a map, so without it the
+// candidate slice is in Go's randomized map order and the broker walks a
+// different list on every call — which means the account a batch row lands on
+// varies run to run for no reason the operator can see. That was invisible while
+// the executor ignored the broker's choice and always used the same credential;
+// now that the reservation decides, an unordered list would make the decision
+// itself nondeterministic.
 func (t *upstreamTable) candidates(provider string) []capacity.Candidate {
 	var out []capacity.Candidate
 	for _, c := range t.creds {
@@ -157,18 +172,22 @@ func (t *upstreamTable) candidates(provider string) []capacity.Candidate {
 			Provider:      c.provider,
 		})
 	}
+	slices.SortFunc(out, func(a, b capacity.Candidate) int {
+		return strings.Compare(a.ID, b.ID)
+	})
 	return out
 }
 
-// firstCredential is the credential a batch row authenticates with.
+// anyCredential is the fallback credential for a provider, used only when a
+// reservation named none.
 //
-// batch.ExecRequest carries no credential: the scheduler reserves capacity
-// against the provider's whole candidate set and the broker picks one, but that
-// choice is inside the Reservation and the Executor is never handed it. Picking
-// the provider's first credential here keeps the two from disagreeing about
-// anything the row can observe, and is the one place batch dispatch is less
-// precise than interactive dispatch.
-func (t *upstreamTable) firstCredential(provider string) string {
+// It is reachable in one case: a provider configured with no capacity
+// candidates at all, where the broker has nothing to choose between and returns
+// "". Every other row authenticates with the credential its reservation was
+// taken against (batch.ExecRequest.Credential), because reserving against one
+// account and dispatching to another makes both accounts' concurrency counts
+// wrong.
+func (t *upstreamTable) anyCredential(provider string) string {
 	best := ""
 	for _, c := range t.creds {
 		if c.provider != provider {
@@ -213,10 +232,17 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		body:      req.Body,
 		creq:      creq,
 	}
+	// The credential the scheduler reserved against, not one chosen here. The
+	// reservation holds slots on THAT account's axes (DESIGN §5.1), so sending
+	// the row anywhere else charges one account and burdens another.
+	cred := req.Credential
+	if cred == "" {
+		cred = st.upstreams.anyCredential(req.Provider)
+	}
 	dec := &router.Decision{
 		Provider:      req.Provider,
 		UpstreamModel: req.UpstreamModel,
-		Credential:    st.upstreams.firstCredential(req.Provider),
+		Credential:    cred,
 		Kind:          up.kind,
 	}
 

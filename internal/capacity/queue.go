@@ -37,6 +37,20 @@ type waiter struct {
 	ch    chan grant
 	state waiterState
 
+	// claimed says this waiter holds at least one soft reservation, so that the
+	// grant path — which every waiter takes — can skip looking for one with a
+	// single byte test. The claims themselves are not stored: they are a prefix
+	// of the claim candidate's axes, and that need set is a pure function of the
+	// immutable request and configuration, so it is recomputed on the rare path
+	// that gives them back rather than carried in every waiter ever allocated.
+	claimed bool
+	// bounces counts the probes this waiter has failed: the number of times it
+	// reached the head of a queue, found some other axis it needs full, and had
+	// to move on. It is the ping-pong signal that arms soft reservations, so
+	// that a waiter which is merely queued does not idle capacity it was about
+	// to be given anyway. See Config.SoftReserveAfter.
+	bounces int32
+
 	// at holds this waiter's position in every queue it currently sits in. A
 	// Spill waiter may block on a different axis per candidate and must be
 	// woken by whichever of them frees first.

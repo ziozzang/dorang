@@ -49,7 +49,7 @@ CREATE TABLE "LiteLLM_VerificationToken" (
 )`
 
 type legacyRow struct {
-	token   string // the STORED value: sha256 of the full "sk-..." token, hex
+	token   string // the STORED value: sha256 of the full "sk-..." token, hex // pragma: allowlist secret — test fixture
 	keyName string
 	expires string
 	blocked int
@@ -110,9 +110,9 @@ func TestScenario13_LegacyCredentialImport(t *testing.T) {
 	)
 	clk := newClock()
 	src := newLegacySource(t, []legacyRow{
-		{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"},
-		{token: store.HashLegacySHA256(dead), keyName: "sk-...DEAD", expires: "2025-01-01 00:00:00"},
-		{token: store.HashLegacySHA256(blocked), keyName: "sk-...BLOK", blocked: 1},
+		{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"}, // pragma: allowlist secret — test fixture
+		{token: store.HashLegacySHA256(dead), keyName: "sk-...DEAD", expires: "2025-01-01 00:00:00"}, // pragma: allowlist secret — test fixture
+		{token: store.HashLegacySHA256(blocked), keyName: "sk-...BLOK", blocked: 1},                  // pragma: allowlist secret — test fixture
 	})
 
 	s := openStore(t, clk.now, store.LegacyAuth{Enabled: true, Until: clk.now().AddDate(0, 1, 0)})
@@ -231,7 +231,7 @@ func TestScenario13_LegacyCredentialImport(t *testing.T) {
 		// with the window shut must refuse a row that is still legacy.
 		clk := newClock()
 		src := newLegacySource(t, []legacyRow{
-			{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"},
+			{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"}, // pragma: allowlist secret — test fixture
 		})
 		open := openStore(t, clk.now, store.LegacyAuth{Enabled: true, Until: clk.now().AddDate(0, 1, 0)})
 		if _, err := open.ImportKeys(context.Background(), src, store.ImportOptions{Now: clk.now()}); err != nil {
@@ -301,7 +301,7 @@ func TestLegacyCredentialUpgradesThroughTheAuthenticator(t *testing.T) {
 	const live = "sk-scenario-auth-token" // pragma: allowlist secret — test fixture
 	clk := newClock()
 	src := newLegacySource(t, []legacyRow{
-		{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"},
+		{token: store.HashLegacySHA256(live), keyName: "sk-...LIVE", expires: "2027-01-01 00:00:00"}, // pragma: allowlist secret — test fixture
 	})
 	s := openStore(t, clk.now, store.LegacyAuth{Enabled: true, Until: clk.now().AddDate(0, 1, 0)})
 	ctx := context.Background()

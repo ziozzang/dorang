@@ -12,20 +12,17 @@ import (
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
-// authStore adapts *store.Store onto auth.Store.
+// authStore adapts *store.Store onto auth.Store and auth.Rehasher.
 //
 // internal/auth declares a one-method Store so that a cache, an HTTP delegate
 // or a test double substitute for persistence without it importing the store.
-// This is the real implementation of that method and nothing else.
+// This is the real implementation of that method, plus the optional upgrade
+// method that turns rehash-on-use on.
 //
-// It deliberately does NOT implement auth.Rehasher. That interface hands over a
-// key id, a lookup and an already-computed digest; internal/store's RehashKey
-// takes the TOKEN and recomputes the digest itself, and there is no store method
-// that writes a digest directly. Implementing it would mean either reaching past
-// the store's API into its SQL or holding the caller's token past verification,
-// and neither is worth rehash-on-use. The consequence is visible and bounded:
-// legacy rows keep verifying under legacy_sha256 until the configured sunset
-// date, and are not upgraded in place.
+// auth.New enables the upgrade path only when its Store also implements
+// auth.Rehasher, so an adapter that omits Rehash does not degrade the feature —
+// it removes it silently, and DESIGN §2.4's "the migration completes without
+// downtime" becomes a legacy window that never narrows.
 type authStore struct {
 	st *store.Store
 }
@@ -40,6 +37,17 @@ func (s *authStore) LoadByLookup(ctx context.Context, lookup string) (auth.Recor
 		return auth.Record{}, err
 	}
 	return recordFromAPIKey(k)
+}
+
+// Rehash implements auth.Rehasher.
+//
+// The digest arrives already computed, because the authenticator derived it
+// while verifying and the token itself must not outlive that verification. The
+// store's upgrade is conditional on the row still being legacy, so a repeated
+// or concurrent upgrade is a no-op rather than a race, and both packages agree
+// on the digest because they are peppered from the same value (see [New]).
+func (s *authStore) Rehash(ctx context.Context, keyID, lookup string, digest auth.Digest) error {
+	return s.st.SetKeyDigest(ctx, keyID, lookup, digest.Hex(), store.SchemeDorangV1)
 }
 
 // recordFromAPIKey converts a stored row into the authenticator's view of it.
@@ -74,6 +82,7 @@ func recordFromAPIKey(k *store.APIKey) (auth.Record, error) {
 				AllowedRoutes:    k.AllowedRoutes,
 				MaxBudgetNanoUSD: k.MaxBudgetNano,
 				SpentNanoUSD:     k.SpendNano,
+				BudgetPeriod:     k.BudgetPeriod,
 				BudgetResetAt:    k.BudgetResetAt,
 				RPMLimit:         k.RPMLimit,
 				TPMLimit:         k.TPMLimit,
@@ -110,6 +119,12 @@ type principal struct {
 
 // KeyID implements server.Principal.
 func (p *principal) KeyID() string { return p.p.KeyID }
+
+// UserID implements server.Principal.
+func (p *principal) UserID() string { return p.p.UserID }
+
+// TeamID implements server.Principal.
+func (p *principal) TeamID() string { return p.p.TeamID }
 
 // Authorize implements server.Principal.
 func (p *principal) Authorize(a server.Access) error {
