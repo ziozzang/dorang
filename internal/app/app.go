@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
@@ -114,8 +115,19 @@ type App struct {
 	// subsystem above rather than being pushed to by any of them, so nothing
 	// here imports internal/metrics except this package.
 	Metrics *metrics.Registry
+	// Admin is the DESIGN §2.3 administration surface and the §11.3 operator
+	// UI. Nil when this process has no store — there is nothing to administer
+	// and nothing to audit — in which case the administrative paths keep
+	// answering the 501 they answered before. See admin.go.
+	Admin *admin.API
 
-	opts     Options
+	opts Options
+	// pepper is the §2.4 HMAC pepper, kept because the administration surface
+	// issues credentials and must hash them exactly as the authenticator and
+	// the store do. It is never logged and never rendered: every type that
+	// holds it redacts under every fmt verb, and this field is unexported so
+	// that a %+v of App cannot reach it.
+	pepper   string
 	cfg      atomic.Pointer[config.Config]
 	requests *metrics.Requests
 	dispatch *dispatcher
@@ -187,6 +199,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 			"Set it explicitly before running more than one node.",
 			cfg.Server.KeyPepperEnv, pepperPath(cfg))
 	}
+	a.pepper = pepper
 	sc, err := storeConfig(cfg, pepper)
 	if err != nil {
 		return nil, err
@@ -341,6 +354,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	//     immediately afterwards — that one edge is a cycle in construction
 	//     order, not in the package graph.
 	a.Metrics = a.buildMetrics(cfg)
+
+	// 7d. Administration (DESIGN §2.3, §11.3). It is built before the HTTP
+	//     surface because the surface mounts it, and after the store and the
+	//     authenticator because it administers the one through the other.
+	//
+	//     Until this line the package had no importer at all, which meant no
+	//     API path could revoke a leaked key.
+	if a.Admin, err = a.buildAdmin(); err != nil {
+		return nil, fmt.Errorf("app: administration surface: %w", err)
+	}
 
 	// 8. HTTP surface.
 	srv, err := server.New(a.serverOptions(cfg))

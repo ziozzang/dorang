@@ -348,6 +348,13 @@ func (c *call) keyGenerate() error {
 	if err := spec.apply(k, now); err != nil {
 		return err
 	}
+	// A scoped administrator may only mint keys on its own team. Without this
+	// the scope is decorative: issue a key with team_id set to somebody else's
+	// team and every later check passes, because the key really is on that
+	// team by then.
+	if err := c.permitTeamParam(k.TeamID); err != nil {
+		return err
+	}
 
 	token, err := c.a.cfg.NewToken()
 	if err != nil {
@@ -402,11 +409,8 @@ func (c *call) keyInfo() error {
 	if err != nil {
 		return err
 	}
-	k, err := ks.GetKey(c.ctx(), id)
+	k, err := c.loadKey(ks, id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return notFound("key", id)
-		}
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": viewKey(k)})
@@ -433,17 +437,20 @@ func (c *call) keyUpdate() error {
 	if err != nil {
 		return err
 	}
-	k, err := ks.GetKey(c.ctx(), id)
+	k, err := c.loadKey(ks, id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return notFound("key", id)
-		}
 		return err
 	}
 	before := viewKey(k)
 
 	updated := *k
 	if err := body.keySpec.apply(&updated, c.a.now()); err != nil {
+		return err
+	}
+	// The update may MOVE the key: an unchecked team_id would let a scoped
+	// administrator hand its own key to another team, or adopt one, which is
+	// the scope check bypassed by writing through it rather than around it.
+	if err := c.permitTeamParam(updated.TeamID); err != nil {
 		return err
 	}
 	updated.UpdatedAt = c.a.now().UTC()
@@ -489,9 +496,16 @@ func (c *call) keyDelete() error {
 	// trail nobody can reconcile against.
 	before := make([]keyView, 0, len(ids))
 	for _, id := range ids {
-		k, err := ks.GetKey(c.ctx(), id)
+		// loadKey, not GetKey: a bulk delete is the easiest place to reach a
+		// key outside the caller's scope, because the caller supplies the whole
+		// list and nothing else in this handler looks at any single one of
+		// them. An id the caller may not administer is refused rather than
+		// skipped — silently dropping it from a delete list and reporting a
+		// smaller "deleted" count reads like the key was already gone.
+		k, err := c.loadKey(ks, id)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			var f *fault
+			if errors.As(err, &f) && f.Status == http.StatusNotFound && c.scope().Global {
 				continue
 			}
 			return err
@@ -538,9 +552,17 @@ func (c *call) keyList() error {
 	if err != nil {
 		return err
 	}
+	// The team filter is the finding: it used to be read straight off the
+	// request and handed to the store, so naming a team was the same as being
+	// entitled to it. It is now narrowed against the caller's own scope, and
+	// the result is filtered again below in case a store ignores it.
+	team, err := c.scopedTeamFilter(queryString(c.r, "team_id"))
+	if err != nil {
+		return err
+	}
 	f := KeyFilter{
 		UserID:  queryString(c.r, "user_id"),
-		TeamID:  queryString(c.r, "team_id"),
+		TeamID:  team,
 		Blocked: blocked,
 		Limit:   limit,
 		Offset:  offset,
@@ -549,6 +571,7 @@ func (c *call) keyList() error {
 	if err != nil {
 		return err
 	}
+	keys = c.keepKeysInScope(keys)
 	out := make([]keyView, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, viewKey(k))
@@ -582,11 +605,8 @@ func keySetBlocked(blocked bool) handler {
 		if err != nil {
 			return err
 		}
-		k, err := ks.GetKey(c.ctx(), id)
+		k, err := c.loadKey(ks, id)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return notFound("key", id)
-			}
 			return err
 		}
 		before := viewKey(k)
@@ -637,11 +657,8 @@ func (c *call) keyRegenerate() error {
 	if err != nil {
 		return err
 	}
-	k, err := ks.GetKey(c.ctx(), id)
+	k, err := c.loadKey(ks, id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return notFound("key", id)
-		}
 		return err
 	}
 	before := viewKey(k)

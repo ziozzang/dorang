@@ -194,8 +194,12 @@ func TestReferenceFailuresNeverStopTheGatewayAndAreAlwaysRecorded(t *testing.T) 
 			})
 			s.Observe(observation("fail-1", 200, okBody))
 
-			waitFor(t, 5*time.Second, "the reference call to resolve", func() bool {
-				return s.Stats().Sent > 0
+			// Wait for the REPORT, not for the counter. m.sent is incremented
+			// as soon as the reference call returns and the record is written
+			// afterwards, so waiting on Sent races the write and this test
+			// failed roughly one run in eight.
+			waitFor(t, 5*time.Second, "the comparison to be reported", func() bool {
+				return len(w.lines()) > 0
 			})
 			st := s.Stats()
 			if st.Panics != 0 {

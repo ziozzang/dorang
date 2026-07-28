@@ -1356,3 +1356,245 @@ pass:
 - [MEDIUM] two independent lists of accepted authentication headers.
 - [LOW] `shadow.Options.ReferenceKey` unredacted; route table enumerable before
   authentication; WebSocket relays unmetered and untimed.
+
+
+---
+
+# Dispositions, second pass
+
+Written when the branch holding the nine fixes was re-applied onto a `main` that
+had moved a long way — T1 endpoints, an L5 backend package, a metrics registry,
+extensions, notifications — and when `internal/admin` was finally mounted.
+
+Every claim below was checked the same way: revert the fix in place, run the
+named test, observe it fail, restore, observe it pass. Three claims did not
+survive that check on the first attempt and are recorded as what they turned out
+to be rather than as what they were meant to be.
+
+## Landing the nine on current `main`
+
+Six of the seven files the rebase flagged as overlapping merged without a
+semantic conflict. Where the two diverged, the security property was kept and
+the newer code's shape was kept with it:
+
+- `internal/server/mux.go` — `Route.ModelAuth` sits alongside `main`'s new
+  `Multipart` and `ModelParam`. The gate resolves the path parameter BEFORE the
+  allow-list check, so a deployment-in-the-path alias is authorized against the
+  name that will be dispatched.
+- `internal/app/budget.go` — the per-subject holds absorbed `main`'s §11.5
+  notifications. `budget_80pct` and `budget_exceeded` are now raised per
+  SUBJECT, which is what the operator is being told about: a team crossing 80%
+  and a key crossing 80% are different facts.
+- `internal/app/batch.go` — the budget hold sits inside `main`'s reshaped
+  upstream encoding and four-value `convertResponse`.
+- `internal/app/app.go`, `internal/server/errors_test.go`, `.gitignore` —
+  additive.
+
+### Re-derived, because the code the fix guarded had moved
+
+`main` grew `internal/backend`, an L5 layer written after the fixes and
+reproducing two of the defects they closed. It has no importer yet, so both were
+latent — and both are exactly the shape this review named: the correct code
+exists one package away and the path that would run does not have it.
+
+- **The §11.3 leak, in `internal/backend/errors.go`.** `upstreamError` scrubbed
+  the provider credential out of `Error.Message` — a field `Normalize` no longer
+  writes anything into. The upstream's text now lives in `NativeMessage`, so
+  that is where the scrubber had to reach. `TestErrorNormalization` was asserting
+  the *opposite* property from the one the fix establishes: it required the
+  client-facing message to CONTAIN the upstream's words. It now asserts both
+  halves — the native text survives where an operator can read it, and it does
+  not appear in the body.
+- **The unbounded read, in `internal/backend/backend.go:396`.** Same asymmetry
+  the interactive dispatcher shipped: 1 MiB on the error branch, `io.ReadAll` on
+  the success branch. `Options.MaxResponseBytes`, `DefaultMaxResponseBytes` and
+  a non-retryable `upstream_response_too_large` were added to match.
+- **Transport error text, in `internal/backend/errors.go`.** `transportError`
+  relayed `err.Error()`, with a comment arguing it was safe because it cannot
+  carry a credential. True, and not the finding: it carries the operator's
+  internal hostname, port and IP.
+
+Four routes `main` added carried no `ModelAuth` answer and were refused at
+registration, which is the mechanism working: `/v1/models/{id}` and the three
+Responses sub-resources are `ModelAuthNone`, each with the reason written down.
+
+### Verification, and what it found
+
+| Fix | Named test | Reverted → |
+|---|---|---|
+| 1 batch allow-list, dispatch | `TestBatchExecutorRefusesAModelTheOwnerMayNotUse` | fails **only when both checks in `identity` are removed** |
+| 1 batch blocked owner | `TestBatchExecutorRefusesABlockedOwner` | fails |
+| 1 batch budget | `TestBatchExecutionIsBudgeted` | fails |
+| 1 upload-time allow-list | `internal/batch` row validation | fails |
+| 2 rpm/tpm | `TestRPMLimitIsEnforced`, `TestTPMLimitIsEnforced`, `TestTeamRPMCountsEveryKeyUnderTheTeam` | fails |
+| 2 max_parallel | `internal/capacity/principalmax_test.go` | fails |
+| 3 §11.3 | `internal/server/errorleak_test.go` | fails |
+| 3 native-type header | `TestNativeErrorTypeHeaderIsCheckedAndClamped` | fails |
+| 3 transport error text | `TestUnreachableUpstreamDoesNotNameInternalHosts` | fails |
+| 4 budget subject | `TestTeamBudgetIsNotMultipliedByTheNumberOfKeys` | fails |
+| 5 tenant scoping | `internal/prefix` chain tests | fails |
+| 5 `Request.Tenant` | `TestRouterRequestCarriesTheTenant` | fails |
+| 6 flood | `internal/auth/flood_test.go` | fails |
+| 7 bounded read (dispatch, L5) | `TestOversizedUpstreamResponseIsRefused` | fails **after the test was strengthened** |
+| 8 passthrough | `internal/server/passthrough_security_test.go` | fails |
+| 9 `MarshalYAML` / import | `internal/config/secretmarshal_test.go` | fails |
+| Set-Cookie | passthrough header tests | fails |
+
+Two entries need their qualification stated rather than buried:
+
+- **Finding 1's dispatch-time check is redundant with itself.** `identity` asks
+  `principalAllowsModel` AND `Authorize(Access{Model: …})`, and `auth.Limits`
+  already consults the allow-list when `Access.Model` is non-empty. Removing
+  either alone changes nothing observable. That is defence in depth and it is
+  fine; what is not fine is calling it "verified" on a revert that a second
+  implementation silently covered. Recorded as one control with two
+  implementations, not two controls.
+- **Finding 7's test proved the refusal, not the bound.** `readUpstreamBody`
+  reverted to `io.ReadAll(r)` still returned `errUpstreamTooLarge`, because the
+  length check follows the read — so the test passed against an implementation
+  with none of the safety. The finding was a remote OOM: the bytes must not be
+  READ, not merely not returned. Both tests now count what the reader was asked
+  for.
+
+### Not a regression, fixed anyway
+
+`TestReferenceFailuresNeverStopTheGatewayAndAreAlwaysRecorded` failed about one
+run in eight on `main` before any of this. `internal/shadow` increments its
+`sent` counter when the reference call returns and writes the report record
+afterwards; the test waited on the counter and then read the report. It now
+waits on the report.
+
+## `internal/admin` — mounted
+
+The previous pass left it unwired on the grounds that mounting it would convert
+three latent findings into live ones. All three are closed and it is mounted.
+
+### read-before-auth
+
+`API.ServeHTTP` authenticates FIRST — before the route lookup, before `OPTIONS`,
+before the 405 and before the 501. Everything above it was an oracle: an
+anonymous caller learned which administrative routes this build serves, which
+methods each accepts, and from the difference between the generic 501 and a
+stub's specific code, which concepts exist. §0.2's contract is unchanged for an
+authenticated caller.
+
+Test: `TestTheRouteTableIsNotReadableBeforeAuthentication`.
+
+### Team-scoped administration
+
+`admin.Scope` and a required `Principal.AdminScope()` method. Two kinds of
+administrator, and the difference is a fact the schema already holds:
+
+- **Global** — the master credential, and an administrative key on no team.
+- **Team-scoped** — an administrative key on a team (`api_keys.team_id`).
+
+No `admin_team` role was invented and no migration was needed. The scope is
+DERIVED from the key, which is what makes it un-forgettable: a key that is on a
+team is scoped by being on a team. The zero `Scope` admits nothing, so an
+adapter that fails to answer produces a surface that refuses rather than one
+that permits.
+
+Deployment configuration — deployments, aliases, capacity, catalog, pricing,
+`/admin/config/reload`, `/health/history`, `/global/spend/report`, creating a
+user or a team — is refused for a scoped administrator rather than filtered.
+There is no honest per-team view of "reload the process's configuration".
+
+`user_role` is global-only to write, because it is the bit that decides who
+administers: a scoped administrator that could set it could promote itself.
+
+Tests: `TestATeamAdminCannotReachAnotherTeam`,
+`TestATeamAdminCannotMintOrMoveKeysAcrossTeams`,
+`TestDeploymentWideEndpointsRefuseAScopedAdmin`, `TestTheZeroScopeAdmitsNothing`.
+
+### Request-supplied id filters
+
+Every place the caller named the subject it wanted now has the name CHECKED
+rather than trusted, and the two refusals differ on purpose:
+
+- A **parameter** naming a team outside the scope is `403 out_of_scope`. The
+  answer is the same whether that team exists, so it discloses nothing.
+- An **object** outside the scope is `404`, identical to an id that does not
+  exist. Answering 403 would turn every id into an existence oracle.
+
+Listings are filtered after the store returns, not only before: a `key_id` or
+`trace_id` filter can select another team's rows through a query that is itself
+legitimate, and a store that ignores a filter must not thereby leak. The
+operator UI carries the same scope, on the session rather than re-derived —
+the cookie is deliberately not the credential.
+
+Tests: `TestListingFiltersCannotWidenTheScope`,
+`TestSpendLogsCannotReachAnotherTeam`, `TestBudgetSubjectsAreScoped`.
+
+### What mounting it exposed
+
+`internal/admin` had no importer, and neither did the storage underneath it.
+`internal/store` could insert and fetch an `api_key` by id and could do nothing
+else the surface needs: no list, no update, no delete, no read of `users.role`,
+and no `INSERT INTO audit_logs` anywhere in the repository — against a table
+that has had a schema, two indexes and a retention sweep that DELETES from it
+since the first migration. The same defect shape, one layer down, and the reason
+`/key/block` answered 501 was not the handler.
+
+`internal/store/admin.go` adds what the mounted surface calls and nothing more.
+Six of the thirteen declared dependencies are supplied; the other seven answer
+`501 dependency_not_configured` naming the missing piece, because a half-working
+adapter over a table nobody writes is worse than a 501 — it looks like it
+worked. The list is in `docs/OPERATIONS.md` §3.2.
+
+Tests: `TestALeakedKeyCanBeRevokedThroughTheAPI` runs the incident end to end
+over HTTP and reads the audit row back; `TestAnOrdinaryKeyCannotAdminister`
+pins 403 for a tenant key and 401 for no credential.
+
+## `batch.ownedBy` — decided
+
+**Uploads always record an owner.** `principalID` gives the master credential a
+reserved, non-empty id (`app.MasterOwnerID`), and `ownedBy` no longer reads an
+empty `recordOwner` as "everyone's".
+
+Both halves, because either alone is incomplete. The alternative — "an unowned
+record is the master credential's" — was rejected for two reasons. It leaves the
+WRITE path producing rows with no owner and adds a rule elsewhere for reading
+them, which is one more invariant to remember at every future call site. And it
+relabels every legacy row — imported, hand-inserted, written by an older version
+— as something the master credential did, which is a lie in an audit sense, and
+the audit trail is one of the things this surface exists to keep honest.
+
+What is left is the residue: rows that already have an empty owner are now
+visible only to an administrative caller, never to a tenant key. That is the
+fail-closed reading. The behaviour change it can cause is a deployment whose
+tenants were reading records that were never theirs.
+
+Tests: `TestAnUnownedRecordIsNotVisibleToEveryKey`,
+`TestTheMasterCredentialOwnsWhatItCreates`.
+
+## Still unreachable
+
+Named, because a control that exists and is not called is this codebase's
+dominant defect and it has now been counted twice.
+
+1. **`internal/store` has no directory, no model registry and no budget-ceiling
+   storage.** `users`, `teams`, `team_members`, `deployments` and
+   `model_aliases` are tables with no Go code. `/user/*`, `/team/*`, `/model/*`
+   and `/budget/*` are mounted and answer `501 dependency_not_configured`. This
+   is now the largest gap between the design and the binary.
+2. **No range-aggregating ledger query.** `/global/spend/report` and the three
+   daily-activity endpoints have nothing to call. `internal/store/rollup.go` has
+   three single-bucket point reads and no scan.
+3. **`/audit/list`.** Rows are written now and still cannot be read over the
+   API.
+4. **`quota.Registry` and `internal/probe`.** Neither is constructed in
+   `internal/app`, so `/admin/credentials/health` and `/admin/quota` have no
+   source and `usage_probe.enabled: true` remains accepted and inert.
+5. **`pricing.Catalog` is not on `App`.** It lives inside the dispatcher's
+   private state, so `/spend/calculate` and `/admin/pricing/preview` cannot
+   reach it.
+6. **`App.Reload` takes a `*config.Config` and returns no result**, and `App`
+   does not retain the config path, so `/admin/config/reload` has no adapter.
+   `SIGHUP` works.
+7. **`internal/backend` still has no importer.** The two defects re-derived
+   above are closed in it; the package itself dispatches nothing.
+8. **`auth.Strip`, the OAuth subsystem, `internal/luaext`, `store.ImportKeys`,
+   `quota.Ranker`** — unchanged from the first pass.
+9. **Store lookups for unknown keys are still unbounded** (finding 6's second
+   half), which the first pass called the largest thing left open and which this
+   pass did not touch.

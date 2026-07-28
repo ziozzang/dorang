@@ -111,6 +111,12 @@ const (
 	FamilyOpenAIImageGeneration
 	FamilyOpenAIImageEdit
 	FamilyOpenAIImageVariation
+
+	// FamilyAdmin is the administration surface (DESIGN §2.3). It is one
+	// family for the whole of it rather than one per path, because these are
+	// metric labels and the surface has forty paths — a label per path is the
+	// cardinality problem this table exists to avoid.
+	FamilyAdmin
 )
 
 // familyNames is the fixed-cardinality label set. It is a table rather than a
@@ -136,6 +142,7 @@ var familyNames = [...]string{
 	FamilyOpenAIImageGeneration: "openai-image-generation",
 	FamilyOpenAIImageEdit:       "openai-image-edit",
 	FamilyOpenAIImageVariation:  "openai-image-variation",
+	FamilyAdmin:                 "admin",
 }
 
 // String names the family.

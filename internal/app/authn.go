@@ -134,6 +134,14 @@ func (p *principal) UserID() string { return p.p.UserID }
 // TeamID implements server.Principal.
 func (p *principal) TeamID() string { return p.p.TeamID }
 
+// IsMaster reports the out-of-band administrative credential.
+//
+// It exists so that principalID can give a master-credential upload a real
+// owner. The master has no api_keys row, so its KeyID is "" — and an object
+// recorded with an empty owner used to be readable, usable and deletable by
+// every key in the deployment (batch.ownedBy).
+func (p *principal) IsMaster() bool { return p.p != nil && p.p.Master }
+
 // Authorize implements server.Principal.
 //
 // The observed rates come from the meter rather than being left at zero, which

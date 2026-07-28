@@ -285,7 +285,8 @@ func reasoningBlobs(msgs []canonical.Message) []byte {
 // pattern, and a route split across two lists would make which one is live
 // depend on the order these are concatenated in.
 func (a *App) extraRoutes() []server.Route {
-	return append(a.batchRoutes(), a.responsesRoutes()...)
+	out := append(a.batchRoutes(), a.responsesRoutes()...)
+	return append(out, a.adminRoutes()...)
 }
 
 // responsesRoutes mounts the stateful half of the Responses API.
@@ -321,16 +322,16 @@ func (a *App) responsesRoutes() []server.Route {
 			}),
 		},
 		{
-			Pattern: "/v1/responses/{id}/input_items",
-			Methods: server.MethodGET,
+			Pattern:   "/v1/responses/{id}/input_items",
+			Methods:   server.MethodGET,
 			Name:      "responses_input_items",
 			Family:    server.FamilyOpenAIResponses,
 			ModelAuth: server.ModelAuthNone,
 			Handler:   a.handleResponseInputItems,
 		},
 		{
-			Pattern: "/v1/responses/{id}/cancel",
-			Methods: server.MethodPOST,
+			Pattern:   "/v1/responses/{id}/cancel",
+			Methods:   server.MethodPOST,
 			Name:      "responses_cancel",
 			Family:    server.FamilyOpenAIResponses,
 			ModelAuth: server.ModelAuthNone,
