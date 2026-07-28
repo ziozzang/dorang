@@ -431,6 +431,7 @@ kinds:
   cohere:           { api: cohere }
   jina:             { api: jina }
   vllm:             { api: openai-chat,        metrics: prometheus, priority: native }
+  sglang:           { api: openai-chat,        metrics: prometheus }        # §4.4
   bedrock | vertex | azure: { … }
   echo:             { api: echo }              # deterministic, tests only
 ```
@@ -475,6 +476,40 @@ sourced from a *different* provider's catalog as no evidence at all.
 A number that is merely a source's own fallback constant is also no evidence: it records
 that nobody looked. Values equal to a catalog's documented default are rejected for that
 reason, not accepted for convenience.
+
+### 4.4 Self-hosted backends are a first-class class, not a special case
+
+vLLM and SGLang are **day-zero backends**, and they are treated as one class rather than two
+adapters. The reason is not tidiness: a self-hosted engine is the only kind of backend where
+the operator controls the flags, so it is the only kind where dorang can *state what
+configuration makes standard protocol behavior apply* — and then hold both engines to it.
+
+Three commitments follow.
+
+**One surface, both engines.** A caller speaking OpenAI or Anthropic must not be able to tell
+which engine is behind a model. Every request field, response field, usage counter, stop
+reason, and error shape is normalized to the canonical names of §10.7. Where an engine cannot
+express something, that is a structural downgrade (§10.1) and surfaces as such — never as a
+silent difference in behavior between two deployments of the same model.
+
+**Metadata parity is part of that surface.** Token accounting, cache counters, context window,
+and reasoning fields are reported identically regardless of engine. This is the part most
+likely to be got wrong quietly, because a mis-mapped cache counter produces no error — only a
+wrong invoice (§10.7).
+
+**A published operator profile, not a list of caveats.** Each engine's required flags are
+documented as a runbook: set these, and the market-standard protocols work as written. Every
+flag entry names **what silently breaks without it**, because that is the failure mode that
+matters here — the engines accept requests and return `200` while ignoring what was asked.
+[VLLM.md](VLLM.md) §5 is the vLLM profile; [SGLANG.md](SGLANG.md) carries SGLang's, plus the
+row-by-row normalization table that makes the single-surface claim checkable rather than
+aspirational.
+
+**What dorang does not do here.** It does not tune the engine, does not compact (§10.5a), and
+does not paper over a missing flag by emulating the behavior in the gateway. If an operator
+has not enabled prompt-token details, dorang reports that cached-token pricing is unavailable
+rather than guessing at it. Emulation would make the gateway's numbers disagree with the
+engine's, and disagreeing numbers are worse than absent ones.
 
 ---
 
