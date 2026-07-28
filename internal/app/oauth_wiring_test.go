@@ -179,6 +179,52 @@ func TestAnOAuthCredentialAuthorizesAnUpstreamRequest(t *testing.T) {
 	}
 }
 
+// TestACredentialWithNoRefresherStillReportsThatItIsBeingRead.
+//
+// No `refresh` block is the safe default and the common case: the vendor's CLI
+// keeps its own token current and dorang only reads the store. That deployment
+// never exchanges anything, so dorang_oauth_refreshes_total sits at zero for the
+// life of the process — and a store that silently stopped being updated would
+// look exactly like one that is fine. The store-load count is the only number
+// that moves for it, so it has to be published.
+func TestACredentialWithNoRefresherStillReportsThatItIsBeingRead(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, chatOK)
+	}))
+	defer up.Close()
+
+	store := writeTokenStore(t, staleAccess, staleRefresh, time.Now().Add(time.Hour))
+	a := newWiringApp(t, oauthYAMLFor(up.URL, store, ""), ownSpool(t),
+		func(o *Options) { o.Upstream = up.Client() })
+
+	c, ok := a.OAuth.Credential("oauth-1")
+	if !ok {
+		t.Fatal("the credential is not registered")
+	}
+	if c.Refreshes() != 0 {
+		t.Fatalf("a credential with no refresh endpoint exchanged %d tokens", c.Refreshes())
+	}
+	waitFor(t, "the store to be read", func() bool { return c.StoreLoads() > 0 })
+
+	page := callWith(a, testMasterKey, http.MethodGet, "/metrics", "").Body.String()
+	var line string
+	for _, l := range strings.Split(page, "\n") {
+		if strings.HasPrefix(l, "dorang_oauth_store_loads_total{") &&
+			strings.Contains(l, `credential="oauth-1"`) {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("the metrics page publishes no store-load count for this credential, so a " +
+			"deployment with no refresh endpoint has no number that moves at all")
+	}
+	if strings.HasSuffix(strings.TrimSpace(line), " 0") {
+		t.Errorf("the store-load count is zero after the store was read: %s", line)
+	}
+}
+
 // TestATokenIsRefreshedAheadOfExpiryAndTheNextRequestCarriesIt is DESIGN
 // §11.2b's mechanism, asserted end to end: the refresh happens against a fake
 // endpoint, the successor is persisted in the vendor's own store without losing
