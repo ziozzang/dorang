@@ -26,6 +26,18 @@ server:
   key_pepper_env: DORANG_KEY_PEPPER   # HMAC pepper for dorang_v1 key hashing (§2.4)
   request_timeout: 600s
   shutdown_grace: 30s
+  # How long the process keeps serving AFTER readiness goes false and BEFORE
+  # the listener closes (§13). A balancer discovers unreadiness by polling, so
+  # this must cover its detection window or a rolling restart is
+  # connection-refused:
+  #
+  #   pre_stop_delay >= probe period x failure threshold + probe timeout
+  #                     + however long the balancer takes to stop routing
+  #
+  # 10s covers deploy/kubernetes.yaml's probes (2s x 2 + 1s = 5s) with 5s to
+  # spare. Set it to 0 on a single node or a workstation, where nothing is
+  # routing to this process and the wait buys nothing.
+  pre_stop_delay: 10s
 
 storage:
   driver: sqlite                  # sqlite | postgres

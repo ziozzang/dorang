@@ -213,6 +213,7 @@ cluster:
 | `key_pepper_env` | string | `DORANG_KEY_PEPPER` | `dorang_v1` 키 해싱용 HMAC pepper 변수 이름 | 빈 값 거부. **변수가 미설정이면 pepper가 한 번 생성되어 SQLite DB 옆에 기록된다.** 의존성 0의 노트북 티어를 유지시키지만, pepper가 DB 파일과 함께 다닌다 — 변수를 설정하지 않은 다중 노드 배포에서는 각 노드가 서로 검증할 수 없는 키를 발급한다 |
 | `request_timeout` | duration | `600s` | 전체 요청 deadline. capacity 예약 만료(`request_timeout + 30s`)도 설정하므로 누수된 goroutine이 슬롯을 영구 점유할 수 없다 | 0 이하 거부. 너무 짧으면 긴 생성이 잘리고, 너무 길면 멈춘 업스트림이 그 창 내내 예약을 붙든다 |
 | `shutdown_grace` | duration | `30s` | drain이 진행 중 요청을 기다리는 시간, 그리고 별도로 drain 이후 해체가 걸릴 수 있는 시간 | 음수 거부. p99보다 짧으면 롤링 재시작이 가시적 에러가 된다: 프로세스가 하드 종료하고 종료 코드 1과 `drain grace expired with requests still in flight`를 낸다 |
+| `pre_stop_delay` | duration | `10s` | readiness가 false가 된 **후**, 리스너를 닫기 **전**까지 계속 서비스하는 시간. 폴링으로 unready를 감지하는 로드밸런서가 라우팅을 멈출 시간을 준다(§13). `프로브 주기 × 실패 임계치 + 프로브 타임아웃 + 엔드포인트 철회 전파` 로 잡을 것. `deploy/kubernetes.yaml`의 프로브는 5s가 필요하고 기본값은 5s의 여유를 남긴다 | 음수 거부. 너무 짧으면 롤링 재시작마다 밸런서가 알아채기까지 클라이언트가 connection-refused를 받는다 — graceful drain이 막으려던 바로 그 실패다. `0`은 명시적이고 정당하다: 단일 노드나 워크스테이션에는 라우팅하는 주체가 없다. 키가 없으면 0이 아니라 기본값이 적용되므로 `0`이라고 쓰면 정말 없음을 뜻한다. 두 번째 SIGTERM도 이 대기를 건너뛴다 |
 
 ---
 

@@ -292,6 +292,7 @@ server:
   key_pepper_env: DORANG_KEY_PEPPER
   request_timeout: 600s
   shutdown_grace: 30s
+  pre_stop_delay: 10s            # readiness off, still serving — §13
 
 storage:
   driver: sqlite                 # sqlite | postgres
@@ -2790,8 +2791,106 @@ The leader — elected through a store lock — owns rollup compaction, partitio
 expiry sweeps (capacity reservations §5.3 **and** budget reservations §6.4), batch
 assignment, and lease rebalancing.
 
-Draining: readiness off, in-flight requests finish within the grace period, leases and
-reservations released, then exit.
+### Draining
+
+The order, and why each step is where it is:
+
+| # | Step | Bound |
+|---|---|---|
+| 1 | Readiness goes false | immediate |
+| 2 | **Keep serving.** The listener stays open, requests are answered in full | `server.pre_stop_delay` |
+| 3 | Listener closes | immediate |
+| 4 | In-flight requests finish | `server.shutdown_grace` |
+| 5 | Whatever is left is cancelled with a named cause, then cut | 2 × 1s |
+| 6 | Leases and reservations released, unspent quota blocks returned, registry row removed | `server.shutdown_grace` |
+
+**Step 2 is the one that is easy to omit and the one that matters.** Every load balancer
+discovers unreadiness by *polling*. Between the readiness flip and the poll that notices
+it there is a window in which the balancer is still routing here, so closing the listener
+at step 1 is connection-refused at the client on every rolling restart — the exact failure
+a graceful drain exists to prevent. The delay is configuration and not a constant because
+it describes the *balancer*, not dorang:
+
+```
+pre_stop_delay  >=  probe period × failure threshold
+                  + probe timeout
+                  + endpoint-withdrawal propagation
+```
+
+`deploy/kubernetes.yaml` ships `periodSeconds: 2`, `failureThreshold: 2`,
+`timeoutSeconds: 1` — five seconds of detection — against the default `pre_stop_delay:
+10s`. An operator who changes one changes both. `0` is legitimate and means "nothing is
+routing to me": a single node, a workstation. A second SIGTERM also skips the wait, so
+Ctrl-C never appears to hang.
+
+**Step 5: a cut stream gets an answer, not a reset.** A completion legitimately streams for
+minutes, and 30 seconds of grace will sometimes expire on one. The response status went out
+with the first chunk and cannot change (§7.6), so the only channel left is the body — and
+§10.5 already establishes that dorang rewrites streams as a matter of course. At the grace
+boundary every in-flight request's context is cancelled with a named cause, and the handler's
+error becomes an in-band `gateway_shutting_down` frame followed by the terminator. A client
+that is merely reset cannot tell a deploy from a crash from a bad network, and it has already
+been billed for the tokens it received; a client that is told can retry against the node that
+is still up. Only after that does the connection close.
+
+The cancellation is also what keeps the *ledger* honest. It lets each handler's normal
+unwind run, so the terminal usage record reaches the meter — and the drain is precisely
+when that is at risk, because the process closes the meter and flushes the spool the moment
+the drain returns. Work billed upstream and never recorded is silent revenue loss.
+
+**One grace, not two.** A separate, longer grace for streams would buy nothing: the pod does
+not go away until the longer window elapses, so the deployment's termination budget is sized
+off it either way, and the shorter window could only cut short the requests that were going to
+finish first anyway — the drain returns the instant the last request does, so a generous grace
+costs nothing when nothing is slow. What a long stream needs at the boundary is an answer,
+which is step 5, not more time.
+
+**Step 6 is last, and deregistration with it.** Nothing routes off the `nodes` table — the
+request path is stateless and the balancer decides — so leaving the row in place for the
+duration of the drain costs nothing, while removing it early costs two things. The leader
+reclaims a dead node's leases by walking that table, so a drain interrupted between step 1
+and step 6 would leave leases it can no longer attribute; and the published overshoot of §5.6
+divides limits by the *live* node count, so a node that deregistered while still serving and
+still holding leases would make every peer size its share as if it were gone. Readiness is the
+signal to the balancer, the registry row is the signal to the cluster, and they correctly stop
+being true at different moments.
+
+**Termination budget.** An orchestrator must allow
+`pre_stop_delay + 2 × shutdown_grace + 10s` — the drain and the post-drain teardown can each
+take a full grace, plus the two cut-over waits. Below that, SIGTERM becomes SIGKILL part way
+through, which skips returning the unspent quota blocks and makes the restart inexact (§9.6).
+
+**Single node: there is a gap, and it is accepted.** dorang has no socket handoff and no
+`SO_REUSEPORT`, so between the old process closing its listener and the new one binding there
+is nothing listening. Two nodes and a balancer remove it, which is what R14 requires and what
+`deploy/kubernetes.yaml` ships. The notebook and single-node tiers take the gap: it is a
+sub-second window and the alternative — inheriting a listener across an exec — buys
+zero-downtime for a tier that is not serving production traffic, at the cost of a
+process-lifecycle mechanism on the one path that is meant to have no moving parts. Stated
+here rather than discovered in production.
+
+**Wiring.** internal/app constructs exactly one `cluster.Node` per process and takes its
+ledger from it rather than building a second one — two ledgers under one node id would be two
+in-memory block caches over the same rows. The node is built whether or not clustering is on,
+because the durable budget (§9.6) is on the request path either way; `cluster.enabled` decides
+whether it **joins**. With it false nothing registers, nothing campaigns, no goroutine of that
+package runs and the `nodes` table is never touched, which is what §0.2's "no required
+dependencies" costs in a package about coordination. With it true the node registers,
+heartbeats, campaigns, and runs the leader jobs — partition maintenance, the reservation sweep
+of §5.3 and §6.4, and lease reclaim.
+
+Lease reclaim is the one whose absence cost money: a node that crashes holding quota leases
+never returns them, so the quota is leaked until someone notices and clears it by hand.
+
+> **Still not wired, after that change.** The request path does not route quota through
+> `cluster.Node.Coordinator` — internal/capacity still counts concurrency per node, so the
+> coordinator owns the leases and publishes the accuracy without admitting or refusing
+> anything. `RollupCompactionJob` and `BatchAssignmentJob` have no caller, so rollup
+> compaction and batch assignment still run on every node instead of on the leader. And
+> `capacity_mode: shared-redis` is refused at load: this build ships the protocol
+> (`cluster.RedisClient`, the Lua scripts, `NewRedisShared`) and no client that speaks it, so
+> accepting it would give an operator a coordinator reporting `shared-redis` while
+> coordinating through the store.
 
 ---
 

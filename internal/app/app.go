@@ -86,6 +86,21 @@ type Options struct {
 	// Zero uses [DefaultBudgetBlockNanoUSD]. It trades store traffic against
 	// the maximum overshoot §5.6 requires to be publishable as a number.
 	BudgetBlockNanoUSD int64
+
+	// ClusterTick, ClusterNodeTTL and ClusterLeaseTTL override the node loop's
+	// timings (§13). Zero uses internal/cluster's defaults, which are sized for
+	// a real deployment: a five-second heartbeat, a thirty-second lapse before
+	// a node is declared gone, a fifteen-second leadership lease.
+	//
+	// They are Options rather than configuration for the reason
+	// BudgetBlockNanoUSD is: they are one coherent set of numbers whose
+	// relationship matters — the TTL must be several heartbeats or a GC pause
+	// evicts a live node — and an operator given three independent keys can
+	// write a set that does not hold together. A caller that needs them, and
+	// every test of the loop, is a Go caller.
+	ClusterTick     time.Duration
+	ClusterNodeTTL  time.Duration
+	ClusterLeaseTTL time.Duration
 }
 
 // App is one assembled gateway. Every exported field is the live subsystem, so
@@ -102,9 +117,33 @@ type App struct {
 	Meter    *meter.Meter
 	Server   *server.Server
 	Batch    *batch.Service
+	// Node is this process's membership in the cluster (DESIGN §13): the
+	// registry row, the heartbeat, the leadership lease, the leader-only jobs,
+	// and the durable ledger.
+	//
+	// It exists whether or not clustering is on, because [App.Ledger] is its
+	// ledger and the durable budget is on the request path either way (§9.6,
+	// risk W9). What `cluster.enabled` decides is whether it JOINS — see
+	// [App.startBackground]. An unclustered gateway builds this, uses its
+	// ledger, and never writes a row to `nodes`.
+	Node *cluster.Node
 	// Ledger is the durable budget and quota counter of DESIGN §9.6. It is on
 	// the request path: the gate reserves against it before every upstream call.
+	//
+	// It is [Node]'s ledger, not a second one. Two ledgers under one node id
+	// would be two in-memory block caches over the same rows: each would draw
+	// blocks the other did not know about, and each would return on close what
+	// the other had already returned.
 	Ledger *cluster.Ledger
+	// Coordinator admits or refuses quota spend across nodes for the mode
+	// `cluster.capacity_mode` selects (§5.6). It is the node's, so the mode,
+	// the node id and the shared backend cannot disagree with the registry.
+	//
+	// It is not yet on the request path: internal/capacity still counts
+	// concurrency per node. What it does today is own the leases and publish
+	// the accuracy, which is what makes the figure in §5.6 a measurement of
+	// something rather than a restatement of the configuration.
+	Coordinator quota.Coordinator
 	// Invalidator publishes revocations, pends and early grace cuts, and applies
 	// the ones other nodes publish (DESIGN §11.2c, risk W11). Without it a
 	// revoked key keeps serving until the auth snapshot's TTL expires, on every
@@ -163,10 +202,18 @@ type App struct {
 	pepper   string
 	cfg      atomic.Pointer[config.Config]
 	requests *metrics.Requests
+	// nodes is the live registry count the published overshoot of §5.6 is
+	// computed against, refreshed on the node's heartbeat rather than read per
+	// scrape. Zero — the unclustered case — reads back as one node.
+	nodes liveNodes
 	// rates is the rolling-minute observation every subject's rpm_limit and
 	// tpm_limit are enforced against (DESIGN §11.2). It is not rebuilt by a
 	// reload: the window is live state, and rebuilding it would hand every
 	// subject a fresh minute on every SIGHUP.
+	//
+	// Per SUBJECT, not per key: a team ceiling compared against one key's
+	// counter is multiplied by the number of keys under the team, which is the
+	// defect the security merge closed.
 	rates *keyRates
 	// guardHistory is the token guard's usage record. It is per node, which
 	// makes the guard's absolute condition a per-node figure in a cluster; the
@@ -272,24 +319,26 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 	a.quota = qs
 
-	// 3a. The durable budget (DESIGN §9.6, risk W9). It is built before the
-	//     dispatcher because the dispatcher's gate reserves against it, and it
-	//     is built from the store rather than from memory because a budget that
-	//     resets on restart is a budget that is not enforced.
-	block := opts.BudgetBlockNanoUSD
-	if block <= 0 {
-		block = DefaultBudgetBlockNanoUSD
+	// 3a. Cluster membership, and with it the durable budget (DESIGN §13, §9.6,
+	//     risk W9).
+	//
+	//     The node is built here rather than later because it OWNS the ledger,
+	//     and the ledger has to exist before the dispatcher whose gate reserves
+	//     against it. It is built from the store rather than from memory
+	//     because a budget that resets on restart is a budget that is not
+	//     enforced.
+	//
+	//     It is built unconditionally. `cluster.enabled: false` does not mean
+	//     "no node", it means "a node that does not join": the ledger is on the
+	//     request path in every deployment, and making its owner conditional
+	//     would put a second construction path in this function for the case
+	//     that matters most. Joining is decided in startBackground.
+	//
+	//     It is built after the broker because the reservation sweep of §5.3 is
+	//     one of its leader jobs and the broker is what it sweeps.
+	if err := a.buildNode(cfg, st); err != nil {
+		return nil, err
 	}
-	ledger, err := cluster.NewLedger(cluster.LedgerConfig{
-		Store:  st,
-		NodeID: nodeID(cfg),
-		Block:  block,
-		Now:    a.now,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("app: budget ledger: %w", err)
-	}
-	a.Ledger = ledger
 
 	// 3b. Extensions and notifications (DESIGN §11.5). Both are built before
 	//     the dispatcher because the dispatcher holds the one and the budget
@@ -301,7 +350,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if a.Notify, err = buildNotifier(cfg, a.Hooks, a.logf, a.now); err != nil {
 		return nil, err
 	}
-	a.budget = &budgetGate{ledger: ledger, now: a.now, notify: a.Notify}
+	a.budget = &budgetGate{ledger: a.Ledger, now: a.now, notify: a.Notify}
 	a.responses = newResponsesStore(a.Store, a.now)
 
 	// 4. Gate.
@@ -497,6 +546,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics, guard: a.Guard},
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
+		PreStopDelay:      cfg.Server.PreStop().Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		LegacyHeaders:     cfg.Compat.LegacyHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),
@@ -681,6 +731,17 @@ func (a *App) startBackground() {
 	}
 	maxAge := a.RotationPolicy.MaxAge
 
+	// Cluster membership (§13). The node registers and starts its own heartbeat
+	// loop; what stays here is re-reading how many peers are alive, because the
+	// published overshoot of §5.6 is proportional to that count and the scrape
+	// must not pay a store round trip for it.
+	//
+	// joinCluster reports false for `cluster.enabled: false`, and then the
+	// ticker below is never created and `accuracy` stays nil. A nil channel
+	// blocks forever in a select, so the notebook tier pays one dead case in a
+	// loop it already runs — no goroutine, no ticker, no query.
+	clustered := a.joinCluster(ctx)
+
 	go func() {
 		defer close(a.bgDone)
 		t := time.NewTicker(purge)
@@ -691,10 +752,18 @@ func (a *App) startBackground() {
 		defer g.Stop()
 		r := time.NewTicker(reload)
 		defer r.Stop()
+		var accuracy <-chan time.Time
+		if clustered {
+			at := time.NewTicker(a.clusterTick())
+			defer at.Stop()
+			accuracy = at.C
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-accuracy:
+				a.refreshAccuracy(ctx)
 			case <-r.C:
 				if a.Auth != nil && a.KeyLoader != nil {
 					// Refresh, not Rejoin: this must not drop the snapshot
@@ -842,13 +911,34 @@ func (a *App) Close(ctx context.Context) error {
 		if a.Broker != nil {
 			a.Broker.Close()
 		}
-		if a.Ledger != nil {
+		// The coordinator before the node, because the leases it holds live in
+		// the node's lease table and cluster.Node.Close empties that table. A
+		// coordinator closed afterwards would be returning units to rows that
+		// no longer exist.
+		if a.Coordinator != nil {
+			if err := a.Coordinator.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if a.Node != nil {
+			// This is where the ledger closes — the node owns it, and this
+			// slot is the one the ledger used to occupy, for the same reasons.
+			// It runs after the broker so that no reservation is taken against
+			// capacity this node is about to stop accounting for, and before
+			// the store because every step of it is a write.
+			//
 			// Returning the unspent part of every block makes a planned restart
 			// exact: the durable counter ends up holding precisely what was
 			// spent, so the next process reads the true figure rather than a
 			// conservative one (DESIGN §9.6). A crash skips this, and the
 			// difference is the whole of the published overshoot.
-			if err := a.Ledger.Close(ctx); err != nil && firstErr == nil {
+			//
+			// The rest of the drain — resign, release the leases, deregister
+			// LAST — is ordered inside cluster.Node.Close and argued there. The
+			// short version of the part that looks wrong: the registry row is
+			// the handle the leader reclaims this node's leases by, so it
+			// outlives everything this node still holds.
+			if err := a.Node.Close(ctx); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

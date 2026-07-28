@@ -38,7 +38,24 @@ type Config struct {
 	NodeTTL time.Duration
 	// BlockSize is the ledger's lease size, the overshoot knob of DESIGN 9.6.
 	// Zero means [DefaultBlockSize].
+	//
+	// It is in the counter's own units, which for the budget the gateway puts
+	// on the request path means nano-USD. See [Config.LeaseBlock] for why that
+	// makes it the wrong number to publish an overshoot against.
 	BlockSize int64
+	// LeaseBlock is how many METRIC units a leased coordinator takes at a
+	// time: concurrency slots, requests, tokens. Zero means
+	// [DefaultBlockSize].
+	//
+	// It is separate from [Config.BlockSize] because the two are denominated
+	// differently and only coincide in this package's tests. internal/app
+	// draws budget in nano-USD, so a single field would either publish a
+	// concurrency overshoot of "50000000 x (nodes - 1)" -- a figure an
+	// operator would size a cluster against -- or force the budget to take one
+	// store write per sixteen nano-USD. DESIGN 5.6 requires the published
+	// number to be a number, and a number in the wrong units is worse than
+	// none.
+	LeaseBlock int64
 	// MinLeasable mirrors cluster.min_leasable. Zero means
 	// [DefaultMinLeasable].
 	MinLeasable int64
@@ -75,28 +92,33 @@ type Node struct {
 	enabled bool
 	mode    Mode
 
-	id        string
-	address   string
-	version   string
-	tick      time.Duration
-	nodeTTL   time.Duration
-	minLease  int64
-	blockSize int64
-	startedAt time.Time
-	now       func() time.Time
-	logf      func(string, ...any)
+	id         string
+	address    string
+	version    string
+	tick       time.Duration
+	nodeTTL    time.Duration
+	minLease   int64
+	leaseBlock int64
+	startedAt  time.Time
+	now        func() time.Time
+	logf       func(string, ...any)
 
 	reg    *Registry
 	el     *Election
 	ledger *Ledger
 	leases *LeaseStore
 
-	mu      sync.Mutex
-	jobs    []*jobState
-	started bool
-	closed  bool
-	stop    chan struct{}
-	stopped chan struct{}
+	mu   sync.Mutex
+	jobs []*jobState
+	// registered records that this node has a row in the registry. Close
+	// deregisters only when it does, so that a node which never joined -- the
+	// unclustered gateway, which builds a Node for its ledger and never starts
+	// the loop -- writes nothing on the way out.
+	registered bool
+	started    bool
+	closed     bool
+	stop       chan struct{}
+	stopped    chan struct{}
 }
 
 // New builds a node.
@@ -159,24 +181,24 @@ func New(cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		enabled:   cfg.Enabled,
-		mode:      cfg.Mode,
-		id:        id,
-		address:   cfg.Address,
-		version:   cfg.Version,
-		tick:      orDuration(cfg.Tick, DefaultTick),
-		nodeTTL:   reg.NodeTTL(),
-		minLease:  orInt64(cfg.MinLeasable, DefaultMinLeasable),
-		blockSize: ledger.BlockSize(),
-		startedAt: now(),
-		now:       now,
-		logf:      logf,
-		reg:       reg,
-		el:        el,
-		ledger:    ledger,
-		leases:    leases,
-		stop:      make(chan struct{}),
-		stopped:   make(chan struct{}),
+		enabled:    cfg.Enabled,
+		mode:       cfg.Mode,
+		id:         id,
+		address:    cfg.Address,
+		version:    cfg.Version,
+		tick:       orDuration(cfg.Tick, DefaultTick),
+		nodeTTL:    reg.NodeTTL(),
+		minLease:   orInt64(cfg.MinLeasable, DefaultMinLeasable),
+		leaseBlock: orInt64(cfg.LeaseBlock, DefaultBlockSize),
+		startedAt:  now(),
+		now:        now,
+		logf:       logf,
+		reg:        reg,
+		el:         el,
+		ledger:     ledger,
+		leases:     leases,
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
 
 	every := n.tick
@@ -238,14 +260,30 @@ func (n *Node) IsLeader() bool { return n.el.IsLeader() }
 // published; publishing one computed from a node count nobody has checked would
 // satisfy the letter of that and nothing else.
 func (n *Node) Accuracy(ctx context.Context, limit int64) (Accuracy, error) {
-	nodes, err := n.reg.Count(ctx)
+	p, err := n.AccuracyParams(ctx, limit)
 	if err != nil {
 		return Accuracy{}, err
 	}
-	return Publish(n.mode, Params{
-		Limit: limit, Nodes: nodes, Block: n.blockSize,
+	return Publish(n.mode, p)
+}
+
+// AccuracyParams returns the deployment description a published figure is
+// about, with the live node count read from the registry.
+//
+// [Node.Accuracy] answers for this node's own mode. A caller that publishes
+// every mode -- which DESIGN 5.6 asks for, so that the cost of a different
+// choice is visible without making it -- needs the parameters rather than one
+// mode's answer, and must not be tempted to assemble them itself from a node
+// count nobody checked.
+func (n *Node) AccuracyParams(ctx context.Context, limit int64) (Params, error) {
+	nodes, err := n.reg.Count(ctx)
+	if err != nil {
+		return Params{}, err
+	}
+	return Params{
+		Limit: limit, Nodes: nodes, Block: n.leaseBlock,
 		MinLeasable: n.minLease, Clustered: n.enabled,
-	})
+	}, nil
 }
 
 // Coordinator builds a quota coordinator for this node's mode.
@@ -254,6 +292,16 @@ func (n *Node) Accuracy(ctx context.Context, limit int64) (Accuracy, error) {
 // than taken from the caller: the mode, whether the deployment is clustered,
 // the node id, and the shared backend. A caller cannot ask for local
 // coordination in a cluster by handing over a config that says so.
+//
+// The shared backend defaults to this node's lease table for shared-pg and
+// leased, and DELIBERATELY NOT for shared-redis ([ErrNoRedisClient]). The two
+// modes are the same coordinator over different stores, so substituting the SQL
+// table for a missing Redis client would produce a working coordinator that
+// reports Mode() == "shared-redis" and publishes "one round trip to Redis per
+// acquire" while touching no Redis at all. An operator reads that figure to
+// choose between the modes; a mode that quietly is not the mode it says it is
+// makes the choice meaningless. A caller with a real client passes
+// [NewRedisShared] in cfg.Shared and the mode is honoured.
 func (n *Node) Coordinator(cfg quota.CoordinatorConfig) (quota.Coordinator, error) {
 	if err := Guard(n.enabled, n.mode); err != nil {
 		return nil, err
@@ -268,19 +316,31 @@ func (n *Node) Coordinator(cfg quota.CoordinatorConfig) (quota.Coordinator, erro
 		cfg.MinLeasable = n.minLease
 	}
 	if cfg.BlockSize <= 0 {
-		cfg.BlockSize = n.blockSize
+		cfg.BlockSize = n.leaseBlock
 	}
-	if cfg.Shared == nil && n.mode != ModeLocal {
-		cfg.Shared = n.leases
+	if cfg.Shared == nil {
+		switch n.mode {
+		case ModeSharedPG, ModeLeased:
+			cfg.Shared = n.leases
+		case ModeSharedRedis:
+			return nil, ErrNoRedisClient
+		}
 	}
 	return quota.NewCoordinator(cfg)
 }
 
 // Register records this node and beats once.
 func (n *Node) Register(ctx context.Context) error {
-	return n.reg.Register(ctx, NodeInfo{
+	err := n.reg.Register(ctx, NodeInfo{
 		ID: n.id, Address: n.address, Version: n.version, StartedAt: n.startedAt,
 	})
+	if err != nil {
+		return err
+	}
+	n.mu.Lock()
+	n.registered = true
+	n.mu.Unlock()
+	return nil
 }
 
 // Tick is one pass of the node loop: heartbeat, campaign, renew this node's
@@ -426,6 +486,7 @@ func (n *Node) Close(ctx context.Context) error {
 	}
 	n.closed = true
 	started := n.started
+	registered := n.registered
 	close(n.stop)
 	n.mu.Unlock()
 
@@ -449,8 +510,43 @@ func (n *Node) Close(ctx context.Context) error {
 	if err := n.leases.Close(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	if err := n.reg.Deregister(ctx); err != nil {
-		errs = append(errs, err)
+	// Deregistration is LAST, and not beside the readiness flip at the top of
+	// the drain. That looks wrong -- the node advertises itself as live for the
+	// whole drain -- so here is why it is not, because the next reader will ask.
+	//
+	// Nothing routes off this table. DESIGN 13 makes the request path stateless
+	// and any node able to serve any request; what stops traffic arriving is the
+	// balancer reading /health/readiness, which went false at the start of the
+	// drain. The registry's readers are all coordination:
+	//
+	//   - [LeaseReclaimJob] walks [Registry.Dead] to reclaim the leases of a
+	//     node that stopped beating. The ROW is the handle for that. Deleting it
+	//     first would mean a drain interrupted between here and the top -- a
+	//     SIGKILL after the grace, a machine that goes away -- leaves leases the
+	//     leader can no longer attribute, recoverable only on their own TTL
+	//     through [Ledger.ReclaimExpired] rather than promptly.
+	//   - [Node.Accuracy] divides a limit by [Registry.Count], the number of
+	//     LIVE nodes, to publish the overshoot of DESIGN 5.6. A node that
+	//     deregistered while still holding its leases and still serving makes
+	//     every peer size its share as if it were gone, on top of a share it has
+	//     not yet returned. The published figure would then understate the real
+	//     overshoot, which is the one number 5.6 exists to keep honest.
+	//
+	// Both arguments say the same thing: readiness is the signal to the
+	// balancer and the registry row is the signal to the cluster, they answer
+	// different questions, and they correctly stop being true at different
+	// moments. The row goes away only once this node holds nothing.
+	//
+	// A node that never registered has no row, and issuing the DELETE anyway
+	// would put a write into the shutdown of every unclustered gateway --
+	// which builds a Node to own its ledger and never joins anything. The
+	// guard is on having registered rather than on having started, because
+	// [Node.Register] is callable on its own and a row placed that way still
+	// has to be taken away.
+	if registered {
+		if err := n.reg.Deregister(ctx); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

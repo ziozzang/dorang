@@ -15,7 +15,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/signal"
 	"runtime/debug"
 	"syscall"
 	"time"
@@ -158,9 +157,6 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 	logger := log.New(stderr, "", log.LstdFlags|log.LUTC)
 	logf := func(format string, args ...any) { logger.Printf(format, args...) }
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	a, err := app.New(context.Background(), app.Options{
 		Config: cfg,
 		Logf:   logf,
@@ -205,11 +201,19 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 	fmt.Fprintf(stdout, "dorang %s listening on %s (%s)\n",
 		versionString(), ln.Addr(), describeSource(path, explicit))
 
-	serveErr := a.Server.Serve(ctx, ln)
+	// ServeSignals rather than a second signal loop here. The wiring it holds —
+	// the pre-stop delay of §13, and the second signal that skips it — is the
+	// wiring internal/server tests; a copy of it in this file would be the copy
+	// nobody exercises.
+	serveErr := a.Server.ServeSignals(ln)
 
 	// The drain is over; everything the process owns comes down in order. The
 	// grace here is the configured one again, so a slow final metering flush
 	// cannot hold the process open past what the operator asked for.
+	//
+	// The whole budget an orchestrator must allow for is therefore
+	// `pre_stop_delay + 2 x shutdown_grace`, plus a few seconds for the two
+	// bounded cut-over waits inside the drain (§13).
 	grace := cfg.Server.ShutdownGrace.Duration()
 	if grace <= 0 {
 		grace = 30 * time.Second

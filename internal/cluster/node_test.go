@@ -184,6 +184,13 @@ func TestJobsAreLeaderOnly(t *testing.T) {
 
 // TestAccuracyUsesTheLiveNodeCount: a published overshoot figure computed from
 // a node count nobody checked is a figure that describes an imagined cluster.
+//
+// The BlockSize set alongside LeaseBlock is deliberately a different number,
+// and a large one, because it stands for the case that made the two fields
+// separate: internal/app draws budget in nano-USD, so the ledger's block is
+// tens of millions. If the published concurrency figure came from it, an
+// operator sizing a fleet against DESIGN 5.6's number would read a bound eight
+// million times too large, in units nobody stated.
 func TestAccuracyUsesTheLiveNodeCount(t *testing.T) {
 	eachCluster(t, 3, func(t *testing.T, stores []*store.Store, clk *clock) {
 		ctx := context.Background()
@@ -191,7 +198,8 @@ func TestAccuracyUsesTheLiveNodeCount(t *testing.T) {
 		for i := range stores {
 			nodes[i] = testNode(t, stores[i], "node-"+string(rune('a'+i)), clk, func(c *Config) {
 				c.Mode = ModeLeased
-				c.BlockSize = 8
+				c.LeaseBlock = 8
+				c.BlockSize = 50_000_000
 			})
 		}
 		tick(t, nodes...)
@@ -201,7 +209,12 @@ func TestAccuracyUsesTheLiveNodeCount(t *testing.T) {
 			t.Fatal(err)
 		}
 		if a.MaxOvershoot != 8*2 {
-			t.Fatalf("with three live nodes the figure is %d, want block x 2 = 16", a.MaxOvershoot)
+			t.Fatalf("with three live nodes the figure is %d, want lease block x 2 = 16", a.MaxOvershoot)
+		}
+		// The ledger's own draw must not be visible here at all.
+		if strings.Contains(a.Formula, "50000000") {
+			t.Fatalf("the published formula %q is computed from the ledger's block, "+
+				"which is denominated in the counter's units and not the metric's", a.Formula)
 		}
 
 		// Two nodes go away. The figure has to follow.

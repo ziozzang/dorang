@@ -123,6 +123,33 @@
 //     caller, and every test here, can drive the loop instead of sleeping
 //     through it.
 //
+// # How it is wired
+//
+// internal/app constructs one [Node] per process and takes its [Ledger] from
+// it rather than building a second one. That single ownership is the point: two
+// ledgers under one node id would be two in-memory block caches over the same
+// rows, each returning on close what the other had already returned.
+//
+// The node is built whether or not clustering is on, because the durable budget
+// is on the request path either way (DESIGN 9.6, risk W9). What `cluster.enabled`
+// decides is whether it JOINS: [Node.Start] -- and with it registration, the
+// heartbeat, the election and every leader job -- runs only when it is true. An
+// unclustered gateway therefore writes nothing to `nodes`, holds no leadership
+// lease, and runs no goroutine of this package's, which is what DESIGN 0.2's
+// "no required dependencies" costs in a package about coordination.
+//
+// The two block sizes are separate on purpose. [Config.BlockSize] is the
+// ledger's draw, in the counter's own units -- nano-USD for the budget --
+// and [Config.LeaseBlock] is what a leased coordinator takes, in the metric's
+// units. Publishing an overshoot in the wrong denomination is the failure the
+// split exists to prevent.
+//
+// Two things this package can do that the gateway does not ask it to: the
+// request path does not route quota through [Node.Coordinator] -- internal/
+// capacity still counts per node -- and [RollupCompactionJob] and
+// [BatchAssignmentJob] have no caller, so rollup compaction and batch
+// assignment still run on every node rather than on the leader.
+//
 // # Storage
 //
 // Four tables, all already in internal/store's schema: nodes, capacity_leases

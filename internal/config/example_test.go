@@ -125,6 +125,10 @@ func TestExampleConfigMatchesDefaults(t *testing.T) {
 		{"server.key_pepper_env", example.Server.KeyPepperEnv, bare.Server.KeyPepperEnv},
 		{"server.request_timeout", example.Server.RequestTimeout, bare.Server.RequestTimeout},
 		{"server.shutdown_grace", example.Server.ShutdownGrace, bare.Server.ShutdownGrace},
+		// Dereferenced on both sides: the field is a pointer so that an explicit
+		// zero is distinguishable from an absent key, and comparing the pointers
+		// would compare addresses.
+		{"server.pre_stop_delay", example.Server.PreStop(), bare.Server.PreStop()},
 		{"storage.driver", example.Storage.Driver, bare.Storage.Driver},
 		{"storage.sqlite.path", example.Storage.SQLite.Path, bare.Storage.SQLite.Path},
 		{"storage.postgres.url_env", example.Storage.Postgres.URLEnv, bare.Storage.Postgres.URLEnv},
