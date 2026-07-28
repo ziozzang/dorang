@@ -884,7 +884,20 @@ accumulation can overflow a signed 64-bit nano value.
 - Every write is range-checked; overflow is an error, not a negative cost.
 
 Components: input, output, cached read, cache write, reasoning, request, characters,
-images, seconds. Cached counts are read from whichever usage field the backend reports.
+seconds. Cached counts are read from whichever usage field the backend reports.
+
+> An earlier draft also listed `images` as a component, but the request type carries no image
+> count, so the component was unreachable. Per-image pricing is expressible today as
+> `per_request` on an image endpoint; a dedicated component is only worth adding once a
+> frontend actually counts images, and inventing the field before then would ship an
+> untested path.
+
+**Estimating and settling are different operations.** The carried remainder and the
+period-to-date accumulator are *state*, and routing must not mutate state — a cost-based
+router prices every candidate on every request, so if pricing had side effects the losers
+would corrupt the ledger. Estimation is pure and rounds each figure independently; only
+settlement carries the remainder. The exactness guarantee of §8.3 therefore holds across
+settlements, not across estimates, and that distinction is asserted by a test.
 
 An unpriced model costs zero **and** increments a counter and logs a warning. Silent
 zero-cost accounting is the failure mode this whole section exists to avoid.
