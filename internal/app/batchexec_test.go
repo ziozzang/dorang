@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -37,10 +38,14 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 	}))
 	defer up.Close()
 
+	prov, err := backend.NewProvider(backend.Spec{
+		Name: "p1", Kind: "openai", API: catalog.APIOpenAIChat, BaseURL: up.URL + "/v1",
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
 	table := &upstreamTable{
-		providers: map[string]*upstream{
-			"p1": {name: "p1", kind: "openai", api: catalog.APIOpenAIChat, baseURL: up.URL + "/v1"},
-		},
+		providers: map[string]*backend.Provider{"p1": prov},
 		creds: map[string]*credential{
 			"cred-a": {id: "cred-a", provider: "p1", capacityGroup: "acct-a", maxConcurrent: 1, secret: "secret-a"},
 			"cred-b": {id: "cred-b", provider: "p1", capacityGroup: "acct-b", maxConcurrent: 1, secret: "secret-b"},

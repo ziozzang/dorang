@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,6 +14,21 @@ import (
 // adapters here join two packages that must agree on it, so it is one constant
 // rather than a literal repeated per test.
 const testPepper = "app-test-pepper-not-a-real-secret" // pragma: allowlist secret — test fixture
+
+// testMasterKey is the out-of-band administrative credential these tests use.
+// It is what reaches an Admin route such as /metrics.
+const testMasterKey = "app-test-master-key" // pragma: allowlist secret — test fixture
+
+// testUpstreamKey is the value the fixtures' key_env points at. Fixtures used
+// to spell their secret key_ref, which resolved to nothing — which is exactly
+// why key_ref is now refused.
+const testUpstreamKey = "app-test-upstream-key" // pragma: allowlist secret — test fixture
+
+// adminRequest stamps the master credential on a request.
+func adminRequest(r *http.Request) *http.Request {
+	r.Header.Set("Authorization", "Bearer "+testMasterKey)
+	return r
+}
 
 // openTestStore opens a migrated SQLite store in a temporary directory.
 //

@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -154,6 +155,55 @@ type Call struct {
 	DefaultMaxTokens int
 	// IncludeUsage mirrors the caller's stream_options.include_usage.
 	IncludeUsage bool
+
+	// Transform is the response half of a §10.5b transform filter, nil when the
+	// model carries none — which is the ordinary case and costs one nil check.
+	//
+	// It exists as an interface rather than as a mask because the mask table
+	// belongs to the caller and must not travel: §10.5b rule 1 is that the table
+	// appears in no log line, no metric label, no trace and no ledger row, and
+	// the narrowest way to keep that true is for this package never to hold one.
+	// What crosses the seam is neutral events and neutral responses, in both
+	// directions.
+	Transform Transform
+
+	// Accepted, when set, is called exactly once, after the upstream answered a
+	// status this package will serve and BEFORE any byte of the answer is
+	// written.
+	//
+	// It is the only moment a caller can still put something on the response
+	// headers: DESIGN §10.4 stamps the extension headers on the first write, and
+	// a stream's first write happens inside [Backend.Do]. A caller that filled
+	// them before the call would be describing an attempt that had not happened
+	// yet; one that filled them afterwards would be writing into a header block
+	// the client can no longer see.
+	Accepted func()
+}
+
+// Transform is the response side of DESIGN §10.5b, held by the caller.
+//
+// The request side is not here: a filter rewrites the neutral request before
+// routing, which is long before this package sees anything. What is left is the
+// mirror image — restoring the caller's own text in whatever comes back — and it
+// has to happen on the neutral form, once, rather than once per encoder.
+type Transform interface {
+	// Response restores a complete answer in place.
+	Response(*canonical.Response)
+	// Stream opens the per-stream rewriter. It is called once per relay, and the
+	// value it returns holds state across frames: a placeholder can straddle a
+	// frame boundary and neither half means anything alone.
+	Stream() StreamTransform
+}
+
+// StreamTransform rewrites one stream's events.
+type StreamTransform interface {
+	// Rewrite applies the transform to one event in place and may return a
+	// synthesized event that must be written BEFORE it — the held tail, when the
+	// stream is about to move on to something with no text to attach it to.
+	Rewrite(*canonical.StreamEvent) *canonical.StreamEvent
+	// Flush is whatever is still held at the end of the stream, or nil. It is
+	// the caller's own text: it only looked like the beginning of a placeholder.
+	Flush() *canonical.StreamEvent
 }
 
 // Result is one exchange's outcome, in the terms the dispatcher needs to
@@ -164,6 +214,15 @@ type Result struct {
 	// Body is the complete answer in the CALLER's protocol. It is nil for a
 	// stream, which has already been written.
 	Body []byte
+	// ErrorBody is the upstream's own error envelope, verbatim apart from the
+	// credential scrubbing of §10.6 rule 4. It is set only alongside a 4xx or
+	// 5xx and is nil otherwise.
+	//
+	// It exists for one consumer: a batch row's error file, which has to carry
+	// the upstream's own envelope rather than dorang's normalization of it —
+	// that file is what the caller diffs against the vendor's documentation.
+	// Every other path reads Err, which is the normalized form.
+	ErrorBody []byte
 	// ContentType labels Body. It is not always application/json: speech
 	// answers audio and a transcription asked for in srt or vtt answers text,
 	// and mislabelling either gives the client something it cannot play or
@@ -344,7 +403,7 @@ func (b *Backend) applyCredential(p *Provider, id string, h http.Header) error {
 		p.ad.headers(h)
 		return nil
 	}
-	return p.applyCredential(secret, oauth, h)
+	return p.ApplyCredential(secret, oauth, h)
 }
 
 // finish handles a response that arrived: the status classes, then the body.
@@ -372,6 +431,11 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		res.Total = b.now().Sub(start)
 		res.Err = upstreamError(resp.StatusCode, body, resp.Header, x.secrets)
+		// The upstream's own bytes, scrubbed. Nothing on the interactive path
+		// reads them; a batch row's error file does, and normalizing there would
+		// hand the caller dorang's paraphrase of a vendor error they are trying
+		// to look up.
+		res.ErrorBody = scrubBytes(body, x.secrets)
 		if res.Err.RetryAfterSeconds > 0 && res.RetryAfter == 0 {
 			res.RetryAfter = time.Duration(res.Err.RetryAfterSeconds) * time.Second
 		}
@@ -380,14 +444,20 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 
+	// The last moment anything can still be put on the response headers: they
+	// are stamped on the first write, and for a stream the first write is three
+	// lines below (DESIGN §10.4).
+	if x.call.Accepted != nil {
+		x.call.Accepted()
+	}
+
 	if x.call.Stream {
 		usage, err := b.relay(x, resp, w)
 		res.Total = b.now().Sub(start)
 		res.Usage = usage
 		res.FirstByteSent = true
 		if err != nil {
-			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
-				"the upstream stream ended abnormally: "+err.Error()).WithCode(CodeUpstreamDecode)
+			res.Err = streamError(err)
 			b.report(&res, *x.target, x.call)
 		}
 		return res
@@ -451,9 +521,28 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 
 	adoptEngineReasoning(dec.resp, x.prov.engine)
 
+	// The non-streaming half of the same rule the stream sinks enforce: a tool
+	// call whose arguments are not a JSON document must not be handed to the
+	// client as a finished call. Here the status has not been spent yet, so it is
+	// an error the client can actually act on rather than an in-band frame.
+	if name, bad := malformedToolCall(dec.resp); bad {
+		return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway,
+			server.TypeAPIError,
+			"the upstream returned a tool call whose arguments are not valid JSON: "+name).
+			WithCode(CodeMalformedToolArguments)
+	}
+
 	var usage canonical.Usage
 	if dec.resp.Usage != nil {
 		usage = *dec.resp.Usage
+	}
+	// §10.5b: restore the caller's own text before it is rendered. It happens
+	// here, on the neutral form, so it happens once for every protocol pairing
+	// rather than once per encoder — and after the usage has been read, because a
+	// placeholder and the text it stands for are not the same number of tokens
+	// and the upstream's count is the one that was billed.
+	if x.call.Transform != nil {
+		x.call.Transform.Response(dec.resp)
 	}
 	// The T1 chat-shaped surfaces render differently from chat completions even
 	// though their caller speaks the same family, so they are asked first.
@@ -470,6 +559,36 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 			"could not render the response: "+eerr.Error()).WithCode(CodeResponseEncode)
 	}
 	return out, jsonType, usage, nil
+}
+
+// malformedToolCall reports a tool call in a complete answer whose arguments do
+// not parse, naming it.
+//
+// It reads the NEUTRAL form, so it covers every backend family at once: the
+// OpenAI shapes carry arguments as an opaque string and are the ones that can be
+// truncated, but a hand-written or proxied answer in any family can arrive the
+// same way.
+func malformedToolCall(r *canonical.Response) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	for i := range r.Choices {
+		blocks := r.Choices[i].Message.Content
+		for j := range blocks {
+			tu := blocks[j].ToolUse
+			if tu == nil || len(bytes.TrimSpace(tu.Input)) == 0 {
+				continue
+			}
+			if !json.Valid(tu.Input) {
+				name := tu.Name
+				if name == "" {
+					name = tu.ID
+				}
+				return name, true
+			}
+		}
+	}
+	return "", false
 }
 
 // encodeClient renders a neutral answer in the caller's protocol.

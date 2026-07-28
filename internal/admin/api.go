@@ -99,7 +99,18 @@ type Config struct {
 	// crypto/rand, base64url, behind the "sk-" prefix every client library
 	// already expects.
 	NewToken func() (string, error)
+
+	// RotationGrace is auth.rotation.grace: how long a rotated-away secret
+	// keeps authenticating (DESIGN §11.2c). Zero means
+	// [DefaultRotationGrace]; a request may override it per rotation, including
+	// with "0" for an immediate cut.
+	RotationGrace time.Duration
 }
+
+// DefaultRotationGrace matches auth.rotation.grace's default. A day is long
+// enough that a client with a nightly deploy rolls inside it, which is the
+// interval the number exists to cover.
+const DefaultRotationGrace = 24 * time.Hour
 
 // API is the administration HTTP surface. It is safe for concurrent use.
 type API struct {
@@ -173,6 +184,9 @@ func New(cfg Config) (*API, error) {
 	}
 	if cfg.NewToken == nil {
 		cfg.NewToken = newToken
+	}
+	if cfg.RotationGrace <= 0 {
+		cfg.RotationGrace = DefaultRotationGrace
 	}
 
 	a := &API{cfg: cfg, routes: map[string]*route{}}

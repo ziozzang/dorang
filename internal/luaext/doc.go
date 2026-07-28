@@ -1,62 +1,86 @@
-// Package luaext is dorang's extension-hook surface: the four hook points of
-// DESIGN §11.5 — on_request, on_route, on_response, on_email — each run under
-// an instruction, memory and wall-clock ceiling, disabled by default, and
-// unable to see a secret.
+// Package luaext is dorang's extension surface: the hook points of DESIGN §11.5
+// plus §10.5b's transform filter, each run under an instruction, memory and
+// wall-clock ceiling, disabled by default, and unable to see a secret.
 //
-// # There is no Lua interpreter here, and that is a decision
+// # Three ways to write an extension, one contract
 //
-// §11.5 names Lua. This package does not embed a Lua VM. The reasoning, so a
-// reader can disagree with it on the merits rather than guess:
+//  1. [Plugin] — a Lua file, named in the configuration. This is the mechanism
+//     §11.5 asks for: "an operator drops in a file that registers handlers,
+//     rather than the gateway shipping every policy anyone might want."
+//  2. [Program] — a tiny total policy language (files `*.policy`) with no loops,
+//     no calls and no way to build a string, so a program terminates by
+//     construction. It covers the config-driven predicates — "deny this key on
+//     that model" — at a fraction of a VM's cost, and it stays because for those
+//     cases it is a better answer than Lua, not a substitute for it.
+//  3. [Native] — a Go function registered by an embedder. Compiled-in code for
+//     anything the other two cannot say.
 //
-//   - A Lua VM is a required module dependency, and dorang's dependency budget
-//     is deliberate (§0.2). Every existing dependency is either the storage
-//     driver or the YAML parser, and the SQLite driver was chosen pure-Go for
-//     the same reason. "The gateway needs a scripting language to boot" is a
-//     larger claim than the feature earns.
-//   - The ceilings §11.5 promises are the hard part, and a general-purpose Lua
-//     VM makes two of the three harder, not easier. gopher-lua — the only
-//     serious pure-Go option — offers cooperative context cancellation but no
-//     per-state instruction counter and no per-state memory accounting, so
-//     "instruction and memory ceilings" would have to be re-implemented on top
-//     of it or quietly withdrawn.
-//   - What the hooks are actually for is small. on_request is a policy
-//     predicate ("deny this key on that model"). on_route is the same predicate
-//     with the chosen deployment in view. on_response is an annotation.
-//     on_email is a filter. Not one of them needs closures, coroutines, string
-//     building, or a standard library.
+// All three see the same secret-free views, run under the same watchdog and the
+// same panic guard, and obey the same fail-open rule.
 //
-// So this package ships the hook contract with two implementations behind it:
+// # The VM, and the two ceilings that had to be built
 //
-//  1. A tiny, total policy language (see [Program], files `*.policy`) that
-//     covers the config-driven cases. It has no loops, no recursion, no
-//     function calls, no I/O, and no way to build a string, so a program
-//     terminates by construction and cannot allocate without bound. The
-//     ceilings are still enforced — as defence in depth, not as the only thing
-//     standing between an extension and the gateway.
-//  2. [Native] hooks: Go functions registered by an embedder. This is the
-//     documented escape hatch for anything the policy language cannot say, and
-//     it inherits the same wall-clock watchdog, the same panic containment, the
-//     same fail-open rule and the same secret-free views.
+// The interpreter is gopher-lua (github.com/yuin/gopher-lua), pure Go. §11.5
+// makes that non-negotiable — "a cgo interpreter would break the static binary
+// that makes the notebook tier's 'zero required dependencies' literal rather
+// than aspirational" — and it costs about 1.8 MB of binary.
 //
-// # What is not delivered
+// gopher-lua gives one of the three ceilings and not the other two: a context
+// check runs between VM instructions, so a wall clock can stop a hook, but there
+// is no per-state instruction counter and no per-state allocation accounting.
+// Both are built here, because a wall clock alone is not a sandbox — a hook
+// allocating in a tight loop exhausts the process long before a 200 ms deadline
+// fires, and the process holds provider credentials.
 //
-//   - Lua. There is no interpreter, and a `.lua` file under extensions.lua.dir
-//     is a **load error** ([ErrLuaSource]), never a file that is silently
-//     ignored. The configuration surface does not accept Lua that never runs.
-//   - Re-routing from on_route. The hook sees the chosen deployment and may
-//     refuse it; it cannot ask for a different one. See [RouteDecision] for the
-//     reason, which is a property of internal/router's fail-back machinery
-//     rather than of this package.
-//   - A memory ceiling over a [Native] hook. A Native is compiled-in Go code;
-//     only wall-clock and panic containment apply to it. The memory ceiling is
-//     enforced against policy programs, where it means peak live operand and
-//     tag bytes.
+//   - **Instructions.** Source is parsed, the AST is rewritten to charge a
+//     budget at every function body, every loop body and every backward `goto`,
+//     and the rewritten AST is compiled. Those are the only three ways Lua can
+//     execute an unbounded number of instructions; everything else is
+//     straight-line code whose length is fixed at load. See luagas.go.
+//   - **Memory.** Every allocation a plugin can cause is either O(1) per charge
+//     — hence bounded by the instruction ceiling — or is charged explicitly
+//     before it happens. String concatenation is rewritten into a charged host
+//     call, and the library functions whose output can exceed their input
+//     pre-flight their worst case. See luavm.go.
+//
+// # Residual exposure, stated rather than implied
+//
+//   - The memory budget is **cumulative, not live**. Bytes charged are never
+//     refunded, because a host cannot see when Lua's collector frees a string.
+//     Cumulative allocation bounds peak live memory from above, so the ceiling
+//     holds; a long-running hook that allocates and releases repeatedly will hit
+//     it earlier than its true footprint deserves.
+//   - The ceilings do not apply to a [Native], which is ordinary Go code with
+//     the whole process in reach. Only the wall clock and the panic guard do.
+//   - A hook that ignores its context is **abandoned, not killed**. Go cannot
+//     kill a goroutine. The request proceeds on time; the goroutine leaks until
+//     the VM notices the cancelled context, and repeated abandonment trips the
+//     hook off entirely ([Engine.Tripped]).
+//   - Plugin globals **persist across requests** inside one pooled VM instance,
+//     exactly as in any long-running Lua program. Nothing can leave — there is
+//     no I/O — but a plugin that stashes request text in a global has kept it.
+//     Every capability the host lends is revoked when the invocation ends, which
+//     is why the mask table is the host's and never Lua's.
+//
+// # The sandbox is a whitelist, and there is a test that proves it
+//
+// io, os, debug, coroutine and the package loader are never opened. Of what is
+// opened, every name not on an allow-list is removed — including `_G`,
+// `getfenv`, `setfenv`, `load`, `loadstring`, `dofile`, `require`, `pcall` and
+// `xpcall`. The first three would hand out the globals table, where the charge
+// functions live; the next four turn text into uninstrumented code; the last two
+// would let a plugin catch its own ceiling, and a ceiling that can be caught is
+// not a ceiling.
+//
+// TestGlobalSurfaceIsExactlyTheAllowlist walks everything reachable and fails on
+// a single name that is not written down, so a gopher-lua upgrade cannot widen
+// the sandbox quietly.
 //
 // # Disabled is free
 //
 // A nil *[Engine] is the disabled engine and every method on it is a constant.
-// [New] returns (nil, nil) when extensions.lua.enabled is false, so a caller
-// holds a typed nil and the hot path costs one nil check:
+// [New] returns (nil, nil) when nothing is configured, so a caller holds a typed
+// nil and the hot path costs one nil check:
 //
 //	if eng.Enabled(luaext.HookRequest) {
 //	    v := luaext.RequestView{...}
@@ -64,31 +88,33 @@
 //	}
 //
 // TestDisabledEngineIsFree asserts zero allocations for that branch, and
-// TestEnabledEngineDoesNotAllocateWhenHookAbsent asserts the same for an engine
-// that is on but has nothing registered for the hook being asked about.
+// TestLuaHookOffCostsNothing asserts the same for an engine that is on but has
+// nothing registered at the hook being asked about.
 //
-// # Fail-open, except a deny
+// # Fail-open, except a deny — and except a mask
 //
 // §11.5's asymmetry is the whole safety argument and it is implemented
 // literally: a hook that exceeds a ceiling, panics, or is cancelled is skipped
 // and warned, and the request proceeds as if the hook were not configured. The
-// one thing that is honoured is an explicit deny from a hook that *completed*.
-// A broken extension cannot take the gateway down; a policy that says no is
-// obeyed.
+// one thing honoured is an explicit deny from a hook that *completed*.
 //
-// The wall-clock ceiling is enforced by the caller, not by the hook: every
-// invocation runs on its own goroutine and the caller stops waiting at the
-// deadline whether or not the hook noticed. A hook that ignores its context
-// therefore delays nothing. Repeatedly abandoning a hook trips it off entirely
-// (see [Engine.Tripped]), because a wedged extension that leaks one goroutine
-// per request is an outage with a delay fuse.
+// [Engine.FilterRequest] inverts it, and §10.5b says why: "a filter that cannot
+// enrich a request should be skipped, but a filter that was supposed to remove
+// an identity number and did not must stop the request." A filter plugin
+// declares which kind it is; [FailClosed] is the default.
 //
 // # Secrets
 //
-// The views are flat structs of identifiers and numbers. There is no field on
-// any of them that can hold a credential, a bearer token, a request or response
-// body, or a header — so a hook cannot read a secret and, having no I/O, could
-// not send one anywhere if it had. TestNoSecretIsReachableFromAnyView asserts
-// the structural half by walking the view types, and TestHookCannotSeeCredential
-// asserts the behavioural half with a real credential in flight.
+// The views are flat structs of identifiers and numbers. No field on any of them
+// can hold a credential, a bearer token, a request or response body, or a header
+// — so a hook cannot read a secret and, having no I/O, could not send one
+// anywhere if it had. TestNoSecretIsReachableFromAnyView asserts the structural
+// half by walking the view types, TestHookCannotSeeCredential asserts the
+// behavioural half with a real credential in flight, and
+// TestNoSecretIsReachableFromLua does it again from inside the VM with a plugin
+// that goes looking.
+//
+// [Doc] is the one exception to "no bodies", and it is the point of §10.5b: a
+// filter sees the request's text because rewriting it is what a filter is for.
+// It sees text only — never a header, never a credential, never the mask table.
 package luaext

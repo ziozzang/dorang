@@ -15,10 +15,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/config"
-	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -225,13 +225,6 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		// reaching here means the row is worse than the validator can see.
 		return nil, err
 	}
-	c := &call{
-		kind:      callChat,
-		clientAPI: catalog.APIOpenAIChat,
-		model:     req.Model,
-		body:      req.Body,
-		creq:      creq,
-	}
 	// The credential the scheduler reserved against, not one chosen here. The
 	// reservation holds slots on THAT account's axes (DESIGN §5.1), so sending
 	// the row anywhere else charges one account and burdens another.
@@ -239,42 +232,32 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 	if cred == "" {
 		cred = st.upstreams.anyCredential(req.Provider)
 	}
-	dec := &router.Decision{
-		Provider:      req.Provider,
-		UpstreamModel: req.UpstreamModel,
+
+	res := e.d.backend.Do(ctx, backend.Target{
+		Provider:      up,
 		Credential:    cred,
-		Kind:          up.kind,
-	}
+		UpstreamModel: req.UpstreamModel,
+	}, &backend.Call{
+		Op:               backend.OpChat,
+		ClientAPI:        catalog.APIOpenAIChat,
+		Model:            req.Model,
+		Body:             req.Body,
+		Request:          creq,
+		DefaultMaxTokens: e.d.defaultMaxTokens(up.Kind(), req.UpstreamModel),
+	}, nil)
 
-	up_, err := e.d.encodeUpstream(c, dec, up)
-	if err != nil {
-		return nil, err
+	if res.Status >= 400 {
+		// The upstream's own envelope, not dorang's normalization of it: this
+		// body is what lands in the caller's error file, and that file is what
+		// they diff against the vendor's documentation.
+		return &batch.ExecResult{StatusCode: res.Status, Body: res.ErrorBody}, nil
 	}
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, up_.endpoint, bytes.NewReader(up_.body))
-	if err != nil {
-		return nil, err
+	if res.Err != nil {
+		// No HTTP answer was produced at all, which is the one condition
+		// [batch.Executor] defines as an error rather than a result.
+		return nil, res.Err
 	}
-	hreq.Header.Set("Content-Type", up_.contentType)
-	hreq.Header.Set("Accept-Encoding", "identity")
-	applyCredential(up.api, st.upstreams.secret(dec.Credential), hreq.Header)
-
-	resp, err := e.d.client.Do(hreq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		return &batch.ExecResult{StatusCode: resp.StatusCode, Body: body}, nil
-	}
-	out, _, _, err := e.d.convertResponse(c, dec, up, body, resp.Header)
-	if err != nil {
-		return nil, err
-	}
-	return &batch.ExecResult{StatusCode: resp.StatusCode, Body: out}, nil
+	return &batch.ExecResult{StatusCode: res.Status, Body: res.Body}, nil
 }
 
 // batchRoutes mounts the batch and files surface on the HTTP server.

@@ -10,12 +10,14 @@ import (
 
 const allHooks = uint8(1<<numHooks) - 1
 
-// TestLuaSourceIsALoadError is the promise that narrowing the scope did not
-// leave a configuration surface that accepts Lua and quietly never runs it.
+// TestLuaSourceIsALoadError pins the loading rule of DESIGN §11.5.
 //
-// This build has no Lua interpreter. A `.lua` file under extensions.lua.dir is
-// therefore a startup failure with a message that says so, not a file the
-// loader steps over while the operator believes their policy is enforced.
+// Lua runs in this build — but only when an operator named the file under
+// filters.plugins. A `.lua` dropped into the policy directory is neither run nor
+// silently stepped over: running it would make a writable directory a
+// code-execution primitive, and ignoring it would leave the operator believing
+// their filter is enforced. It is a startup failure that says where the file
+// belongs.
 func TestLuaSourceIsALoadError(t *testing.T) {
 	dir := t.TempDir()
 	writePolicy(t, dir, "on_request.lua", "function on_request(r) return false end\n")
@@ -27,7 +29,9 @@ func TestLuaSourceIsALoadError(t *testing.T) {
 	if !errors.Is(err, ErrLuaSource) {
 		t.Fatalf("err = %v, want ErrLuaSource", err)
 	}
-	for _, want := range []string{"on_request.lua", PolicyExt} {
+	// The message has to say where a Lua plugin *does* go, or an operator whose
+	// file was refused learns only that it was refused.
+	for _, want := range []string{"on_request.lua", "filters.plugins"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error must name %q: %v", want, err)
 		}
@@ -123,8 +127,11 @@ func TestHookSetFromConfiguredNames(t *testing.T) {
 	if err != nil || m != allHooks {
 		t.Fatalf("an empty list means all hooks: %v %v", m, err)
 	}
+	// A configured list names the policy and notification hooks. The filter hook
+	// is always in the set, because a filter is declared on the model it runs
+	// for and listing it twice is a way to configure a mask that does not mask.
 	m, err = hookSet([]string{"on_email"})
-	if err != nil || m != 1<<HookEmail {
+	if err != nil || m != 1<<HookEmail|1<<HookFilterRequest {
 		t.Fatalf("hookSet(on_email) = %v %v", m, err)
 	}
 	if _, err := hookSet([]string{"nope"}); err == nil {

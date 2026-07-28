@@ -39,8 +39,15 @@ FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 COPY --from=build /out/dorang    /usr/local/bin/dorang
 COPY --from=build /out/dorangctl /usr/local/bin/dorangctl
 
-# Writable state for the notebook tier: the embedded database and the trace
-# spool. Mount a volume here in any deployment that matters.
+# Writable state for the notebook tier: the embedded database, the trace spool,
+# the generated key pepper and batch blobs. Mount a volume here in any deployment
+# that matters.
+#
+# DORANG_STATE_DIR is what makes the defaults land inside the volume. Every
+# shipped state path is written "~/.dorang/…", and config.ExpandPath resolves
+# that leading "~" to this directory. Without it, "~" is /home/nonroot and all of
+# it — the database and the pepper that makes its keys verifiable — goes into the
+# container's writable layer and is lost on restart.
 VOLUME ["/var/lib/dorang"]
 ENV DORANG_STATE_DIR=/var/lib/dorang
 

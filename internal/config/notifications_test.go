@@ -110,24 +110,24 @@ func TestNotificationValidation(t *testing.T) {
 		{
 			"a recipient that is not an address",
 			"notifications:\n  email:\n    driver: http\n    to: [\"not-an-address\"]\n" +
-				"    http:\n      url: https://example.invalid/hook\n      key_ref: \"vault:kv/w#k\"\n",
+				"    http:\n      url: https://example.invalid/hook\n      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.to[0]", "not an email address",
 		},
 		{
 			"a sender that is not an address",
 			"notifications:\n  email:\n    driver: http\n    from: nobody\n" +
-				"    http:\n      url: https://example.invalid/hook\n      key_ref: \"vault:kv/w#k\"\n",
+				"    http:\n      url: https://example.invalid/hook\n      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.from", "not an email address",
 		},
 		{
 			"http without a url",
-			"notifications:\n  email:\n    driver: http\n    http:\n      key_ref: \"vault:kv/w#k\"\n",
+			"notifications:\n  email:\n    driver: http\n    http:\n      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.http.url", "must be set",
 		},
 		{
 			"http with a url dorang cannot post to",
 			"notifications:\n  email:\n    driver: http\n    http:\n      url: \"ftp://x/y\"\n" +
-				"      key_ref: \"vault:kv/w#k\"\n",
+				"      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.http.url", "http or https",
 		},
 		{
@@ -175,13 +175,13 @@ func TestNotificationValidation(t *testing.T) {
 		{
 			"a password without a username",
 			"notifications:\n  email:\n    driver: smtp\n    from: a@b.c\n    to: [d@e.f]\n" +
-				"    smtp:\n      addr: h:25\n      starttls: true\n      key_ref: \"vault:kv/x#k\"\n",
+				"    smtp:\n      addr: h:25\n      starttls: true\n      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.smtp.username", "alongside an SMTP password",
 		},
 		{
 			"a username without STARTTLS",
 			"notifications:\n  email:\n    driver: smtp\n    from: a@b.c\n    to: [d@e.f]\n" +
-				"    smtp:\n      addr: h:25\n      username: u\n      key_ref: \"vault:kv/x#k\"\n",
+				"    smtp:\n      addr: h:25\n      username: u\n      key_env: DORANG_TEST_FIXTURE_KEY\n",
 			"notifications.email.smtp.starttls", "unencrypted connection",
 		},
 	} {
@@ -214,7 +214,7 @@ func TestLuaDriverWithTheHookEnabledValidates(t *testing.T) {
 func TestWebhookURLMayCarryAQuery(t *testing.T) {
 	if _, err := loadYAML(t, "notifications:\n  email:\n    driver: http\n"+
 		"    http:\n      url: \"https://hooks.example.invalid/x?token=abc\"\n"+
-		"      key_ref: \"vault:kv/webhook#secret\"\n"); err != nil {
+		"      key_env: DORANG_TEST_FIXTURE_KEY\n"); err != nil {
 		t.Fatalf("a webhook URL with a query must validate: %v", err)
 	}
 }

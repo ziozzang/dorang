@@ -1,32 +1,23 @@
 package app
 
 import (
-	"crypto/tls"
 	"fmt"
-	"net"
-	"net/http"
-	"net/url"
-	"strings"
-	"time"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
-// upstream is one configured provider, resolved: everything the backend half of
-// a request needs, in one struct that never changes after a reload builds it.
-type upstream struct {
-	name    string
-	kind    string
-	api     catalog.API
-	baseURL string
-	timeout time.Duration
-}
-
-// upstreamTable is the provider and credential lookup the dispatcher uses. It
-// is immutable; a hot reload builds a new one and swaps the pointer.
+// upstreamTable is the provider and credential lookup the dispatcher hands to
+// internal/backend. It is immutable; a hot reload builds a new one and swaps the
+// pointer, so an in-flight request keeps the snapshot it started with.
+//
+// The split of responsibility is DESIGN §1's L4/L5 line: this package turns a
+// configuration file into [backend.Provider] values and a routing decision into
+// a [backend.Target], and never builds an HTTP request, spells a credential, or
+// parses a provider's error envelope itself.
 type upstreamTable struct {
-	providers map[string]*upstream
+	providers map[string]*backend.Provider
 	creds     map[string]*credential
 }
 
@@ -39,36 +30,40 @@ type upstreamTable struct {
 // alternative is a 502 on the first request that names it.
 func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable, error) {
 	t := &upstreamTable{
-		providers: make(map[string]*upstream, len(cfg.Providers)),
+		providers: make(map[string]*backend.Provider, len(cfg.Providers)),
 		creds:     collectCredentials(cfg),
 	}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
-		base := trimBase(p.BaseURL)
+		base := p.BaseURL
 		if base == "" {
 			if kd, ok := cat.Kind(p.Kind); ok {
-				base = trimBase(kd.BaseURL)
+				base = kd.BaseURL
 			}
 		}
-		if base == "" {
-			return nil, fmt.Errorf(
-				"app: provider %q has no base_url and its kind %q declares none", p.Name, p.Kind)
+		prov, err := backend.NewProvider(backend.Spec{
+			Name:    p.Name,
+			Kind:    p.Kind,
+			API:     apiFor(cat, p.Kind),
+			BaseURL: base,
+			Timeout: p.Timeout.Duration(),
+			// providers[].retry, which is a different thing from the fallback
+			// chain of §7.6 and is documented as such on [backend.Policy].
+			Retry: backend.Policy{
+				MaxAttempts: p.Retry.MaxAttempts,
+				Backoff:     p.Retry.Backoff,
+				Base:        p.Retry.Base.Duration(),
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("app: provider %q (kind %q): %w", p.Name, p.Kind, err)
 		}
-		if _, err := url.Parse(base); err != nil {
-			return nil, fmt.Errorf("app: provider %q base_url: %w", p.Name, err)
-		}
-		t.providers[p.Name] = &upstream{
-			name:    p.Name,
-			kind:    p.Kind,
-			api:     apiFor(cat, p.Kind),
-			baseURL: base,
-			timeout: p.Timeout.Duration(),
-		}
+		t.providers[p.Name] = prov
 	}
 	return t, nil
 }
 
-func (t *upstreamTable) provider(name string) (*upstream, bool) {
+func (t *upstreamTable) provider(name string) (*backend.Provider, bool) {
 	u, ok := t.providers[name]
 	return u, ok
 }
@@ -78,88 +73,4 @@ func (t *upstreamTable) secret(credentialID string) string {
 		return c.secret
 	}
 	return ""
-}
-
-// Endpoint suffixes, per wire adapter.
-const (
-	pathChatCompletions = "/chat/completions"
-	pathCompletions     = "/completions"
-	pathEmbeddings      = "/embeddings"
-	pathMessages        = "/messages"
-	pathCountTokens     = "/messages/count_tokens"
-	pathModerations     = "/moderations"
-	pathRerank          = "/rerank"
-	pathSpeech          = "/audio/speech"
-	pathTranscriptions  = "/audio/transcriptions"
-	pathTranslations    = "/audio/translations"
-	pathImageGenerate   = "/images/generations"
-	pathImageEdit       = "/images/edits"
-	pathImageVariation  = "/images/variations"
-)
-
-// cohereRerankPath is the vendor's own rerank endpoint.
-//
-// It is joined RAW rather than through [upstream.endpoint], because that helper
-// supplies "/v1" for a bare host and this route lives under /v2. Running it
-// through the helper produces /v1/v2/rerank, which 404s.
-const cohereRerankPath = "/v2/rerank"
-
-// endpoint joins a provider's base URL with the path for one operation.
-//
-// Configured base URLs come in two shapes in the wild and both are correct: one
-// already carries the version segment ("https://api.example.com/v1",
-// "https://api.z.ai/api/coding/paas/v4") and one is a bare host
-// ("https://api.anthropic.com"). A bare host gets "/v1" and a versioned one does
-// not, which is the only rule that leaves every catalogued kind pointing at a
-// real endpoint.
-func (u *upstream) endpoint(suffix string) string {
-	base := trimBase(u.baseURL)
-	if strings.HasSuffix(base, suffix) {
-		return base
-	}
-	if p, err := url.Parse(base); err == nil && (p.Path == "" || p.Path == "/") {
-		base += "/v1"
-	}
-	return base + suffix
-}
-
-// endpointRaw joins a suffix that carries its own version segment, so a bare
-// host gets nothing inserted.
-func (u *upstream) endpointRaw(suffix string) string {
-	base := trimBase(u.baseURL)
-	if strings.HasSuffix(base, suffix) {
-		return base
-	}
-	return base + suffix
-}
-
-// defaultUpstreamClient is the client used when the caller supplies none.
-//
-// Redirects are not followed: a redirect from a provider endpoint is a
-// misconfiguration or a captive portal, and following one would resend the
-// provider credential to whatever answered.
-func defaultUpstreamClient() *http.Client {
-	return &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          256,
-			MaxIdleConnsPerHost:   64,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-			// A streaming relay must see bytes as they arrive, and dorang has
-			// to read the terminal usage frame, so the response is never
-			// compressed on the wire between here and the provider.
-			DisableCompression: true,
-		},
-	}
 }

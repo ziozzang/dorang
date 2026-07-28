@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 )
@@ -120,6 +121,10 @@ type StreamDecoder struct {
 	// blockTool maps a content-block index to the neutral tool-call index.
 	blockTool map[int]int
 	nextTool  int
+	// blocks is the per-content-block state needed to close a tool block
+	// correctly: whether it was started, whether it was already stopped, and what
+	// content_block_start put in its input.
+	blocks map[int]*decodedBlock
 
 	inputExclusive int
 	cacheRead      int
@@ -128,6 +133,20 @@ type StreamDecoder struct {
 	haveUsage      bool
 
 	done bool
+}
+
+// decodedBlock is one inbound content block's state.
+type decodedBlock struct {
+	tool bool
+	// input is what content_block_start carried, kept only when it is a
+	// non-trivial object. The vendor's own streams send {} there and put the real
+	// document in input_json_delta, but a backend that emits the whole call in
+	// one block puts it here, and dropping it turns a real argument object into
+	// no arguments at all.
+	input []byte
+	// sawArgs records that at least one input_json_delta arrived.
+	sawArgs bool
+	stopped bool
 }
 
 // NewStreamDecoder returns a decoder over an SSE body.
@@ -187,7 +206,7 @@ func (d *StreamDecoder) frame(f *Frame) ([]canonical.StreamEvent, error) {
 		// 6.2 says dorang emits no ping. Receiving one is normal — the vendor's
 		// own stream sends them — and it carries nothing.
 		return nil, nil
-	case EventMessageStop, EventContentBlockStop:
+	case EventMessageStop:
 		// Block boundaries are explicit here and implicit in the neutral form,
 		// which is the asymmetry DESIGN §10.7 describes from the other side.
 		// Nothing to carry.
@@ -200,6 +219,9 @@ func (d *StreamDecoder) frame(f *Frame) ([]canonical.StreamEvent, error) {
 	}
 
 	switch f.Event {
+	case EventContentBlockStop:
+		return d.closeBlock(raw.Index), nil
+
 	case EventMessageStart:
 		if raw.Message == nil {
 			return nil, nil
@@ -218,8 +240,24 @@ func (d *StreamDecoder) frame(f *Frame) ([]canonical.StreamEvent, error) {
 		return []canonical.StreamEvent{ev}, nil
 
 	case EventContentBlockStart:
-		if raw.ContentBlock == nil || raw.ContentBlock.Type != BlockToolUse {
+		if raw.ContentBlock == nil {
 			return nil, nil
+		}
+		b := d.block(raw.Index)
+		if raw.ContentBlock.Type != BlockToolUse {
+			return nil, nil
+		}
+		b.tool, b.stopped = true, false
+		if in := trimSpace(raw.ContentBlock.Input); len(in) > 0 &&
+			string(in) != "{}" && string(in) != "null" {
+			// A backend that put the whole argument object in the start event.
+			// Held rather than emitted: if input_json_delta frames follow, the
+			// two spellings contradict each other and the incremental one — the
+			// only one the protocol defines as cumulative — has to win.
+			b.input = append(b.input[:0], in...)
+		}
+		if raw.ContentBlock.ID == "" {
+			d.warn.warn(WarnToolCallMissingID, raw.ContentBlock.Name)
 		}
 		idx := d.toolIndex(raw.Index)
 		return []canonical.StreamEvent{d.event(canonical.Delta{
@@ -269,6 +307,17 @@ func (d *StreamDecoder) frame(f *Frame) ([]canonical.StreamEvent, error) {
 			if bd.PartialJSON == "" {
 				return nil, nil
 			}
+			b := d.block(raw.Index)
+			if len(b.input) > 0 {
+				// content_block_start already carried a complete input and now the
+				// incremental form contradicts it. Concatenating produces two JSON
+				// documents in one field; the deltas are the form the protocol
+				// defines, so the pre-seeded object is dropped and the conflict is
+				// reported.
+				d.warn.warn(WarnToolInputConflict, string(b.input))
+				b.input = b.input[:0]
+			}
+			b.sawArgs = true
 			return []canonical.StreamEvent{d.event(canonical.Delta{
 				ToolCalls: []canonical.ToolCallDelta{{
 					Index:     d.toolIndex(raw.Index),
@@ -324,6 +373,56 @@ func (d *StreamDecoder) event(delta canonical.Delta) canonical.StreamEvent {
 		Model: d.model,
 		Delta: delta,
 	}
+}
+
+// block returns the per-content-block state, creating it on first sight.
+func (d *StreamDecoder) block(index int) *decodedBlock {
+	if d.blocks == nil {
+		d.blocks = make(map[int]*decodedBlock, 2)
+	}
+	b := d.blocks[index]
+	if b == nil {
+		b = &decodedBlock{}
+		d.blocks[index] = b
+	}
+	return b
+}
+
+// closeBlock handles content_block_stop.
+//
+// It exists for one reason that is easy to miss: a tool call with no arguments
+// produces content_block_start with input:{} and then NO input_json_delta at
+// all. Carrying nothing across leaves an OpenAI-shaped client with a tool call
+// whose arguments field is absent rather than "{}", and the clients that do
+// json.loads(arguments) on it raise instead of calling the tool.
+//
+// It is also where the two malformed shapes are absorbed: a second stop for a
+// block already stopped, and a stop for a block that never started. Neither may
+// allocate a tool index — doing so invents a parallel call out of a stray frame.
+func (d *StreamDecoder) closeBlock(index int) []canonical.StreamEvent {
+	b := d.blocks[index]
+	if b == nil {
+		d.warn.warn(WarnUnknownBlockStop, strconv.Itoa(index))
+		return nil
+	}
+	if b.stopped {
+		d.warn.warn(WarnDuplicateBlockStop, strconv.Itoa(index))
+		return nil
+	}
+	b.stopped = true
+	if !b.tool || b.sawArgs {
+		return nil
+	}
+	args := "{}"
+	if len(b.input) > 0 {
+		args = string(b.input)
+	}
+	return []canonical.StreamEvent{d.event(canonical.Delta{
+		ToolCalls: []canonical.ToolCallDelta{{
+			Index:     d.toolIndex(index),
+			Arguments: args,
+		}},
+	})}
 }
 
 // toolIndex maps a content-block index to a dense tool-call index.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/keyguard"
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
@@ -28,6 +29,13 @@ type meterAdapter struct {
 	// request, after the client's last byte. A second hook would be a second
 	// chance to disagree with this one.
 	record func(*server.Event)
+	// guard is DESIGN §11.6's token guard. It is fed here rather than from the
+	// request path for the same reason the meter is: this is the one place a
+	// finished request is described in full, and recording usage is a bounded
+	// map write, not a decision. The decision is a periodic sweep.
+	//
+	// Nil is the disabled guard and costs one nil check.
+	guard *keyguard.Guard
 }
 
 // Record implements server.Meter. It never blocks and never fails the request:
@@ -37,9 +45,16 @@ func (a *meterAdapter) Record(ev server.Event) {
 		a.record(&ev)
 	}
 	r := &ev.Result
+	if tokens := r.Tokens.Input + r.Tokens.Output + r.Tokens.Reasoning; tokens > 0 && ev.KeyID != "" {
+		// The guard watches TOKENS, not requests: §11.6's trigger is a token
+		// rate against a token baseline, and a key that doubles its request
+		// count while halving its context has not departed from anything.
+		_ = a.guard.Observe(context.Background(), ev.KeyID, tokens, a.now())
+	}
 	a.m.Record(meter.Event{
 		Time:         a.now(),
 		APIKeyID:     ev.KeyID,
+		SecretID:     ev.SecretID,
 		UserID:       ev.UserID,
 		TeamID:       ev.TeamID,
 		ModelGroup:   ev.Model,
@@ -145,6 +160,7 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			ID:               t.RequestID,
 			TS:               t.Time,
 			APIKeyID:         t.APIKeyID,
+			SecretID:         t.SecretID,
 			UserID:           t.UserID,
 			TeamID:           t.TeamID,
 			CredentialID:     t.CredentialID,

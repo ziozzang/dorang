@@ -68,6 +68,8 @@ import (
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/router"
+	"github.com/ziozzang/dorang/internal/server"
+	"github.com/ziozzang/dorang/internal/tokenest"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -429,11 +431,14 @@ func (g *Gateway) Do(ctx context.Context, c Call) (*Reply, error) {
 	if req.MaxTokens != nil {
 		rr.MaxOutputTokens = int64(*req.MaxTokens)
 	}
-	// §10.5a requires the prompt estimate to err pessimistic: an over-estimate
-	// costs an unnecessary route to a larger model, an under-estimate costs a
-	// hard failure the router cannot see. Four bytes per token with a fixed
-	// margin is deliberately on the high side of the usual rule of thumb.
-	rr.InputTokens = int64(len(c.Body)/3 + 16)
+	// §10.5a requires the prompt estimate to err pessimistic, and to be
+	// script-aware rather than a division of the body length: a base64 image is
+	// body bytes, and dividing those by three charges a photograph several
+	// hundred times what it costs. internal/tokenest is the same estimator the
+	// dispatcher uses, walking the same decoded request.
+	est := tokenest.Request(req)
+	rr.InputTokens = est.Tokens
+	rr.InputTokensExact, rr.InputTokensMethod = est.Exact, est.Method
 	if c.Prefix {
 		// The chain is seeded with the model group so two groups can never
 		// share an entry (DESIGN §7.4b). The group is what the alias resolves
@@ -557,6 +562,15 @@ func (g *Gateway) dispatch(ctx context.Context, c Call, req *canonical.Request, 
 			Err:    fmt.Errorf("upstream %d", resp.StatusCode),
 			Status: resp.StatusCode,
 			Total:  time.Since(start),
+		}
+		// A context overflow reaches dorang as a 400 whose only distinguishing
+		// mark is the body, which is why [router.Outcome.Cause] documents itself
+		// as the frontend's job for exactly this condition. server.Normalize
+		// decodes all five upstream envelope shapes; router.ClassifyBody reads
+		// the result. Leaving Cause zero for anything unrecognised keeps every
+		// other 400 terminal, as before.
+		if e := server.Normalize(resp.StatusCode, body); e != nil {
+			oc.Cause = router.ClassifyBody(resp.StatusCode, e.Code, e.Message)
 		}
 		if ra := resp.Header.Get("retry-after"); ra != "" {
 			if secs, err := strconv.Atoi(ra); err == nil {

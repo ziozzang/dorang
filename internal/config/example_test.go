@@ -28,6 +28,7 @@ func TestExampleConfigLoads(t *testing.T) {
 
 	t.Setenv("DORANG_EXAMPLE_PLAN_A_KEY", "example-key-plan-a")
 	t.Setenv("DORANG_EXAMPLE_CLOUD_A_KEY_1", "example-key-1")
+	t.Setenv("DORANG_EXAMPLE_FILTER_SECRET", "example-filter-seed")
 
 	c, err := LoadBytes([]byte(src))
 	if err != nil {
@@ -51,6 +52,10 @@ func TestExampleConfigLoads(t *testing.T) {
 		{"passthrough routes", len(c.Passthrough.Routes) == 2},
 		{"priority emit", len(c.PriorityMapping.Emit.Backends) == 2},
 		{"notification events", len(c.Notifications.Events) == 7},
+		{"filter plugins", len(c.Filters.Plugins) == 1},
+		{"a model carrying a filter", len(c.Models) > 0 && len(c.Models[0].Filters) == 1},
+		{"filter patterns", len(c.Models) > 0 && len(c.Models[0].Filters) == 1 &&
+			len(c.Models[0].Filters[0].Patterns) == 2},
 	} {
 		if !tc.ok {
 			t.Errorf("the example does not cover %s", tc.name)
@@ -72,6 +77,10 @@ func TestExampleConfigLoads(t *testing.T) {
 	} else {
 		t.Error("credential acct-2 is missing")
 	}
+	// The filter seed is a secret like any other, resolved the same way (§10.5b).
+	if v, ok := c.Filters.Secret.Value(); !ok || v != "example-filter-seed" {
+		t.Error("filters.secret did not resolve from the environment")
+	}
 }
 
 // TestExampleConfigMatchesDefaults checks that the commented values really are
@@ -89,10 +98,27 @@ func TestExampleConfigMatchesDefaults(t *testing.T) {
 	bare := &Config{}
 	bare.ApplyDefaults()
 
+	// The filter section has no counterpart in an empty file — a bare Config
+	// declares no plugin and no model — so its written values are compared
+	// against the default constants themselves. `on` is a slice, which the table
+	// below cannot compare, so it is joined.
+	if len(example.Filters.Plugins) == 0 {
+		t.Fatal("the example no longer declares a filter plugin")
+	}
+	if len(example.Models) == 0 || len(example.Models[0].Filters) == 0 {
+		t.Fatal("the example no longer attaches a filter to a model")
+	}
+	exampleFilter := example.Models[0].Filters[0]
+
 	for _, tc := range []struct {
 		name      string
 		got, want any
 	}{
+		{"filters.plugins[0].fail", example.Filters.Plugins[0].Fail, defaultFilterFail},
+		{"models[0].filters[0].scope", exampleFilter.Scope, defaultFilterScope},
+		{"models[0].filters[0].on", strings.Join(exampleFilter.On, ","),
+			strings.Join(defaultFilterOn, ",")},
+		{"models[0].filters[0].retain", exampleFilter.Retain, Duration(0)},
 		{"server.listen", example.Server.Listen, bare.Server.Listen},
 		{"server.env", example.Server.Env, bare.Server.Env},
 		{"server.master_key_env", example.Server.MasterKeyEnv, bare.Server.MasterKeyEnv},

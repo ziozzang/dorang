@@ -35,6 +35,11 @@ type Record struct {
 	// Scheme is the stored hash_scheme.
 	Scheme Scheme
 	// Principal is the authorization envelope of the row.
+	//
+	// It carries the key's identity AND the identity of the one secret this
+	// lookup belongs to (DESIGN §11.2c): a key with two live secrets during a
+	// rotation grace period is two Records with two lookups, one Principal
+	// each, the same KeyID and different SecretIDs.
 	Principal Principal
 }
 
@@ -97,9 +102,38 @@ type Config struct {
 	// by Load do not expire; they are replaced by the next Load or dropped by
 	// Invalidate, because the snapshot is the authority on the hot path
 	// (DESIGN §9.1).
+	//
+	// It is the FALLBACK bound on a revocation, not the mechanism: a node that
+	// received the published invalidation drops the key at once (§11.2c).
 	EntryTTL time.Duration
-	// NegativeTTL is how long an unknown index key is remembered as unknown.
+	// NegativeTTL is how long a REFUSAL is remembered — an unknown index key,
+	// and equally a row that was found and refused.
+	//
+	// §11.2c rule 3: a key that was refused is cheap to re-check and a key that
+	// is serving is not, so the two do not need the same freshness. Treating
+	// them alike is what made the revocation window a full EntryTTL wide. [New]
+	// refuses a configuration where this is longer than EntryTTL, because such
+	// a configuration inverts the rule rather than merely weakening it.
 	NegativeTTL time.Duration
+	// Sink publishes revocations, pends and early grace cuts to the other nodes
+	// (DESIGN §11.2c). Nil is the single-node deployment, where the local drop
+	// in [Authenticator.Announce] is the whole mechanism.
+	Sink Sink
+	// ReloadInterval is how often the deployment calls
+	// [Authenticator.Refresh] to re-read the whole credential set.
+	//
+	// It is not used to schedule anything — this package owns no timer — but it
+	// is the FALLBACK for a snapshot row, because a row placed by a bulk load
+	// does not expire (DESIGN §9.1). Leaving it zero is a statement that no
+	// bulk reload is scheduled, and [Authenticator.RevocationBound] then
+	// publishes "never" for those rows rather than the entry TTL, which does
+	// not apply to them.
+	ReloadInterval time.Duration
+	// Tiers is the operator's tier configuration (DESIGN §11.6). Nil means
+	// [DefaultTiers]. It is held so that a caller resolving a stored row's tier
+	// uses the same set the gateway was configured with, and so that a tier a
+	// caller names has nowhere to enter from.
+	Tiers *TierSet
 	// StoreTimeout bounds one store lookup.
 	StoreTimeout time.Duration
 	// RehashQueue is the depth of the asynchronous upgrade queue.
@@ -148,6 +182,24 @@ type Stats struct {
 	RehashDone    uint64
 	SnapshotSize  int
 	OverlaySize   int
+
+	// Invalidations counts messages applied, Dropped the cache entries they
+	// removed, Published the ones this node put on the bus, and PublishFailed
+	// the ones it could not. A published figure nobody can check is not a
+	// guarantee, so the failures are counted rather than logged (§11.2c).
+	Invalidations uint64
+	Dropped       uint64
+	Published     uint64
+	PublishFailed uint64
+	// Rejoins counts drop-then-load reloads (§11.2c rule 4), and Refreshes the
+	// periodic load-then-swap ones. They are counted apart because a node whose
+	// Refreshes have stopped is a node whose snapshot rows have no fallback at
+	// all, and that has to be visible rather than inferred.
+	Rejoins   uint64
+	Refreshes uint64
+	// NegativeCached counts entries cached at the short TTL because the row was
+	// found and refusing. It is what makes rule 3 observable.
+	NegativeCached uint64
 }
 
 // Authenticator resolves credentials to principals.
@@ -160,15 +212,18 @@ type Stats struct {
 //
 // An Authenticator is safe for concurrent use.
 type Authenticator struct {
-	hasher  *Hasher
-	store   Store
-	rehash  Rehasher
-	now     func() time.Time
-	entTTL  time.Duration
-	negTTL  time.Duration
-	stoTO   time.Duration
-	masterD Digest
-	master  *Principal
+	hasher      *Hasher
+	store       Store
+	rehash      Rehasher
+	now         func() time.Time
+	entTTL      time.Duration
+	negTTL      time.Duration
+	stoTO       time.Duration
+	masterD     Digest
+	master      *Principal
+	sink        Sink
+	tiers       *TierSet
+	reloadEvery time.Duration
 
 	snap atomic.Pointer[map[Lookup]*entry]
 
@@ -183,7 +238,21 @@ type Authenticator struct {
 
 	hits, misses, storeCalls, coalesced, rejected, masterHits atomic.Uint64
 	rehashQueued, rehashDropped, rehashOK                     atomic.Uint64
+	invalidations, dropped, published, publishFails, rejoins  atomic.Uint64
+	negativeCached, refreshes                                 atomic.Uint64
 }
+
+// ErrNegativeTTLTooLong reports a configuration that holds a refusal for longer
+// than it holds a serving row.
+//
+// It is refused rather than clamped because it inverts §11.2c rule 3 — the
+// whole point of the rule is that a refusal is the CHEAP thing to re-check —
+// and a silently clamped value would leave an operator believing a number that
+// was not honoured.
+var ErrNegativeTTLTooLong = errors.New(
+	"auth: NegativeTTL must not exceed EntryTTL: a refused key is cheap to re-check and a " +
+		"serving one is not, and holding refusals longer is what makes a revocation window " +
+		"wide (DESIGN §11.2c)")
 
 type rehashJob struct {
 	keyID  string
@@ -208,6 +277,10 @@ func New(cfg Config) (*Authenticator, error) {
 	if now == nil {
 		now = time.Now
 	}
+	tiers := cfg.Tiers
+	if tiers == nil {
+		tiers = DefaultTiers()
+	}
 	a := &Authenticator{
 		hasher: h,
 		store:  cfg.Store,
@@ -215,6 +288,13 @@ func New(cfg Config) (*Authenticator, error) {
 		entTTL: orDuration(cfg.EntryTTL, DefaultEntryTTL),
 		negTTL: orDuration(cfg.NegativeTTL, DefaultNegativeTTL),
 		stoTO:  orDuration(cfg.StoreTimeout, DefaultStoreTimeout),
+		sink:   cfg.Sink,
+		tiers:  tiers,
+
+		reloadEvery: cfg.ReloadInterval,
+	}
+	if a.negTTL > a.entTTL {
+		return nil, fmt.Errorf("%w: NegativeTTL %s > EntryTTL %s", ErrNegativeTTLTooLong, a.negTTL, a.entTTL)
 	}
 	empty := map[Lookup]*entry{}
 	a.snap.Store(&empty)
@@ -335,8 +415,27 @@ func (a *Authenticator) Stats() Stats {
 		RehashDone:    a.rehashOK.Load(),
 		SnapshotSize:  len(*a.snap.Load()),
 		OverlaySize:   ov,
+
+		Invalidations:  a.invalidations.Load(),
+		Dropped:        a.dropped.Load(),
+		Published:      a.published.Load(),
+		PublishFailed:  a.publishFails.Load(),
+		Rejoins:        a.rejoins.Load(),
+		Refreshes:      a.refreshes.Load(),
+		NegativeCached: a.negativeCached.Load(),
 	}
 }
+
+// Tiers returns the tier configuration this authenticator was built with. It is
+// read-only: a tier is assigned by an operator, and there is no setter through
+// which a request could reach one (DESIGN §11.6, §10.5).
+func (a *Authenticator) Tiers() *TierSet { return a.tiers }
+
+// EntryTTL and NegativeTTL report the configured lifetimes, so the published
+// revocation bound can be checked against the thing it describes rather than
+// against a constant.
+func (a *Authenticator) EntryTTL() time.Duration    { return a.entTTL }
+func (a *Authenticator) NegativeTTL() time.Duration { return a.negTTL }
 
 // Close stops the rehash worker. It is idempotent.
 func (a *Authenticator) Close() {
@@ -450,15 +549,26 @@ func (a *Authenticator) use(e *entry, sum, mac Digest, now time.Time) (*Principa
 		return nil, err
 	}
 	p := e.principal
-	// Two kill switches are enforced here as well as in Authorize, so a caller
-	// that forgets to authorize still cannot use a revoked credential.
+	// Four kill switches are enforced here as well as in Authorize, so a caller
+	// that forgets to authorize still cannot use a revoked, pended or
+	// rotation-cut credential. The guard's requirement is that the key STOPS
+	// SERVING, and a check that only runs in Authorize is a check a code path
+	// can walk around.
 	if p.Key.Blocked || (p.User != nil && p.User.Blocked) || (p.Team != nil && p.Team.Blocked) {
 		a.rejected.Add(1)
 		return nil, refuse(ReasonBlocked, "key", "")
 	}
+	if p.Key.Pended || (p.User != nil && p.User.Pended) || (p.Team != nil && p.Team.Pended) {
+		a.rejected.Add(1)
+		return nil, refuse(ReasonPended, "key", "")
+	}
 	if p.Key.Expired(now) || (p.User != nil && p.User.Expired(now)) || (p.Team != nil && p.Team.Expired(now)) {
 		a.rejected.Add(1)
 		return nil, refuse(ReasonExpired, "key", "")
+	}
+	if p.SecretRetired(now) {
+		a.rejected.Add(1)
+		return nil, refuse(ReasonSecretRetired, "secret", "")
 	}
 	if e.scheme == SchemeLegacySHA256 && a.rehash != nil {
 		a.scheduleRehash(e, p.KeyID, mac, sum)
@@ -528,12 +638,24 @@ func (a *Authenticator) fetch(ctx context.Context, l Lookup) (*entry, error) {
 			return nil, refuse(ReasonUnavailable, "", "")
 		}
 		p := rec.Principal
+		// §11.2c rule 3. A row that was found but REFUSES is a negative answer,
+		// and it is cached for the negative lifetime rather than the serving
+		// one. This is the difference between a pended key being re-checked in
+		// seconds and being re-checked in a minute, on a node that never saw the
+		// invalidation — and it costs a store read on a key that is refusing
+		// anyway, which is the cheapest read the gateway makes.
+		now := a.now()
+		ttl := a.entTTL
+		if p.Refusing(now) {
+			ttl = a.negTTL
+			a.negativeCached.Add(1)
+		}
 		ne := &entry{
 			digest:    rec.Digest,
 			scheme:    rec.Scheme,
 			principal: &p,
 			found:     true,
-			expires:   a.now().Add(a.entTTL).UnixNano(),
+			expires:   now.Add(ttl).UnixNano(),
 		}
 		a.insert(l, ne)
 		return ne, nil

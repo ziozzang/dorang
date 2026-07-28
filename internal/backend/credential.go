@@ -43,13 +43,18 @@ type Credentials interface {
 // opaque and safe; the message it failed with is not, so it does not travel.
 var errCredentialUnavailable = errors.New("backend: the credential is not usable")
 
-// applyCredential puts a provider credential on an outbound request in the
+// ApplyCredential puts a provider credential on an outbound request in the
 // spelling that wire shape expects.
 //
 // The client's own credential never travels upstream — internal/auth strips
 // every accepted header at the gate — so this is the only thing that
 // authenticates dorang to a backend.
-func (p *Provider) applyCredential(secret string, oauth Applier, h http.Header) error {
+//
+// [Backend.Do] calls it for the requests it makes. It is exported for the one
+// outbound path that is not a [Backend.Do] — the §10.6 passthrough relay, which
+// forwards a caller's own bytes to a provider and needs the credential spelled
+// the same way, from the same table, by the same code.
+func (p *Provider) ApplyCredential(secret string, oauth Applier, h http.Header) error {
 	// Family headers that are not the credential itself go on regardless of how
 	// the credential is spelled: anthropic-version is mandatory on that surface
 	// whether the key is static or an OAuth token.

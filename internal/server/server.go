@@ -35,6 +35,24 @@ const (
 	defaultMaxBodyBytes = DefaultMaxBodyBytes
 )
 
+// MetricsAccess selects who may read GET /metrics (DESIGN §12.3).
+//
+// The zero value is the restrictive one on purpose. A scrape endpoint reads
+// like infrastructure rather than data, which is exactly why it was public: the
+// body is a page of numbers with no obvious owner. It is not — it names every
+// model a deployment routes to, every credential id, and what each key has
+// spent. Opening it is a decision, and a decision has to be written down.
+type MetricsAccess uint8
+
+const (
+	// MetricsAdmin requires the master credential or an [AdminPrincipal].
+	MetricsAdmin MetricsAccess = iota
+	// MetricsPublic serves the scrape to anyone who can reach the listener.
+	MetricsPublic
+	// MetricsOff does not register the route at all.
+	MetricsOff
+)
+
 // ModelsCreated is the constant `created` of every GET /v1/models item.
 //
 // COMPATIBILITY §7.4: it is a fixed constant, not the current time, because
@@ -71,6 +89,16 @@ type Options struct {
 	// five labels — and a second `# TYPE` line for one name makes Prometheus
 	// reject the whole scrape.
 	Metrics MetricsSource
+
+	// MetricsAccess selects who may read GET /metrics. The zero value
+	// authenticates and requires an administrative caller, which is the safe
+	// default: the scrape carries per-key spend, per-credential quota state and
+	// every configured model name.
+	MetricsAccess MetricsAccess
+
+	// HealthReporters contribute named objects to the /health body, in order.
+	// Nil adds nothing and the body keeps the shape it always had.
+	HealthReporters []HealthReporter
 
 	// CaptureHeadBytes and CaptureTailBytes bound what a sampled response
 	// retains for comparison; 0 uses [DefaultCaptureHeadBytes] and
@@ -129,6 +157,7 @@ type snapshot struct {
 	meter      Meter
 	observer   Observer
 	metrics    MetricsSource
+	reporters  []HealthReporter
 
 	captureHead int
 	captureTail int
@@ -194,6 +223,7 @@ func (s *Server) Reload(opts Options) error {
 		meter:          opts.Meter,
 		observer:       opts.Observer,
 		metrics:        opts.Metrics,
+		reporters:      opts.HealthReporters,
 		captureHead:    opts.CaptureHeadBytes,
 		captureTail:    opts.CaptureTailBytes,
 		maxBody:        opts.MaxBodyBytes,
@@ -231,7 +261,7 @@ func (s *Server) Reload(opts Options) error {
 		snap.logf = func(string, ...any) {}
 	}
 
-	routes := s.baseRoutes()
+	routes := s.baseRoutes(opts.MetricsAccess)
 	pt, err := compilePassthrough(opts.Passthrough)
 	if err != nil {
 		return err
@@ -407,6 +437,12 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 			return asError(err, http.StatusUnauthorized, TypeAuthentication)
 		}
 		rq.Principal = p
+		if rt.Admin && !isAdmin(p) {
+			s.metrics.authFailures.Add(1)
+			return NewError(http.StatusForbidden, TypePermission,
+				"this route is administrative: it needs the master credential or an admin key").
+				WithCode("admin_required")
+		}
 	}
 
 	if rt.NeedsBody {
@@ -627,6 +663,7 @@ func (s *Server) finish(cfg *snapshot, rq *Request, rw *responseWriter) {
 	cfg.meter.Record(Event{
 		RequestID:   rq.ID,
 		KeyID:       keyID,
+		SecretID:    principalSecret(rq.Principal),
 		UserID:      userID,
 		TeamID:      teamID,
 		Route:       name,
@@ -657,4 +694,19 @@ func principalIDs(p Principal) (keyID, userID, teamID string) {
 		return "", "", ""
 	}
 	return p.KeyID(), p.UserID(), p.TeamID()
+}
+
+// principalSecret reads the optional secret identity (DESIGN §11.2c).
+//
+// It is an optional interface rather than a sixth method on [Principal] for the
+// same reason [AdminPrincipal] is one: a Principal that cannot name a secret is
+// not an incomplete implementation, it is a deployment whose credentials are
+// not rotated. The empty string is the honest answer there, and it is what the
+// ledger column holds.
+func principalSecret(p Principal) string {
+	sp, ok := p.(SecretPrincipal)
+	if !ok {
+		return ""
+	}
+	return sp.SecretID()
 }

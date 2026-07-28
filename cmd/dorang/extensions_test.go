@@ -487,7 +487,10 @@ func TestLuaSourceRefusesToStart(t *testing.T) {
 	if err == nil {
 		t.Fatal("a .lua file must not be silently ignored")
 	}
-	if !strings.Contains(err.Error(), "Lua source is not executable") {
-		t.Errorf("the error must say why: %v", err)
+	// Lua runs in this build, but only when an operator names the file under
+	// filters.plugins. The message has to say so, or the operator learns only
+	// that their file was refused.
+	if !strings.Contains(err.Error(), "filters.plugins") {
+		t.Errorf("the error must say where a plugin is declared: %v", err)
 	}
 }

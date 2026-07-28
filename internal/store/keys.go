@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -31,6 +32,11 @@ const (
 var (
 	ErrKeyExpired = errors.New("store: api key expired")
 	ErrKeyBlocked = errors.New("store: api key blocked")
+	// ErrKeyPended is the token guard's refusal (DESIGN §11.6). It is distinct
+	// from ErrKeyBlocked because a pend is reversible in one operator action
+	// and a block is a decision; a caller who cannot tell them apart cannot
+	// tell an outage from a policy.
+	ErrKeyPended = errors.New("store: api key pended")
 )
 
 // APIKey is one row of api_keys: the authorization fields that must be carried
@@ -74,6 +80,20 @@ type APIKey struct {
 	Blocked   bool
 	ExpiresAt time.Time
 
+	// Tier is the key's tier (DESIGN §11.6). It is assigned by an operator and
+	// there is no request field that writes it: §10.5's rule is that an
+	// operator can grant urgency and a caller cannot claim it. Empty means the
+	// configured default tier.
+	Tier string
+	// PendedAt is when the token guard pended this key, zero when it is not
+	// pended (§11.6). It is separate from Blocked because the two are different
+	// judgements: Blocked is an operator's decision, a pend is a statistical
+	// one that might be wrong and that an operator releases in one action
+	// without reissuing a credential.
+	PendedAt time.Time
+	// PendReason records which condition tripped, in words.
+	PendReason string
+
 	// Source distinguishes natively issued keys from imported ones.
 	Source string
 
@@ -90,6 +110,10 @@ func (k *APIKey) Expired(now time.Time) bool {
 // Authenticated is the result of AuthenticateKey.
 type Authenticated struct {
 	Key *APIKey
+	// Secret is WHICH of the key's secrets verified (DESIGN §11.2c). The ledger
+	// records it, so an operator can see whether the client actually rolled
+	// before the grace window closes instead of finding out when it shuts.
+	Secret *KeySecret
 	// NeedsRehash is true when the token verified under legacy_sha256 and
 	// auth.rehash_on_use should schedule an asynchronous upgrade to
 	// dorang_v1 (DESIGN 2.4). The upgrade is RehashKey.
@@ -163,7 +187,7 @@ func (s *Store) AuthenticateKey(ctx context.Context, token string) (Authenticate
 	if token == "" {
 		return Authenticated{}, ErrBadCredential
 	}
-	key, err := s.GetAPIKeyByLookup(ctx, KeyLookup(token))
+	key, secret, err := s.ResolveKeyByLookup(ctx, KeyLookup(token))
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return Authenticated{}, ErrBadCredential
@@ -173,20 +197,23 @@ func (s *Store) AuthenticateKey(ctx context.Context, token string) (Authenticate
 
 	now := s.now()
 	var legacy bool
-	switch key.HashScheme {
+	// The digest verified against belongs to the SECRET, not to the key. During
+	// a rotation's grace period the two differ, and verifying against the key's
+	// denormalized copy would refuse the caller who has not rolled yet.
+	switch secret.HashScheme {
 	case SchemeDorangV1:
 		want, err := HashDorangV1(s.cfg.Pepper, token)
 		if err != nil {
 			return Authenticated{}, err
 		}
-		if !constantTimeHexEqual(want, key.TokenHash) {
+		if !constantTimeHexEqual(want, secret.TokenHash) {
 			return Authenticated{}, ErrBadCredential
 		}
 	case SchemeLegacySHA256:
 		// The comparison happens either way so that a disabled legacy scheme
 		// is not distinguishable from a wrong secret by timing; only the
 		// returned error differs.
-		ok := constantTimeHexEqual(HashLegacySHA256(token), key.TokenHash)
+		ok := constantTimeHexEqual(HashLegacySHA256(token), secret.TokenHash)
 		if !s.cfg.Legacy.allowed(now) {
 			return Authenticated{}, ErrLegacyDisabled
 		}
@@ -195,16 +222,23 @@ func (s *Store) AuthenticateKey(ctx context.Context, token string) (Authenticate
 		}
 		legacy = true
 	default:
-		return Authenticated{}, fmt.Errorf("store: key %s has unknown hash scheme %q", key.ID, key.HashScheme)
+		return Authenticated{}, fmt.Errorf("store: key %s has unknown hash scheme %q", key.ID, secret.HashScheme)
 	}
 
 	if key.Blocked {
 		return Authenticated{}, ErrKeyBlocked
 	}
+	if key.Pended() {
+		return Authenticated{}, ErrKeyPended
+	}
 	if key.Expired(now) {
 		return Authenticated{}, ErrKeyExpired
 	}
-	return Authenticated{Key: key, NeedsRehash: legacy}, nil
+	// The secret's own expiry: the key is fine and this credential is not.
+	if secret.Retired(now) {
+		return Authenticated{}, ErrSecretRetired
+	}
+	return Authenticated{Key: key, Secret: secret, NeedsRehash: legacy}, nil
 }
 
 // constantTimeHexEqual compares two hex digests without leaking where they
@@ -267,34 +301,100 @@ func (s *Store) SetKeyDigest(ctx context.Context, keyID, lookup, digest string, 
 	if _, err := hex.DecodeString(digest); err != nil {
 		return fmt.Errorf("store: SetKeyDigest digest is not hex: %w", err)
 	}
-	res, err := s.exec(ctx, `
-		UPDATE api_keys
-		   SET token_hash = ?, hash_scheme = ?, updated_at = ?
-		 WHERE id = ? AND lookup = ? AND hash_scheme = ?`,
-		digest, string(SchemeDorangV1), Micros(s.now()),
-		keyID, lookup, string(SchemeLegacySHA256))
-	if err != nil {
+	// Both copies are upgraded in one transaction. api_key_secrets is the
+	// authority and api_keys.token_hash is its denormalized copy for the
+	// current secret; upgrading one and not the other would leave a key that
+	// verifies under one scheme and reports the other.
+	//
+	// The secrets row is matched on the LOOKUP, not on "the current secret":
+	// a legacy secret can be one that is still inside a rotation's grace
+	// period, and rehash-on-use has to upgrade whichever one actually verified.
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := s.txExec(ctx, tx, `
+			UPDATE api_key_secrets
+			   SET token_hash = ?, hash_scheme = ?
+			 WHERE key_id = ? AND lookup = ? AND hash_scheme = ?`,
+			digest, string(SchemeDorangV1), keyID, lookup, string(SchemeLegacySHA256)); err != nil {
+			return err
+		}
+		_, err := s.txExec(ctx, tx, `
+			UPDATE api_keys
+			   SET token_hash = ?, hash_scheme = ?, updated_at = ?
+			 WHERE id = ? AND lookup = ? AND hash_scheme = ?`,
+			digest, string(SchemeDorangV1), Micros(s.now()),
+			keyID, lookup, string(SchemeLegacySHA256))
+		// Zero rows is not an error. Either another node upgraded the row
+		// first, or the (id, lookup) pair names no legacy row — and the second
+		// cannot start succeeding later, because lookup never changes.
 		return err
-	}
-	if _, err := res.RowsAffected(); err != nil {
-		return err
-	}
-	// Zero rows is not an error. Either another node upgraded the row first, or
-	// the (id, lookup) pair names no legacy row — and the second cannot start
-	// succeeding later, because lookup never changes.
-	return nil
+	})
 }
 
 const apiKeyColumns = `id, lookup, token_hash, hash_scheme, key_label, key_alias,
 	user_id, team_id, models, allowed_routes, object_permission_id,
 	max_budget_nano, soft_budget_nano, budget_period, budget_reset_at, spend_nano,
 	rpm_limit, tpm_limit, max_parallel, priority_class, tags, blocked, expires_at,
-	source, created_at, updated_at`
+	source, created_at, updated_at, tier, pended_at, pend_reason`
 
-// GetAPIKeyByLookup fetches a key row by its scheme-independent lookup value.
+// apiKeyColumnCount must match the placeholder count in InsertAPIKey. A column
+// added to the list and not to the VALUES clause is a runtime error on the
+// first insert, which is the one place this is worth asserting in a constant.
+const apiKeyColumnCount = 29
+
+// GetAPIKeyByLookup fetches a key row by any of its secrets' index keys.
+//
+// The lookup is resolved through api_key_secrets rather than through the
+// denormalized column on api_keys, because after a rotation the key has two
+// live index keys and only one of them is on that column. Both must authenticate
+// to the same principal during the grace period — that is §11.2c's contract —
+// and a query keyed on the current secret alone would refuse the caller who has
+// not rolled yet as an unknown key.
 func (s *Store) GetAPIKeyByLookup(ctx context.Context, lookup string) (*APIKey, error) {
-	row := s.queryRow(ctx, `SELECT `+apiKeyColumns+` FROM api_keys WHERE lookup = ?`, lookup)
+	row := s.queryRow(ctx, `SELECT `+apiKeyColumns+` FROM api_keys
+		 WHERE id = (SELECT key_id FROM api_key_secrets WHERE lookup = ?)`, lookup)
 	return scanAPIKey(row)
+}
+
+// resolveKeyQuery selects a key and the one secret an index key belongs to, in
+// ONE statement.
+//
+// §2.4's rule that one lookup selects the row and only verification branches
+// survives rotation intact: a key with two live secrets is two rows in
+// api_key_secrets with two index keys, and the join is still a unique-index
+// probe followed by a primary-key probe inside a single query. Splitting it
+// into two round trips would double the cost of every authentication miss, and
+// there is a test that counts the statements.
+var resolveKeyQuery = `SELECT ` + prefixCols(apiKeyColumns, "k") + `, ` +
+	prefixCols(keySecretColumns, "s") + `
+	  FROM api_key_secrets s JOIN api_keys k ON k.id = s.key_id
+	 WHERE s.lookup = ?`
+
+// ResolveKeyByLookup returns the key AND the specific secret an index key
+// belongs to.
+//
+// The pair is what authentication actually needs. The key carries the
+// authorization envelope, which belongs to the id; the secret carries the
+// digest to verify against and its own expiry, which belongs to the secret. A
+// caller handed only the key would verify a grace-period credential against the
+// current secret's digest and refuse it.
+func (s *Store) ResolveKeyByLookup(ctx context.Context, lookup string) (*APIKey, *KeySecret, error) {
+	var (
+		k  APIKey
+		kt apiKeyScan
+		v  KeySecret
+		vt keySecretScan
+	)
+	dest := append(kt.dests(&k), vt.dests(&v)...)
+	err := s.queryRow(ctx, resolveKeyQuery, lookup).Scan(dest...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	kt.finish(&k)
+	vt.finish(&v)
+	return &k, &v, nil
 }
 
 // GetAPIKey fetches a key row by id.
@@ -305,54 +405,94 @@ func (s *Store) GetAPIKey(ctx context.Context, id string) (*APIKey, error) {
 
 type rowScanner interface{ Scan(dest ...any) error }
 
+// apiKeyScan holds the nullable and encoded intermediates one api_keys row
+// needs on the way in.
+//
+// It exists so that the destination list and the conversion that follows it can
+// be reused by a JOINed query, which is what keeps authentication at ONE
+// statement now that a key has several secrets (DESIGN §2.4's rule, §11.2c's
+// shape). Two hand-written scanners over the same columns would drift, and the
+// symptom of that drift is a column read into the wrong field.
+type apiKeyScan struct {
+	scheme, label                                      string
+	alias, userID, teamID, objPerm                     sql.NullString
+	models, routes, tags                               string
+	maxBudget, softBudget, resetAt, rpm, tpm, parallel sql.NullInt64
+	budgetPeriod                                       sql.NullString
+	expiresAt, pendedAt                                sql.NullInt64
+	createdAt, updatedAt                               int64
+}
+
+// dests returns the Scan destinations for apiKeyColumns, in that exact order.
+func (t *apiKeyScan) dests(k *APIKey) []any {
+	return []any{&k.ID, &k.Lookup, &k.TokenHash, &t.scheme, &t.label, &t.alias,
+		&t.userID, &t.teamID, &t.models, &t.routes, &t.objPerm,
+		&t.maxBudget, &t.softBudget, &t.budgetPeriod, &t.resetAt, &k.SpendNano,
+		&t.rpm, &t.tpm, &t.parallel, &k.PriorityClass, &t.tags, &k.Blocked, &t.expiresAt,
+		&k.Source, &t.createdAt, &t.updatedAt, &k.Tier, &t.pendedAt, &k.PendReason}
+}
+
+func (t *apiKeyScan) finish(k *APIKey) {
+	k.HashScheme = HashScheme(t.scheme)
+	k.KeyLabel = t.label
+	k.KeyAlias = str(t.alias)
+	k.UserID = str(t.userID)
+	k.TeamID = str(t.teamID)
+	k.ObjectPermissionID = str(t.objPerm)
+	k.Models = decodeStrings(t.models)
+	k.AllowedRoutes = decodeStrings(t.routes)
+	k.Tags = decodeStrings(t.tags)
+	k.MaxBudgetNano = nullableInt(t.maxBudget)
+	k.SoftBudgetNano = nullableInt(t.softBudget)
+	k.BudgetPeriod = str(t.budgetPeriod)
+	k.BudgetResetAt = TimeAt(nullInt(t.resetAt))
+	k.RPMLimit = nullableInt(t.rpm)
+	k.TPMLimit = nullableInt(t.tpm)
+	k.MaxParallel = nullableInt(t.parallel)
+	k.ExpiresAt = TimeAt(nullInt(t.expiresAt))
+	k.PendedAt = TimeAt(nullInt(t.pendedAt))
+	k.CreatedAt = TimeAt(t.createdAt)
+	k.UpdatedAt = TimeAt(t.updatedAt)
+}
+
 func scanAPIKey(row rowScanner) (*APIKey, error) {
 	var (
-		k                                                  APIKey
-		scheme, label                                      string
-		alias, userID, teamID, objPerm                     sql.NullString
-		models, routes, tags                               string
-		maxBudget, softBudget, resetAt, rpm, tpm, parallel sql.NullInt64
-		budgetPeriod                                       sql.NullString
-		expiresAt                                          sql.NullInt64
-		createdAt, updatedAt                               int64
+		k APIKey
+		t apiKeyScan
 	)
-	err := row.Scan(&k.ID, &k.Lookup, &k.TokenHash, &scheme, &label, &alias,
-		&userID, &teamID, &models, &routes, &objPerm,
-		&maxBudget, &softBudget, &budgetPeriod, &resetAt, &k.SpendNano,
-		&rpm, &tpm, &parallel, &k.PriorityClass, &tags, &k.Blocked, &expiresAt,
-		&k.Source, &createdAt, &updatedAt)
+	err := row.Scan(t.dests(&k)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	k.HashScheme = HashScheme(scheme)
-	k.KeyLabel = label
-	k.KeyAlias = str(alias)
-	k.UserID = str(userID)
-	k.TeamID = str(teamID)
-	k.ObjectPermissionID = str(objPerm)
-	k.Models = decodeStrings(models)
-	k.AllowedRoutes = decodeStrings(routes)
-	k.Tags = decodeStrings(tags)
-	k.MaxBudgetNano = nullableInt(maxBudget)
-	k.SoftBudgetNano = nullableInt(softBudget)
-	k.BudgetPeriod = str(budgetPeriod)
-	k.BudgetResetAt = TimeAt(nullInt(resetAt))
-	k.RPMLimit = nullableInt(rpm)
-	k.TPMLimit = nullableInt(tpm)
-	k.MaxParallel = nullableInt(parallel)
-	k.ExpiresAt = TimeAt(nullInt(expiresAt))
-	k.CreatedAt = TimeAt(createdAt)
-	k.UpdatedAt = TimeAt(updatedAt)
+	t.finish(&k)
 	return &k, nil
 }
 
-// InsertAPIKey writes a key row. The caller supplies Lookup, TokenHash and
-// HashScheme, or NewAPIKeyFromToken derives them.
+// prefixCols qualifies a column list with a table alias, so a JOIN reuses the
+// single declaration of the column ORDER that the scanner depends on.
+func prefixCols(cols, alias string) string {
+	parts := strings.Split(cols, ",")
+	for i, p := range parts {
+		parts[i] = alias + "." + strings.TrimSpace(p)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// Pended reports whether the token guard has pended this key (DESIGN §11.6).
+func (k *APIKey) Pended() bool { return !k.PendedAt.IsZero() }
+
+// InsertAPIKey writes a key row and its first secret.
+//
+// The caller supplies Lookup, TokenHash and HashScheme, or NewAPIKeyFromToken
+// derives them. Both writes happen in one transaction: a key row with no
+// generation-1 secret would authenticate through the denormalized columns and
+// then rotate into a state where the secrets table disagreed with them
+// (DESIGN §11.2c).
 func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) error {
-	return s.insertAPIKey(ctx, nil, k)
+	return s.withTx(ctx, func(tx *sql.Tx) error { return s.insertAPIKey(ctx, tx, k) })
 }
 
 func (s *Store) insertAPIKey(ctx context.Context, tx *sql.Tx, k *APIKey) error {
@@ -387,8 +527,7 @@ func (s *Store) insertAPIKey(ctx context.Context, tx *sql.Tx, k *APIKey) error {
 		return err
 	}
 
-	const q = `INSERT INTO api_keys (` + apiKeyColumns + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	q := `INSERT INTO api_keys (` + apiKeyColumns + `) VALUES (` + placeholders(apiKeyColumnCount) + `)`
 	args := []any{
 		k.ID, k.Lookup, k.TokenHash, string(k.HashScheme), k.KeyLabel, nullStr(k.KeyAlias),
 		nullStr(k.UserID), nullStr(k.TeamID), encodeStrings(k.Models), encodeStrings(k.AllowedRoutes),
@@ -398,6 +537,7 @@ func (s *Store) insertAPIKey(ctx context.Context, tx *sql.Tx, k *APIKey) error {
 		ptrInt(k.RPMLimit), ptrInt(k.TPMLimit), ptrInt(k.MaxParallel), k.PriorityClass,
 		encodeStrings(k.Tags), k.Blocked, nullMicros(k.ExpiresAt),
 		k.Source, Micros(k.CreatedAt), Micros(k.UpdatedAt),
+		k.Tier, nullMicros(k.PendedAt), k.PendReason,
 	}
 	var err error
 	if tx != nil {
@@ -405,7 +545,20 @@ func (s *Store) insertAPIKey(ctx context.Context, tx *sql.Tx, k *APIKey) error {
 	} else {
 		_, err = s.exec(ctx, q, args...)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return s.insertKeySecret(ctx, tx, &KeySecret{
+		ID:         k.ID + ".1",
+		KeyID:      k.ID,
+		Generation: 1,
+		Lookup:     k.Lookup,
+		TokenHash:  k.TokenHash,
+		HashScheme: k.HashScheme,
+		KeyLabel:   k.KeyLabel,
+		Current:    true,
+		CreatedAt:  k.CreatedAt,
+	})
 }
 
 // NewAPIKeyFromToken fills Lookup, TokenHash, HashScheme and KeyLabel for a

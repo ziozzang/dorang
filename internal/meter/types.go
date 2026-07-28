@@ -187,6 +187,11 @@ type Event struct {
 	Time time.Time
 
 	APIKeyID string
+	// SecretID names which of the key's secrets authenticated (DESIGN §11.2c).
+	// Like UserID it is carried on the trace path only: it belongs in the
+	// ledger, and adding it to [Key] would multiply rollup cardinality across a
+	// rotation for a materialization nothing queries by secret.
+	SecretID string
 	// UserID is the owning user. It is carried on the trace path only: the
 	// ledger has a user_id column (DESIGN §9.2) and an index on it, while
 	// §9.4's rollups are keyed by key, model and team. Adding it to [Key] would
@@ -288,7 +293,13 @@ type Trace struct {
 	ParentSpanID string
 	Time         time.Time
 
-	APIKeyID      string
+	APIKeyID string
+	// SecretID names WHICH of the key's secrets authenticated the request
+	// (DESIGN §11.2c). During a rotation's grace period a key has two, both
+	// authenticate, and the whole value of the grace period is that an operator
+	// can see whether the client actually rolled BEFORE the window closes
+	// rather than finding out when it shuts. The key id alone cannot say that.
+	SecretID      string
 	UserID        string
 	TeamID        string
 	ModelGroup    string

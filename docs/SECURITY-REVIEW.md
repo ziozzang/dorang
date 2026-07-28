@@ -180,7 +180,16 @@ recur. The third recurs the most.
 ### [HIGH] The upstream's error message is copied verbatim into the client-facing envelope, contradicting COMPATIBILITY §11.3 and exposing the provider credential
 
 - **Location:** `internal/server/errors.go:269`, `:287`, `:302`, `:315`, `:358`;
-  reached from `internal/app/dispatch.go:298` (`server.Normalize(resp.StatusCode, body)`)
+  reached from `internal/backend/errors.go` (`upstreamError` → `server.Normalize`)
+- **Status: partially closed.** The scrubber half is now on the shipped path. When this was
+  written the dispatch path made its own HTTP call in `internal/app` and had no scrubber;
+  that copy has been deleted and `internal/app` now calls `internal/backend`, whose
+  `upstreamError` collects what was actually put on the outbound credential headers
+  (`collectSecrets`, which reads the headers rather than the credential table so an OAuth
+  token applied by code it does not own is caught too) and scrubs it from the message, the
+  native type and the code before anything renders them. The *other* half of the finding
+  stands: `Normalize` still puts the upstream's own message in the response body, which
+  COMPATIBILITY §11.3 says it must not, and the four structured branches are still unbounded.
 - **Attack:** two variants, neither needing access to dorang.
   1. A provider that echoes the offending key in its 401 body. Several
      OpenAI-compatible servers do (`{"error":{"message":"Invalid API key: sk-…"}}`), and
@@ -230,9 +239,17 @@ recur. The third recurs the most.
   has presented" — and `internal/probe/scrub.go` is a working implementation that also
   handles the URL-escaped spelling of a key arriving in a query parameter.
   `internal/probe/http.go` applies it at every error site (`:94`, `:111`) and bounds every
-  read (`:98`, `:106`). That package has no importers. The shipped dispatch path has no
+  read (`:98`, `:106`). That package has no importers. The shipped dispatch path had no
   scrubber at all. This is the fixed-defect shape once more: the correct code exists, and
   the path that runs is not the path that has it.
+
+  That last sentence was the whole defect class, and it recurred a third time before it was
+  caught: `internal/backend` was written as an extraction out of `internal/app`, four
+  tool-call defects were fixed in it, its tests passed — and nothing imported it, so
+  production kept all four. The extraction has since been completed and `internal/app`'s
+  copy deleted. The lesson the two occurrences share is that a package test proves the code
+  works, never that anything calls it; the check that would have caught both is an importer
+  count, and after it, a test that fails when the fix is reverted.
 
 ---
 
@@ -1356,3 +1373,186 @@ pass:
 - [MEDIUM] two independent lists of accepted authentication headers.
 - [LOW] `shadow.Options.ReferenceKey` unredacted; route table enumerable before
   authentication; WebSocket relays unmetered and untimed.
+
+---
+
+# The "configured but never applied" sweep
+
+A separate pass over the twelve remaining controls that were validated, loaded,
+and read by nothing — the defect class DESIGN §17.1 names as this codebase's
+dominant one. Nothing here edits a finding above; where an earlier disposition
+turned out to be wrong, it is corrected below by name.
+
+## The correction that has to come first
+
+**Finding 2 was recorded as closed and was not.** The table above says
+`rpm_limit`, `tpm_limit`, `max_parallel_requests` — **Closed | patched + wired**,
+and the prose describes `auth.Access.Rates auth.RateSource`, an
+`internal/app/rates.go` holding a tumbling minute, `capacity.Request.PrincipalMax`,
+and five named tests. None of it existed. `grep` for `RateSource` or
+`PrincipalMax` returned nothing, `internal/app/rates.go` was not a file, and
+`TestRPMLimitIsEnforced` appeared only inside this document.
+
+That is worse than the defect it claimed to fix, because a closed finding is not
+re-checked. It is also the same failure shape one level up: a disposition
+satisfied on paper and connected to nothing. The rule that follows is the one
+§17.1 already states for code, applied to the review — **a disposition that names
+a file or a test is only closed once that file or test exists**, and the way to
+hold it is to cite something a reader can run.
+
+The control is closed now, and the implementation differs from what the
+disposition described. It is written out below rather than left to match by
+coincidence.
+
+## What was wired
+
+| # | Control | What it does now |
+|---|---|---|
+| 1 | per-key `rpm_limit` / `tpm_limit` | `internal/app/rates.go` keeps a rolling minute per api key: sixty stamped one-second buckets, sharded sixteen ways, capped at 100 000 subjects with cold-entry eviction. `app.principal.Authorize` fills `auth.Access.ObservedRPM`/`ObservedTPM` — the one production construction site, which omitted both, so every positive ceiling compared against a hard-coded zero. The request is counted at the gate (a ceiling enforced only on finished requests cannot refuse a burst) and the tokens at settlement |
+| 1 | per-key `max_parallel_requests` | `capacity.Request.PrincipalMax`, combined with the static `capacity.principals` table by taking the **more restrictive**: a key's own ceiling can tighten a configured one and never widen it. It travels with the request because it is not in the file and changes when the key is edited |
+| 2 | `capacity.*.max_queue` | A per-axis queue-depth ceiling in `internal/capacity`. Past it `Acquire` returns `ErrQueueFull` and leaves nothing enqueued. Before this the wait queue was an unbounded heap |
+| 2 | `capacity.principals.<id>.max_queue_wait` | A wait budget on `Acquire`, returning `ErrQueueTimeout`. The router uses it for a **pinned** request, which is the request that genuinely has to wait — an unpinned one spills or falls back (§7.4a2, §7.6), and queueing it instead would trade a fast hop onto a healthy backend for a slow wait on a saturated one. It does **not** apply to batch: batch is the work that is supposed to wait (§11.1), and the thirty-second default every principal carries would have turned ordinary contention into failed rows |
+| 3 | `metering_degraded` | `server.HealthReporter`, implemented by `app.meterHealth`. `GET /health` now carries `"metering":{"degraded":…,"reason":…,"dropped":…,"spool_bytes":…}` on every response, degraded or not — reporting only on failure leaves an operator unable to tell "not degraded" from "this build does not report it". It never changes the status code: losing traces is a data-quality failure, not a serving failure |
+| 4 | `observability.prometheus` | False removes the `/metrics` route entirely, so it answers 501 like any other unserved route rather than 200 with an empty body |
+| 4 | `/metrics` authentication | The route is `Admin` by default: the master credential or a principal implementing the new optional `server.AdminPrincipal`. `observability.metrics.public: true` opens it deliberately. It was `Public` alongside the container probes, which put per-key spend, per-credential quota state and the whole configured model list on an unauthenticated port |
+| 5 | `key_rotation.strategy` | `router.Rotation`, applied in `Router.eligible` as the preferred credential. `failover` is the old behaviour, `round_robin` advances a per-deployment cursor, `least_used` asks the broker (`Broker.LeastUsedKey`, one lock for the whole pool), `random` picks uniformly. A credential pin and a sticky entry both outrank it: those are statements about a conversation, a rotation is a statement about load |
+| 6 | `quota_urgency` | `router.StrategyQuotaUrgency`, added to **both** name lists, with a `compare` case ranking descending and a `Deps.Urgency` fed by `quota.Ranker`. The scorer, the occupancy damping and the per-node jitter all already existed and had no caller |
+| 7 | `client_priority` / `range` | `capacity.principals.<id>.client_priority: allow` with a `range` of two class names, compiled into `router.PriorityConfig.Grants` and applied by `CanonicalFor(principal, …)`. The inbound hint is read from `X-Request-Priority`; an ungranted hint is reported in `x-dorang-dropped-params`, which §10.5 requires and which was silent before. The key's `priority_class` now reaches the router too — it was loaded, carried on the principal, and read by nothing but the Lua hook view |
+| 8 | `DORANG_STATE_DIR` | `config.ExpandPath` resolves a leading `~` to it. Every shipped state path is `~/.dorang/…`, so under the image's `nonroot` user the database, the spool and the **generated key pepper** were written to `/home/nonroot` — outside the declared volume, lost on restart. Losing the pepper makes every issued api key unverifiable |
+| 8 | the image's `HEALTHCHECK` | `dorangctl health` now exists. The image invoked it and the CLI answered `unknown command "health"` and exited 2, so every container reported unhealthy after `start-period + 3 × interval`, forever — and being distroless, nothing else in it could have probed either |
+| 10 | model allow-list status | 403 `permission_error`, per COMPATIBILITY §11.2. The branch cited §7.2, which is about **tag routing**; the shared authorization gate has always answered 403 for the same refusal, so one rule had two answers and only the unreachable one was wrong |
+| 12 | inline `notional_rate` | Accepted in `pricing.rules[]` with mandatory `source` and `as_of`, and carried across the bridge into the catalog's spelling. Adding the class name alone would not have been a fix: `internal/pricing` refuses a notional rule without provenance, so the translation had to carry it |
+| 12 | `cached_read` / `cache_read` | Both spellings are accepted in both files and resolved to one component. The same component under both names in one rule is refused as pricing one thing twice |
+| — | `routing.prefix.ttl` per backend | Not on the list; see below |
+
+## What was made to refuse
+
+Each refusal names the setting and what to use instead. That is the whole
+difference between a refusal and a wall.
+
+| Setting | Refusal |
+|---|---|
+| `capacity.*.rpm`, `.tpm` on every group, on `global` and on `models[]` | "a rate ceiling is not enforced on a capacity axis… put the ceiling on the deployment instead — `models[].deployments[].limits[]` with `metric: rpm` or `tpm`" |
+| `capacity.principals.<id>.rpm`, `.tpm` | the same, naming the api key instead: `dorangctl key create --rpm N --tpm N`, which is what item 1 above now enforces |
+| `key_ref` everywhere it appears | "key_ref is not resolved by this build… Use `key_env` or `key_file` — a vault agent that writes a file or exports a variable satisfies both" |
+| `pricing.rules[].rates.images` | now a **load** error rather than an assembly error. It used to pass `dorangctl config lint` and then stop the server from starting |
+| a `notional_rate` rule with no `source` or `as_of`, and provenance on any other class | both directions, per §8.5 |
+| `client_priority: allow` with no `range`, a `range` with no grant, a `range` naming an undeclared class | a half-written grant is the shape this sweep exists to remove |
+
+### Why `rpm`/`tpm` are refused on capacity axes rather than wired
+
+The question the task asked — which package is the right home — has one answer.
+A capacity axis counts **concurrent reservations**, released when a request
+finishes; a rate counts **events over a window**, which are never released. The
+broker has no clock and no window, and giving it one would duplicate
+`internal/quota`, which owns exactly that and already has both configuration
+surfaces: `models[].deployments[].limits[]` for the credential axis and the api
+key's own `rpm_limit`/`tpm_limit` for the caller axis. Wiring `capacity.*.rpm`
+would have produced a **third** spelling of a ceiling that two other spellings
+already enforce, which is the defect class rather than a fix for it.
+
+`tpm` has a second, decisive problem on that axis: a token count does not exist
+at admission. Enforcing it there would mean charging an estimate and settling
+later — the mechanism `internal/quota` already implements, one package over.
+
+## Not on the list, found while sweeping
+
+1. **`routing.prefix.ttl` was one number for a thing that is not global.** The
+   affinity table's entry lifetime models how long the **backend** still holds
+   the KV blocks for a prefix, and that differs by more than an order of
+   magnitude: roughly five minutes for OpenAI's automatic caching, five minutes
+   on Anthropic's default tier against an hour on its extended one, an
+   operator-set TTL for Gemini's explicit caching — and for vLLM and SGLang it is
+   not a duration at all, because blocks live until LRU eviction under memory
+   pressure. One hour was wrong in both directions at once: too long for a hosted
+   backend, where it pins a conversation to a node that no longer holds the
+   prefix and costs load balance for nothing; too short for a self-hosted one,
+   where it discards hits that were still there.
+
+   Now settable per provider and per deployment, inheriting the global, with
+   `until_evicted` for the class that has no clock. **The claim was checked before
+   it was made**: `internal/prefix` evicts in two passes, expired first and then
+   coldest-by-last-use against the byte budget, so an entry with no lifetime is
+   still bounded — by capacity, which is exactly the contract a self-hosted
+   engine's prefix cache has. `TestUntilEvictedIsStillBoundedByBytes` asserts it,
+   and asserts that the budget was actually reached, so it cannot pass vacuously.
+
+2. **`dorang_passthrough_requests_total` does have an increment site**, at
+   `internal/server/passthrough.go:211`, since the file was written.
+   `docs/OPERATIONS.md` and its Korean mirror said it had none. The counter and
+   the claim about it drifted because nothing asserted either. Docs corrected;
+   `TestPassthroughCounterIsIncrementedAndExported` now holds them together.
+
+3. **`metering_degraded` already had a metric.** `docs/CONFIG.md` §23.1 and
+   `docs/OPERATIONS.md` said "no metric, no health field, no admin field"; the
+   metric landed with the §12.3 surface and the docs were not revisited. Only the
+   health field was still missing. Same shape as (2): the prose was the only
+   record, and prose does not fail a build.
+
+4. **Eleven further settings that load and do nothing**, found by the recurrence
+   guard on its first run and listed in `knownUnwired` in
+   `internal/config/consumed_test.go`: `providers[].usage_probe` (§6.2, the
+   fetchers exist and nothing constructs one), `providers[].metrics.interval`
+   (§12.4), `providers[].params.drop` and `.drop_unsupported` (§10.3 — the two
+   knobs that say *which* parameters to drop never reach the conversion path),
+   `routing.prefix.checkpoints` (§7.4b), `models[].deployments[].stream_timeout`,
+   `key_rotation.providers[].affinity_group` (not even validated),
+   `cluster.redis_url_env` (§13 — required for `capacity_mode: shared-redis` and
+   no Redis client is constructed anywhere), `observability.otlp_endpoint`,
+   `.log_level` and `.log_format`. None was in scope here; each is now recorded
+   in a place that fails a test rather than in prose.
+
+5. **`router.Config.PinnedWait` is never set from configuration.** It gates the
+   only interactive path that can block, so that path was dead. The principal's
+   `max_queue_wait` now supplies the budget when `PinnedWait` is zero, which is
+   what gave that setting an interactive consumer at all.
+
+## The recurrence guard, and what it cannot catch
+
+`TestEveryConfiguredFieldIsReadSomewhere` (`internal/config/consumed_test.go`)
+walks `config.Config` by reflection, collects every field carrying a `yaml` tag,
+and requires each one's Go name to appear as an identifier in non-test source
+**outside** `internal/config`. Two escape hatches, both of which are claims
+rather than silencers: `readExempt` for fields whose whole effect is inside this
+package (a secret source is resolved here and leaves as a value) or that exist to
+carry a refusal, and `knownUnwired` for the ledger above. The ledger is checked in
+**both** directions — a new setting with no consumer fails, and an entry that has
+since been wired also fails, so the list cannot go stale.
+
+It is a floor, not a proof:
+
+- **It cannot see a value that is read and then dropped.** `Decision.PriorityTier`
+  was computed and discarded, and every name in that chain was "referenced".
+  Reference is necessary, not sufficient. The per-setting tests beside it are what
+  assert behaviour.
+- **It is vacuous for short field names.** `Enabled`, `Path`, `Drop`, `Interval`
+  and `Timeout` occur everywhere, so four settings this sweep confirmed to be
+  unwired — `providers[].metrics.interval`, `providers[].params.drop`,
+  `providers[].usage_probe.interval`, `models[].deployments[].stream_timeout` —
+  are invisible to it and are tracked in `docs/CONFIG.md` §23.1 instead. It does
+  hold for the distinctive names, which is where new settings land:
+  `MaxQueueWait`, `ClientPriority`, `PrefixTTL`, `AffinityGroup`.
+- **It says nothing about semantics.** Reading `MaxQueue` and comparing it against
+  the wrong quantity passes.
+- **It only covers `config.Config`.** A control that is not a configuration field
+  — `Decision.PriorityTier`, `auth.Access.ObservedRPM` — is outside its reach
+  entirely. That half of the defect class has no automated guard, and the honest
+  answer is that the only thing which finds it is an assembled-stack test that
+  asserts an observable the owning package cannot produce alone.
+
+## On the tests
+
+For this defect class a test that proves a check works proves nothing: the
+existing suites already did that for the rate limits, for the urgency scorer and
+for the priority clamp, and all three were unreachable. So every test added here
+either asserts an observable outside the package that owns the check — an HTTP
+status, a header, the health body, a `Snapshot` counter — or asserts the joint
+itself, that a configured value reached the subsystem that acts on it
+(`Router.Rotation()`, `Broker.WaitBudget()`, `PriorityConfig.GrantsHint()`).
+
+Two are structural rather than behavioural, and deliberately so.
+`TestDockerfileHealthcheckInvokesARealSubcommand` reads the image's own
+`HEALTHCHECK` line and feeds its arguments to the real CLI dispatcher, because
+"the CLI has a health command" was never the thing that was wrong — the two
+halves disagreeing was. `TestStateDirIsDeclaredAndRead` requires the image's
+`ENV DORANG_STATE_DIR` to name the directory its `VOLUME` declares.

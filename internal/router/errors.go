@@ -112,15 +112,23 @@ const (
 	CodeCredentialPinLost    = "credential_pin_unroutable"
 	CodeCredentialExhausted  = "credential_pin_exhausted"
 	CodeCredentialSaturated  = "credential_pin_saturated"
-	CodeContextWindow        = "context_window_exceeded"
-	CodeQuotaExhausted       = "quota_exhausted"
-	CodeNoCapacity           = "no_capacity"
-	CodeNoCandidate          = "no_candidate"
-	CodeFallbackExhausted    = "fallback_exhausted"
-	CodeHopsExhausted        = "max_hops_exhausted"
-	CodeBudgetElapsed        = "fallback_budget_elapsed"
-	CodeStreamCommitted      = "stream_committed"
-	CodeNotChainable         = "not_a_fallback_condition"
+	// CodeContextWindow and CodeQuotaExhausted are spelled as COMPATIBILITY
+	// §11.2's table spells them, not as the fallback cause of §7.6 is spelled.
+	// The two vocabularies are separate on purpose: `context_window` and
+	// `quota_exhausted` are configuration keys under fallbacks.on, and
+	// `context_length_exceeded` and `insufficient_quota` are what a client
+	// branches on in the error envelope. §11 opens by describing exactly this
+	// failure — a gateway whose error code does not match the contract it
+	// publishes — so the code follows the document rather than the config key.
+	CodeContextWindow     = "context_length_exceeded"
+	CodeQuotaExhausted    = "insufficient_quota"
+	CodeNoCapacity        = "no_capacity"
+	CodeNoCandidate       = "no_candidate"
+	CodeFallbackExhausted = "fallback_exhausted"
+	CodeHopsExhausted     = "max_hops_exhausted"
+	CodeBudgetElapsed     = "fallback_budget_elapsed"
+	CodeStreamCommitted   = "stream_committed"
+	CodeNotChainable      = "not_a_fallback_condition"
 )
 
 // Error is a routing refusal, carrying everything a caller needs to act on it
@@ -154,6 +162,15 @@ type Error struct {
 	ResetAt time.Time
 	// Attempt is how many attempts had been made when this refusal was raised.
 	Attempt int
+
+	// Estimated reports that the size in Message is dorang's own estimate rather
+	// than a count anything measured. A caller refused for exceeding a context
+	// window is being refused on the strength of a number, and whether that
+	// number is a measurement decides what they should do about it.
+	Estimated bool
+	// EstimateMethod names the rule that produced the size, matching
+	// internal/tokenest's method constants. Empty when no size was involved.
+	EstimateMethod string
 
 	terminal bool
 }

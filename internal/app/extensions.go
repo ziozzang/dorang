@@ -37,10 +37,16 @@ func buildHooks(cfg *config.Config, natives []luaext.Native,
 	logf func(string, ...any), now func() time.Time) (*luaext.Engine, error) {
 
 	lua := cfg.Extensions.Lua
+	plugins := filterPlugins(cfg)
 	o := luaext.Options{
-		Enabled: lua.Enabled || len(natives) > 0,
+		// A configured plugin turns the engine on by itself. A `filters:` block
+		// that did nothing because `extensions.lua.enabled` was false elsewhere
+		// in the file is a masking filter that does not mask, which is the one
+		// failure this feature must not have.
+		Enabled: lua.Enabled || len(natives) > 0 || len(plugins) > 0,
 		Hooks:   lua.Hooks,
 		Native:  natives,
+		Plugins: plugins,
 		Limits: luaext.Limits{
 			Instructions: lua.Limits.Instructions,
 			MemoryBytes:  int64(lua.Limits.MemoryMB) << 20,

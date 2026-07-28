@@ -140,7 +140,7 @@ func TestDeploymentPathModelIsAuthorized(t *testing.T) {
 	// The body names an allowed model and the PATH names a disallowed one. The
 	// path wins, so the request must be refused.
 	w := do(s, post("/openai/deployments/expensive/chat/completions", `{"model":"allowed"}`))
-	if w.Code != http.StatusUnauthorized {
+	if w.Code != http.StatusForbidden {
 		t.Fatalf("status %d body %s — the path model must be the one authorized",
 			w.Code, w.Body.String())
 	}
@@ -236,7 +236,7 @@ func TestMultipartModelIsResolvedInTheGate(t *testing.T) {
 	})
 
 	w := do(s, multipartPost("/v1/audio/transcriptions", "expensive", "file", "a.wav", []byte("RIFF")))
-	if w.Code != http.StatusUnauthorized {
+	if w.Code != http.StatusForbidden {
 		t.Fatalf("status %d body %s — the form's model must be the one authorized",
 			w.Code, w.Body.String())
 	}

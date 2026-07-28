@@ -117,6 +117,17 @@ not add hot-path cost. That is precisely why §10.1 uses a neutral intermediate 
 One process. No worker-process split — the Go runtime uses the cores. Redis is optional
 and only becomes necessary for exact shared capacity across nodes (§5.6).
 
+Each layer is one package, and L5 is the one whose boundary is easy to get wrong, so it is
+stated here. `internal/backend` owns everything between "the router chose a deployment" and
+"the client's protocol has an answer": endpoint derivation, credential application, the
+canonical round trip, error normalization to COMPATIBILITY §11's taxonomy, the streaming
+relay, and the per-provider timeout and retry policy. `internal/app` **assembles and calls**
+— it turns a configuration file into `backend.Provider` values and a routing decision into a
+`backend.Target`, and never builds an HTTP request, spells a credential, or parses a
+provider's error envelope itself. There is exactly one implementation of each of those, and
+that is the point: a second one is only ever discovered to disagree with the first by an
+upstream answering 401, or by a caller receiving a tool name they never declared.
+
 ---
 
 ## 2. Interoperability
@@ -1871,37 +1882,127 @@ national identity number with a placeholder before the text leaves the operator'
 and restore it in the answer, so the upstream never sees it and the caller never notices.
 
 ```yaml
+filters:
+  secret: { key_env: DORANG_FILTER_SECRET }   # cluster-wide; see "Determinism" below
+  plugins:
+    - { name: pii-mask, path: /etc/dorang/plugins/pii_mask.lua, fail: closed }
 models:
   - name: model-x
     filters:
-      - { plugin: pii-mask, on: [request, response], config: { patterns: [krrn, email] } }
+      - plugin: pii-mask
+        on: [request, response]
+        scope: conversation
+        patterns: [krrn, email]
 ```
 
 Filters are §11.5 plugins, which is the point: an operator's disclosure rules are theirs, and
-a gateway cannot ship the right pattern set for every jurisdiction.
+a gateway cannot ship the right pattern set for every jurisdiction. The *pattern set* is
+configuration; the *plugin* decides which segments of a request to apply it to; the *host*
+owns the mask table and every unmasking pass.
+
+#### Determinism is the hard part, not secrecy — and the first draft got it wrong
+
+The original text of this section required a **per-request random component** in every
+placeholder. That is wrong, and wrong in a way that silently deletes another section.
+
+Prefix caching (§7.4b) requires the bytes sent upstream to be byte-identical, and in order,
+across the turns of a conversation. With a random component the same conversation masks
+differently on turn N and turn N+1, so the upstream prefix differs, so **every masked
+conversation becomes a permanent cache miss**. On a self-hosted backend that is the
+difference between reusing a 40k-token prefix and recomputing it every turn.
+
+So a placeholder is **derived, not allocated**:
+
+```
+placeholder = "[PII:" ‖ base16a(HMAC-SHA256(secret, scope ‖ salt ‖ 0x00 ‖ value)[:8]) ‖ "]"
+```
+
+Two consequences, both good:
+
+- **Nothing has to be persisted.** The reverse table is rebuilt from the request's own text on
+  every request, because the chat and messages protocols resend the whole conversation: every
+  plaintext that can appear in the answer was present in the question. The mapping therefore
+  survives five minutes, an hour, or a year, with zero storage.
+- **Nothing has to be replicated but one constant.** The secret is operator-configured and
+  shared cluster-wide. A retained *table* would have to be — unbounded, full of plaintext, and
+  different on every request. A retained *secret* is one small value, set once and rotated
+  deliberately. Rotation invalidates every prefix cache on the fleet, so it is a staged,
+  announced operation.
+
+**The cost has to be stated rather than implied: a deterministic placeholder is a stable
+pseudonym, so the provider can link "this same person appears in these requests."** That is
+not a defect to be engineered away. It is the same property as the cache hit — a backend that
+cannot recognise the repeated bytes cannot reuse the cache — and any design claiming both is
+wrong about one of them.
+
+What can be bounded is how far the pseudonym reaches, which is what `scope` is for:
+
+| `scope` | Placeholders are stable across | Prefix caching | Linkability |
+|---|---|---|---|
+| `conversation` *(default)* | the turns of one conversation | works | nothing the provider did not already see, since it sees those turns together |
+| `principal` | everything one key sends | works, across conversations | the provider can link a key's traffic |
+| `tenant` | one team | works, across a team | the provider can link a team's traffic |
+| `request` | nothing | **disabled for that route** | none |
+
+`request` is the honest end of the dial: it turns prefix affinity **off** for the request
+rather than leaving a claim about bytes that can never repeat. A knob that quietly makes
+another subsystem useless is worse than one that says so.
+
+The conversation salt is the caller's session header when they sent one, and otherwise a
+digest of the conversation's opening segment — stable across turns for exactly the reason the
+hash chain is, because the protocols resend the history. A client that trims its history gets
+new placeholders, which costs a cache miss and never a wrong answer.
 
 #### The reversible-mask contract
 
-A mask is not a redaction. It has to come back, which means holding a per-request
-**mask → original** table, and that table is the most dangerous object in the system.
-
-1. **The table lives for one request and is never persisted.** Not in the ledger, not in the
-   trace excerpt, not in a log, not in an audit row, not in a metric label. A redaction whose
-   key material is written next to the redacted text has redacted nothing.
-2. **Placeholders must be unforgeable and unambiguous.** A caller who sends text that looks
-   like a placeholder must not be able to make the unmasker substitute something. Placeholders
-   carry a per-request random component, and a placeholder-shaped string in the *input* is
-   escaped before masking runs.
+1. **The table is never persisted.** Not in the ledger, not in the trace excerpt, not in a
+   log, not in an audit row, not in a metric label. A redaction whose key material is written
+   next to the redacted text has redacted nothing. This is the rule that survives whole, and
+   it is about *durability*, not lifetime.
+2. **Placeholders are unforgeable and unambiguous.** A caller who sends text that looks like a
+   placeholder must not be able to make the unmasker substitute something, so a
+   placeholder-shaped string in the *input* is escaped before masking runs — by being masked
+   itself, which makes the round trip exact and leaves no escape syntax to study. A
+   placeholder is fixed-width, and its alphabet is letters only, so it can never match a
+   digit-shaped or address-shaped pattern on a later pass.
 3. **Unmasking is not a blind string replace.** A model may echo a placeholder inside a longer
-   token, split it across a streaming frame boundary, translate it, or invent one that was
-   never issued. Only exact, whole placeholders issued in *this* request are substituted;
-   anything else is left alone and **counted**, because an invented placeholder is a signal
-   worth seeing.
+   token, split it across a streaming frame boundary, translate it, replay one from another
+   scope, or invent one that was never issued. Only exact, whole placeholders that resolve in
+   *this* scope are substituted; anything else is left alone and **counted**, because an
+   invented placeholder is a signal worth seeing.
 4. **Streaming makes this genuinely harder.** A placeholder can straddle two SSE frames, so
-   the unmasker holds a bounded tail across frames. That bound is a real limit: a placeholder
-   longer than it cannot be reassembled, which is why they are short and fixed-width.
+   the unmasker holds a bounded tail — one byte less than a placeholder's width. That bound is
+   a real limit: a placeholder longer than it could not be reassembled, which is why they are
+   short and fixed-width. It composes into §10.5's single pass; it is not a second one.
 5. **Masking changes token counts and therefore cost.** Metering records what the *upstream*
-   was actually sent, since that is what was billed — not the pre-mask text.
+   was actually sent, since that is what was billed — not the pre-mask text. The pre-request
+   estimate that drives the budget hold and the routing decision is taken after the filter for
+   the same reason.
+6. **One mask per model, not one per filter entry.** Several filters on one model share one
+   table. Two tables would mean two placeholder namespaces in one body and an unmasker that
+   had to guess which one a placeholder came from — or, worse, one that counted the other
+   table's placeholders as invented.
+
+#### Retention: the one direction derivation cannot serve
+
+Re-derivation makes the *forward* direction reproducible. It cannot make the *reverse*
+direction work when the plaintext is not in the request, because an HMAC does not invert.
+That happens when the conversation state lives on the **provider's** side — the Responses API
+with `previous_response_id`, or any provider-held session — and generally whenever the model
+quotes a placeholder whose source turn was not resent.
+
+So a retained reverse table exists too. They are not alternatives; they solve opposite
+directions. Retention is cheap — a conversation holds a handful of values, and one in-flight
+40k-token request body costs more memory than a dozen retained tables — so it is held
+generously rather than grudgingly: default lifetime an hour, `retain` configurable per model
+filter to at least the provider's own state lifetime.
+
+What is not negotiable about it: memory only, never serialized, bounded by entry count, with a
+stated eviction policy (expired first, then oldest), and **keyed by scope** — a placeholder
+resolves only inside the scope that issued it, or a caller who has seen one from another
+conversation could ask a model to emit it and read someone else's text back. A rising eviction
+count beside a rising unresolved count is the signal that the bound is too small for the
+traffic, which is why both are counted.
 
 #### What a filter must not be allowed to do
 
@@ -1911,7 +2012,25 @@ fail-open — **except** that a *failed mask* must fail **closed**. Those two ru
 opposite directions, deliberately: a filter that cannot enrich a request should be skipped,
 but a filter that was supposed to remove an identity number and did not must stop the
 request. The plugin declares which kind it is; `fail: closed` is the safe declaration and the
-default for anything named as a masking filter.
+default.
+
+Three limits that follow from being honest about the rest of the system, and are refusals
+rather than silences:
+
+- **A thinking block's text is not masked.** It travels with integrity material the provider
+  signed and dorang replays byte-identically or not at all (§10.2). Rewriting text under a
+  signature it no longer matches is a corruption dorang would have caused.
+- **A tool call's arguments are not masked.** The neutral form keeps them as raw JSON
+  precisely because re-encoding a decoded map reorders keys, and a model that emitted an
+  ordering on turn one must see the same bytes on turn two. A filter that re-encoded them
+  would break the determinism this section just bought. PII does appear in tool arguments;
+  this is a stated gap, not a solved problem.
+- **A surface whose text the filter cannot reach is refused**, not sent unfiltered. A model
+  carrying a masking filter, used for embeddings, answers an error.
+
+Filters resolve from the **client-facing model**, never from the chosen deployment: a
+fail-back hop to another deployment must not mask differently, or the bytes change and both
+the prefix claim and the unmasking go with them.
 
 > **Do not confuse this with §10.5a's compaction non-goal.** dorang refuses to rewrite a
 > caller's conversation *on its own initiative*. A filter is the operator's explicit,
@@ -2378,6 +2497,32 @@ So revocation is explicit rather than incidental:
    **Clustered**: through the same coordination §13 already uses, and the **worst case is
    published as a number** — the same rule §5.6 applies to overshoot. "Revocation is fast" is
    not a specification.
+
+   The number, and the arithmetic that produces it (`auth.RevocationBound`):
+
+   | Topology | Bound | Formula |
+   |---|---|---|
+   | single node | **0** | the control drops the key from the one snapshot before it returns |
+   | clustered | **`poll + store_latency`** — 1.25 s at the defaults (`poll: 1s`, `store_latency: 250ms`) | `propagation(store poll + store round trip)` |
+
+   The fallback for a node that **missed** the message is two numbers, not one, because
+   the two kinds of cache entry behave differently and reporting one figure for both would
+   be false:
+
+   | Entry | Fallback | Why |
+   |---|---|---|
+   | learned at runtime through the store | `entry_ttl` (60 s) | it expires |
+   | placed by a bulk load (`Load`, `Rejoin`) | the **reload interval** (`entry_ttl / 2`) | it does **not** expire — §9.1 makes the snapshot the authority, which is what makes a snapshot hit cost no store read. Its fallback is the interval at which the whole set is re-read, and a deployment that schedules no reload has **none**: the published figure then reads *never*, not *0* |
+
+   The bound is stated **from the moment the control returns**, not from its call: the
+   control's own durable write is synchronous and already visible to the operator who ran it,
+   and folding it in would produce a figure that describes the database's write latency rather
+   than the propagation this mechanism is about. An **unmeasured** propagation delay publishes
+   `entry_ttl`, because an unmeasured delay is not a small one.
+
+   Measured end to end on SQLite, four nodes with independent store handles and independent
+   snapshots, `poll: 20ms`: **~21 ms** to the last node, against a published 270 ms. Single
+   node: a **zero window** — the first request after the control returns is already refused.
 3. **The bound is enforced by shortening the TTL for negative entries specifically.** A key
    that was refused is cheap to re-check; a key that is serving is not. The two do not need
    the same freshness, and treating them alike is what made the number large.
@@ -2455,8 +2600,22 @@ policy anyone might want.
 This is the project's first non-trivial runtime dependency, so the constraint that keeps §0.2
 true is explicit: **the VM must be pure Go**. A cgo interpreter would break the static binary
 that makes the notebook tier's "zero required dependencies" literal rather than aspirational.
+The VM is gopher-lua, about 1.8 MB of binary.
 
-Hooks: `on_request`, `on_route`, `on_response`, `on_event`.
+It supplies one of the three ceilings below and not the other two — a context check runs
+between VM instructions, so a wall clock can stop a hook, but there is no per-state
+instruction counter and no per-state allocation accounting. Both are built on top, because a
+wall clock alone is not a sandbox: a hook allocating in a tight loop exhausts the process long
+before a 200 ms deadline fires. The instruction ceiling is source instrumentation — a charge
+at every function body, every loop body and every backward `goto`, which are the only three
+ways Lua can run unboundedly. The memory ceiling is charged allocation: every allocation is
+either O(1) per charge, and so bounded by the instruction ceiling, or is charged before it
+happens.
+
+Hooks: `on_request`, `on_route`, `on_response`, `on_event`, and §10.5b's `on_filter_request`.
+There is deliberately no `on_filter_response`: unmasking runs once per streamed frame inside
+§10.5's single pass, and calling an untrusted VM there would put a sandbox on the token path
+for a job the host already does exactly.
 
 - **Loading is explicit configuration**, never a scan of a writable directory. A plugin
   mechanism that picks up whatever appears in a path is a code-execution primitive.
@@ -2773,7 +2932,8 @@ formatted string construction. Full-body buffering beyond the replay budget.
 cmd/dorang · cmd/dorangctl
 internal/{server,canonical,wire/<family>,router,capacity,prefix,health,quota,
           pricing,meter,store,auth,admin,batch,cluster,config,luaext,notify,
-          passthrough}
+          backend,mask,metrics,keyguard,probe,shadow,tokenest}
+internal/app         the assembly (§1): the one place every package is named at once
 pkg/catalog          provider defaults, model catalog, base pricing
 ui/                  embedded admin SPA
 deploy/              compose for tests, Dockerfile, examples
@@ -2841,6 +3001,29 @@ more, all of the same shape — a value computed, stored, documented, and never 
 | an upstream `429`'s `Retry-After` | reached the cooldown but never the client, so §11.4's mandatory header could not fire |
 | `Decision.PriorityTier` | §7.5's `service_tier` fold has been dead in production |
 
+A later sweep closed twelve more and found eleven beyond them. Three results from it are worth
+carrying here, because each says something about the class rather than about one setting:
+
+1. **A closed finding was not closed.** The security review recorded the per-key rate limits as
+   "Closed — patched + wired" and described a file, a field and five tests, none of which
+   existed. A disposition is the same shape as the defect it disposes of — satisfied on paper,
+   connected to nothing — and a closed finding is not re-checked. The rule: a disposition that
+   names a file or a test is only closed once that file or test exists.
+
+2. **Two of the twelve were already fixed and the documentation still said otherwise.** The
+   metering-degraded gauge and the passthrough counter both existed; the prose describing them
+   as absent was the only record, and prose does not fail a build. A claim about the code that
+   nothing executes decays exactly like code that nothing calls.
+
+3. **The guard that catches the class is narrow, and worth having anyway.**
+   `TestEveryConfiguredFieldIsReadSomewhere` walks `config.Config` and requires every
+   `yaml`-tagged field to be named somewhere outside `internal/config`. It cannot see a value
+   that is read and then dropped — which is precisely how `PriorityTier` failed — and it is
+   vacuous for short field names. It found eleven unwired settings on its first run regardless.
+   The half it cannot cover has no automated guard: for a control that is not a configuration
+   field, the only thing that finds it is an assembled-stack test asserting an observable the
+   owning package cannot produce alone.
+
 #### The harness that hid the bug
 
 The last row deserves its own note. `PriorityTier` is computed by the router and dropped on the
@@ -2871,6 +3054,6 @@ done when something end to end exercises it and asserts an observable outside it
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
 | W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **closed** — soft reservation as a prefix-ordered claim on one unit per axis key; deadlock excluded by the §5.7 axis order; the oldest waiter is served within `SoftReserveAfter + axes` releases. Measured +5.3% on the mixed contended benchmark, nil on single-axis. On by default, with an off switch |
-| W11 | **Revocation latency was never specified** (§11.2c) | **open** — the auth snapshot's TTL is what makes authentication 354 ns, and it also means a revoked, pended, or rotation-cut key keeps serving until the snapshot refreshes, per node. An invalidation path plus a published worst case closes it; until then the guarantee is "eventually", which for a compromised key is not a guarantee |
+| W11 | **Revocation latency was never specified** (§11.2c) | **closed** — revocations, pends and early grace cuts publish a durable invalidation; every node drops the key from its snapshot on receipt, and the TTL is now the fallback for a node that missed the message rather than the mechanism. The worst case is published as a number (`auth.RevocationBound`): **0 on one node**, **`poll + store_latency` clustered** — 1.25 s at the defaults — with `entry_ttl` as the stated fallback and an unmeasured propagation delay publishing the TTL rather than an optimistic figure. Four further defects were found while closing it: a **found-but-refusing row was cached for the SERVING lifetime**, so a pended key was re-checked a full `entry_ttl` later on a node that missed the message (rule 3 was written and not implemented); `Rejoin` had to drop the snapshot **before** the reload rather than replace it after, or a failed reload left the stale set serving — the exact state rule 4 exists to prevent; a rejoining node had to read the invalidation watermark **before** the reload, or a message published during it was skipped; and **a row placed by a bulk load never expires** (§9.1), so publishing `entry_ttl` as its fallback was simply wrong — its fallback is the reload interval, and with no reload scheduled it has none, which the figure now says rather than reporting a number that does not apply. Measured end to end: **zero window** single-node, **~21 ms** to the last of four nodes at `poll: 20ms`. Was **open** — the auth snapshot's TTL is what makes authentication 354 ns, and it also means a revoked, pended, or rotation-cut key keeps serving until the snapshot refreshes, per node |
 | W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
 | W9 | **Quota and budget state is in-memory only** (§9.6) | **closed** — the request path reserves against the durable ledger. The gate holds an upper bound before every upstream call, settles with the actual cost, and refuses an exhausted budget as a terminal `400` (§6.4); a restart re-reads the counter rather than starting the period over, and a graceful stop returns the unspent part so a planned restart costs nothing. The hold is taken after the routing decision rather than at the gate, because §6.4's estimate prices output at `max_tokens` and there is no price before a deployment is chosen — the property that mattered (concurrent requests cannot both see the pre-spend balance, and anything that never reaches an upstream is refunded in full) is unaffected. No in-memory path is kept beside it: `quota.Budget` serializes on one mutex where the ledger takes an atomic compare-and-swap on a block it already holds, so the durable path is also the cheaper one. Was **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Was **open** — a restart resets the windows |

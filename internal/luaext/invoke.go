@@ -3,6 +3,8 @@ package luaext
 import (
 	"context"
 	"errors"
+
+	lua "github.com/yuin/gopher-lua"
 )
 
 // The four hook entry points.
@@ -71,6 +73,19 @@ func (j *requestJob) run(ctx context.Context) error {
 		}
 		// An explicit allow ends evaluation, natives included: a rule that says
 		// "this key is exempt" has to be able to mean it.
+		return nil
+	}
+
+	denied, reason, code, err := e.luaHookRun(ctx, HookRequest, &res,
+		func(L *lua.LState) lua.LValue { return requestTable(L, j.v) })
+	if err != nil {
+		return err
+	}
+	j.out.tagset = res.tags
+	if denied {
+		j.out.Denied = true
+		j.out.Reason = reason
+		j.out.Code = code
 		return nil
 	}
 
@@ -144,6 +159,19 @@ func (j *routeJob) run(ctx context.Context) error {
 		return nil
 	}
 
+	denied, reason, code, err := e.luaHookRun(ctx, HookRoute, &res,
+		func(L *lua.LState) lua.LValue { return routeTable(L, j.v) })
+	if err != nil {
+		return err
+	}
+	j.out.tagset = res.tags
+	if denied {
+		j.out.Denied = true
+		j.out.Reason = reason
+		j.out.Code = code
+		return nil
+	}
+
 	for i := range e.natives[HookRoute] {
 		n := &e.natives[HookRoute][i]
 		if n.Route == nil {
@@ -194,6 +222,10 @@ func (j *responseJob) run(ctx context.Context) error {
 
 	var res result
 	if _, err := e.runPrograms(HookResponse, j.v, &b, &res); err != nil {
+		return err
+	}
+	if _, _, _, err := e.luaHookRun(ctx, HookResponse, &res,
+		func(L *lua.LState) lua.LValue { return responseTable(L, j.v) }); err != nil {
 		return err
 	}
 	j.out.tagset = res.tags
@@ -282,6 +314,18 @@ func (j *emailJob) run(ctx context.Context) error {
 	if stop && res.denied {
 		j.out.Denied = true
 		j.out.Reason = res.reason
+		return nil
+	}
+
+	denied, reason, _, err := e.luaHookRun(ctx, HookEmail, &res,
+		func(L *lua.LState) lua.LValue { return emailTable(L, j.v) })
+	if err != nil {
+		return err
+	}
+	j.out.tagset = res.tags
+	if denied {
+		j.out.Denied = true
+		j.out.Reason = reason
 		return nil
 	}
 

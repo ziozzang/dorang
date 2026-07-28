@@ -68,6 +68,110 @@ func ParseDuration(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("invalid duration %q: want a value such as \"250ms\", \"30s\" or \"1h\"", s)
 }
 
+// UntilEvicted is the CacheTTL spelling for "this entry does not expire on a
+// clock; it lives until the table's byte budget evicts it".
+const UntilEvicted = "until_evicted"
+
+// CacheTTL is how long a cache-affinity entry stays believable. It reads either
+// a duration ("5m", "1h") or the word "until_evicted".
+//
+// It is not a Duration because the honest answer for a self-hosted engine is not
+// a duration at all. vLLM and SGLang hold prefix blocks until LRU eviction under
+// memory pressure; there is no clock involved, and any number written there is a
+// guess that throws away hits it still had. The hosted services do run a clock —
+// five minutes, ten minutes, an hour depending on vendor and tier — and those
+// need a real duration. One type carries both facts so a configuration can state
+// which kind of cache it is talking to.
+type CacheTTL struct {
+	d       time.Duration
+	forever bool
+	set     bool
+}
+
+// TTL builds a CacheTTL from a duration.
+func TTL(d time.Duration) CacheTTL { return CacheTTL{d: d, set: true} }
+
+// Forever builds the "until_evicted" CacheTTL.
+func ForeverTTL() CacheTTL { return CacheTTL{forever: true, set: true} }
+
+// IsZero reports whether the value was left unset, which means "inherit".
+func (c CacheTTL) IsZero() bool { return !c.set }
+
+// IsForever reports whether entries never expire on a clock.
+func (c CacheTTL) IsForever() bool { return c.forever }
+
+// Duration returns the clock lifetime, or zero when the value is unset or
+// "until_evicted". Callers that must tell those apart read [CacheTTL.IsForever].
+func (c CacheTTL) Duration() time.Duration {
+	if c.forever {
+		return 0
+	}
+	return c.d
+}
+
+// TableTTL renders the value the way internal/prefix reads it: a positive
+// duration expires, and a NEGATIVE one means "never expire on a clock". Zero is
+// not usable for that, because internal/prefix already spends zero on "use the
+// default" — and a setting whose "off" value collides with its "unset" value is
+// how a disabled feature turns back on at the next refactor.
+func (c CacheTTL) TableTTL() time.Duration {
+	if c.forever {
+		return -1
+	}
+	return c.d
+}
+
+// Or returns c when it is set, and fallback otherwise. This is the whole
+// inheritance rule: deployment, then provider, then the global default.
+func (c CacheTTL) Or(fallback CacheTTL) CacheTTL {
+	if c.set {
+		return c
+	}
+	return fallback
+}
+
+func (c CacheTTL) String() string {
+	switch {
+	case !c.set:
+		return ""
+	case c.forever:
+		return UntilEvicted
+	}
+	return c.d.String()
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (c *CacheTTL) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: a cache lifetime must be a scalar such as \"5m\" or %q",
+			n.Line, UntilEvicted)
+	}
+	s := strings.TrimSpace(n.Value)
+	switch s {
+	case "", "~", "null":
+		*c = CacheTTL{}
+		return nil
+	case UntilEvicted:
+		*c = ForeverTTL()
+		return nil
+	}
+	v, err := ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("line %d: %w (or %q for a cache with no clock, such as vLLM or SGLang)",
+			n.Line, err, UntilEvicted)
+	}
+	*c = TTL(v)
+	return nil
+}
+
+// MarshalYAML implements yaml.Marshaler.
+func (c CacheTTL) MarshalYAML() (any, error) {
+	if !c.set {
+		return nil, nil
+	}
+	return c.String(), nil
+}
+
 // byteUnits maps a lower-cased unit suffix to its multiplier. Binary units are
 // powers of 1024; decimal units are powers of 1000. Both spellings appear in
 // the design (64MiB, 8GiB) and in configurations written by hand.

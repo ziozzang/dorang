@@ -85,11 +85,48 @@ type PriorityConfig struct {
 	// harmless to an engine that ignores it, which is why an unknown backend
 	// gets only this.
 	Header string
-	// Min and Max clamp a client's priority hint to the principal's permitted
-	// range (§10.5). They are canonical values, so Min is the MOST urgent the
-	// caller may ask for. Both zero means hints are not accepted and the class
-	// alone decides.
+	// Min and Max clamp a client's priority hint to the permitted range when no
+	// per-principal grant applies (§10.5). They are canonical values, so Min is
+	// the MOST urgent the caller may ask for. Both zero means hints are not
+	// accepted and the class alone decides, which is the shipped default.
 	Min, Max int
+	// Grants is the §10.5 grant table, keyed exactly as capacity.principals is:
+	// by api key id, with "default" as the fallback. A principal with no entry,
+	// and a table with no "default", falls back to Min/Max — which is to say, to
+	// ignoring the hint.
+	//
+	// The grant is per principal because the whole rule is: an operator can
+	// grant urgency, a caller cannot claim it. One fleet-wide clamp cannot
+	// express that, which is why Min/Max alone left §10.5 unimplementable.
+	Grants map[string]PriorityGrant
+}
+
+// PriorityGrant is one principal's permitted priority band, in canonical values.
+// Min is the most urgent the caller may ask for.
+type PriorityGrant struct {
+	Min, Max int
+}
+
+// grantFor resolves a principal's band, falling back to the "default" entry and
+// then to the fleet-wide Min/Max.
+func (p PriorityConfig) grantFor(principal string) PriorityGrant {
+	if len(p.Grants) > 0 {
+		if g, ok := p.Grants[principal]; ok {
+			return g
+		}
+		if g, ok := p.Grants["default"]; ok {
+			return g
+		}
+	}
+	return PriorityGrant{Min: p.Min, Max: p.Max}
+}
+
+// GrantsHint reports whether this principal's callers may set their own
+// priority. It is what tells a dropped hint from an honoured one, which §10.5
+// requires to be reported rather than silent.
+func (p PriorityConfig) GrantsHint(principal string) bool {
+	g := p.grantFor(principal)
+	return g.Max > g.Min
 }
 
 // DefaultPriority is the mapping of DESIGN §7.5, including the two self-hosted
@@ -141,6 +178,17 @@ func DefaultPriority() PriorityConfig {
 // ignored, because an unclamped client hint is a way for one caller to outrank
 // every other.
 func (p PriorityConfig) Canonical(class string, hint *int) int {
+	return p.CanonicalFor("", class, hint)
+}
+
+// CanonicalFor is [PriorityConfig.Canonical] for a named principal, applying
+// that principal's §10.5 grant rather than the fleet-wide clamp.
+//
+// A principal with no grant ignores the hint entirely, which is the default and
+// the safe direction: a caller who may set their own priority eventually sets
+// the most urgent value, not maliciously but because it is free and appears to
+// help, and the scale then carries no information.
+func (p PriorityConfig) CanonicalFor(principal, class string, hint *int) int {
 	if class == "" {
 		class = p.Default
 	}
@@ -148,17 +196,21 @@ func (p PriorityConfig) Canonical(class string, hint *int) int {
 	if !ok {
 		v = p.Classes[p.Default]
 	}
-	if hint != nil && p.Max > p.Min {
-		h := *hint
-		if h < p.Min {
-			h = p.Min
-		}
-		if h > p.Max {
-			h = p.Max
-		}
-		v = h
+	if hint == nil {
+		return v
 	}
-	return v
+	g := p.grantFor(principal)
+	if g.Max <= g.Min {
+		return v
+	}
+	h := *hint
+	if h < g.Min {
+		h = g.Min
+	}
+	if h > g.Max {
+		h = g.Max
+	}
+	return h
 }
 
 // Wire converts a canonical value into the number a specific engine must

@@ -11,14 +11,14 @@ import (
 )
 
 // baseYAML is a minimal configuration that loads and validates cleanly. Tests
-// append the section they exercise. It uses key_ref so that loading it touches
-// neither the environment nor the filesystem.
+// append the section they exercise. Its secret is a key_env naming the variable
+// TestMain sets, so loading it touches the environment and nothing else.
 const baseYAML = `
 version: 1
 providers:
   - {name: p1, kind: openai, base_url: "https://example.invalid"}
 credentials:
-  - {id: c1, provider: p1, key_ref: "vault:kv/p1#key"}
+  - {id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}
 models:
   - name: m1
     deployments:
@@ -46,7 +46,7 @@ func buildYAML(f fragments) string {
 	b.WriteString("  - {name: p1, kind: openai, base_url: \"https://example.invalid\"}\n")
 	b.WriteString(f.providers)
 	b.WriteString("credentials:\n")
-	b.WriteString("  - {id: c1, provider: p1, key_ref: \"vault:kv/p1#key\"}\n")
+	b.WriteString("  - {id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}\n")
 	b.WriteString(f.credentials)
 	b.WriteString("models:\n  - name: m1\n    deployments:\n")
 	b.WriteString("      - {provider: p1, upstream_model: m1-upstream, credentials: [c1]}\n")
@@ -203,7 +203,7 @@ func TestDesignShapeRoundTrip(t *testing.T) {
 	})
 	eq("routing.prefix", c.Routing.Prefix, PrefixRouting{
 		Enabled: boolPtr(true), ChunkBytes: 4096, Checkpoints: "logarithmic",
-		MaxBytes: 64 << 20, TTL: Duration(time.Hour),
+		MaxBytes: 64 << 20, TTL: TTL(time.Hour),
 	})
 
 	eq("fallbacks.on", c.Fallbacks.On, map[string][]string{
@@ -416,7 +416,7 @@ observability: {prometheus: false}
 version: 1
 providers:
   - {name: p1, kind: openai, params: {drop_unsupported: false}}
-credentials: [{id: c1, provider: p1, key_ref: "vault:x"}]
+credentials: [{id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}]
 models: [{name: m1, deployments: [{provider: p1, upstream_model: u1}]}]
 `))
 	if err != nil {
@@ -443,7 +443,7 @@ func TestOpaqueModelNames(t *testing.T) {
 
 	var b strings.Builder
 	b.WriteString("version: 1\nproviders:\n  - {name: p1, kind: openai}\n")
-	b.WriteString("credentials:\n  - {id: c1, provider: p1, key_ref: \"vault:x\"}\n")
+	b.WriteString("credentials:\n  - {id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}\n")
 	b.WriteString("models:\n")
 	for _, n := range names {
 		b.WriteString("  - name: \"" + n + "\"\n    class: everything\n")

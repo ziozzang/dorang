@@ -29,6 +29,12 @@ type candidate struct {
 	busyKnown bool
 	ttft      time.Duration
 	tps       float64
+	// urgency is §7.5a(c)'s expiring-allowance score, and urgencyKnown says
+	// whether anything reported one. A credential with no resetting quota rule
+	// has NO OPINION rather than an urgency of zero — zero is the score of an
+	// allowance at the start of its window, which is a different fact.
+	urgency      float64
+	urgencyKnown bool
 
 	sticky      bool
 	prefixHit   bool
@@ -80,6 +86,15 @@ func compare(s Strategy, a, b *candidate) int {
 	case StrategyPriority:
 		// Deployment priority uses the canonical scale: lower is preferred.
 		return cmpInt(a.dep.Priority, b.dep.Priority)
+	case StrategyQuotaUrgency:
+		// Descending: the most urgent allowance is the one about to be thrown
+		// away. Silence from either side ends the comparison, so a credential
+		// with no resetting window never loses to one merely because its
+		// urgency was never computed.
+		if !a.urgencyKnown || !b.urgencyKnown {
+			return 0
+		}
+		return -cmpFloat(a.urgency, b.urgency)
 	case StrategyRoundRobin:
 		return cmpInt(a.rr, b.rr)
 	case StrategyWeightedRandom:

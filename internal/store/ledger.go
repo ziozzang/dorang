@@ -18,7 +18,14 @@ type RequestLog struct {
 	ID string
 	TS time.Time
 
-	APIKeyID     string
+	APIKeyID string
+	// SecretID names WHICH of the key's secrets authenticated this request
+	// (DESIGN §11.2c). A key has one id and, during a rotation's grace period,
+	// two secrets; both authenticate to the same principal, and an operator
+	// needs to see whether the client actually rolled BEFORE the window closes
+	// rather than finding out when it shuts. The key id alone cannot answer
+	// that question.
+	SecretID     string
 	UserID       string
 	TeamID       string
 	CredentialID string
@@ -143,7 +150,7 @@ const requestLogCols = `l.ts, l.id, l.api_key_id, l.user_id, l.team_id, l.creden
 	l.reasoning_tokens, l.total_tokens, l.cost_nano, l.marginal_cost_nano,
 	l.subscription_cost_nano, l.latency_ms, l.ttft_ms, l.queue_ms, l.capacity_wait_ms,
 	l.upstream_ms, l.fallback_count, l.streamed, l.trace_id, l.session_id, l.node_id,
-	l.batch_id, l.metadata`
+	l.batch_id, l.metadata, l.secret_id`
 
 const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_id,
 	provider_id, deployment_id, model_group, upstream_model, endpoint,
@@ -151,9 +158,9 @@ const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_i
 	reasoning_tokens, total_tokens, cost_nano, marginal_cost_nano,
 	subscription_cost_nano, latency_ms, ttft_ms, queue_ms, capacity_wait_ms,
 	upstream_ms, fallback_count, streamed, trace_id, session_id, node_id,
-	batch_id, metadata`
+	batch_id, metadata, secret_id`
 
-const requestLogInsertArity = 33
+const requestLogInsertArity = 34
 
 // ---------------------------------------------------------------------------
 // Writing
@@ -234,7 +241,7 @@ func (s *Store) insertLogChunk(ctx context.Context, tx *sql.Tx, rows []RequestLo
 			r.CostNano, r.MarginalCostNano, r.SubscriptionCostNano,
 			r.LatencyMS, r.TTFTMS, r.QueueMS, r.CapacityWaitMS, r.UpstreamMS,
 			r.FallbackCount, r.Streamed, nullStr(r.TraceID), nullStr(r.SessionID),
-			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata)
+			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata, nullStr(r.SecretID))
 	}
 	_, err := s.txExec(ctx, tx, b.String(), args...)
 	return err
@@ -575,13 +582,15 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		us                                            int64
 		keyID, userID, teamID, credID, provID, deplID sql.NullString
 		errClass, traceID, sessionID, nodeID, batchID sql.NullString
+		secretID                                      sql.NullString
 	)
 	err := rows.Scan(&us, &r.ID, &keyID, &userID, &teamID, &credID, &provID, &deplID,
 		&r.ModelGroup, &r.UpstreamModel, &r.Endpoint, &r.Status, &errClass,
 		&r.PromptTokens, &r.CompletionTokens, &r.CachedTokens, &r.ReasoningTokens,
 		&r.TotalTokens, &r.CostNano, &r.MarginalCostNano, &r.SubscriptionCostNano,
 		&r.LatencyMS, &r.TTFTMS, &r.QueueMS, &r.CapacityWaitMS, &r.UpstreamMS,
-		&r.FallbackCount, &r.Streamed, &traceID, &sessionID, &nodeID, &batchID, &r.Metadata)
+		&r.FallbackCount, &r.Streamed, &traceID, &sessionID, &nodeID, &batchID, &r.Metadata,
+		&secretID)
 	if err != nil {
 		return RequestLog{}, err
 	}
@@ -597,6 +606,7 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 	r.SessionID = str(sessionID)
 	r.NodeID = str(nodeID)
 	r.BatchID = str(batchID)
+	r.SecretID = str(secretID)
 	return r, nil
 }
 

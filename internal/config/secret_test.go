@@ -57,12 +57,6 @@ func TestSecretSources(t *testing.T) {
 			wantSource:   "key_file:" + crlfFile,
 		},
 		{
-			name:         "key_ref is recorded, not fetched",
-			cred:         "{id: c1, provider: p1, key_ref: \"vault:secret/data/dorang#key\"}",
-			wantResolved: false,
-			wantSource:   "key_ref:vault:secret/data/dorang#key",
-		},
-		{
 			name:         "inline literal under development",
 			cred:         fmt.Sprintf("{id: c1, provider: p1, key: %q}", testSecret),
 			env:          "development",

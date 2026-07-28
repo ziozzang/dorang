@@ -27,8 +27,20 @@ const (
 	EventBatchCompleted
 	// EventInvite fires when a user is invited to a team (§11.4).
 	EventInvite
+	// EventTokenGuard fires on every token-guard action (§11.6).
+	//
+	// "The action is always announced" is one of the four things the guard has
+	// to get right, and it is the one that decides whether an automated
+	// refusal is operable: the first thing the operator learns must not be a
+	// support ticket from the affected user. It fires for an alert as well as
+	// for a pend, because an alert that nobody sees is the same as no alert.
+	EventTokenGuard
+	// EventKeyRotated fires on a rotation, an early grace cut and a max_age
+	// warning (§11.2c). max_age is a policy that warns and does not execute,
+	// and a warning with no transport is not a warning.
+	EventKeyRotated
 
-	numEvents = 7
+	numEvents = 9
 )
 
 // eventNames is indexed by Event and matches internal/config's
@@ -36,6 +48,7 @@ const (
 var eventNames = [numEvents]string{
 	"key_created", "budget_80pct", "budget_exceeded", "quota_exhausted",
 	"credential_unhealthy", "batch_completed", "invite",
+	"token_guard", "key_rotated",
 }
 
 // String returns the configuration spelling.
@@ -74,6 +87,8 @@ var titles = [numEvents]string{
 	"credential unhealthy",
 	"batch completed",
 	"team invitation",
+	"token guard",
+	"API key rotated",
 }
 
 // Title returns the subject-line headline.
@@ -155,6 +170,19 @@ var EventFields = map[Event][]string{
 	},
 	EventInvite: {
 		"invite_id", "email", "team_id", "role", "expires_at", "accept_path",
+	},
+	// §11.6 requires the observed rate, the baseline and WHICH CONDITION
+	// tripped. All three are here, and so is the action, because an operator
+	// reading "the guard fired" without knowing whether it pended or only
+	// alerted has to go and look.
+	EventTokenGuard: {
+		"key_id", "action", "condition", "observed_rate", "baseline_rate",
+		"factor", "factor_threshold", "absolute", "absolute_threshold",
+		"window", "baseline_window", "history", "min_history", "released_by",
+	},
+	EventKeyRotated: {
+		"key_id", "action", "generation", "previous_generation",
+		"previous_expires_at", "grace", "age", "max_age", "live_generations",
 	},
 }
 

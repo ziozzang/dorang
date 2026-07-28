@@ -16,7 +16,7 @@ import (
 // ending in /v1 and one configured without it both exist in the wild, and both
 // must work; that is why /chat/completions is registered next to
 // /v1/chat/completions rather than redirected to it.
-func (s *Server) baseRoutes() []*Route {
+func (s *Server) baseRoutes(access MetricsAccess) []*Route {
 	inference := func(pattern, name string, family Family) *Route {
 		return &Route{
 			Pattern:   pattern,
@@ -134,15 +134,27 @@ func (s *Server) baseRoutes() []*Route {
 		health("/health/liveness", "health_liveness", healthLive),
 		health("/health/readiness", "health_readiness", healthReady),
 		health("/health", "health", healthOverall),
+	}
 
-		{
+	// The scrape. observability.prometheus removes it entirely rather than
+	// serving an empty page: a route this build does not serve answers 501 with
+	// a reason like every other one (COMPATIBILITY §9), and a 200 with no
+	// families would tell a scraper the gateway is healthy and idle.
+	//
+	// It authenticates unless the file says otherwise. It used to be Public
+	// alongside the container probes, which put per-key spend, per-credential
+	// quota state and the whole configured model list on an unauthenticated
+	// port.
+	if access != MetricsOff {
+		routes = append(routes, &Route{
 			Pattern: "/metrics",
 			Methods: MethodGET | MethodHEAD,
 			Name:    "metrics",
 			Family:  FamilyMetrics,
-			Public:  true,
+			Public:  access == MetricsPublic,
+			Admin:   access == MetricsAdmin,
 			Handler: s.handleMetrics,
-		},
+		})
 	}
 
 	// The deployment-in-the-path aliases.
@@ -188,12 +200,19 @@ func (s *Server) handleInference(w http.ResponseWriter, rq *Request) error {
 			"the request did not name a model").
 			WithCode("missing_model").WithParam("model")
 	}
-	// COMPATIBILITY §7.2 puts tag-routing misses at 401, and the reference
-	// proxy answers a model outside a key's allow-list the same way. It reads
-	// oddly — the caller authenticated fine — but it is what deployed clients
-	// branch on, and a 403 here would be a divergence they notice.
+	// COMPATIBILITY §11.2: a model outside the key's allow-list is 403, not 401.
+	// The credential authenticated fine; it is not permitted this model, and a
+	// 401 tells the client to re-authenticate, which cannot help. A reference
+	// proxy answers 401 here and dorang deliberately does not follow it.
+	//
+	// This branch used to answer 401, citing §7.2 — but §7.2 is about TAG
+	// ROUTING misses, which are a different condition. The shared authorization
+	// gate has always answered 403 for the same refusal (server.go, via
+	// auth.Error.Status), so the two halves of one rule disagreed and only the
+	// unreachable half was wrong. It is reachable by any Principal whose
+	// Authorize does not itself check models.
 	if rq.Principal != nil && !rq.Principal.AllowsModel(rq.Model) {
-		return NewError(http.StatusUnauthorized, TypeAuthentication,
+		return NewError(http.StatusForbidden, TypePermission,
 			"this key is not allowed to use the requested model").
 			WithCode("model_not_allowed").WithParam("model")
 	}
@@ -263,14 +282,15 @@ func (s *Server) healthHandler(kind healthKind) Handler {
 		// not take the pod out of rotation — so the status stays what it was
 		// and the fact appears beside it (DESIGN §14.1).
 		if kind != healthLive {
-			if o := rq.srv.snap.Load().observer; o != nil {
-				n := len(b)
-				b = append(b, `,"shadow":`...)
-				if grown := o.Health(b); len(grown) > n+10 {
-					b = grown
-				} else {
-					b = b[:n]
-				}
+			snap := rq.srv.snap.Load()
+			if o := snap.observer; o != nil {
+				b = appendHealthObject(b, "shadow", o.Health)
+			}
+			// Everything else that has something to say about its own health,
+			// metering first among them: DESIGN §12.1 promises a drop is never
+			// silent, and this is where an operator looks.
+			for _, r := range snap.reporters {
+				b = appendHealthObject(b, r.HealthName(), r.Health)
 			}
 		}
 		b = append(b, '}')
@@ -285,6 +305,24 @@ func (s *Server) healthHandler(kind healthKind) Handler {
 		}
 		return nil
 	}
+}
+
+// appendHealthObject writes `,"name":<json>` when the reporter produced
+// something, and leaves dst untouched when it did not.
+//
+// "Produced something" is measured as growth past the key it was offered,
+// because a reporter that appends nothing must not leave a dangling key behind
+// — a health body that fails to parse is worse than one that omits a subsystem.
+func appendHealthObject(dst []byte, name string, fill func([]byte) []byte) []byte {
+	n := len(dst)
+	dst = append(dst, ',', '"')
+	dst = append(dst, name...)
+	dst = append(dst, '"', ':')
+	grown := fill(dst)
+	if len(grown) <= len(dst) {
+		return dst[:n]
+	}
+	return grown
 }
 
 // handleModels serves GET /v1/models.

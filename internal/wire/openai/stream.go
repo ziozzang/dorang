@@ -3,7 +3,9 @@ package openai
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -77,8 +79,22 @@ type StreamWriter struct {
 	// finished records which choice indexes already carried a finish_reason.
 	finished []bool
 
+	// args accumulates each tool call's argument text so that the terminal chunk
+	// is not upgraded to tool_calls over a body that does not parse. dorang does
+	// not execute tools and cannot repair the call; what it can do is refuse to
+	// tell the client a broken call is ready.
+	args map[argKey]*argBuf
+
 	usage    canonical.Usage
 	hasUsage bool
+}
+
+type argKey struct{ choice, index int }
+
+type argBuf struct {
+	name string
+	id   string
+	text []byte
 }
 
 // NewStreamWriter returns a writer over w.
@@ -142,15 +158,22 @@ func (s *StreamWriter) WriteChunk(c *Chunk) error {
 		ch := &c.Choices[i]
 		if len(ch.Delta.ToolCalls) > 0 {
 			s.sawToolCall = true
-			if s.cfg.ToolNames != nil {
-				for j := range ch.Delta.ToolCalls {
-					fn := ch.Delta.ToolCalls[j].Function
-					if fn != nil && fn.Name != nil {
-						restored := s.cfg.ToolNames.Restore(*fn.Name)
-						fn.Name = &restored
-					}
+			for j := range ch.Delta.ToolCalls {
+				tc := &ch.Delta.ToolCalls[j]
+				fn := tc.Function
+				if fn != nil && fn.Name != nil && s.cfg.ToolNames != nil {
+					restored := s.cfg.ToolNames.Restore(*fn.Name)
+					fn.Name = &restored
 				}
+				s.recordArgs(ch.Index, tc)
 			}
+		}
+		if s.isFinished(ch.Index) && !ch.Delta.Empty() {
+			// COMPATIBILITY has no rule for this because the shape is out of
+			// contract. Forwarding it is still right — what the model produced is
+			// not dorang's to discard — but it is reported, because a client that
+			// stopped reading at the finish_reason has already lost it.
+			s.cfg.Warn.warn(WarnDataAfterFinish, strconv.Itoa(ch.Index))
 		}
 		if ch.FinishReason != nil && *ch.FinishReason != "" {
 			s.markFinished(ch.Index)
@@ -306,6 +329,22 @@ func (s *StreamWriter) Close() error {
 		return nil // COMPATIBILITY 1.4
 	}
 
+	// A tool call whose arguments do not parse is the one condition that must not
+	// be finished normally. COMPATIBILITY 4.4 upgrades the synthesized terminal
+	// to tool_calls the moment a call was seen, which on a stream that ended
+	// mid-JSON tells the client a call is ready that it cannot execute — and the
+	// client's own failure will name a JSON error, not this gateway. dorang
+	// cannot repair the call; it does not run tools. So it says so, in band
+	// (1.3), and the exchange is counted as failed by the caller.
+	if b, bad := s.malformedToolCall(); bad {
+		s.cfg.Warn.warn(WarnMalformedToolArguments, b.name)
+		s.closed = false // WriteError re-closes; it refuses a closed writer
+		if err := s.WriteError(malformedArgumentsError(b)); err != nil {
+			return err
+		}
+		return ErrMalformedToolArguments
+	}
+
 	if !s.anyFinished() {
 		if err := s.writeTerminal(); err != nil {
 			return err
@@ -317,6 +356,24 @@ func (s *StreamWriter) Close() error {
 		}
 	}
 	return s.writeDone()
+}
+
+// ErrMalformedToolArguments reports that the stream carried a tool call whose
+// arguments never became valid JSON. The in-band error frame has already been
+// written when it is returned; it exists so the exchange is counted as failed
+// rather than logged as a clean 200.
+var ErrMalformedToolArguments = errorString("openai: a tool call's arguments are not valid JSON")
+
+func malformedArgumentsError(b *argBuf) *Error {
+	name := b.name
+	if name == "" {
+		name = b.id
+	}
+	msg := "the upstream ended a tool call whose arguments are not valid JSON"
+	if name != "" {
+		msg += ": " + name
+	}
+	return NewError(502, TypeInvalidResponse, msg).WithCode(WarnMalformedToolArguments)
 }
 
 // writeTerminal synthesizes the missing terminal chunk.
@@ -400,6 +457,51 @@ func (s *StreamWriter) recordUsage(u canonical.Usage) {
 	s.hasUsage = true
 }
 
+// recordArgs accumulates one tool-call fragment's argument text.
+func (s *StreamWriter) recordArgs(choice int, tc *ToolCallDelta) {
+	k := argKey{choice: choice, index: tc.Index}
+	if s.args == nil {
+		s.args = make(map[argKey]*argBuf, 2)
+	}
+	b := s.args[k]
+	if b == nil {
+		b = &argBuf{}
+		s.args[k] = b
+	}
+	if tc.ID != nil && *tc.ID != "" {
+		b.id = *tc.ID
+	}
+	if tc.Function == nil {
+		return
+	}
+	if tc.Function.Name != nil && *tc.Function.Name != "" {
+		b.name += *tc.Function.Name
+	}
+	if tc.Function.Arguments != nil {
+		b.text = append(b.text, *tc.Function.Arguments...)
+	}
+}
+
+// malformedToolCall returns the first tool call whose accumulated arguments are
+// not a JSON value, and whether there is one.
+//
+// An empty body is not malformed: a zero-argument call sends no argument
+// fragments at all, and "" means {} to every client in this family.
+func (s *StreamWriter) malformedToolCall() (*argBuf, bool) {
+	// Iterated in index order so the reported call is stable across runs.
+	var worst *argBuf
+	best := argKey{choice: 1 << 30, index: 1 << 30}
+	for k, b := range s.args {
+		if len(trimSpace(b.text)) == 0 || json.Valid(b.text) {
+			continue
+		}
+		if k.choice < best.choice || (k.choice == best.choice && k.index < best.index) {
+			best, worst = k, b
+		}
+	}
+	return worst, worst != nil
+}
+
 func (s *StreamWriter) markFinished(index int) {
 	if index < 0 {
 		index = 0
@@ -417,6 +519,13 @@ func (s *StreamWriter) anyFinished() bool {
 		}
 	}
 	return false
+}
+
+func (s *StreamWriter) isFinished(index int) bool {
+	if index < 0 {
+		index = 0
+	}
+	return index < len(s.finished) && s.finished[index]
 }
 
 // TextChunk builds a plain text chunk. Its marshaled form is exactly

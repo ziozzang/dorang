@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/server"
+	"github.com/ziozzang/dorang/internal/wire/anthropic"
+	"github.com/ziozzang/dorang/internal/wire/openai"
 )
 
 // Error codes this package authors. Every one names a condition an operator can
@@ -36,7 +38,30 @@ const (
 	CodeCredentialUnavailable = "credential_unavailable"
 	// CodeUpstreamRequest is a request dorang could not even construct.
 	CodeUpstreamRequest = "upstream_request"
+	// CodeMalformedToolArguments is a stream that ended on a tool call whose
+	// arguments are not valid JSON. dorang does not execute tools and cannot
+	// repair the call; the client was told in band, and this is the counted half
+	// of the same fact (DESIGN §12.4).
+	CodeMalformedToolArguments = "malformed_tool_arguments"
 )
+
+// streamError classifies a relay that did not end cleanly.
+//
+// A tool call whose arguments never parsed is not "dorang could not understand
+// this answer": the frames were all readable and the stream was relayed in full.
+// It gets its own code because the operator's next step differs — one is a
+// broken backend envelope, the other a model that stopped mid-call — and because
+// the client has already been told, in band, which no other branch here can say.
+func streamError(err error) *server.Error {
+	if errors.Is(err, openai.ErrMalformedToolArguments) ||
+		errors.Is(err, anthropic.ErrMalformedToolArguments) {
+		return server.NewError(http.StatusBadGateway, server.TypeAPIError,
+			"the upstream ended a tool call whose arguments are not valid JSON").
+			WithCode(CodeMalformedToolArguments)
+	}
+	return server.NewError(http.StatusBadGateway, server.TypeAPIError,
+		"the upstream stream ended abnormally: "+err.Error()).WithCode(CodeUpstreamDecode)
+}
 
 // credentialHeaders are the headers this package puts key material into. They
 // are the whole list, per adapter: bearer for the OpenAI-shaped families and the
@@ -89,6 +114,19 @@ func scrub(s string, secrets []string) string {
 		}
 	}
 	return s
+}
+
+// scrubBytes is [scrub] over a body that is relayed rather than parsed.
+//
+// It returns nil for an empty body so that "the upstream said nothing" stays
+// distinguishable from "the upstream said the empty string", and it copies
+// rather than aliasing the response buffer, because the result outlives the
+// request that produced it.
+func scrubBytes(body []byte, secrets []string) []byte {
+	if len(body) == 0 {
+		return nil
+	}
+	return []byte(scrub(string(body), secrets))
 }
 
 // upstreamError normalizes an upstream failure into dorang's envelope.

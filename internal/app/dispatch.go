@@ -1,19 +1,19 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/luaext"
+	"github.com/ziozzang/dorang/internal/mask"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
@@ -33,17 +33,31 @@ const (
 	HeaderSession = "X-Dorang-Session"
 )
 
-// dispatcher owns everything past the gate: conversion, routing, capacity, the
-// upstream call, and writing the response body. It satisfies server.Dispatcher.
+// dispatcher owns everything past the gate: decoding, routing, capacity,
+// budgets, and writing the response body. It satisfies server.Dispatcher.
+//
+// It does NOT own the upstream call. That is internal/backend's, and the
+// division is DESIGN §1's L4/L5 line: this type turns a configuration into
+// providers and a decision into a target, and never builds an HTTP request,
+// spells a credential, or parses a provider's error envelope.
 //
 // It holds its subsystems behind an atomic pointer because a hot reload rebuilds
 // the router, the price catalog and the upstream table, and an in-flight request
 // must keep the snapshot it started with (DESIGN §4.1, §15.2).
 type dispatcher struct {
-	st     atomic.Pointer[dispatchState]
-	client *http.Client
-	logf   func(string, ...any)
-	now    func() time.Time
+	st atomic.Pointer[dispatchState]
+	// backend is L5 (DESIGN §1): everything between "the router chose a
+	// deployment" and "the client's protocol has an answer". It is built once
+	// and is immutable — a hot reload rebuilds providers, which live on the
+	// state, not this.
+	backend *backend.Backend
+	logf    func(string, ...any)
+	now     func() time.Time
+	// filter are the §10.5b transform-filter counters. They live on the
+	// dispatcher rather than the state because a configuration reload must not
+	// reset them: a counter that restarts on SIGHUP is a counter nobody can
+	// alert on.
+	filter filterCounters
 }
 
 type dispatchState struct {
@@ -65,16 +79,41 @@ type dispatchState struct {
 	// default on the hot path" true rather than aspirational.
 	hooks *luaext.Engine
 
+	// filters are the §10.5b transform filters, resolved by client-facing model
+	// name. Nil, or a model with no entry, costs one map lookup that is skipped
+	// entirely when nothing is configured.
+	filters *filterTable
+
 	prefixOn bool
 	chunk    int
 }
 
 func newDispatcher(client *http.Client, logf func(string, ...any), now func() time.Time) *dispatcher {
-	return &dispatcher{client: client, logf: logf, now: now}
+	d := &dispatcher{logf: logf, now: now}
+	d.backend = backend.New(backend.Options{Client: client, Credentials: d, Now: now})
+	return d
 }
 
 func (d *dispatcher) swap(st *dispatchState) { d.st.Store(st) }
 func (d *dispatcher) state() *dispatchState  { return d.st.Load() }
+
+// Credential implements backend.Credentials.
+//
+// It resolves through the CURRENT state rather than through a table captured at
+// construction, because credentials hot-reload and the backend does not: a
+// rotated key has to reach the next request without rebuilding L5 under the
+// in-flight ones.
+//
+// OAuth returns nil today. internal/auth's OAuthCredential already satisfies
+// [backend.Applier], so wiring it is a lookup here and nothing in L5 — which is
+// the point of the seam.
+func (d *dispatcher) Credential(id string) (string, backend.Applier) {
+	st := d.state()
+	if st == nil || st.upstreams == nil {
+		return "", nil
+	}
+	return st.upstreams.secret(id), nil
+}
 
 // call is one client request, decoded once and reused across fail-back hops.
 //
@@ -107,6 +146,21 @@ type call struct {
 	// the state (DESIGN §9.2 [R1-C7]), so it owns the id: an upstream id would
 	// be meaningless to the store and would change on a fail-back hop.
 	responseID string
+
+	// mask is this request's reversible mask (§10.5b). It is nil unless a
+	// transform filter with a pattern set is configured for the model, it lives
+	// exactly as long as this call, and it is never written anywhere: the ledger,
+	// the trace, the log and the metric labels all take counts from
+	// [call.filterStats] and have no path to the table.
+	mask *mask.Session
+	// noAffinity suppresses the prefix claim for this request.
+	//
+	// It is set by a filter whose scope is per-request, whose placeholders are
+	// therefore different on every turn. The upstream bytes cannot repeat, so a
+	// prefix claim would be a claim about bytes no backend holds. Saying so is
+	// the point: a scope that quietly made another subsystem useless would be
+	// the defect this codebase keeps finding.
+	noAffinity bool
 }
 
 type callKind uint8
@@ -170,7 +224,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 		return server.NewError(http.StatusServiceUnavailable, server.TypeAPIError,
 			"the gateway is not configured").WithCode("not_configured")
 	}
-	c, err := d.decode(st, rq)
+	c, err := d.decode(ctx, st, rq)
 	if err != nil {
 		return err
 	}
@@ -239,6 +293,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 			// is why its post-hoc values travel by the opt-in usage event
 			// instead.
 			d.settle(st, c, dec, rq, res)
+			// The mask's counts are folded in here, after every unmasking pass
+			// has run: counts only, and the session itself goes out of scope
+			// with the call (§10.5b rule 1).
+			d.observeFilter(c)
 			// The estimate was an upper bound, so settlement only ever releases
 			// budget — which is why settling after the answer is safe.
 			hold.settle(rq.Result.CostNanoUSD)
@@ -275,7 +333,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 }
 
 // decode turns one HTTP request into a routing question.
-func (d *dispatcher) decode(st *dispatchState, rq *server.Request) (*call, error) {
+func (d *dispatcher) decode(ctx context.Context, st *dispatchState, rq *server.Request) (*call, error) {
 	body := rq.Body.Bytes()
 	c := &call{model: rq.Model, body: body, stream: rq.Stream}
 
@@ -323,24 +381,99 @@ func (d *dispatcher) decode(st *dispatchState, rq *server.Request) (*call, error
 	}
 
 	c.rreq = router.Request{
-		Model:           rq.Model,
-		Principal:       principalID(rq),
-		Session:         rq.HTTP.Header.Get(HeaderSession),
-		AllowLossy:      parseAllowLossy(rq.HTTP.Header.Get(HeaderAllowLossy)),
-		InputTokens:     estimateInputTokens(body),
+		Model:      rq.Model,
+		Principal:  principalID(rq),
+		Session:    rq.HTTP.Header.Get(HeaderSession),
+		AllowLossy: parseAllowLossy(rq.HTTP.Header.Get(HeaderAllowLossy)),
+		// The caller's own ceiling, and only theirs. A caller who named none
+		// reserves the TARGET's declared ceiling instead, which is a per
+		// deployment number and therefore the router's to apply — nothing here
+		// knows yet which deployment will serve this.
 		MaxOutputTokens: maxOutputTokens(c.creq),
 		Stream:          rq.Stream,
 	}
+	applyPrincipalPolicy(rq, &c.rreq)
 	if c.creq != nil {
 		c.rreq.Required = c.creq.RequiredCapabilities()
 	}
-	if st.prefixOn && st.chunk > 0 {
-		// The chain is seeded with the client-facing model group so two models
-		// never share a prefix entry, and cut at byte boundaries — there is no
-		// tokenizer on this path (§7.4b).
-		c.rreq.Digests = prefix.Compute(rq.Model, body, st.chunk)
+	// §10.5b's transform filters run here: after decoding, before routing, and
+	// before either of the two things below that describe what the upstream will
+	// be sent. A filter that ran later would be metered as though it had not run
+	// and would hash bytes the backend never receives.
+	if err := d.filterRequest(ctx, st, rq, c); err != nil {
+		d.filter.refused.Add(1)
+		return nil, err
+	}
+
+	// The prompt-size estimate is taken here, after the filter, for the reason
+	// §10.5b rule 5 gives: what a transform masked is what the upstream is sent,
+	// so it is also what the budget hold and the context-window filter have to be
+	// about. A filter rewrites the canonical request in place, so estimating from
+	// it afterwards gets the masked size with no second pass over the bytes.
+	//
+	// It is structural, not a division of the body length. A base64 image is body
+	// bytes, and the length rule charged a 2 MB photograph ~900,000 tokens against
+	// a real cost near 1,600 — large enough that no window admits it, so ordinary
+	// multimodal traffic was refused everywhere rather than routed anywhere.
+	est := c.estimate()
+	c.rreq.InputTokens = est.Tokens
+	c.rreq.InputTokensExact, c.rreq.InputTokensMethod = est.Exact, est.Method
+
+	// image is the bytes the prefix claim is *about*. Without a filter it is the
+	// client's body, as before. With one it is the post-filter canonical
+	// request, because the backend keys its cache on what it received, and a
+	// digest over pre-filter bytes would claim a prefix the backend never saw.
+	//
+	// The invariant, so the next person does not move this back above the
+	// filter: same client prefix + same filter output ⇒ same digest. Both halves
+	// are needed. The filter's own identity — its pattern set and its derivation
+	// secret — is folded in for free, because changing either changes the masked
+	// bytes, so an edited pattern set *misses* the cache instead of corrupting a
+	// claim.
+	image := body
+	if c.mask != nil {
+		image = prefixImage(c, body)
+	}
+	if st.prefixOn && st.chunk > 0 && !c.noAffinity {
+		// The chain is seeded with the client-facing model group AND the
+		// principal, and cut at byte boundaries — there is no tokenizer on this
+		// path (§7.4b).
+		//
+		// The principal is in the seed because a prompt cache belongs to an
+		// account (§7.4a2). Without it two tenants sending identical bodies
+		// produce identical digests, so the affinity table pins tenant B to the
+		// deployment tenant A warmed — for a hit that cannot happen when they
+		// authenticate with different credentials, and, worse, for one B can
+		// *observe*: cache_read_input_tokens, or simply TTFT, answers "has
+		// somebody else recently sent exactly this?". The order of the two
+		// inputs is part of the digest, so it is fixed here and length-prefixed
+		// for the same reason chain.go suffixes segment lengths: two different
+		// splits must not produce one seed.
+		c.rreq.Digests = prefix.Compute(prefixSeed(rq.Model, c.rreq.Principal), image, st.chunk)
 	}
 	return c, nil
+}
+
+// prefixSeed builds the chain seed. See the comment at its only call site.
+func prefixSeed(model, principal string) string {
+	return strconv.Itoa(len(model)) + ":" + model + "|" + strconv.Itoa(len(principal)) + ":" + principal
+}
+
+// prefixImage renders the post-filter request for hashing.
+//
+// It marshals the canonical request rather than re-encoding the upstream body,
+// because the upstream encoding is chosen by routing and the digest is needed
+// before routing. It is deterministic — struct field order is fixed and
+// encoding/json sorts map keys — which is the only property the chain needs.
+func prefixImage(c *call, body []byte) []byte {
+	if c.creq == nil {
+		return body
+	}
+	b, err := json.Marshal(c.creq)
+	if err != nil {
+		return body
+	}
+	return b
 }
 
 // result is one attempt's outcome, in the two shapes its two consumers need:
@@ -363,11 +496,15 @@ type result struct {
 }
 
 // attempt makes one upstream call and relays its answer.
+//
+// Everything past this point is internal/backend's: the endpoint, the
+// credential, the request bytes, the retry policy, the error taxonomy and the
+// streaming relay. What stays here is what L5 deliberately does not take — the
+// routing decision it is handed, and the router's view of how the attempt went.
 func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 	dec *router.Decision, rq *server.Request, w http.ResponseWriter) result {
 
 	var res result
-	start := d.now()
 
 	up, ok := st.upstreams.provider(dec.Provider)
 	if !ok {
@@ -376,113 +513,170 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		res.outcome = router.Outcome{Err: res.err, Cause: router.CauseUpstream5xx}
 		return res
 	}
-	if err := checkFamily(c, up.api); err != nil {
+	// The crossing check stays in front of the backend rather than inside it,
+	// because it is a question about the CALLER's route and the deployment's
+	// family together — "a rerank request on a messages deployment" — and L5 is
+	// only ever told which operation to perform, not which frontend asked.
+	if err := checkFamily(c, up.API()); err != nil {
 		res.err = err
 		res.outcome = router.Outcome{Err: err}
 		return res
 	}
 
-	call, err := d.encodeUpstream(c, dec, up)
-	if err != nil {
-		res.err = err
-		res.outcome = router.Outcome{Err: err}
-		return res
+	target := backend.Target{
+		Provider:      up,
+		Credential:    dec.Credential,
+		UpstreamModel: dec.UpstreamModel,
+		// Direction-normalized for THIS engine by internal/router (§7.5).
+		// Nothing on this side negates, offsets or clamps it: two
+		// implementations of one negation is how vLLM and SGLang end up agreeing
+		// about a number they must disagree about.
+		PriorityField: dec.PriorityField,
+		Priority:      dec.Priority,
+		PriorityTier:  dec.PriorityTier,
 	}
+	return backendResult(d.backend.Do(ctx, target, d.backendCall(c, dec, rq), w))
+}
 
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, call.endpoint, bytes.NewReader(call.body))
-	if err != nil {
-		res.err = server.NewError(http.StatusBadGateway, server.TypeAPIError, err.Error()).
-			WithCode("upstream_request")
-		res.outcome = router.Outcome{Err: res.err, Cause: router.CauseUpstream5xx}
-		return res
+// backendCall renders one hop's request in the terms L5 takes.
+//
+// It is rebuilt per hop rather than once per request because two of its fields
+// are properties of the DEPLOYMENT — the catalogued output ceiling, and the
+// callback that stamps the routing decision — and a hop that reused the previous
+// deployment's would describe an attempt that did not happen.
+func (d *dispatcher) backendCall(c *call, dec *router.Decision, rq *server.Request) *backend.Call {
+	return &backend.Call{
+		Op:            c.operation(),
+		ClientAPI:     c.clientAPI,
+		Model:         c.model,
+		Body:          c.body,
+		Request:       c.creq,
+		Rerank:        c.rerankReq,
+		Moderation:    c.modReq,
+		Speech:        c.speechReq,
+		Transcription: c.transReq,
+		Image:         c.imageReq,
+		ResponseID:    c.responseID,
+		ResponseEcho:  c.respEcho,
+		Stream:        c.stream,
+		AllowLossy:    c.rreq.AllowLossy,
+		// The deployment's catalogued ceiling, for the wire shapes that make the
+		// field mandatory. Nothing is invented: a model the catalog declares no
+		// ceiling for yields zero, which the encoder turns into an explicit error
+		// rather than a guess (§10.7).
+		DefaultMaxTokens: d.defaultMaxTokens(dec.Kind, dec.UpstreamModel),
+		IncludeUsage:     c.allowUsg,
+		Transform:        c.transform(),
+		// The extension headers are stamped on the first write and anything set
+		// afterwards is invisible (DESIGN §10.4). For a stream the first write
+		// happens inside the backend, so this is the last moment the routing
+		// decision can still reach the client.
+		Accepted: func() { fillRouteResult(rq, dec) },
 	}
-	hreq.Header.Set("Content-Type", call.contentType)
-	// Identity encoding, always: a compressed stream cannot be relayed frame by
-	// frame and the terminal usage frame has to be readable (see openai.Scanner).
-	hreq.Header.Set("Accept-Encoding", "identity")
-	if c.stream {
-		hreq.Header.Set("Accept", "text/event-stream")
-	}
-	applyCredential(up.api, st.upstreams.secret(dec.Credential), hreq.Header)
+}
 
-	resp, err := d.client.Do(hreq)
-	if err != nil {
-		res.total = d.now().Sub(start)
-		cause := router.CauseUpstream5xx
-		status := http.StatusBadGateway
-		if errors.Is(err, context.DeadlineExceeded) {
-			cause, status = router.CauseTimeout, http.StatusGatewayTimeout
+// operation is which backend operation this call asks for.
+//
+// It is a mapping and not a shared type on purpose: a callKind is a FRONTEND
+// route and an Operation is what the backend must be asked for, and the two
+// coincide everywhere except audio and images, where one client kind covers
+// several upstream routes.
+func (c *call) operation() backend.Operation {
+	switch c.kind {
+	case callCountTokens:
+		return backend.OpCountTokens
+	case callEmbeddings:
+		return backend.OpEmbeddings
+	case callCompletions:
+		return backend.OpCompletions
+	case callResponses:
+		return backend.OpResponses
+	case callModerations:
+		return backend.OpModerations
+	case callRerank:
+		return backend.OpRerank
+	case callSpeech:
+		return backend.OpSpeech
+	case callTranscription:
+		if c.transReq != nil && c.transReq.Translate {
+			return backend.OpTranslation
 		}
-		res.err = server.NewError(status, server.TypeAPIError,
-			"upstream request failed: "+err.Error()).WithCode("upstream_unreachable")
-		res.outcome = router.Outcome{Err: err, Cause: cause, Total: res.total}
-		res.retryable = true
-		return res
+		return backend.OpTranscription
+	case callImages:
+		if c.imageReq != nil {
+			switch c.imageReq.Op {
+			case canonical.ImageEdit:
+				return backend.OpImageEdit
+			case canonical.ImageVariation:
+				return backend.OpImageVariation
+			}
+		}
+		return backend.OpImageGenerate
 	}
-	defer resp.Body.Close()
-	res.ttft = d.now().Sub(start)
+	return backend.OpChat
+}
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		res.total = d.now().Sub(start)
-		e := server.Normalize(resp.StatusCode, body)
-		cause := router.Classify(resp.StatusCode, nil)
-		res.err = e
+// backendResult renders one exchange in the two shapes this package's consumers
+// need: a [router.Outcome] for Report, and an error for the client.
+func backendResult(br backend.Result) result {
+	res := result{
+		usage:       br.Usage,
+		ttft:        br.TTFT,
+		total:       br.Total,
+		body:        br.Body,
+		contentType: br.ContentType,
+	}
+	if br.Err == nil {
 		res.outcome = router.Outcome{
-			Err: e, Status: resp.StatusCode, Cause: cause,
-			TTFT: res.ttft, Total: res.total,
-			RetryAfter: retryAfter(resp.Header),
-		}
-		res.retryable = cause.Chainable()
-		return res
-	}
-
-	// Everything the client can still learn from the headers is decided here,
-	// before the first byte: the extension headers are stamped on the first
-	// write and anything set afterwards is invisible (DESIGN §10.4).
-	fillRouteResult(rq, dec)
-
-	if c.stream {
-		usage, err := d.relayStream(c, dec, up, resp, w)
-		res.total = d.now().Sub(start)
-		res.usage = usage
-		if err != nil {
-			res.err = err
-			res.outcome = router.Outcome{Err: err, Cause: router.CauseUpstream5xx,
-				TTFT: res.ttft, Total: res.total, FirstByteSent: true}
-			return res
-		}
-		res.outcome = router.Outcome{
-			TTFT: res.ttft, Total: res.total, FirstByteSent: true,
-			InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens),
+			TTFT: br.TTFT, Total: br.Total, FirstByteSent: br.FirstByteSent,
+			InputTokens:  int64(br.Usage.InputTokens),
+			OutputTokens: int64(br.Usage.OutputTokens),
 		}
 		return res
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		res.total = d.now().Sub(start)
-		res.err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
-			"could not read the upstream response").WithCode("upstream_body")
-		res.outcome = router.Outcome{Err: err, Cause: router.CauseUpstream5xx, Total: res.total}
-		res.retryable = true
-		return res
-	}
-	out, ct, usage, err := d.convertResponse(c, dec, up, body, resp.Header)
-	res.total = d.now().Sub(start)
-	if err != nil {
-		res.err = err
-		res.outcome = router.Outcome{Err: err, Cause: router.CauseUpstream5xx, Total: res.total}
-		return res
-	}
-	res.usage = usage
-	res.body = out
-	res.contentType = ct
+	cause := backendCause(br)
+	res.err = br.Err
+	// Retryable here means "another DEPLOYMENT may be tried", never "call this
+	// provider again": the in-provider retry was already made and spent. A
+	// failure the fallback chain has no target for is terminal even when the
+	// backend was willing to hand it on.
+	res.retryable = br.Retryable && (br.Status < 400 || cause.Chainable())
 	res.outcome = router.Outcome{
-		TTFT: res.ttft, Total: res.total,
-		InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens),
+		Err: br.Err, Status: br.Status, Cause: cause,
+		TTFT: br.TTFT, Total: br.Total,
+		FirstByteSent: br.FirstByteSent, RetryAfter: br.RetryAfter,
 	}
 	return res
+}
+
+// backendCause classifies one failed exchange into a fail-back class.
+func backendCause(br backend.Result) router.Cause {
+	switch {
+	case br.Status >= 400:
+		// The status line alone cannot tell a context overflow from any other
+		// 400, which is why [router.Outcome.Cause] documents itself as the
+		// frontend's job for exactly this condition: the signature is in the
+		// body, and the backend's normalization has already decoded it out of
+		// whichever of the five upstream envelope shapes arrived. Consulting it
+		// is what makes §10.5a's "route to a larger window" reachable from an
+		// upstream signal at all — and it is the ONLY overflow path a deployment
+		// that declares no window has, which is the ordinary self-hosted case.
+		return upstreamCause(br.Status, br.Err)
+	case br.Timeout:
+		return router.CauseTimeout
+	case br.Err.Code == backend.CodeCredentialUnavailable:
+		// A credential dorang holds but cannot use. It is not this deployment's
+		// fault and not a transport failure; another deployment authenticating
+		// with a different credential may well serve the request.
+		return router.CauseAuth
+	case br.Transport, br.Status > 0:
+		// No response at all, or one whose body could not be read, converted or
+		// relayed. Both are the upstream's failure to answer.
+		return router.CauseUpstream5xx
+	}
+	// Nothing reached the wire: the request could not be addressed, encoded, or
+	// built. There is no upstream to blame.
+	return router.CauseNone
 }
 
 // writeBody sends a complete non-streaming answer.
@@ -495,233 +689,6 @@ func writeBody(w http.ResponseWriter, body []byte, contentType string) error {
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	_, err := w.Write(body)
 	return err
-}
-
-// upstreamRequest is one rendered upstream call.
-type upstreamRequest struct {
-	body        []byte
-	endpoint    string
-	contentType string
-}
-
-func jsonUpstream(body []byte, endpoint string) upstreamRequest {
-	return upstreamRequest{body: body, endpoint: endpoint, contentType: "application/json"}
-}
-
-// encodeUpstream renders the request for the deployment that will serve it and
-// names the endpoint it goes to.
-func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream) (upstreamRequest, error) {
-	switch c.kind {
-	case callEmbeddings:
-		body, err := replaceModel(c.body, dec.UpstreamModel)
-		if err != nil {
-			return upstreamRequest{}, server.NewError(http.StatusBadRequest,
-				server.TypeInvalidRequest, err.Error()).WithCode("invalid_request")
-		}
-		return jsonUpstream(body, up.endpoint(pathEmbeddings)), nil
-
-	case callCountTokens:
-		if up.api != catalog.APIAnthropicMessages {
-			return upstreamRequest{}, server.NewError(http.StatusNotImplemented,
-				server.TypeNotImplemented,
-				"count_tokens has no equivalent on this deployment's protocol").
-				WithCode("count_tokens_unsupported")
-		}
-		body, err := anthropic.MarshalRequest(c.creq, &anthropic.EncodeOptions{
-			Model:            dec.UpstreamModel,
-			DefaultMaxTokens: 1,
-		})
-		if err != nil {
-			return upstreamRequest{}, encodeError(err)
-		}
-		return jsonUpstream(body, up.endpoint(pathCountTokens)), nil
-
-	case callRerank, callModerations, callSpeech, callTranscription, callImages:
-		return d.encodeT1Upstream(c, dec, up)
-	}
-
-	req := *c.creq
-	if dec.PriorityField != "" {
-		// The engine's own priority field, already direction-normalized for
-		// THIS engine by the router (§7.5). Extra is the neutral request's
-		// pass-through map, so it reaches the wire without either encoder
-		// needing to know the field exists.
-		req.Extra = cloneExtra(req.Extra)
-		req.Extra[dec.PriorityField] = json.RawMessage(strconv.Itoa(dec.Priority))
-	}
-
-	switch up.api {
-	case catalog.APIAnthropicMessages:
-		body, err := anthropic.MarshalRequest(&req, &anthropic.EncodeOptions{
-			Model:            dec.UpstreamModel,
-			AllowLossy:       c.rreq.AllowLossy,
-			DefaultMaxTokens: d.defaultMaxTokens(dec),
-		})
-		if err != nil {
-			return upstreamRequest{}, encodeError(err)
-		}
-		return jsonUpstream(body, up.endpoint(pathMessages)), nil
-
-	default:
-		// The openai-responses KIND is served on the chat route deliberately.
-		// internal/wire/openai has a Responses request/response encoder but no
-		// Responses STREAM decoder — that surface's events are a typed sequence
-		// with nothing in common with a chat chunk — so sending this kind to
-		// /v1/responses would trade a working streaming deployment for a
-		// non-streaming one. DESIGN §4.3 records that the hosts declaring the
-		// kind serve BOTH routes, so the chat route is a correct address for
-		// them. dorang's own /v1/responses FRONTEND is unaffected: it decodes to
-		// the neutral form and reaches whatever the deployment speaks.
-		if c.kind == callCompletions {
-			body, err := openai.MarshalCompletionRequest(&req, &openai.EncodeOptions{Model: dec.UpstreamModel})
-			if err != nil {
-				return upstreamRequest{}, encodeError(err)
-			}
-			return jsonUpstream(body, up.endpoint(pathCompletions)), nil
-		}
-		body, err := openai.MarshalRequest(&req, &openai.EncodeOptions{Model: dec.UpstreamModel})
-		if err != nil {
-			return upstreamRequest{}, encodeError(err)
-		}
-		return jsonUpstream(body, up.endpoint(pathChatCompletions)), nil
-	}
-}
-
-// convertResponse turns the upstream answer into the client's protocol.
-//
-// A same-family exchange still goes through the neutral form rather than being
-// copied: §7.2 requires the body to carry the name the client asked for, and the
-// name is not the only place the two differ once a deployment's upstream model
-// id is not the client's.
-func (d *dispatcher) convertResponse(c *call, dec *router.Decision, up *upstream,
-	body []byte, header http.Header) ([]byte, string, canonical.Usage, error) {
-
-	switch c.kind {
-	case callEmbeddings:
-		out, err := replaceModel(body, c.model)
-		if err != nil {
-			return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway,
-				server.TypeAPIError, "the upstream answer was not a JSON object").
-				WithCode("upstream_shape")
-		}
-		u, _ := scanEmbeddingUsage(body)
-		return out, jsonContentType, u, nil
-
-	case callCountTokens:
-		// The count is the whole answer; there is nothing to convert and no
-		// usage to price beyond the request itself.
-		return body, jsonContentType, canonical.Usage{}, nil
-
-	case callRerank, callModerations, callSpeech, callTranscription, callImages:
-		return d.convertT1Response(c, up, body, header)
-	}
-
-	var (
-		cresp *canonical.Response
-		err   error
-	)
-	switch up.api {
-	case catalog.APIAnthropicMessages:
-		cresp, err = anthropic.DecodeResponse(body, &anthropic.DecodeOptions{Model: c.model})
-	default:
-		if c.kind == callCompletions {
-			cresp, err = openai.DecodeCompletionResponse(body, &openai.DecodeOptions{Model: c.model})
-		} else {
-			cresp, err = openai.DecodeResponse(body, &openai.DecodeOptions{Model: c.model})
-		}
-	}
-	if err != nil {
-		return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway, server.TypeAPIError,
-			"could not read the upstream response: "+err.Error()).WithCode("upstream_decode")
-	}
-	var usage canonical.Usage
-	if cresp.Usage != nil {
-		usage = *cresp.Usage
-	}
-
-	var out []byte
-	switch {
-	case c.kind == callCompletions:
-		out, err = openai.MarshalCompletionResponse(cresp, &openai.ResponseOptions{Model: c.model})
-	case c.kind == callResponses:
-		if c.responseID != "" {
-			cresp.ID = c.responseID
-		}
-		out, err = openai.MarshalResponsesResponse(cresp, c.respEcho)
-	case c.clientAPI == catalog.APIAnthropicMessages:
-		out, err = anthropic.MarshalResponse(cresp, &anthropic.ResponseOptions{Model: c.model})
-	default:
-		out, err = openai.MarshalResponse(cresp, &openai.ResponseOptions{Model: c.model})
-	}
-	if err != nil {
-		return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
-			"could not render the response: "+err.Error()).WithCode("response_encode")
-	}
-	return out, jsonContentType, usage, nil
-}
-
-// jsonContentType is the answer of every route whose body is JSON, which is all
-// of them but speech and a subtitle-formatted transcript.
-const jsonContentType = "application/json"
-
-// relayStream forwards an event stream to the client.
-//
-// OpenAI to OpenAI is the one case that is not decoded: internal/wire/openai's
-// Scanner rewrites the model field in place and reads the terminal usage frame
-// without parsing a single chunk, which is what keeps the per-token path free of
-// a JSON round trip. Every other combination goes through the neutral event
-// stream, because the two families disagree about block boundaries and there is
-// nothing to relay verbatim.
-func (d *dispatcher) relayStream(c *call, dec *router.Decision, up *upstream,
-	resp *http.Response, w http.ResponseWriter) (canonical.Usage, error) {
-
-	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
-
-	if c.clientAPI == catalog.APIOpenAIChat && up.api == catalog.APIOpenAIChat {
-		sc := openai.NewScanner(&flushWriter{w: w}, openai.ScannerOptions{
-			From:         dec.UpstreamModel,
-			To:           c.model,
-			CollectUsage: true,
-		})
-		if _, err := io.Copy(sc, resp.Body); err != nil {
-			return canonical.Usage{}, err
-		}
-		if err := sc.Flush(); err != nil {
-			return canonical.Usage{}, err
-		}
-		u, _ := sc.Usage()
-		return u, nil
-	}
-
-	events, err := newEventSource(up.api, resp.Body)
-	if err != nil {
-		return canonical.Usage{}, err
-	}
-	sink, err := newEventSink(c, w)
-	if err != nil {
-		return canonical.Usage{}, err
-	}
-	for {
-		batch, err := events.next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return sink.usage(), err
-		}
-		for _, ev := range batch {
-			if err := sink.write(ev); err != nil {
-				return sink.usage(), err
-			}
-		}
-	}
-	if err := sink.close(); err != nil {
-		return sink.usage(), err
-	}
-	return sink.usage(), nil
 }
 
 // settle prices a completed request, feeds the quota meters and fills the parts
@@ -803,9 +770,26 @@ func fillRouteResult(rq *server.Request, dec *router.Decision) {
 		rq.Result.FallbackFrom = dec.Reason
 		rq.Result.FallbackFromDeployment = prev
 	}
-	if names := dec.Dropped.Params(); len(names) > 0 {
-		rq.Result.DroppedParams = strings.Join(names, ",")
+	rq.Result.DroppedParams = droppedParams(dec)
+}
+
+// droppedParams is what x-dorang-dropped-params carries: the capability
+// conversion removed, plus the client priority hint when this principal has no
+// §10.5 grant.
+//
+// The hint belongs on the same header for the reason §10.3 gives — silently
+// discarding something a caller sent leaves them believing it took effect — and
+// §10.5 names this header specifically. Before this, a hint was dropped in
+// complete silence, which was easy to miss because it was also never read.
+func droppedParams(dec *router.Decision) string {
+	names := dec.Dropped.Params()
+	if dec.PriorityHintDropped {
+		names = append(names, HeaderClientPriority)
 	}
+	if len(names) == 0 {
+		return ""
+	}
+	return strings.Join(names, ",")
 }
 
 // routeError renders a routing refusal as an HTTP answer. router.Error already
@@ -830,24 +814,18 @@ func routeError(err error) error {
 	return err
 }
 
-func encodeError(err error) error {
-	return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-		"the request cannot be expressed by the selected deployment: "+err.Error()).
-		WithCode("conversion_failed")
-}
-
-// defaultMaxTokens is the output ceiling handed to the Anthropic encoder when
-// the caller named none. The field is required on that surface, and a constant
+// defaultMaxTokens is the output ceiling handed to an encoder when the caller
+// named none. The field is required on the messages surface, and a constant
 // would silently cap output at a number the caller never chose, so the
 // deployment's catalogued ceiling is used and nothing is invented (§10.7).
 // A model the catalog does not declare a ceiling for yields zero, which the
 // encoder turns into an explicit error rather than a guess.
-func (d *dispatcher) defaultMaxTokens(dec *router.Decision) int {
+func (d *dispatcher) defaultMaxTokens(kind, upstreamModel string) int {
 	st := d.state()
 	if st == nil || st.catalog == nil {
 		return 0
 	}
-	return st.catalog.Model(dec.Kind, dec.UpstreamModel).MaxOutputTokens
+	return st.catalog.Model(kind, upstreamModel).MaxOutputTokens
 }
 
 func principalID(rq *server.Request) string {
@@ -857,6 +835,13 @@ func principalID(rq *server.Request) string {
 	return rq.Principal.KeyID()
 }
 
+// maxOutputTokens is the ceiling the CALLER named, and nothing else.
+//
+// Zero means they named none, which on the OpenAI family is the common case
+// rather than an edge one — max_tokens is optional there. It is deliberately not
+// filled in with a default here: the number that belongs in its place is the
+// serving deployment's own declared ceiling, and no deployment has been chosen
+// yet. internal/router applies it per candidate, where it is knowable.
 func maxOutputTokens(c *canonical.Request) int64 {
 	if c == nil || c.MaxTokens == nil {
 		return 0
@@ -864,13 +849,9 @@ func maxOutputTokens(c *canonical.Request) int64 {
 	return int64(*c.MaxTokens)
 }
 
-// estimateInputTokens is the pessimistic prompt-size estimate of §10.5a.
-//
-// It errs high on purpose: an over-estimate costs an unnecessary route to a
-// larger model, an under-estimate costs a hard failure the router cannot see.
-// Three bytes per token is below every tokenizer's real ratio for prose and is
-// arithmetic rather than a tokenizer on the hot path.
-func estimateInputTokens(body []byte) int64 { return int64((len(body) + 2) / 3) }
+// estimateInputTokens is gone. It divided the raw request body by three, which
+// made a base64 image cost several hundred times what an image costs; the
+// replacement is internal/tokenest, reached through (*call).estimate.
 
 // parseAllowLossy reads the x-dorang-allow-lossy opt-in.
 func parseAllowLossy(v string) canonical.Capability {
@@ -884,77 +865,4 @@ func parseAllowLossy(v string) canonical.Capability {
 		}
 	}
 	return out
-}
-
-func cloneExtra(in map[string]json.RawMessage) map[string]json.RawMessage {
-	out := make(map[string]json.RawMessage, len(in)+1)
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-// retryAfter reads a provider-signalled cooldown.
-func retryAfter(h http.Header) time.Duration {
-	v := h.Get("Retry-After")
-	if v == "" {
-		return 0
-	}
-	if n, err := strconv.Atoi(v); err == nil && n > 0 {
-		return time.Duration(n) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
-
-// replaceModel swaps the top-level "model" of a JSON object.
-//
-// It decodes into a raw-message map, so every other field survives byte for
-// byte and the model name is copied whole: nothing here splits it (§2.1).
-func replaceModel(body []byte, model string) ([]byte, error) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return nil, err
-	}
-	if obj == nil {
-		return nil, errors.New("body is not a JSON object")
-	}
-	enc, err := json.Marshal(model)
-	if err != nil {
-		return nil, err
-	}
-	obj["model"] = enc
-	return json.Marshal(obj)
-}
-
-// scanEmbeddingUsage reads the usage object of an embeddings answer, which is
-// the only part of that body dorang looks inside.
-func scanEmbeddingUsage(body []byte) (canonical.Usage, bool) {
-	var shape struct {
-		Usage *struct {
-			PromptTokens int `json:"prompt_tokens"`
-			TotalTokens  int `json:"total_tokens"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &shape); err != nil || shape.Usage == nil {
-		return canonical.Usage{}, false
-	}
-	return canonical.Usage{InputTokens: shape.Usage.PromptTokens}, true
-}
-
-// flushWriter pushes every relayed chunk to the client immediately. Without it
-// a streaming response is buffered and arrives as one block, which is not a
-// stream.
-type flushWriter struct{ w http.ResponseWriter }
-
-func (f *flushWriter) Write(p []byte) (int, error) {
-	n, err := f.w.Write(p)
-	if fl, ok := f.w.(http.Flusher); ok {
-		fl.Flush()
-	}
-	return n, err
 }

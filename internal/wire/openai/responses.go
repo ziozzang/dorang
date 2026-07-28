@@ -845,6 +845,7 @@ func EncodeResponsesRequest(req *canonical.Request, opt *EncodeOptions) (*Respon
 	names := opt.toolNames()
 	for i := range req.Tools {
 		t := &req.Tools[i]
+		names.Declare(t.Name)
 		typ := t.Type
 		if typ == "" {
 			typ = "function"

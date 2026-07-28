@@ -15,6 +15,11 @@ import (
 // families refuse them through their own `default` branch, which is where a
 // refusal belongs: the shape decides what it serves.
 //
+// The Responses API appears here only in [encodeT1Client], the CLIENT-facing
+// half. Its upstream half is the chat request every family already understands,
+// so it is encoded by the ordinary chat path and the operation only decides how
+// the answer is rendered — see [openaiAdapter.endpoint].
+//
 // Two of them are not JSON in one direction and that is the whole reason this
 // file has any structure at all:
 //
@@ -38,16 +43,6 @@ func encodeT1(x *exchange) ([]byte, error) {
 	switch c.Op {
 	case OpCompletions:
 		return openai.MarshalCompletionRequest(x.req, &openai.EncodeOptions{Model: model})
-
-	case OpResponses:
-		// dorang owns the conversation state (DESIGN §9.2 [R1-C7]), so the
-		// upstream is asked to store nothing and is never handed a reference it
-		// did not issue: the previous turns were expanded into the neutral
-		// request's messages before this point.
-		req := *x.req
-		req.Store = falsePtr()
-		req.PreviousResponseID = ""
-		return openai.MarshalResponsesRequest(&req, &openai.EncodeOptions{Model: model})
 
 	case OpModerations:
 		return openai.MarshalModerationRequest(c.Moderation, model)
@@ -84,13 +79,6 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 	switch c.Op {
 	case OpCompletions:
 		resp, err := openai.DecodeCompletionResponse(body, &openai.DecodeOptions{Model: c.Model})
-		if err != nil {
-			return nil, err
-		}
-		return &decoded{resp: resp}, nil
-
-	case OpResponses:
-		resp, err := openai.DecodeResponsesResponse(body, &openai.DecodeOptions{Model: c.Model})
 		if err != nil {
 			return nil, err
 		}
@@ -183,5 +171,3 @@ const jsonType = "application/json"
 func multipartType(boundary string) string {
 	return "multipart/form-data; boundary=" + boundary
 }
-
-func falsePtr() *bool { v := false; return &v }

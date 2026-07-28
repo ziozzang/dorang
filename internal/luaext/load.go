@@ -37,10 +37,12 @@ var docExts = map[string]bool{".md": true, ".txt": true, ".yaml": true, ".yml": 
 // Three things are load errors rather than skips, because each of them is a
 // configuration that looks like it works and does not:
 //
-//   - A `.lua` file. This build cannot run Lua (see the package documentation),
-//     and silently ignoring the file would leave an operator with a policy they
-//     believe is enforced. This is the promise that the configuration surface
-//     does not accept Lua that never runs.
+//   - A `.lua` file. Lua *is* executable in this build — see [Plugin] — but only
+//     because an operator named the file in the configuration. A plugin that ran
+//     because it was found in a writable directory is precisely the
+//     code-execution primitive §11.5 refuses, so a `.lua` here is an error that
+//     tells the operator where to declare it, not a file that is silently
+//     ignored and not one that is silently run.
 //   - A file whose name does not start with a hook point, or names a hook that
 //     extensions.lua.hooks excludes.
 //   - Any other unrecognised extension.
@@ -63,9 +65,10 @@ func LoadDir(dir string, allowed uint8) ([]*Program, error) {
 		ext := strings.ToLower(filepath.Ext(name))
 		switch {
 		case ext == ".lua":
-			return nil, fmt.Errorf("%w: %s: rewrite it as a %s policy or register a Go hook; "+
-				"see internal/luaext's package documentation for why this build has no Lua VM",
-				ErrLuaSource, filepath.Join(dir, name), PolicyExt)
+			return nil, fmt.Errorf("%w: %s: declare it under filters.plugins with a name and a "+
+				"path, which is how a plugin is loaded (§11.5); a directory that runs whatever "+
+				"appears in it is a code-execution primitive",
+				ErrLuaSource, filepath.Join(dir, name))
 		case docExts[ext]:
 			continue
 		case ext != PolicyExt:

@@ -50,6 +50,24 @@ const (
 	ReasonNoPrincipal
 	// ReasonUnavailable: the store could not be consulted for an unknown key.
 	ReasonUnavailable
+	// ReasonPended: the key is pended by the token guard (DESIGN §11.6).
+	//
+	// It is a distinct, documented refusal and not a second spelling of
+	// "blocked", because the two are different judgements that fail
+	// differently. Blocked is a decision an operator made; pended is a
+	// statistical judgement that might be wrong, and it is released in one
+	// action without reissuing a credential. A caller who cannot tell them
+	// apart cannot tell an outage from a policy, and a support ticket that says
+	// "blocked" sends the operator to the wrong screen.
+	ReasonPended
+	// ReasonSecretRetired: the key is fine and this SECRET is not — its
+	// rotation grace period ended, or an operator cut it short (§11.2c).
+	//
+	// Distinct from ReasonExpired for the reason that makes rotation worth
+	// having: the fix is "use the secret you were issued", not "ask for a new
+	// key". Reporting a retired secret as an expired key sends a caller to
+	// re-provisioning, which is the thing rotation exists to avoid.
+	ReasonSecretRetired
 )
 
 // String returns the wire code for the reason.
@@ -85,6 +103,10 @@ func (r Reason) String() string {
 		return "no_principal"
 	case ReasonUnavailable:
 		return "auth_unavailable"
+	case ReasonPended:
+		return "credential_pended"
+	case ReasonSecretRetired:
+		return "secret_retired"
 	}
 	return "unknown"
 }
@@ -121,6 +143,10 @@ func (r Reason) message() string {
 		return "API key has no owning user or team"
 	case ReasonUnavailable:
 		return "authentication is temporarily unavailable"
+	case ReasonPended:
+		return "API key is pended pending review and can be released by an operator"
+	case ReasonSecretRetired:
+		return "this API key secret has been retired; use the secret issued by the most recent rotation"
 	}
 	return "authentication failed"
 }
@@ -174,6 +200,11 @@ func (e *Error) Status() int {
 	switch e.Reason {
 	case ReasonBlocked, ReasonModelNotAllowed, ReasonRouteNotAllowed, ReasonNoPrincipal:
 		return http.StatusForbidden
+	case ReasonPended:
+		// 403, with the key authenticated: the credential is genuine and the
+		// policy refused it. A 401 would tell a caller to check their key,
+		// which is the one thing that will not help.
+		return http.StatusForbidden
 	case ReasonRateLimited:
 		return http.StatusTooManyRequests
 	case ReasonBudgetExceeded:
@@ -206,6 +237,8 @@ var (
 	ErrRateLimited        = &Error{Reason: ReasonRateLimited}
 	ErrNoPrincipal        = &Error{Reason: ReasonNoPrincipal}
 	ErrUnavailable        = &Error{Reason: ReasonUnavailable}
+	ErrPended             = &Error{Reason: ReasonPended}
+	ErrSecretRetired      = &Error{Reason: ReasonSecretRetired}
 )
 
 // ReasonOf extracts the reason from an error, or ReasonNone.

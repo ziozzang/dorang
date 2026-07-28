@@ -497,7 +497,7 @@ func TestObserverHealthAndMetricsAreSurfaced(t *testing.T) {
 		t.Errorf("liveness must stay minimal: %s", w.Body.String())
 	}
 
-	w = do(s, get("/metrics"))
+	w = do(s, getAdmin("/metrics"))
 	if !strings.Contains(w.Body.String(), "dorang_shadow_cost_capped 1") {
 		t.Error("observer metrics are not on the scrape")
 	}

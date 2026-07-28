@@ -199,15 +199,7 @@ func TestFamilyMismatchIsANamed501(t *testing.T) {
 	}
 }
 
-// TestRerankEndpointIsVersionedPerRoute. The vendor's own rerank lives at
-// /v2/rerank on a bare host; running it through the helper that supplies "/v1"
-// produces /v1/v2/rerank, which 404s.
-func TestRerankEndpointIsVersionedPerRoute(t *testing.T) {
-	up := &upstream{baseURL: "https://api.example.test"}
-	if got := up.endpointRaw(cohereRerankPath); got != "https://api.example.test/v2/rerank" {
-		t.Errorf("cohere rerank endpoint %q", got)
-	}
-	if got := up.endpoint(pathRerank); got != "https://api.example.test/v1/rerank" {
-		t.Errorf("generic rerank endpoint %q", got)
-	}
-}
+// Endpoint derivation is asserted in internal/backend, which owns it:
+// TestEndpointDerivation covers both rerank spellings — the vendor's own
+// /v2/rerank on a bare host and the ordinary /v1/rerank every OpenAI-compatible
+// engine serves — alongside every other catalogued kind.

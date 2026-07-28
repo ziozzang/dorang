@@ -33,7 +33,7 @@ with a machine-readable code**, never a silent `404`.
 | `/v1/messages`, `/v1/messages/count_tokens` | POST | yes |
 | `/v1/models`, `/models` | GET, HEAD | yes |
 | `/health`, `/health/liveness`, `/health/liveliness`, `/health/readiness` | GET, HEAD, OPTIONS | **no** |
-| `/metrics` | GET, HEAD | **no** |
+| `/metrics` | GET, HEAD | **yes — master credential or an admin key**, unless `observability.metrics.public: true` |
 
 **T1 — a generic SDK call fails without these:**
 
@@ -147,31 +147,40 @@ docker run -d --name dorang \
 
 The entrypoint is `dorang --config /etc/dorang/config.yaml`.
 
-Two things about the image that will bite you:
+Two things about the image that used to bite you, and no longer do:
 
-⚠️ **The `HEALTHCHECK` is broken.** It invokes `dorangctl health --addr http://127.0.0.1:4100`,
-and `dorangctl` has **no `health` subcommand** — the call exits 2 with `unknown command "health"`,
-so the container is reported unhealthy from `start-period + 3 × interval` onwards regardless of
-the process's real state. Override it, or drop it and use an orchestrator probe:
+**The `HEALTHCHECK` works.** It invokes `dorangctl health --addr http://127.0.0.1:4100`, which
+probes `/health/liveliness` and exits non-zero on anything but a `200`. Liveness rather than
+readiness on purpose: a draining node is alive and must not be restarted (§13), and conflating
+the two turns a graceful drain into a kill. `--ready` probes readiness when that is what you
+want, and `--addr` defaults from `DORANG_LISTEN`, so an image that moved its listener does not
+also have to rewrite its probe.
 
-```
-docker run --health-cmd='wget -qO- http://127.0.0.1:4100/health/readiness || exit 1' …
-```
-— except the distroless image has no `wget` either. In practice: run with `--no-healthcheck`
-and probe `/health/readiness` from outside the container.
+This was broken for the whole of the image's life: there was no `health` subcommand, so the
+call exited 2 with `unknown command "health"` and the container was reported unhealthy from
+`start-period + 3 × interval` onwards regardless of the process's real state. The image is
+distroless — no `curl`, no `wget`, no shell — so nothing else in it could have probed either.
+`cmd/dorangctl/health_test.go` now reads the Dockerfile's own `HEALTHCHECK` line and feeds its
+arguments to the real dispatcher, because the two halves disagreeing was the defect, not either
+half on its own.
 
-⚠️ **`DORANG_STATE_DIR=/var/lib/dorang` is set by the image and read by nothing.** The state
-paths come from `storage.sqlite.path` and `metering.spool.dir` and default to `~/.dorang/…`,
-which under `nonroot` is `/home/nonroot`, **not** the declared volume. Point them at the volume
-explicitly:
+**`DORANG_STATE_DIR=/var/lib/dorang` is read.** Every shipped state path is written
+`~/.dorang/…`, and a leading `~` resolves to the state directory: the database, the trace
+spool, batch blobs, the shadow report, and the generated key pepper. Setting an absolute path
+in the file still wins — that is an instruction, not a default, and re-rooting it silently would
+make the variable a way to redirect a deliberate choice.
+
+Before this, `~` was the serving user's home, which under `nonroot` is `/home/nonroot`: outside
+the declared volume, in the container's writable layer, and gone on `docker rm`. The database
+was the visible loss; the pepper was the expensive one, because regenerating it makes every api
+key issued under it unverifiable.
+
+To place state somewhere other than the volume, say so:
 
 ```yaml
-storage: {driver: sqlite, sqlite: {path: /var/lib/dorang/dorang.db}}
-metering: {spool: {dir: /var/lib/dorang/spool}}
+storage: {driver: sqlite, sqlite: {path: /srv/dorang/dorang.db}}
+metering: {spool: {dir: /srv/dorang/spool}}
 ```
-
-Otherwise your database and spool live in the container's writable layer and vanish on
-`docker rm`.
 
 ### 1.3 Kubernetes probes
 
@@ -463,7 +472,20 @@ truncated prompt, which removes the only signal `context_window` fallback has.
 is hand-rolled rather than backed by a client library — the notebook tier has no required
 dependencies, and that includes a metrics library.
 
-⚠️ **`/metrics` is unauthenticated and `observability.prometheus: false` does not turn it off.**
+**`/metrics` authenticates.** It needs the master credential (or an admin key) unless
+`observability.metrics.public: true` says otherwise, and `observability.prometheus: false`
+removes the route entirely — it then answers 501 with a reason, like any other route this build
+does not serve. Both were unread before: the scrape carries per-key spend, per-credential quota
+state and every configured model name, on whatever port the gateway listens on.
+
+A scrape configuration therefore needs a credential:
+
+```yaml
+scrape_configs:
+  - job_name: dorang
+    authorization: {type: Bearer, credentials_file: /etc/prometheus/dorang-master-key}
+    static_configs: [{targets: ["dorang:4100"]}]
+```
 The config key is never read. If the port is reachable, so is the scrape. Put it behind your
 network boundary.
 
@@ -486,7 +508,7 @@ Per-key and per-model figures come from the ledger, not from the scrape.
 | `dorang_late_errors_total` | counter | Errors delivered **in band** because the response had already started |
 | `dorang_handler_panics_total` | counter | Panics recovered in a handler |
 | `dorang_meter_panics_total` | counter | Panics recovered in the meter; requests unaffected |
-| `dorang_passthrough_requests_total` | counter | ⚠️ Has no increment site in this build; always 0 |
+| `dorang_passthrough_requests_total` | counter | Requests served by the generic passthrough engine, counted at entry — a relay that cannot dial its upstream still counted |
 | `dorang_websocket_upgrades_total` | counter | WebSocket upgrades relayed |
 | `dorang_replay_refused_total` | counter | Requests marked non-replayable because the process-wide replay budget was full |
 | `dorang_body_too_large_total` | counter | Requests refused for exceeding the body cap |
@@ -612,20 +634,24 @@ Each row is a condition worth paging on, what it actually means, and the first a
 | Work dropped | `increase(dorang_shadow_dropped_total[1h]) > 0` | The shadow queue was full and work was discarded. Coverage has a hole you cannot see from the report | Raise `queue_size` or `workers`, or lower `sample_rate` |
 | Report truncated | `increase(dorang_shadow_report_dropped_total[1h]) > 0` | The report hit its byte cap. **A truncated report read as an empty one is the worst outcome this mechanism has** | Raise `report.max_bytes`, rotate the file, and re-run |
 
-### 7.4 What you cannot alert on in this build
+### 7.4 Metering degradation
 
-⚠️ There is **no metering-degradation signal**. The meter tracks five degradation reasons —
-`trace_queue_full`, `spool_full`, `spool_error`, `sink_error` — with hysteresis so it cannot
-flap, and **nothing reads it**: no metric, no health field, no log-driven counter. The design's
-"the drop is never silent" is not true of this build. Until it is wired, watch the spool
-directory's size and the store's own health instead, and treat §11.4 as the diagnosis procedure
-rather than the alert.
+The meter tracks five degradation reasons — `trace_queue_full`, `spool_full`, `spool_error`,
+`sink_error` and `none` — with hysteresis, so a steady drop rate cannot flap the signal. It is
+readable in two places:
 
-There are also no exported metrics for capacity occupancy per axis, credential health, provider
-quota percentage, budget consumption ratio, prefix hit ratio, or fallbacks by reason. The
-underlying state exists in the capacity broker, the health tracker, the prefix table and the
-cluster node; none of it reaches `/metrics`, and the admin API that would expose it is not
-mounted (§0.2).
+| Where | What |
+|---|---|
+| `dorang_metering_degraded` / `dorang_metering_degraded_reason{reason=…}` | the gauge and its state set. Sampling and the daily byte budget never set them: those are policy, and conflating policy with failure makes the signal useless on any deployment that samples |
+| `GET /health` → `"metering"` | `{"degraded":…,"reason":…,"dropped":…,"spool_bytes":…}`, present on every response rather than only when degraded — otherwise "not degraded" and "this build does not report it" look the same |
+
+| Alert | Expression | Why |
+|---|---|---|
+| Metering degraded | `dorang_metering_degraded == 1` | Trace payloads are being lost or failing to ship. Numeric accounting is unaffected (§12.1), so the bill is still right and the traces behind it are not |
+
+It never changes the health status code. Losing trace payloads is a data-quality failure, not a
+serving failure, and taking the pod out of rotation for it would turn a metering incident into
+an outage.
 
 ---
 
@@ -896,7 +922,6 @@ Two things that are **not** causes any more, and were:
 | A reload "did nothing" | It probably succeeded and rebuilt only what is rebuildable. Storage, the authenticator, the meter and the capacity broker are **not** replaced on reload — that needs a restart |
 | A shadow configuration change is ignored | Correct. `shadow:` is the one section that refuses to hot-reload, because rebuilding it re-arms the daily cost ceiling |
 | A passthrough prefix 501s | Its provider has no `base_url`, so the route was dropped at build time rather than pointed at nothing |
-| `/metrics` still serves after setting `observability.prometheus: false` | The key is never read (§12) |
 | A model routes to the wrong deployment and the decision headers look right | Historically this exact shape existed: pinned and quota-filtered candidate lists were cut from one shared buffer, so every candidate carried the last one's provider, and reservations landed on another deployment's axes **while the decision reported the correct identity**. No assertion about a decision can observe that. If you see it, capture `X-Dorang-Deployment` *and* the capacity snapshot together |
 | A multi-axis request waits forever while both its axes stay busy | Risk W8, open. A waiter needing two saturated axes can sit at the head of both queues and never find them free at the same instant. Aging cannot close it — the waiter is never overtaken, it simply never wins. Widen one of the two axes |
 
@@ -909,20 +934,16 @@ Operationally relevant gaps, so you do not plan around something that is not the
 | Area | Status |
 |---|---|
 | **HTTP administration** | `internal/admin` is complete, tested and **not mounted**. All of `/key/*`, `/user/*`, `/team/*`, `/model/*`, `/budget/*`, `/spend/*`, `/admin/*` and the embedded `/ui` answer 501. Use `dorangctl` |
-| **Metering degradation signal** | Tracked internally with five reasons and hysteresis; **read by nothing**. No metric, no health field. Note that `internal/notify` has its own, separately reported, degraded state — the two are not the same signal |
-| `observability.prometheus` | Never read; `/metrics` is unconditional and unauthenticated |
 | `observability.otlp_endpoint` | No exporter is wired. The latency breakdown is recorded and not exported |
-| Per-key / user / team `rpm` and `tpm` | Stored and carried on the principal; the observed-rate inputs are **never supplied**, so the checks never fire. Use `deployments[].limits[]` (which becomes a per-credential rolling-minute quota) and `capacity.principals` |
-| Per-key `max_parallel` | Stored; not fed to the capacity broker. Use `capacity.principals.<key-id>.max_concurrent` |
-| `capacity.*.rpm`, `.tpm`, `.max_queue`, `.max_queue_wait` | Validated, unwired. The broker implements counted gauges only |
-| `key_rotation.strategy` | Validated, unwired. Credentials are tried in configuration order |
+| Per-key `rpm_limit` / `tpm_limit` on a USER or a TEAM | The rolling minute is counted per **api key**, so a user or team ceiling is enforced per key rather than across the keys under it. A single key cannot exceed it; ten keys under one team can, ten times over |
+| `capacity.*.rpm`, `.tpm` | **Refused at load**, naming the working home: `deployments[].limits[]` for a per-deployment rate, the api key's own `rpm_limit`/`tpm_limit` for a per-caller one |
 | **Lua** | There is **no Lua interpreter**, and that is a decision rather than an omission — see [CONFIG.md](CONFIG.md) §16. The four hook points, their ceilings and their secret-free views are built; what runs in them is a total policy language (`*.policy`) or a compiled-in Go `Native`. A `.lua` file under `extensions.lua.dir` is a **load error**, never a file that is silently ignored |
 | `on_route` re-routing | The hook sees the chosen deployment and may refuse it; it cannot ask for a different one |
-| `quota_urgency` routing | Designed (expiring-quota urgency); not an accepted strategy name |
 | Top-level `quotas:` and `budget:` blocks | Not in the schema. Budgets are per-key via `dorangctl key create --budget-usd` |
 | Credential import from an incumbent database | Implemented in the store and **has no CLI entry point** — see [MIGRATION.md](MIGRATION.md) §3 |
-| Capacity / health / prefix / cluster metrics | State exists; nothing exports it, and the admin API that would is not mounted |
-| `dorangctl health` | Referenced by the image's `HEALTHCHECK`; does not exist |
+| Rate limiting across nodes | The rolling minute is per process. An N-node deployment enforces N times every `rpm_limit` and `tpm_limit`. The durable ledger would close it, at a store write per request — not taken |
+| `tpm_limit` bounds the NEXT request | A token count does not exist until settlement, so one enormous request can cross the ceiling once before anything refuses |
+| `providers[].usage_probe`, `providers[].metrics.interval`, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. The list is held as executable state in `internal/config/consumed_test.go`, so it cannot drift; see [CONFIG.md](CONFIG.md) §23.1 |
 
 ---
 

@@ -116,6 +116,9 @@ type fakeStore struct {
 	keys      map[string]*Key
 	verifiers map[string]Verifier
 	keyOrder  []string
+	// secrets models §11.2c: a key has an id and one or more secrets, and
+	// everything except the verifier hangs off the id.
+	secrets map[string][]KeySecret
 
 	users     map[string]*User
 	userOrder []string
@@ -167,6 +170,13 @@ func (s *fakeStore) CreateKey(_ context.Context, k *Key, v Verifier) error {
 	s.keys[k.ID] = &cp
 	s.verifiers[k.ID] = v
 	s.keyOrder = append(s.keyOrder, k.ID)
+	if s.secrets == nil {
+		s.secrets = map[string][]KeySecret{}
+	}
+	s.secrets[k.ID] = []KeySecret{{
+		ID: k.ID + ".1", Generation: 1, KeyLabel: k.KeyLabel,
+		Current: true, CreatedAt: k.CreatedAt,
+	}}
 	return nil
 }
 
@@ -253,6 +263,115 @@ func (s *fakeStore) ReplaceVerifier(_ context.Context, id string, v Verifier, la
 	s.verifiers[id] = v
 	k.KeyLabel = label
 	k.HashScheme = v.HashScheme
+	k.UpdatedAt = now
+	return nil
+}
+
+// --- rotation and pend (§11.2c, §11.6) ---
+
+var _ RotatingKeyStore = (*fakeStore)(nil)
+var _ PendableKeyStore = (*fakeStore)(nil)
+
+func (s *fakeStore) Rotate(_ context.Context, id string, v Verifier, label string, grace time.Duration, now time.Time) (RotationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.keys[id]
+	if !ok {
+		return RotationResult{}, ErrNotFound
+	}
+	list := s.secrets[id]
+	var (
+		prev    KeySecret
+		prevIdx = -1
+		maxGen  int64
+	)
+	for i, sec := range list {
+		if sec.Generation > maxGen {
+			maxGen = sec.Generation
+		}
+		if sec.Current {
+			prev, prevIdx = sec, i
+		}
+	}
+	if prevIdx < 0 {
+		return RotationResult{}, ErrNotFound
+	}
+	graceEnd := now.Add(grace)
+	list[prevIdx].Current = false
+	list[prevIdx].ExpiresAt = graceEnd
+	prev = list[prevIdx]
+
+	next := KeySecret{
+		ID: fmt.Sprintf("%s.%d", id, maxGen+1), Generation: maxGen + 1,
+		KeyLabel: label, Current: true, CreatedAt: now,
+	}
+	s.secrets[id] = append(list, next)
+
+	// The verifier follows the current secret; nothing else about the key is
+	// written, which is what makes the "rotation preserves everything" test an
+	// assertion about behaviour rather than about this fake.
+	s.verifiers[id] = v
+	k.KeyLabel = label
+	k.HashScheme = v.HashScheme
+	k.UpdatedAt = now
+	return RotationResult{Previous: prev, New: next, PreviousExpiresAt: graceEnd}, nil
+}
+
+func (s *fakeStore) EndGrace(_ context.Context, id string, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, ok := s.secrets[id]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	n := 0
+	for i := range list {
+		if list[i].Current || !list[i].RevokedAt.IsZero() {
+			continue
+		}
+		list[i].RevokedAt = now
+		n++
+	}
+	return n, nil
+}
+
+func (s *fakeStore) ListSecrets(_ context.Context, id string) ([]KeySecret, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, ok := s.secrets[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	out := make([]KeySecret, len(list))
+	copy(out, list)
+	sort.Slice(out, func(i, j int) bool { return out[i].Generation > out[j].Generation })
+	return out, nil
+}
+
+func (s *fakeStore) Pend(_ context.Context, id, reason string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.keys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if k.PendedAt.IsZero() {
+		k.PendedAt = now
+	}
+	k.PendReason = reason
+	k.UpdatedAt = now
+	return nil
+}
+
+func (s *fakeStore) Release(_ context.Context, id string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.keys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	k.PendedAt = time.Time{}
+	k.PendReason = ""
 	k.UpdatedAt = now
 	return nil
 }

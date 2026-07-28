@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"bufio"
 	"io"
 	"net/http"
 
@@ -38,7 +37,14 @@ func (openaiAdapter) endpoint(p *Provider, op Operation, _ string, _ bool) (stri
 	case OpCompletions:
 		return joinVersioned(p.base, "/v1", pathCompletions), nil
 	case OpResponses:
-		return joinVersioned(p.base, "/v1", pathResponses), nil
+		// dorang's own /v1/responses FRONTEND, deliberately sent to the chat
+		// route. See the comment on [openaiAdapter] for the reasoning; the short
+		// version is that /v1/responses is served by a strict subset of the
+		// deployments /v1/chat/completions is, and a caller's Responses request
+		// is already in the neutral form by the time it gets here — so the chat
+		// route reaches every deployment and the Responses route reaches some.
+		// The answer is still rendered as a Response object, by encodeT1Client.
+		return joinVersioned(p.base, "/v1", pathChatCompletions), nil
 	case OpModerations:
 		return joinVersioned(p.base, "/v1", pathModerations), nil
 	case OpSpeech:
@@ -75,8 +81,14 @@ func (openaiAdapter) encode(x *exchange) ([]byte, error) {
 			Model:  x.target.UpstreamModel,
 			Flavor: rerank.FlavorGeneric,
 		})
-	case OpChat:
-		return openai.MarshalRequest(x.req, &openai.EncodeOptions{Model: x.target.UpstreamModel})
+	case OpChat, OpResponses:
+		return openai.MarshalRequest(x.req, &openai.EncodeOptions{
+			Model: x.target.UpstreamModel,
+			// The SAME registry the decoders read. Shortening into a mapping
+			// nobody keeps is what turns COMPATIBILITY 5.3 into a one-way
+			// destruction of any tool name over 64 bytes.
+			ToolNames: x.toolNames(),
+		})
 	}
 	return encodeT1(x)
 }
@@ -87,8 +99,10 @@ func (openaiAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 		return relayResponse(body, x.call.Model)
 	case OpRerank:
 		return decodeRerank(body, rerank.FlavorGeneric, x)
-	case OpChat:
-		resp, err := openai.DecodeResponse(body, &openai.DecodeOptions{Model: x.call.Model})
+	case OpChat, OpResponses:
+		resp, err := openai.DecodeResponse(body, &openai.DecodeOptions{
+			Model: x.call.Model, ToolNames: x.names,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -98,7 +112,7 @@ func (openaiAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 }
 
 func (openaiAdapter) source(r io.Reader, x *exchange) (eventSource, error) {
-	return &openaiSource{br: bufio.NewReaderSize(r, 8<<10), engine: x.prov.engine}, nil
+	return newOpenAISource(r, x), nil
 }
 
 // decodeRerank converts a rerank answer and renders it in the one client-facing

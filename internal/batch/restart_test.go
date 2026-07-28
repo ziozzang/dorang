@@ -20,10 +20,12 @@ func TestRestartResumesWithoutRerunningFinishedRows(t *testing.T) {
 	g.allow(30)
 	g.waitFinished(t, 30)
 
-	// Release only enough for the rows already inside the executor, so the
-	// close drains cleanly without letting the batch run to completion.
-	go g.allow(2 * 4)
+	// Keep the executor supplied for exactly as long as the close is draining.
+	// The batch still cannot finish: Close stops admitting rows, so only those
+	// already inside get through.
+	stop := g.feed()
 	h.restart(nil)
+	stop()
 
 	mid, err := h.svc.Retrieve(context.Background(), b.ID, "")
 	if err != nil {

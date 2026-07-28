@@ -25,12 +25,27 @@ const (
 	StrategyPrefixSticky   Strategy = "prefix_sticky"
 	StrategyPriority       Strategy = "priority"
 	StrategyWeightedRandom Strategy = "weighted_random"
+	// StrategyQuotaUrgency prefers the credential whose resetting allowance is
+	// closest to being discarded (§7.5a(c)): unused_fraction ÷
+	// remaining_fraction_of_window, ranked descending.
+	//
+	// It is not a performance signal. A subscription window that resets is
+	// use-it-or-lose-it, so routing that ignores it systematically wastes the
+	// cheapest capacity available and does so invisibly — nothing fails, the
+	// bill is simply higher than it needed to be. §7.5a constrains it twice:
+	// it composes AFTER lowest_cost by default, because preferring an expiring
+	// allowance is right only when the alternative is also already paid for;
+	// and it is damped by occupancy and jittered per node, or every node
+	// converges on the same credential at the window edge and turns its
+	// concurrency limit into a fleet-wide bottleneck.
+	StrategyQuotaUrgency Strategy = "quota_urgency"
 )
 
 var allStrategies = [...]Strategy{
 	StrategyRoundRobin, StrategyLeastBusy, StrategyLowestCost,
 	StrategyLowestLatency, StrategyHighestTPS, StrategySticky,
 	StrategyPrefixSticky, StrategyPriority, StrategyWeightedRandom,
+	StrategyQuotaUrgency,
 }
 
 // ParseStrategy decodes a configured strategy name.
@@ -111,6 +126,16 @@ type Deployment struct {
 	// reservation, because §5.3 derives the deadline from the request's own
 	// timeout rather than from a broker-wide constant.
 	Timeout time.Duration
+	// PrefixTTL is how long cache affinity to THIS deployment stays believable
+	// (§7.4b). Zero inherits the table default; negative means the backend's
+	// prefix cache has no clock and the entry lives until the table's byte
+	// budget evicts it.
+	//
+	// It is per deployment because it models the backend's cache, not dorang's
+	// table: a hosted service holds a prefix for a vendor-set window of minutes
+	// while a self-hosted engine holds blocks until memory pressure evicts them,
+	// and one number cannot be right for both.
+	PrefixTTL time.Duration
 
 	// compiled at New.
 	caps      []capacity.Candidate
@@ -210,6 +235,9 @@ type Config struct {
 	// Strategy is the default tie-break chain for groups that name none.
 	// Empty selects DefaultStrategy.
 	Strategy []Strategy
+	// Rotation is how a credential is chosen among a deployment's pool
+	// (`key_rotation.strategy`). Empty means [RotationFailover].
+	Rotation Rotation
 
 	Sticky   StickyConfig
 	Prefix   PrefixConfig

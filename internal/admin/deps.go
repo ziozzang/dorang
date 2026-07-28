@@ -91,6 +91,19 @@ type Key struct {
 	Blocked   bool
 	ExpiresAt time.Time
 
+	// Tier is the key's tier (DESIGN §11.6). It is set here and nowhere else:
+	// every route in this package requires an operator credential, which is the
+	// whole content of "an operator can grant a tier, a caller cannot claim
+	// one" (§10.5).
+	Tier string
+	// PendedAt is when the token guard pended the key, zero when it is not
+	// pended (§11.6). It is separate from Blocked because a pend is reversible
+	// in one action and a block is a decision, and a caller who cannot tell
+	// them apart cannot tell an outage from a policy.
+	PendedAt time.Time
+	// PendReason records which condition tripped.
+	PendReason string
+
 	// HashScheme is "dorang_v1" or "legacy_sha256". It is metadata about how
 	// the credential verifies, not a verifier, and an operator needs it to know
 	// which keys still depend on the legacy migration window of §2.4.
@@ -150,7 +163,85 @@ type KeyStore interface {
 	// ReplaceVerifier rotates the secret behind an existing key id, keeping
 	// every authorization field. The label changes with the secret because it
 	// is derived from it.
+	//
+	// It replaces the secret OUTRIGHT, with no grace period, which is what
+	// `/key/regenerate` has always meant. `/key/rotate` uses [RotatingKeyStore]
+	// instead.
 	ReplaceVerifier(ctx context.Context, id string, v Verifier, label string, now time.Time) error
+}
+
+// RotatingKeyStore is the optional half of [KeyStore] that implements DESIGN
+// §11.2c: a key has an id and one or more secrets, and rotation mints a new
+// secret while leaving the old one valid for a grace period.
+//
+// It is optional so that a deployment whose key store predates rotation answers
+// `/key/rotate` with a named 501 rather than with a regeneration that silently
+// cut the caller off. Doing less than the route promises, under the route's
+// name, is the failure mode §17.1 calls this codebase's dominant one.
+type RotatingKeyStore interface {
+	// Rotate mints a new secret for an existing key and leaves the current one
+	// valid for grace. Everything else about the key — tier, budget, spend,
+	// allow-list, rate limits, team, ledger history — belongs to the id and is
+	// untouched.
+	Rotate(ctx context.Context, id string, v Verifier, label string, grace time.Duration, now time.Time) (RotationResult, error)
+	// EndGrace cuts every superseded secret immediately, keeping the current
+	// one. This is what a suspected compromise needs.
+	EndGrace(ctx context.Context, id string, now time.Time) (int, error)
+	// ListSecrets returns the key's secrets, newest generation first. Retired
+	// ones are included: an operator asking "did the client roll?" needs to see
+	// the one that is about to stop working.
+	ListSecrets(ctx context.Context, id string) ([]KeySecret, error)
+}
+
+// PendableKeyStore is the optional half of [KeyStore] that implements §11.6's
+// pend: the reversible refusal the token guard uses, released by an operator in
+// ONE action.
+type PendableKeyStore interface {
+	// Pend refuses the key with a distinct, documented error until it is
+	// released.
+	Pend(ctx context.Context, id, reason string, now time.Time) error
+	// Release clears a pend. One argument, because it is one action.
+	Release(ctx context.Context, id string, now time.Time) error
+}
+
+// KeySecret is one of a key's secrets, as an operator sees it. It holds nothing
+// that could be turned back into the secret: not the digest, not the lookup.
+type KeySecret struct {
+	ID string
+	// Generation counts rotations; 1 is the secret the key was issued with.
+	Generation int64
+	// KeyLabel is the non-reversible display label for this secret.
+	KeyLabel string
+	// Current marks the secret a rotation would replace.
+	Current   bool
+	CreatedAt time.Time
+	// ExpiresAt is the end of this secret's grace period, zero for the current
+	// one.
+	ExpiresAt time.Time
+	// RevokedAt is an early cut, zero when there was none. It is separate from
+	// ExpiresAt so that "the grace ran out" and "an operator ended it" are
+	// distinguishable a month later.
+	RevokedAt time.Time
+	// LastUsedAt is when a request last authenticated with this secret, zero if
+	// never. It is the field an operator actually reads before letting a grace
+	// period close.
+	LastUsedAt time.Time
+}
+
+// RotationResult is what a rotation did.
+type RotationResult struct {
+	// Previous is the secret that was current a moment ago.
+	Previous KeySecret
+	// New is the secret just minted. Its plaintext is not here — it is returned
+	// exactly once, by the handler that minted it.
+	New KeySecret
+	// PreviousExpiresAt is when the old secret stops authenticating. This is
+	// the field the response is about: a caller that has to infer it from a
+	// policy plus a clock will infer it wrong.
+	PreviousExpiresAt time.Time
+	// Retired names the secrets this rotation cut outright to stay within
+	// max_secrets.
+	Retired []KeySecret
 }
 
 // Hasher turns a plaintext token into the three non-reversible values the

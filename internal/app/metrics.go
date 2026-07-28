@@ -1,11 +1,13 @@
 package app
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/metrics"
 	"github.com/ziozzang/dorang/internal/server"
 )
@@ -54,6 +56,14 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 	if a.Ledger != nil {
 		reg.Register(metrics.NewBudgetCollector(a.Ledger, a.now, 0))
 	}
+	// Registered only when a transform filter is configured: a page of zeroed
+	// masking counters would say the filter found nothing, not that there is no
+	// filter (DESIGN §12.3's rule 3).
+	if a.dispatch != nil {
+		if st := a.dispatch.state(); st != nil && st.filters != nil && len(st.filters.byModel) > 0 {
+			reg.Register(a.dispatch.filterMetrics())
+		}
+	}
 	reg.Register(clusterCollector(cfg))
 	if a.Auth != nil {
 		reg.Register(metrics.NewAuthCollector(a.Auth, cfg.Auth.RehashesOnUse(),
@@ -72,6 +82,65 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 		reg.Register(metrics.NewShadowCollector(a.Shadow))
 	}
 	return reg
+}
+
+// metricsAccess renders observability.prometheus and observability.metrics.public
+// onto the HTTP surface's access rule.
+//
+// Both were unread before this. `prometheus: false` changed nothing, and
+// /metrics served per-key spend, per-credential quota state and the whole model
+// list to anyone who could reach the port — on a gateway whose entire reason for
+// existing is that those numbers are worth keeping.
+func metricsAccess(cfg *config.Config) server.MetricsAccess {
+	switch {
+	case !cfg.Observability.PrometheusEnabled():
+		return server.MetricsOff
+	case cfg.Observability.MetricsPublic():
+		return server.MetricsPublic
+	}
+	return server.MetricsAdmin
+}
+
+// healthReporters are the subsystems that contribute to GET /health.
+//
+// Metering is the one that matters: DESIGN §12.1 says a drop is never silent,
+// and until this existed the meter tracked five degradation reasons with
+// hysteresis and nothing anywhere read the result.
+func (a *App) healthReporters() []server.HealthReporter {
+	var out []server.HealthReporter
+	if a.Meter != nil {
+		out = append(out, &meterHealth{m: a.Meter})
+	}
+	return out
+}
+
+// meterHealth reports the metering pipeline's degraded state into /health.
+type meterHealth struct{ m *meter.Meter }
+
+// HealthName implements server.HealthReporter.
+func (h *meterHealth) HealthName() string { return "metering" }
+
+// Health implements server.HealthReporter.
+//
+// It always reports, degraded or not. An operator checking whether metering is
+// healthy must be able to tell "not degraded" from "this build does not report
+// it", and an object that appears only on failure cannot answer that — the same
+// reason the metrics collector emits the gauge at 0 rather than omitting it.
+//
+// It never changes the status code. Losing trace payloads is a data-quality
+// failure, not a serving failure, and taking the pod out of rotation for it
+// would turn a metering incident into an outage.
+func (h *meterHealth) Health(dst []byte) []byte {
+	st := h.m.Stats()
+	dst = append(dst, `{"degraded":`...)
+	dst = strconv.AppendBool(dst, st.Degraded)
+	dst = append(dst, `,"reason":"`...)
+	dst = append(dst, st.Reason.String()...)
+	dst = append(dst, `","dropped":`...)
+	dst = strconv.AppendInt(dst, st.TracesDropped, 10)
+	dst = append(dst, `,"spool_bytes":`...)
+	dst = strconv.AppendInt(dst, st.SpoolBytes, 10)
+	return append(dst, '}')
 }
 
 // Version and Commit are stamped at link time by the Makefile and read by
@@ -177,10 +246,18 @@ func legacySunset(cfg *config.Config) time.Time {
 // the metrics scrape included. Nothing new is measured and nothing is measured
 // twice.
 func (a *App) recordMetrics(ev *server.Event) {
+	r := &ev.Result
+	// The token half of the key's rolling minute. The request half was counted
+	// at the gate, because a ceiling enforced only on FINISHED requests cannot
+	// refuse a burst; tokens are not known until here, so they land here.
+	if a.rates != nil && ev.KeyID != "" {
+		if n := totalTokens(r.Tokens); n > 0 {
+			a.rates.record(ev.KeyID, n)
+		}
+	}
 	if a.requests == nil {
 		return
 	}
-	r := &ev.Result
 	a.requests.Observe(metrics.Sample{
 		Model:        ev.Model,
 		Provider:     r.Provider,
@@ -207,6 +284,19 @@ func (a *App) recordMetrics(ev *server.Event) {
 		FallbackTo:     r.Deployment,
 		FallbackReason: r.FallbackFrom,
 	})
+}
+
+// totalTokens is what a tpm ceiling counts: everything the request consumed.
+//
+// Total is preferred when the dispatcher filled it, because a backend that
+// reports a total which is not the sum of its parts is reporting the number it
+// will bill for. Falling back to the sum keeps the ceiling working against a
+// backend that reports only the parts.
+func totalTokens(u server.Usage) int64 {
+	if u.Total > 0 {
+		return u.Total
+	}
+	return u.Input + u.Output + u.CacheRead + u.CacheWrite + u.Reasoning
 }
 
 // prefixHitPrefix is what internal/router stamps on a decision made by cache

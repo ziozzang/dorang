@@ -258,6 +258,7 @@ func (m *Meter) recordTrace(ev *Event, ts time.Time) {
 		ParentSpanID:    ev.Trace.ParentSpanID,
 		Time:            ts,
 		APIKeyID:        ev.APIKeyID,
+		SecretID:        ev.SecretID,
 		UserID:          ev.UserID,
 		TeamID:          ev.TeamID,
 		ModelGroup:      ev.ModelGroup,

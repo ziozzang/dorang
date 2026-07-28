@@ -28,11 +28,13 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/auth"
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/health"
+	"github.com/ziozzang/dorang/internal/keyguard"
 	"github.com/ziozzang/dorang/internal/luaext"
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/metrics"
@@ -100,6 +102,29 @@ type App struct {
 	// Ledger is the durable budget and quota counter of DESIGN §9.6. It is on
 	// the request path: the gate reserves against it before every upstream call.
 	Ledger *cluster.Ledger
+	// Invalidator publishes revocations, pends and early grace cuts, and applies
+	// the ones other nodes publish (DESIGN §11.2c, risk W11). Without it a
+	// revoked key keeps serving until the auth snapshot's TTL expires, on every
+	// node independently — which is a timer, not a revocation.
+	Invalidator *cluster.KeyInvalidator
+	// KeyControl is the operator-facing set of controls that change whether a
+	// key serves: rotate, cut a grace period short, pend, release, revoke. Each
+	// one does the durable write AND publishes the invalidation.
+	KeyControl *cluster.KeyControl
+	// KeyLoader reloads the whole credential set, which is what a node does on
+	// rejoin rather than trusting a snapshot it knows is stale (§11.2c rule 4).
+	KeyLoader *cluster.KeyLoader
+	// Guard is DESIGN §11.6's token guard. Nil when token_guard.enabled is
+	// false, which is the default: an automated refusal is something an
+	// operator opts into.
+	Guard *keyguard.Guard
+	// RotationPolicy is `auth.rotation` (§11.2c): the grace period a rotated-away
+	// secret keeps, how many secrets may be in flight, and the max_age the
+	// gateway WARNS about. It is held on the assembled gateway because a
+	// rotation is an operator action arriving over the administration surface,
+	// and the policy it honours must be the configured one rather than whatever
+	// the caller happened to send.
+	RotationPolicy store.RotationPolicy
 	// Shadow compares a sampled fraction of traffic against a reference gateway
 	// (DESIGN §14.1). Nil when shadow.mode is off, which is the default.
 	Shadow *shadow.Shadower
@@ -118,11 +143,20 @@ type App struct {
 	opts     Options
 	cfg      atomic.Pointer[config.Config]
 	requests *metrics.Requests
-	dispatch *dispatcher
-	targets  *batchResolver
-	models   *modelList
-	quota    *quotaSet
-	budget   *budgetGate
+	// rates is the rolling-minute observation a key's rpm_limit and tpm_limit
+	// are enforced against (DESIGN §11.2). It is not rebuilt by a reload: the
+	// window is live state, and rebuilding it would hand every key a fresh
+	// minute on every SIGHUP.
+	rates *keyRates
+	// guardHistory is the token guard's usage record. It is per node, which
+	// makes the guard's absolute condition a per-node figure in a cluster; the
+	// History interface is the seam for a store-backed one (DESIGN §11.6).
+	guardHistory *keyguard.MemHistory
+	dispatch     *dispatcher
+	targets      *batchResolver
+	models       *modelList
+	quota        *quotaSet
+	budget       *budgetGate
 	// responses is the Responses API's server-side state (DESIGN §9.2
 	// [R1-C7]). Nil when no store is configured, which makes `store: true`
 	// answer a named 501 rather than silently not storing.
@@ -200,8 +234,11 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if cfg.Routing.Prefix.IsEnabled() {
 		a.Prefix = prefix.NewTable(prefix.Options{
 			MaxBytes: cfg.Routing.Prefix.MaxBytes.Bytes(),
-			TTL:      cfg.Routing.Prefix.TTL.Duration(),
-			Now:      a.now,
+			// TableTTL, not Duration: `until_evicted` has to survive the trip or
+			// the one class of backend that most needs long affinity — a
+			// self-hosted engine with no cache clock — silently gets an hour.
+			TTL: cfg.Routing.Prefix.TTL.TableTTL(),
+			Now: a.now,
 		})
 	}
 	prices, err := buildPricing(cfg)
@@ -247,6 +284,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	a.responses = newResponsesStore(a.Store, a.now)
 
 	// 4. Gate.
+	a.rates = newKeyRates(a.now)
 	master := os.Getenv(cfg.Server.MasterKeyEnv)
 	legacy, err := legacyPolicy(cfg)
 	if err != nil {
@@ -256,19 +294,72 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		a.logf("app: %s is unset; no administrative credential is configured",
 			cfg.Server.MasterKeyEnv)
 	}
+	// The tier set is configuration (DESIGN §11.6): an operator defines the set
+	// and the ordering. What is fixed is that a tier is a property of the key,
+	// and there is exactly one path by which one reaches a principal — the
+	// stored row, through authStore. Nothing here reads a request.
+	tiers, err := tierSet(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("app: tiers: %w", err)
+	}
+	// The invalidator is built before the authenticator and attached after,
+	// because the two are mutually referential: the authenticator publishes
+	// revocations through it, and it applies the revocations other nodes
+	// publish to the authenticator (DESIGN §11.2c, risk W11).
+	invalidator, err := cluster.NewKeyInvalidator(cluster.InvalidatorConfig{
+		Store:        st,
+		NodeID:       nodeID(cfg),
+		Poll:         time.Duration(cfg.Auth.Revocation.Poll),
+		Retain:       time.Duration(cfg.Auth.Revocation.Retain),
+		StoreLatency: time.Duration(cfg.Auth.Revocation.StoreLatency),
+		Now:          a.now,
+		Logf:         a.logf,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: key invalidator: %w", err)
+	}
 	authn, err := auth.New(auth.Config{
 		Pepper:      pepper,
 		MasterKey:   master,
 		NoMasterKey: master == "",
 		Legacy:      legacy,
 		RehashOnUse: cfg.Auth.RehashesOnUse(),
-		Store:       &authStore{st: st},
-		Now:         a.now,
+		Store:       &authStore{st: st, tiers: tiers},
+		Sink:        invalidator,
+		Tiers:       tiers,
+		EntryTTL:    time.Duration(cfg.Auth.Revocation.EntryTTL),
+		NegativeTTL: time.Duration(cfg.Auth.Revocation.NegativeTTL),
+		// A row placed by a bulk load does not expire (§9.1), so the entry TTL
+		// is not its fallback. The reload interval is, and it is declared here
+		// so the published bound reports the interval this process actually
+		// runs rather than a number that does not apply.
+		ReloadInterval: reloadInterval(cfg),
+		Now:            a.now,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: authenticator: %w", err)
 	}
 	a.Auth = authn
+	invalidator.Attach(authn)
+	a.Invalidator = invalidator
+	a.KeyLoader = cluster.NewKeyLoader(st, 0, tiers)
+	if a.KeyControl, err = cluster.NewKeyControl(st, authn, a.Notify, a.now); err != nil {
+		return nil, fmt.Errorf("app: key controls: %w", err)
+	}
+	a.RotationPolicy = rotationPolicy(cfg)
+	// The token guard (§11.6). Off by default; keyguard.New answers a disabled
+	// configuration with a typed nil, so a deployment that has not asked for an
+	// automated refusal pays one nil check for the mechanism.
+	gc, err := guardConfig(cfg, a.now)
+	if err != nil {
+		return nil, fmt.Errorf("app: token guard: %w", err)
+	}
+	if gc.Enabled {
+		a.guardHistory = keyguard.NewMemHistory(0, gc.BaselineWindow, 0)
+		if a.Guard, err = keyguard.New(gc, a.guardHistory, a.KeyControl, a.Notify); err != nil {
+			return nil, fmt.Errorf("app: token guard: %w", err)
+		}
+	}
 
 	// 5. Metering. The sink is the store; internal/meter declares Sink and
 	//    internal/store implements the operations behind it, and neither
@@ -300,9 +391,13 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	}
 	client := opts.Upstream
 	if client == nil {
-		client = defaultUpstreamClient()
+		client = backend.NewClient()
 	}
 	a.dispatch = newDispatcher(client, a.logf, a.now)
+	filters, err := buildFilters(cfg, a.logf)
+	if err != nil {
+		return nil, err
+	}
 	a.dispatch.swap(&dispatchState{
 		router:    rt,
 		pricing:   prices,
@@ -312,6 +407,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		budget:    a.budget,
 		responses: a.responses,
 		hooks:     a.Hooks,
+		filters:   filters,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -354,17 +450,19 @@ func (a *App) Config() *config.Config { return a.cfg.Load() }
 // serverOptions renders the HTTP surface's configuration from the file.
 func (a *App) serverOptions(cfg *config.Config) server.Options {
 	return server.Options{
-		Auth:              &authAdapter{a: a.Auth, now: a.now},
+		Auth:              &authAdapter{a: a.Auth, now: a.now, rates: a.rates},
 		Dispatcher:        a.dispatch,
 		Models:            a.models,
-		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics},
+		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics, guard: a.Guard},
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
-		Passthrough:       passthroughRoutes(cfg, a.Catalog),
+		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),
 		Routes:            a.extraRoutes(),
 		Observer:          shadowObserver(a.Shadow),
 		Metrics:           a.Metrics,
+		MetricsAccess:     metricsAccess(cfg),
+		HealthReporters:   a.healthReporters(),
 		CaptureHeadBytes:  int(cfg.Shadow.Capture.HeadBytes.Bytes()),
 		CaptureTailBytes:  int(cfg.Shadow.Capture.TailBytes.Bytes()),
 		Now:               a.now,
@@ -444,6 +542,10 @@ func (a *App) Reload(cfg *config.Config) error {
 	}
 	a.Hooks = hooks
 
+	filters, err := buildFilters(cfg, a.logf)
+	if err != nil {
+		return err
+	}
 	a.dispatch.swap(&dispatchState{
 		router:    rt,
 		pricing:   prices,
@@ -453,6 +555,7 @@ func (a *App) Reload(cfg *config.Config) error {
 		budget:    a.budget,
 		responses: a.responses,
 		hooks:     hooks,
+		filters:   filters,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -483,16 +586,92 @@ func (a *App) startBackground() {
 	// renewed only as often as a sticky purge would expire between renewals and
 	// be reclaimed out from under a node that is still spending it.
 	maintain := cluster.DefaultRenewBefore / 2
+
+	// The invalidation poller is what makes a revocation take effect on this
+	// node rather than one cache TTL after it happened (DESIGN §11.2c, W11).
+	// It starts BEFORE the rejoin reload, so that a message published while the
+	// reload is running is not missed.
+	if a.Invalidator != nil {
+		if err := a.Invalidator.Start(ctx); err != nil {
+			a.logf("app: key invalidation poller: %v", err)
+		}
+		// §11.2c rule 4: on start a node reloads rather than trusting a
+		// snapshot it may have inherited. This is one of the few places the
+		// request path is deliberately allowed to wait — serving from a
+		// snapshot known to be stale is worse than a brief pause at startup —
+		// but it is bounded, and a failure leaves the node reading per key from
+		// the store rather than serving what it had.
+		rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := a.Invalidator.Rejoin(rctx, a.KeyLoader); err != nil {
+			a.logf("app: credential reload on start: %v", err)
+		}
+		rcancel()
+	}
+
+	// The periodic credential reload. It is the TTL fallback for a snapshot row:
+	// those do not expire, so without this a node that missed an invalidation
+	// would serve a revoked key indefinitely rather than for one entry TTL
+	// (§9.1, §11.2c).
+	reload := reloadInterval(a.cfg.Load())
+
+	// The token guard's sweep and the max_age rotation warning are periodic
+	// judgements, not request-path work.
+	guardEvery := time.Duration(a.cfg.Load().TokenGuard.Window)
+	if guardEvery <= 0 {
+		guardEvery = time.Hour
+	}
+	maxAge := a.RotationPolicy.MaxAge
+
 	go func() {
 		defer close(a.bgDone)
 		t := time.NewTicker(purge)
 		defer t.Stop()
 		m := time.NewTicker(maintain)
 		defer m.Stop()
+		g := time.NewTicker(guardEvery)
+		defer g.Stop()
+		r := time.NewTicker(reload)
+		defer r.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-r.C:
+				if a.Auth != nil && a.KeyLoader != nil {
+					// Refresh, not Rejoin: this must not drop the snapshot
+					// first, or every interval would send every key to the
+					// store in the gap. A failure leaves the snapshot as it was
+					// and is reported.
+					rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					if err := a.Auth.Refresh(rctx, a.KeyLoader); err != nil {
+						a.logf("app: credential refresh: %v", err)
+					}
+					cancel()
+				}
+			case <-g.C:
+				if a.Guard != nil {
+					gctx, cancel := context.WithTimeout(ctx, time.Minute)
+					if _, err := a.Guard.Sweep(gctx); err != nil {
+						a.logf("app: token guard sweep: %v", err)
+					}
+					cancel()
+				}
+				if a.KeyControl != nil && maxAge > 0 {
+					// A policy, not an execution: this warns and reports, and
+					// nothing here rotates, pends or blocks anything (§11.2c).
+					wctx, cancel := context.WithTimeout(ctx, time.Minute)
+					if _, err := a.KeyControl.WarnOverdue(wctx, maxAge); err != nil {
+						a.logf("app: rotation max_age warning: %v", err)
+					}
+					cancel()
+				}
+				if a.Invalidator != nil {
+					pctx, cancel := context.WithTimeout(ctx, time.Minute)
+					if _, err := a.Invalidator.Prune(pctx); err != nil {
+						a.logf("app: invalidation prune: %v", err)
+					}
+					cancel()
+				}
 			case <-m.C:
 				if a.Ledger != nil {
 					mctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -525,6 +704,20 @@ func (a *App) startBackground() {
 // leases rather than waiting for them to expire. Without one, an id is generated
 // per process: a single-node deployment never collides, and a multi-node one is
 // required to configure cluster.node_id anyway (§13).
+// reloadInterval is how often the whole credential set is re-read.
+//
+// Half the entry TTL, so a snapshot row's fallback is no worse than a
+// runtime-learned row's, and one bulk query replaces the N per-key reads that
+// expiring the snapshot would cost. Rows placed by a bulk load do not expire
+// (DESIGN §9.1) — this interval is what stands in for the TTL they do not have.
+func reloadInterval(cfg *config.Config) time.Duration {
+	ttl := time.Duration(cfg.Auth.Revocation.EntryTTL)
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return ttl / 2
+}
+
 func nodeID(cfg *config.Config) string {
 	if cfg.Cluster.NodeID != "" {
 		return cfg.Cluster.NodeID
@@ -544,6 +737,9 @@ func (a *App) Close(ctx context.Context) error {
 		if a.bgCancel != nil {
 			a.bgCancel()
 			<-a.bgDone
+		}
+		if a.Invalidator != nil {
+			a.Invalidator.Close()
 		}
 		if a.Batch != nil {
 			if err := a.Batch.Close(ctx); err != nil && firstErr == nil {
@@ -674,6 +870,24 @@ func parseUntil(s string) (time.Time, error) {
 // request completes.
 type quotaSet struct {
 	meters router.Meters
+	// rank scores expiring allowances for the quota_urgency strategy
+	// (DESIGN §7.5a(c)). It is built with the meter set rather than on demand,
+	// because a Ranker holds the meters it scores and the set is immutable once
+	// a reload has swapped it.
+	rank *quota.Ranker
+}
+
+// ranker is the router's view of the urgency scorer, or a nil interface when no
+// credential has a resetting quota rule.
+//
+// A typed nil would be non-nil in an interface and would make the router call
+// through it on the hot path for every candidate, which is exactly the shape
+// the shadow observer already had to avoid.
+func (q *quotaSet) ranker() router.UrgencySource {
+	if q == nil || q.rank == nil {
+		return nil
+	}
+	return q.rank
 }
 
 func (q *quotaSet) Check(credential string, now time.Time) quota.Decision {

@@ -25,6 +25,18 @@ type Limits struct {
 	// AllowedRoutes is an allow-list of request paths. Empty allows all. An
 	// entry may be an exact path, a prefix ending in "/*", or "*".
 	AllowedRoutes []string
+	// Pended refuses every request from this subject with a distinct,
+	// reversible refusal (DESIGN §11.6).
+	//
+	// It is separate from Blocked because the two are different judgements and
+	// they fail differently. Blocked is an operator's decision; Pended is the
+	// token guard's *statistical* judgement, which might be wrong, and an
+	// operator releases it in one action without reissuing a credential. A
+	// caller who cannot tell the two apart cannot tell an outage from a policy.
+	Pended bool
+	// PendReason is the short, non-secret explanation an operator sees, and the
+	// caller does not.
+	PendReason string
 	// MaxBudgetNanoUSD is the spend ceiling in nano-USD. The unit matches
 	// internal/quota, which owns budget accounting; auth only refuses a
 	// subject whose recorded spend has already reached its ceiling.
@@ -66,8 +78,34 @@ func Limit(v int64) *int64 { return &v }
 //
 // A Principal holds no credential material: not the token, not the digest.
 type Principal struct {
-	// KeyID is the api_keys row id.
+	// KeyID is the api_keys row id. It is the DURABLE identity: rotation mints a
+	// new secret and leaves this, and everything hanging off it, alone
+	// (DESIGN §11.2c).
 	KeyID string
+	// SecretID names WHICH of the key's secrets authenticated this request.
+	//
+	// A key has one id and one or more secrets, and during a rotation's grace
+	// period both authenticate to the same principal. Carrying the secret id out
+	// of authentication is what lets the ledger record which one was used, so an
+	// operator can see whether the client actually rolled before the window
+	// closes instead of finding out when it shuts.
+	//
+	// Each secret is its own cache entry — entries are keyed by the lookup, and
+	// a lookup is derived from the secret — so this field is per-secret even
+	// though every other field on the Principal is per-key.
+	SecretID string
+	// SecretGeneration counts rotations: 1 is the secret the key was issued
+	// with. It is here so an operator reading a ledger sees "generation 1 is
+	// still in use" without joining anything.
+	SecretGeneration int
+	// SecretExpiresAt is when THIS secret stops authenticating: the end of a
+	// rotation's grace period, or the instant an early cut set. Zero means the
+	// secret is current and expires only with the key.
+	SecretExpiresAt time.Time
+	// Tier is the key's tier (DESIGN §11.6). It comes from the stored row and
+	// from nowhere else: an operator can grant a tier, a caller cannot claim
+	// one (§10.5).
+	Tier string
 	// Label is a non-reversible display label. R1-A: never copy an incumbent's
 	// column that stores trailing characters of the secret.
 	Label string
@@ -129,6 +167,9 @@ func (p *Principal) Authorize(a Access) error {
 	if p.RequireOwner && p.UserID == "" && p.TeamID == "" {
 		return refuse(ReasonNoPrincipal, "key", p.KeyID)
 	}
+	if p.SecretRetired(now) {
+		return refuse(ReasonSecretRetired, "secret", "")
+	}
 	if err := p.Key.authorize("key", a, now); err != nil {
 		return err
 	}
@@ -145,10 +186,57 @@ func (p *Principal) Authorize(a Access) error {
 	return nil
 }
 
+// SecretRetired reports whether the secret that authenticated has passed its
+// own expiry — the end of a rotation grace period, or an early cut.
+//
+// The boundary is inclusive, as everywhere else: a secret expiring at T is
+// refused at T. It is a property of the secret, not of the key: the key, its
+// budget, its spend and its ledger history are untouched, which is the entire
+// point of rotation (DESIGN §11.2c).
+func (p *Principal) SecretRetired(now time.Time) bool {
+	return p != nil && !p.SecretExpiresAt.IsZero() && !now.Before(p.SecretExpiresAt)
+}
+
+// Refusing reports whether this principal would be refused whatever the request
+// asked for — blocked, pended, expired, out of budget, or presenting a retired
+// secret.
+//
+// The authenticator uses it to decide a cache entry's lifetime. A principal
+// that is refusing is a NEGATIVE answer even though a row was found, and
+// §11.2c's rule 3 is that a negative answer is cheap to re-check and must not
+// be held for as long as a serving one. Treating a found-but-refused row like a
+// serving row is what made the revocation window a full entry TTL wide.
+func (p *Principal) Refusing(now time.Time) bool {
+	if p == nil {
+		return true
+	}
+	if p.Master {
+		return false
+	}
+	if p.SecretRetired(now) {
+		return true
+	}
+	for _, l := range []*Limits{&p.Key, p.User, p.Team} {
+		if l == nil {
+			continue
+		}
+		if l.Blocked || l.Pended || l.Expired(now) || l.BudgetExceeded(now) {
+			return true
+		}
+	}
+	return false
+}
+
 // authorize applies one subject's limits.
 func (l *Limits) authorize(subject string, a Access, now time.Time) error {
 	if l.Blocked {
 		return refuse(ReasonBlocked, subject, "")
+	}
+	// A pend is checked after the block and before everything else. It is a
+	// refusal in its own right rather than a second spelling of blocked, so the
+	// caller's error names a condition an operator can release in one action.
+	if l.Pended {
+		return refuse(ReasonPended, subject, "")
 	}
 	if l.Expired(now) {
 		return refuse(ReasonExpired, subject, "")

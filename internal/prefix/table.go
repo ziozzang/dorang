@@ -43,22 +43,40 @@ type Table struct {
 	ttl      time.Duration
 	now      func() time.Time
 
+	// perTarget is the per-deployment lifetime override, indexed by interned
+	// target id. It is swapped by pointer rather than locked: the read path
+	// touches it once per candidate entry, and a hot reload replaces the whole
+	// slice. A nil pointer, or an id past the end, means the table default.
+	perTarget atomic.Pointer[[]time.Duration]
+
 	lookups atomic.Uint64
 	hits    atomic.Uint64
 	evicted atomic.Uint64
 }
 
+// neverExpires is the stored form of "this entry has no clock". It is a
+// sentinel rather than a zero because zero already means "use the default"
+// everywhere else in this package.
+const neverExpires = time.Duration(-1)
+
 // Options configures a Table.
 type Options struct {
 	// MaxBytes caps retained size. Zero means 64 MiB.
 	MaxBytes int64
-	// TTL expires an entry. Zero means one hour.
+	// TTL expires an entry. Zero means one hour; NEGATIVE means entries never
+	// expire on a clock and the byte budget alone bounds the table.
 	//
 	// Expiry is measured from LAST USE here, unlike session stickiness, which
 	// expires from creation. The difference is deliberate: a session pin is a
 	// promise about a cache that has certainly gone cold after the TTL, whereas
 	// a prefix that keeps being requested keeps the upstream cache warm, so
 	// refreshing on use tracks reality rather than defeating it.
+	//
+	// This is the table-wide default. [Table.SetTargetTTLs] overrides it per
+	// deployment, which is what the setting actually models: how long the
+	// BACKEND still holds those KV blocks, which differs between a hosted
+	// service with a five-minute window and a self-hosted engine that evicts by
+	// memory pressure and never by time.
 	TTL time.Duration
 	// Now is injectable for tests.
 	Now func() time.Time
@@ -69,8 +87,11 @@ func NewTable(opts Options) *Table {
 	if opts.MaxBytes <= 0 {
 		opts.MaxBytes = 64 << 20
 	}
-	if opts.TTL <= 0 {
+	switch {
+	case opts.TTL == 0:
 		opts.TTL = time.Hour
+	case opts.TTL < 0:
+		opts.TTL = neverExpires
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -87,20 +108,61 @@ func (t *Table) shardFor(d Digest) *shard {
 	return &t.shards[d[0]%shardCount]
 }
 
+// SetTargetTTLs installs the per-deployment lifetimes, indexed by interned
+// target id. A zero entry, or an id past the end of the slice, uses the table
+// default; a negative entry never expires on a clock.
+//
+// It replaces the whole table rather than merging, so a hot reload cannot leave
+// a lifetime behind for a deployment the new configuration removed. The slice is
+// not copied and must not be mutated afterwards.
+func (t *Table) SetTargetTTLs(ttls []time.Duration) {
+	if len(ttls) == 0 {
+		t.perTarget.Store(nil)
+		return
+	}
+	t.perTarget.Store(&ttls)
+}
+
+// ttlFor is this target's lifetime, or the table default.
+func (t *Table) ttlFor(target uint32) time.Duration {
+	if p := t.perTarget.Load(); p != nil {
+		if s := *p; int(target) < len(s) && s[target] != 0 {
+			return s[target]
+		}
+	}
+	return t.ttl
+}
+
+// liveAt reports whether an entry last used at lastSeen is still believable at
+// now. An entry whose target never expires on a clock always is: the byte
+// budget is what bounds it, and evict's second pass drops the coldest such
+// entries exactly as it drops any other.
+func (t *Table) liveAt(e entry, now int64) bool {
+	ttl := t.ttlFor(e.target)
+	if ttl < 0 {
+		return true
+	}
+	return e.lastSeen >= now-int64(ttl)
+}
+
 // Lookup returns the deployment for the deepest matching prefix, searching
 // deepest first so the longest common prefix wins. valid reports whether the
 // candidate is still acceptable; callers pass a predicate because a target that
 // has gone unhealthy or exhausted must not be resurrected by cache affinity.
 func (t *Table) Lookup(digests []Digest, valid func(target uint32) bool) (target uint32, depth int, ok bool) {
 	t.lookups.Add(1)
-	cutoff := t.now().Add(-t.ttl).UnixNano()
+	now := t.now().UnixNano()
 	for i := len(digests) - 1; i >= 0; i-- {
 		d := digests[i]
 		sh := t.shardFor(d)
 		sh.mu.RLock()
 		e, found := sh.entries[d]
 		sh.mu.RUnlock()
-		if !found || e.lastSeen < cutoff {
+		// The lifetime is the TARGET's, not the table's: a five-minute hosted
+		// cache and a self-hosted engine that evicts by memory pressure can be
+		// candidates for the same request, and one clock cannot be right for
+		// both.
+		if !found || !t.liveAt(e, now) {
 			continue
 		}
 		if valid != nil && !valid(e.target) {
@@ -143,15 +205,17 @@ func (t *Table) Record(digests []Digest, target uint32) {
 // slightly stale eviction order costs at most a few extra cache misses.
 func (t *Table) evict() {
 	target := t.maxBytes - t.maxBytes/8 // reclaim to 87.5% so this is not per-insert
-	cutoff := t.now().Add(-t.ttl).UnixNano()
+	now := t.now().UnixNano()
 
 	// Pass one: expired entries only. Usually enough, and it never evicts
-	// anything still useful.
+	// anything still useful. An entry whose target never expires on a clock is
+	// never in this pass — pass two is what bounds it, which is exactly the
+	// "until evicted" contract a self-hosted engine's prefix cache has.
 	for i := range t.shards {
 		sh := &t.shards[i]
 		sh.mu.Lock()
 		for d, e := range sh.entries {
-			if e.lastSeen < cutoff {
+			if !t.liveAt(e, now) {
 				delete(sh.entries, d)
 				t.curBytes.Add(-entryBytes)
 				t.evicted.Add(1)

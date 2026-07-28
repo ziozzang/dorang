@@ -61,15 +61,17 @@ A secret value never appears in this file. Every key material field is a referen
 ```yaml
 key_env:  NAME             # read from the process environment
 key_file: /path/to/key     # read from a file; a trailing newline is trimmed
-key_ref:  vault:secret/…   # recorded verbatim and handed to an external resolver
 key:      literal          # accepted ONLY when server.env is "development"
 ```
 
 Setting none is an error. Setting two is an error. A `key_env` that names an unset or empty
 variable is an error, and so is an unreadable or empty `key_file`.
 
-`key_ref` is **recorded, not fetched**. This build does not ship a resolver, so a credential
-declared with `key_ref` alone loads, validates, and has no usable secret at request time.
+`key_ref` is **refused**. It used to load and validate and leave the credential with no usable
+secret: the request then went upstream with no `Authorization` header at all, and the failure
+arrived as a `401` from the provider with nothing in the file to explain it. There is no
+resolver in this build, so the key is a load error naming `key_env` and `key_file` instead — a
+vault agent that writes a file or exports a variable satisfies both.
 
 A resolved secret is unreachable from every rendering path — `String`, `%v`, `%#v`, YAML
 marshal, JSON marshal and every error this package produces return the redacted *source*
@@ -234,7 +236,7 @@ are listed here because operationally they behave like refusals.
 | Configuration | When it fails | What you see |
 |---|---|---|
 | `pricing.rules[].rates.images` | **Assembly.** Lint passes | `pricing rule X: the images component is not priced by this build` |
-| `pricing.rules[].class: notional_rate` | **Load.** Only the three inline classes are accepted | `"notional_rate" is not a known value` — put notional rules in the catalog file instead (§13.3) |
+| `pricing.rules[].rates.images` | **Load.** `internal/pricing` has no per-image unit | `the images component is not priced by this build` — price the request instead |
 | `shadow.mode` on with no `sample_rate` | Never. It runs and shadows **nothing** | Gate verdict `no_data`, empty report, and an empty report read as proof (§18) |
 | `storage.driver: postgres` with the URL variable unset | **Assembly.** Lint only checks that the variable is *named* | Store open fails at start-up |
 
@@ -437,7 +439,7 @@ credentials:
 |---|---|---|---|---|
 | `id` | string | — | The credential's identity. It is **not secret**: it appears in routing decisions, metrics, headers and errors | Empty or duplicate is refused |
 | `provider` | string | — | Which provider this identity authenticates at | Must name a declared provider. A deployment that lists a credential belonging to another provider is refused, by name |
-| `key_env` / `key_file` / `key_ref` / `key` | secret ref | — | Where the secret comes from (§0.3) | Zero or two or more sources is refused |
+| `key_env` / `key_file` / `key` | secret ref | — | Where the secret comes from (§0.3) | Zero or two or more sources is refused. `key_ref` is refused outright |
 | `capacity_group` | string | `""` | Membership in the `credential_group` axis — per account, across every model that account can serve | A group not declared under `capacity.credential_groups` is refused |
 
 > **Key material may be declared twice and the schema does not say which wins.** The same
@@ -633,7 +635,7 @@ never infer a provider from it.
 |---|---|---|---|---|
 | `models[].name` | string | — | The client-facing name. Compared **whole** | Empty or duplicate is refused. A name that is also an alias is refused — the same name cannot mean two things |
 | `models[].class` | string | `""` | The model class, which is the scope fail-back may delegate within | A class not declared under `classes` is refused. A model that declares a class but is **not listed among that class's members** is also refused: the two directions must agree |
-| `models[].strategy[]` | []string | `[prefix_sticky, lowest_cost, least_busy]` | The tie-break chain. Allowed: `round_robin`, `least_busy`, `lowest_cost`, `lowest_latency`, `highest_tps`, `sticky`, `prefix_sticky`, `priority`, `weighted_random` | Anything else is refused. Note `quota_urgency` from the design is **not** an accepted value in this build (§23.1). The default chain is "stay warm, then stay cheap, then stay idle" |
+| `models[].strategy[]` | []string | `[prefix_sticky, lowest_cost, least_busy]` | The tie-break chain. Allowed: `round_robin`, `least_busy`, `lowest_cost`, `lowest_latency`, `highest_tps`, `sticky`, `prefix_sticky`, `priority`, `weighted_random`, `quota_urgency` | Anything else is refused. `quota_urgency` composes **after** `lowest_cost` by default (§7.5a(c)): preferring an expiring allowance is right only when the alternative is also already paid for. The default chain is "stay warm, then stay cheap, then stay idle" |
 | `models[].deployments[]` | list | — | The routing candidates, in configuration order — which is the final tie-break, so it is deterministic rather than map-random | A model with no deployments is refused |
 | `deployments[].provider` | string | — | Which provider | Must be declared |
 | `deployments[].upstream_model` | string | — | The real model id sent upstream. Used **verbatim**; never parsed | Empty is refused |
@@ -686,7 +688,45 @@ routing:
 | `prefix.chunk_bytes` | size | `4096` | The base segment size. **Byte boundaries — there is no tokenizer on the hot path** | Zero or negative is refused |
 | `prefix.checkpoints` | `logarithmic` \| `fixed` | `logarithmic` | How depths are chosen | Anything else is refused. `fixed` cannot distinguish two conversations that share a system prompt and diverge afterwards — they collide at the deepest tracked node and "longest common prefix wins" becomes quietly false |
 | `prefix.max_bytes` | size | `64MiB` | The table is budgeted by **retained bytes**, not by entry count | Zero or negative is refused. One request writes an entry at every checkpoint, and per-entry size had been underestimated before this was measured; deployment ids are interned to keep an entry at 24 bytes |
-| `prefix.ttl` | duration | `1h` | Entry lifetime. Unlike a session pin, a prefix entry **refreshes on use** — a prefix still in use is keeping the upstream cache warm | Zero or negative is refused when prefix is enabled |
+| `prefix.ttl` | duration \| `until_evicted` | `1h` | **Default** entry lifetime, overridden per provider and per deployment. Unlike a session pin, a prefix entry **refreshes on use** — a prefix still in use is keeping the upstream cache warm | Zero or negative is refused when prefix is enabled; `until_evicted` is accepted |
+
+#### The affinity lifetime is a fact about the backend
+
+`prefix.ttl` models one thing: **how long the backend still holds the KV blocks for this
+prefix.** That is not a property of dorang, and it differs between vendors by more than an
+order of magnitude.
+
+| Backend | What it actually does | Write |
+|---|---|---|
+| Anthropic prompt caching | ~5 minutes on the default tier, 1 hour on the extended tier — and the tier is a per-**request** property | `5m` or `1h`, per deployment |
+| OpenAI automatic prompt caching | roughly 5–10 minutes, not contractual | `5m` |
+| Gemini explicit caching | an operator-set TTL on the cached content itself | whatever you set there |
+| vLLM, SGLang | **no TTL at all** — blocks live until LRU eviction under memory pressure | `until_evicted` |
+
+Getting it wrong is not symmetric. Too long and the router keeps pinning a conversation to a
+node that no longer holds the prefix: sticky routing with none of the benefit, paid for in lost
+load balance and a hot node. Too short and hits that were there are thrown away.
+
+So the lifetime is settable at three levels, most specific winning:
+
+```yaml
+routing:
+  prefix: {ttl: 30m}                     # the default
+
+providers:
+  - {name: fleet-vllm, kind: vllm, prefix_ttl: until_evicted}
+  - {name: cloud-a,    kind: anthropic, prefix_ttl: 5m}
+
+models:
+  - name: model-x
+    deployments:
+      - {provider: cloud-a, upstream_model: …, prefix_ttl: 1h}   # extended cache tier
+```
+
+`until_evicted` means the entry never expires on a clock. It is still bounded: the affinity
+table is budgeted by **bytes** (`prefix.max_bytes`), and eviction runs in two passes — expired
+entries first, then the coldest by last use. An entry with no lifetime is simply never in the
+first pass, which is exactly the contract a self-hosted engine's prefix cache has.
 
 The chain is `h₀ = H(group)`, `hᵢ = H(hᵢ₋₁ ‖ cᵢ ‖ len(cᵢ))`. A match at depth *i* proves
 `c₁..cᵢ` are byte-identical **and in that order** — swap, reverse, insert, delete, prepend and
@@ -776,7 +816,7 @@ pricing:
 | `catalog` | path | `""` | An external price list, merged with the inline rules into one catalog | **A named-but-absent catalog is not fatal** — the inline rules may be the whole price list, and an unpriced model is already visible through a counter rather than through a refusal to start. A malformed one *is* fatal |
 | `currency` | string | `USD` | The ISO code every amount is denominated in. It overrides the catalog file's own `currency` | Empty is refused |
 | `rules[].id` | string | `""` | Rule identity, and the final deterministic tie-break | A duplicate id is refused |
-| `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` | `marginal_usage` | Which kind of cost this is | Anything else is refused — including `notional_rate`, which is catalog-only (§13.3) |
+| `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
 | `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images` | A `marginal_usage` rule with no rates is refused. ⚠️ **`images` passes validation and then refuses to assemble** — the request type carries no image count, so the component is unreachable and is reported rather than silently priced at zero. Use `request` on an image endpoint |
@@ -908,7 +948,8 @@ observability:
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
 |---|---|---|---|---|
-| `prometheus` | bool | `true` | Intended to gate `/metrics` | ⚠️ **Never read.** `/metrics` is served unconditionally and unauthenticated. Setting `false` changes nothing. §23.1 |
+| `prometheus` | bool | `true` | Serves `GET /metrics` | `false` removes the route, which then answers 501 with a reason like any other unserved route — not 200 with an empty body |
+| `metrics.public` | bool | `false` | Serves `/metrics` without authentication | Off by default. The scrape carries per-key spend, per-credential quota state and every configured model name, so it needs the master credential unless a deployment says otherwise in writing |
 | `otlp_endpoint` | string | `""` | OTLP trace export target | ⚠️ Not acted on in this build; the latency breakdown is recorded regardless. §23.1 |
 | `log_level` | `debug` \| `info` \| `warn` \| `error` | `info` | Log verbosity | Anything else is refused |
 | `log_format` | `json` \| `text` | `json` | Log encoding | Anything else is refused |
@@ -947,35 +988,121 @@ from `on_request`, which is honoured (**fail-closed**). A panic in a hook is con
 can see a secret — the views handed to them are constructed without key material rather than
 filtered afterwards.
 
-> ⚠️ **The section is named `lua` and there is no Lua interpreter.** That is a decision, and it
-> is worth stating plainly because the configuration key does not say so.
->
-> Embedding a general-purpose VM would add the project's first non-storage, non-YAML dependency,
-> and — more decisively — it makes **two of the three promised ceilings harder rather than
-> easier**: the serious pure-Go option offers cooperative cancellation but no per-state
-> instruction counter and no per-state memory accounting, so "instruction and memory ceilings"
-> would have to be re-implemented on top of it or quietly withdrawn. Quietly withdrawn is the
-> outcome this whole document exists to prevent.
->
-> What runs instead: a **total policy language** (`*.policy` files) with no loops, no recursion,
-> no function calls, no I/O and no string building, so a program terminates by construction and
-> cannot allocate without bound — the ceilings are still enforced, as defence in depth rather
-> than as the only thing standing between an extension and the gateway. For anything the policy
-> language cannot express there are compiled-in Go **`Native`** hooks, which inherit the same
-> watchdog, panic containment, fail-open rule and secret-free views (a `Native` gets wall-clock
-> and panic containment only; the memory ceiling is meaningful for policy programs).
->
-> **A `.lua` file under `extensions.lua.dir` is a load error, not a file that is silently
-> ignored.** A configuration surface that accepts Lua which never runs is worse than one that
-> refuses it.
->
+**Three ways to write an extension, one contract.** `extensions.lua.dir` holds `*.policy`
+files: a total policy language with no loops, no calls and no string building, so a program
+terminates by construction. Lua *plugins* are declared under [`filters.plugins`](#17-filters),
+not here, because §11.5 requires loading to be explicit configuration — a directory that runs
+whatever appears in it is a code-execution primitive. Compiled-in Go `Native` hooks are the
+third. All three see the same secret-free views and obey the same rules (a `Native` gets
+wall-clock and panic containment only; it is Go code, so a memory ceiling over it means
+nothing).
+
+> **A `.lua` file under `extensions.lua.dir` is a load error**, and the message says where the
+> file belongs. It is neither run — that would make the directory a code-execution primitive —
+> nor silently ignored, which would leave an operator believing a filter is enforced.
+
+**About the ceilings.** The VM is gopher-lua, pure Go, about 1.8 MB of binary. It supplies the
+wall clock (a context check runs between VM instructions) and neither of the other two: there
+is no per-state instruction counter and no per-state allocation accounting. Both are built on
+top rather than withdrawn.
+
+- *Instructions* are charged by rewriting the plugin's syntax tree at load: a charge at every
+  function body, every loop body and every backward `goto`, which are the only three ways Lua
+  can execute unboundedly. `instructions` therefore counts work, not merely back-edges.
+- *Memory* is charged allocation. Every allocation is either O(1) per charge — hence bounded by
+  the instruction ceiling — or is charged before it happens: string concatenation is rewritten
+  into a charged host call, and `string.rep`, `string.format`, `string.gsub`, `string.byte` and
+  `table.concat` pre-flight their worst case. The budget is **cumulative, not live**: bytes
+  charged are never refunded, because a host cannot see when Lua's collector frees a string.
+  That bounds peak memory from above, and it means a long-running hook that allocates and
+  releases repeatedly hits the ceiling earlier than its true footprint deserves.
+
+**What the sandbox does not contain**, each for a reason: `io`, `os`, `debug`, `coroutine` and
+the package loader are never opened; `load`, `loadstring`, `loadfile`, `dofile` and `require`
+are removed because each turns text into a function that never passed the instrumenter;
+`_G`, `getfenv` and `setfenv` because they hand out the globals table, where the charge
+functions live; `pcall` and `xpcall` because a ceiling a plugin can catch is not a ceiling;
+`math.random` because a filter that is not a pure function of its input produces different
+upstream bytes on every turn and silently kills prefix caching.
+
 > One capability the hook points deliberately do **not** have: `on_route` sees the chosen
 > deployment and may refuse it, but cannot ask for a different one. That is a property of the
 > fail-back machinery, not of the hook.
 
 ---
 
-## 17. `passthrough`
+## 17. `filters`
+
+Transform filters sit between the canonical request and the backend (§10.5b). The motivating
+case is reversible PII masking: an identity number is replaced with a placeholder before the
+text leaves the operator's control and restored in the answer.
+
+```yaml
+filters:
+  secret:
+    key_env: DORANG_FILTER_SECRET
+  plugins:
+    - name: pii-mask
+      path: /etc/dorang/plugins/pii_mask.lua
+      fail: closed
+      config: {skip_system: "true"}
+
+models:
+  - name: model-x
+    filters:
+      - plugin: pii-mask
+        on: [request, response]
+        scope: conversation
+        patterns: [krrn, email, {name: employee_id, regexp: 'EMP-\d{6}'}]
+        retain: 1h
+```
+
+| Key | Type | Default | What it does | What breaks if it is wrong |
+|---|---|---|---|---|
+| `secret` | secret ref | — | The cluster-wide seed a placeholder is derived from | **Required unless every filter uses `scope: request`.** It must be the same on every node and across restarts: a per-process seed masks the same text differently everywhere, so the bodies reaching a backend differ byte for byte and every prefix cache cold-starts (§7.4b). Rotating it invalidates every cache on the fleet — a staged, announced operation |
+| `plugins[].name` | string | — | How a model refers to the plugin | Must be unique; a model naming a plugin that is not declared is refused at load |
+| `plugins[].path` | path | — | The Lua file. Named explicitly, never scanned for | A missing file is a startup failure, not a filter that quietly does nothing |
+| `plugins[].fail` | `closed` \| `open` | `closed` | What happens when the plugin does not complete | `closed` refuses the request. This inverts §11.5's fail-open on purpose: a filter that cannot *enrich* should be skipped, but one that was supposed to remove an identity number and did not must stop the request |
+| `plugins[].config` | map[string]string | `{}` | Handed to the plugin as `dorang.config` while it loads | It holds no secret; it is readable by untrusted code |
+| `models[].filters[].plugin` | string | — | Which declared plugin runs | A dangling name is refused |
+| `models[].filters[].on` | []string | `[request, response]` | Which halves run | `[response]` alone is refused: there is nothing to unmask if nothing was masked |
+| `models[].filters[].scope` | `conversation` \| `principal` \| `tenant` \| `request` | `conversation` | How far a placeholder's stability reaches | See below — this is the one knob with a privacy/performance trade in it |
+| `models[].filters[].patterns[]` | name or `{name, regexp}` | — | What gets masked. Built-ins: `krrn`, `email` | A pattern that can match the empty string is refused. An unknown name with no regexp is refused |
+| `models[].filters[].retain` | duration | `1h` | How long the reverse table holds a mapping in memory | It should be at least as long as the provider keeps its own conversation state. Memory only, never written anywhere |
+
+**Scope is the whole trade, and it is not avoidable.** A placeholder is derived —
+`HMAC(secret, scope ‖ salt ‖ value)` — so the same text always masks to the same bytes, which
+is what keeps the upstream prefix identical across turns and the backend's KV cache alive. The
+price is that a deterministic placeholder is a stable pseudonym: within its scope, the provider
+can link "this same person appears in these requests". That is the same property as the cache
+hit, not a bug next to it.
+
+| `scope` | Stable across | Prefix caching | Linkability |
+|---|---|---|---|
+| `conversation` | the turns of one conversation | works | nothing the provider did not already see |
+| `principal` | everything one key sends | works, across conversations | a key's traffic links |
+| `tenant` | one team | works, across a team | a team's traffic links |
+| `request` | nothing | **turned off for that route** | none |
+
+`request` disables prefix affinity for the request rather than leaving a claim about bytes that
+can never repeat.
+
+**Three limits, stated rather than silent.** A thinking block's text is not masked (it travels
+with provider integrity material dorang replays byte-identically). A tool call's arguments are
+not masked (the neutral form keeps them as raw JSON because re-encoding reorders keys, and a
+filter that re-encoded them would break the determinism above). A surface whose text the filter
+cannot reach — embeddings, for instance — is **refused** on a filtered model rather than sent
+unfiltered.
+
+**Counters.** `dorang_filter_masked_total`, `_restored_total`, `_unresolved_total` and
+`_refused_total`. `_unresolved_total` rising means a model is emitting placeholder-shaped text
+this gateway never issued, which is worth knowing. No counter carries a label derived from
+caller text, and no placeholder or original ever reaches a log line, a metric, the ledger or a
+trace.
+
+---
+
+## 18. `passthrough`
 
 Provider-native routes, opened by configuration rather than by writing an adapter each time.
 
@@ -1020,7 +1147,7 @@ surface you are willing to expose to whoever can reach that prefix. See
 
 ---
 
-## 18. `shadow`
+## 19. `shadow`
 
 Compares a sampled fraction of live traffic against a reference gateway during a migration.
 Full procedure in [MIGRATION.md](MIGRATION.md) §4.
@@ -1043,7 +1170,7 @@ shadow:
 |---|---|---|---|---|
 | `mode` | `off` \| `mirror` \| `compare` | `off` | `mirror` sends and records; `compare` sends, records and diffs | Anything else is refused. Quote `"off"` — bare `off` is YAML boolean false |
 | `reference.url` | string | `""` | The gateway being compared against | Required when mode is not `off`. Must be `http`/`https`, must have a host, and **must carry no query or fragment** — neither can survive being joined with the request path |
-| `reference.api_key_env` | string | `""` | Names the variable holding the **reference gateway's own** credential. The client's credential is never forwarded there | This is the one place in the file that spells a secret reference `api_key_env` rather than the `key_env`/`key_file`/`key_ref` triple. **A deployment that keeps secrets in a file or a vault cannot express a shadow reference credential at all** |
+| `reference.api_key_env` | string | `""` | Names the variable holding the **reference gateway's own** credential. The client's credential is never forwarded there | This is the one place in the file that spells a secret reference `api_key_env` rather than the `key_env`/`key_file` pair. **A deployment that keeps secrets in a file or a vault cannot express a shadow reference credential at all** |
 | `reference.timeout` | duration | `60s` | Bounds one reference call | Negative is refused. It is deliberately shorter than `server.request_timeout`: a shadow call that outlives the request it copies is holding a worker for a comparison nobody will read |
 | `sample_rate` | float | **`0`** | Fraction of eligible requests shadowed | Must be in `[0,1]`. ⚠️ **There is no default.** Turning `mode` on without setting this shadows nothing, produces an empty report, and reports gate verdict `no_data` — and an empty report is exactly what a cutover decision looks for |
 | `compare.structural` | bool | `true` | Compares status, field-path set, types at each path, header keys, and the error envelope | With `mode: compare` and structural off, the configuration is refused with "use `mode: mirror` instead" |
@@ -1063,7 +1190,7 @@ worst case at the defaults.
 
 ---
 
-## 19. `notifications`
+## 20. `notifications`
 
 An **event bus with pluggable sinks**, not an email system. Everything under `email` is delivery;
 everything beside it is the pipeline — and the pipeline exists because a notification is a
@@ -1118,13 +1245,13 @@ enqueue). Rendering, redaction, connection and retry all happen on a worker.
 | `email.to[]` | []string | `[]` | Default recipients | Each must contain `@`. **At least one is required by the `smtp` driver** — an address that is not an address fails at delivery time, which is to say during the incident the notification was meant to report |
 | `email.smtp.addr` | string | `""` | `host:port` | Required by `smtp`, and must parse as `host:port` |
 | `email.smtp.username` | string | `""` | SMTP user | **Required alongside a password** |
-| `email.smtp.key_env` / `key_file` / `key_ref` | secret ref | — | The SMTP password, as a normal secret reference (§0.3) | An inline literal outside development is refused, as everywhere else |
+| `email.smtp.key_env` / `key_file` | secret ref | — | The SMTP password, as a normal secret reference (§0.3) | An inline literal outside development is refused, as everywhere else |
 | `email.smtp.starttls` | bool | `false` | Upgrades the connection | ⚠️ **Setting a username with `starttls: false` is refused.** Go's SMTP client will not send `PLAIN` over an unencrypted connection to anything but a loopback server, so this would otherwise fail at delivery time; saying so at load is the cheaper discovery |
 | `email.smtp.tls_skip_verify` | bool | `false` | Accepts an unverifiable certificate | A deliberate downgrade, for a private relay |
 | `email.smtp.timeout` | duration | `10s` | Per-delivery timeout | Negative is refused |
 | `email.smtp.helo` | string | `""` | The name dorang announces itself as | — |
 | `email.http.url` | string | `""` | Webhook endpoint | Required by `http`. Must be `http`/`https` with a host. **A query string is fine here** — unlike a shadow reference the URL is used whole rather than joined with a request path, and hosted webhooks routinely carry a token in one |
-| `email.http.key_env` / `key_file` / `key_ref` | secret ref | — | The signing secret | ⚠️ **Required, not optional.** A delivery is signed with HMAC-SHA256 over the body, and a receiver with no secret cannot tell a real delivery from a forged one. The payload carries budget and quota state, so an unsigned webhook is an information leak waiting for a reachable URL |
+| `email.http.key_env` / `key_file` | secret ref | — | The signing secret | ⚠️ **Required, not optional.** A delivery is signed with HMAC-SHA256 over the body, and a receiver with no secret cannot tell a real delivery from a forged one. The payload carries budget and quota state, so an unsigned webhook is an information leak waiting for a reachable URL |
 | `email.http.timeout` | duration | `10s` | Per-delivery timeout | Negative is refused |
 | `email.http.headers{}` | map | `{}` | Extra request headers | — |
 
@@ -1149,7 +1276,7 @@ the renderer's.
 
 ---
 
-## 20. `priority_mapping`
+## 21. `priority_mapping`
 
 ```yaml
 priority_mapping:
@@ -1202,15 +1329,15 @@ who left it alone are the ones penalised. A clamp bounds how far the self-elevat
 does not remove the incentive.
 
 The asymmetry is deliberate: **an operator can grant urgency, a caller cannot claim it.** The
-design expresses the grant as `capacity.principals.<id>.client_priority` with a `range`. ⚠️ That
-is **not in this build's schema** — the ignore behaviour is implemented and the grant is not.
-§23.1.
+The grant is `capacity.principals.<id>.client_priority: allow` with a `range` of two priority
+class names, and the hint travels in `X-Request-Priority`. Both halves are implemented: a
+principal with no grant has its hint dropped and the drop reported.
 
 Dropping the hint is reported in `x-dorang-dropped-params` rather than being silent.
 
 ---
 
-## 21. Referential integrity
+## 22. Referential integrity
 
 Every cross-reference is checked at load, by name, with the YAML path:
 
@@ -1234,7 +1361,7 @@ Every cross-reference is checked at load, by name, with the YAML path:
 
 ---
 
-## 22. Environment variables
+## 23. Environment variables
 
 | Variable | Read by | Default name settable in | Notes |
 |---|---|---|---|
@@ -1248,11 +1375,16 @@ Every cross-reference is checked at load, by name, with the YAML path:
 `dorangctl key create` and `dorangctl migrate` resolve the pepper the same way the server does.
 A CLI that issued keys under a different pepper would issue keys the server cannot verify.
 
-⚠️ `DORANG_STATE_DIR` is set by the container image and **read by nothing**. See §23.1.
+`DORANG_STATE_DIR` relocates every state path written with a leading `~` — the database, the
+trace spool, the generated key pepper, batch blobs and the shadow report. The container image
+sets it to the directory it declares as a volume. Without it, `~` is the serving user's home
+directory, which under the image's `nonroot` user is `/home/nonroot`: outside the volume, in
+the container's writable layer, and gone on restart. Losing the generated pepper makes every
+api key issued under it unverifiable.
 
 ---
 
-## 23. Keys the schema accepts that this build does not act on
+## 24. Keys the schema accepts that this build does not act on
 
 Everything in this section validates, loads, and has no effect. It is listed by name because a
 ceiling you believe you set and that does nothing is worse than no ceiling.
@@ -1261,13 +1393,41 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 
 | Key | Status |
 |---|---|
-| `capacity.*.rpm`, `.tpm`, `.max_queue` on every group and on `global` | Validated for sign; the broker implements counted gauges only. No token bucket, no queue ceiling exists |
-| `capacity.principals.<id>.rpm`, `.tpm`, `.max_queue`, `.max_queue_wait` | Same. `max_queue_wait` is defaulted to `30s` on every principal and has no consumer |
 | `models[].deployments[].limits[]` with `metric: max_concurrent` or `max_queue` | Only `rpm` and `tpm` are consumed, and as a per-credential quota (§10.2) |
-| `key_rotation.strategy` | Validated against the four names; credentials are tried in configuration order regardless |
-| `observability.prometheus` | Never read. `/metrics` is served unconditionally and **unauthenticated** |
+| `providers[].usage_probe` | §6.2's fetchers exist in `internal/probe`; nothing constructs one from configuration |
+| `providers[].metrics.interval` | The endpoint and the enabled flag are read; the poll interval is not |
+| `providers[].params.drop`, `.drop_unsupported` | §10.3's two knobs never reach the conversion path — only the kind's own capability set decides what is dropped |
+| `routing.prefix.checkpoints` | The chain is cut logarithmically; `fixed` validates and selects nothing |
+| `models[].deployments[].stream_timeout` | Only the non-stream timeout reaches the upstream call |
+| `key_rotation.providers[].affinity_group` | Not read, and not validated either |
+| `key_rotation.providers[].stickiness.scope` | Not read; the session key comes from `routing.sticky.key` |
+| `cluster.redis_url_env` | Required for `capacity_mode: shared-redis` and no Redis client is constructed anywhere |
 | `observability.otlp_endpoint` | No exporter is wired |
-| `DORANG_STATE_DIR` | Declared by the container image; no code reads it. The state paths come from `storage.sqlite.path` and `metering.spool.dir` |
+| `observability.log_level`, `.log_format` | No logger reads either; diagnostics go through the `Logf` hook the embedder supplies |
+
+`internal/config/consumed_test.go` holds this list as executable state rather than prose:
+adding a setting with no consumer fails the build, and so does wiring one without striking it
+from the list. It cannot see the four rows whose Go field name is too common to search for
+(`interval`, `drop`, `stream_timeout`), which is why they are still written down here.
+
+### 23.1a Closed since the last pass
+
+Everything below used to be in the table above.
+
+| Key | What it does now |
+|---|---|
+| `capacity.*.max_queue`, `capacity.principals.<id>.max_queue`, `.max_queue_wait` | Wired. `max_queue` bounds the wait queue per axis and refuses past it; `max_queue_wait` bounds how long one of a principal's requests may wait, and a **pinned** request is the one that uses it — an unpinned one spills or falls back rather than queueing (§7.4a2, §7.6). Batch is exempt: it is the work that is meant to wait (§11.1) |
+| `capacity.*.rpm`, `.tpm` on every group, on `global`, on `models[]` and on `principals` | **Refused**, with the working home named. A capacity axis counts concurrent reservations, released when a request finishes; a rate needs a time window, which `internal/quota` owns. Put a per-deployment rate on `models[].deployments[].limits[]` and a per-caller rate on the api key's own `rpm_limit`/`tpm_limit` |
+| `key_rotation.strategy` | Wired. All four names now choose the preferred credential; a credential pin and a sticky entry still outrank the rotation |
+| `observability.prometheus` | Wired. `false` removes the `/metrics` route, which then answers 501 like any other unserved route |
+| `observability.metrics.public` | New. `/metrics` authenticates and requires the master credential by default; this opens it deliberately |
+| `capacity.principals.<id>.client_priority` + `range` | New, and §10.5's own example now loads |
+| `pricing.rules[].class: notional_rate` with `source` and `as_of` | New. §8.5's class is no longer catalog-only |
+| `pricing.rules[].rates.cache_read` | New spelling, alongside `cached_read`; both mean the same component in both files |
+| `pricing.rules[].rates.images` | Now a **load** error rather than an assembly error — it used to pass `config lint` and then stop the server from starting |
+| `key_ref` | **Refused**, naming `key_env` and `key_file` |
+| `providers[].prefix_ttl`, `models[].deployments[].prefix_ttl` | New. The affinity lifetime is per backend, because that is what it models; `until_evicted` is the honest value for vLLM and SGLang |
+| `DORANG_STATE_DIR` | Wired. A leading `~` in any state path resolves to it, so the image's defaults land inside its declared volume |
 
 ### 23.2 Designed and not in the schema at all
 
@@ -1275,25 +1435,22 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 |---|---|
 | §6.1 `quotas:` — rolling `5h`/`daily`/`weekly`/`monthly` windows over `cost_usd` or `tokens_total`, with `on_exhaust` | There is **no top-level `quotas:` block**. The only quota rules this build creates are rolling-minute request and token counters derived from `deployments[].limits[].rpm`/`.tpm` |
 | §6.4 `budget:` — a `period`/`limit_usd`/`on_exceed` block | There is **no top-level `budget:` block**. Budgets are per-API-key, set with `dorangctl key create --budget-usd`, and enforced through the durable ledger |
-| §7.5a `quota_urgency` | Not an accepted strategy name. The expiring-quota comparator is designed and unbuilt |
-| §10.5 `capacity.principals.<id>.client_priority` + `range` | Not in `PrincipalLimits`. The default (`ignore`) is implemented; the grant is not |
 | §7.4a2 `stickiness.pin_on_state` | Not in the schema — and correctly so: the pin is inferred from the request, not configured (§7.1) |
-| §12.1 `metering_degraded` | The meter tracks degradation with five reasons and hysteresis, and **nothing reads it**: no metric, no health field, no admin field. The design's "it is never silent" is not true in this build. (`notifications` has its own degraded state, separately reported — the two are different signals) |
 | §11.5 "Lua hooks" | The hook points, ceilings, fail-open/fail-closed rule and secret-free views are built; **there is no Lua interpreter** and a `.lua` file is a load error. §16 explains why, and what runs instead |
-| §8.5 `notional_rate` in `pricing.rules[]` | Inline rules accept three classes. Notional rules must live in the external catalog file (§13.3) |
 
 ### 23.3 What `--check` does not catch
 
 - A `key_env` variable that is set on the linting machine and unset on the serving one, or the
   reverse (secret failures are downgraded to warnings under `--check`).
 - A `storage.postgres.url_env` whose *contents* are wrong.
-- `pricing.rules[].rates.images`, which fails at assembly.
+- Nothing about pricing that is not a syntax or a naming error: `rates.images` and a
+  `notional_rate` rule missing its provenance are both refused at load now.
 - A `passthrough.routes[]` entry whose provider has no `base_url`, which is dropped silently.
 - Anything about whether the upstreams exist, answer, or speak the protocol their `kind` claims.
 
 ---
 
-## 24. Three worked configurations
+## 25. Three worked configurations
 
 The same binary and the same schema across the whole range. You scale by changing
 configuration, not by changing deployment model.
@@ -1514,7 +1671,7 @@ providers:
     usage_probe: {enabled: true, fetcher: openai, interval: 60s}
 
 credentials:
-  - {id: fleet-1, provider: fleet-vllm, key_ref: "vault:secret/dorang/fleet#key", capacity_group: fleet-acct}
+  - {id: fleet-1, provider: fleet-vllm, key_file: /run/secrets/fleet.key, capacity_group: fleet-acct}
   - {id: acct-1,  provider: cloud-a,    key_env: CLOUD_A_KEY_1, capacity_group: acct-1}
   - {id: acct-2,  provider: cloud-a,    key_env: CLOUD_A_KEY_2, capacity_group: acct-2}
 
@@ -1566,7 +1723,7 @@ Notes that matter at this tier:
   switch to `leased` — at which point every `max_concurrency` under 16 in this file is refused.
 - `store_messages: hash` with `sample_rate: 0.01` at ~2 k req/s keeps roughly 880 MB/day of the
   ~88 GB/day that full excerpts would cost.
-- `key_ref` is recorded and **not resolved by this build**: the `fleet-1` credential above will
+- `key_ref` is **refused by this build**: a credential declared that way would
   load and have no usable secret until an external resolver exists. Use `key_env` or `key_file`
   today.
 - The vLLM `metrics` scrape is only useful if `--disable-log-stats` is **not** set. Without that,

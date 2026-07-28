@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -229,35 +230,142 @@ func TestBothFramingLinesArePresent(t *testing.T) {
 	}
 }
 
-// TestInterleavedToolCallsReopenRatherThanDrop. This protocol has one open
-// block at a time and cannot express interleaving; the fragment is still
-// delivered, under the id it belongs to, and the condition is warned about.
-func TestInterleavedToolCallsReopenRatherThanDrop(t *testing.T) {
+// TestParallelToolCallsEachGetOneBlock is the shape the previous revision got
+// wrong, and the reason its test passed anyway.
+//
+// The old emitter closed and reopened a block every time the tool index changed.
+// Over a fixture whose calls arrive whole that produces a plausible-looking
+// stream. Over the ordinary chat-completions shape — where ONE frame carries
+// argument fragments for several parallel calls — it produces one tool_use block
+// per fragment: the same id repeated, each block holding a slice of JSON that
+// does not parse. The fixture below fragments the arguments, which is exactly
+// what the old fixture omitted.
+func TestParallelToolCallsEachGetOneBlock(t *testing.T) {
+	em := NewEmitter(StreamConfig{ID: "m1", Model: "m"})
+	var evs []Event
+	push := func(cs ...canonical.ToolCallDelta) {
+		evs = em.Push(evs, canonical.StreamEvent{
+			Type: canonical.EventDelta, Delta: canonical.Delta{ToolCalls: cs},
+		})
+	}
+	push(canonical.ToolCallDelta{Index: 0, ID: "a", Name: "f"},
+		canonical.ToolCallDelta{Index: 1, ID: "b", Name: "g"})
+	// One frame, both calls, both fragments. This is the ordinary vLLM/OpenAI
+	// shape for parallel calls and not an edge case.
+	push(canonical.ToolCallDelta{Index: 0, Arguments: `{"x":`},
+		canonical.ToolCallDelta{Index: 1, Arguments: `{"y":`})
+	push(canonical.ToolCallDelta{Index: 0, Arguments: `1}`},
+		canonical.ToolCallDelta{Index: 1, Arguments: `2}`})
+	evs = em.Finish(evs)
+
+	checkStreamInvariants(t, evs)
+	blocks := toolBlocksOf(evs)
+	if len(blocks) != 2 {
+		t.Fatalf("got %d tool_use blocks, want exactly 2 — one per call:\n%s", len(blocks), dumpEvents(evs))
+	}
+	want := []struct{ id, name, input string }{{"a", "f", `{"x":1}`}, {"b", "g", `{"y":2}`}}
+	for i, w := range want {
+		got := blocks[i]
+		if got.id != w.id || got.name != w.name {
+			t.Errorf("block %d = %q/%q, want %q/%q", i, got.id, got.name, w.id, w.name)
+		}
+		if got.input != w.input {
+			t.Errorf("block %d input = %q, want %q", i, got.input, w.input)
+		}
+		if !json.Valid([]byte(got.input)) {
+			t.Errorf("block %d carries JSON that does not parse on its own: %q", i, got.input)
+		}
+	}
+}
+
+// TestToolCallResumedAfterItsBlockClosedReopens is the one case where reopening
+// survives, and it is kept deliberately.
+//
+// Once a text block has been emitted the tool block behind it is closed and this
+// protocol has no way to amend it. Reopening under the same id is the only shape
+// left that a client can still act on; dropping the fragment would lose the call
+// and buffering it would put the block after content that came later.
+func TestToolCallResumedAfterItsBlockClosedReopens(t *testing.T) {
 	var warned []Warning
 	em := NewEmitter(StreamConfig{ID: "m1", Model: "m", Warn: func(w Warning) { warned = append(warned, w) }})
 	var evs []Event
 	evs = em.Push(evs, canonical.StreamEvent{Type: canonical.EventDelta, Delta: canonical.Delta{
-		ToolCalls: []canonical.ToolCallDelta{{Index: 0, ID: "a", Name: "f"}},
+		ToolCalls: []canonical.ToolCallDelta{{Index: 0, ID: "a", Name: "f", Arguments: `{"x":`}},
 	}})
 	evs = em.Push(evs, canonical.StreamEvent{Type: canonical.EventDelta, Delta: canonical.Delta{
-		ToolCalls: []canonical.ToolCallDelta{{Index: 1, ID: "b", Name: "g"}},
+		Content: []canonical.Block{canonical.TextBlock("interrupting")},
 	}})
 	evs = em.Push(evs, canonical.StreamEvent{Type: canonical.EventDelta, Delta: canonical.Delta{
-		ToolCalls: []canonical.ToolCallDelta{{Index: 0, Arguments: `{"x":1}`}},
+		ToolCalls: []canonical.ToolCallDelta{{Index: 0, Arguments: `1}`}},
 	}})
 	evs = em.Finish(evs)
 
+	checkStreamInvariants(t, evs)
 	if !hasWarning(warned, WarnInterleavedToolCalls) {
-		t.Error("interleaving must warn: it is a shape this protocol cannot carry")
+		t.Errorf("a call resumed after its block closed must warn: %+v", warned)
 	}
-	reopened := false
-	for i := range evs {
-		if s, ok := evs[i].Payload.(*ContentBlockStartEvent); ok && s.ContentBlock.ID == "a" && s.Index == 2 {
-			reopened = true
+	blocks := toolBlocksOf(evs)
+	if len(blocks) != 2 {
+		t.Fatalf("want the reopened block, got %d:\n%s", len(blocks), dumpEvents(evs))
+	}
+	// The fragment is delivered, in order, under the id it belongs to. The two
+	// halves land in two blocks that share an id, which is all this protocol
+	// leaves once the boundary has gone out — and is why the condition warns.
+	for i, w := range []string{`{"x":`, `1}`} {
+		if blocks[i].id != "a" {
+			t.Errorf("block %d id = %q, want a", i, blocks[i].id)
+		}
+		if blocks[i].input != w {
+			t.Errorf("block %d input = %q, want %q", i, blocks[i].input, w)
 		}
 	}
-	if !reopened {
-		t.Errorf("the reopened block lost its tool id: %+v", evs)
+}
+
+// seenToolBlock is one tool_use block as it appeared on the wire, with every
+// input_json_delta of that block concatenated.
+type seenToolBlock struct {
+	index       int
+	id          string
+	name        string
+	input       string
+	sawInputSet bool
+}
+
+func toolBlocksOf(evs []Event) []seenToolBlock {
+	var out []seenToolBlock
+	cur := -1
+	for i := range evs {
+		switch p := evs[i].Payload.(type) {
+		case *ContentBlockStartEvent:
+			if p.ContentBlock.Type != BlockToolUse {
+				cur = -1
+				continue
+			}
+			out = append(out, seenToolBlock{
+				index: p.Index, id: p.ContentBlock.ID, name: p.ContentBlock.Name,
+				sawInputSet: len(p.ContentBlock.Input) > 0,
+			})
+			cur = len(out) - 1
+		case *ContentBlockDeltaEvent:
+			if cur >= 0 && p.Delta.Type == DeltaInputJSON {
+				out[cur].input += p.Delta.PartialJSON
+			}
+		case *ContentBlockStopEvent:
+			cur = -1
+		}
 	}
-	checkStreamInvariants(t, evs)
+	return out
+}
+
+func dumpEvents(evs []Event) string {
+	var b strings.Builder
+	for i := range evs {
+		b.WriteString(evs[i].Type)
+		b.WriteByte(' ')
+		if data, err := Marshal(evs[i].Payload); err == nil {
+			b.Write(data)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

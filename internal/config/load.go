@@ -106,4 +106,9 @@ func (c *Config) resolveSecrets(col *collector) {
 	if c.Notifications.Email.HTTP.Secret.sources() == 1 {
 		c.Notifications.Email.HTTP.Secret.resolve(env, "notifications.email.http", col)
 	}
+	// §10.5b: the placeholder seed. It is cluster-wide rather than per-process,
+	// which is exactly why it is a reference and not a value generated at start.
+	if c.Filters.Secret.sources() == 1 {
+		c.Filters.Secret.resolve(env, "filters.secret", col)
+	}
 }

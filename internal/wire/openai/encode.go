@@ -22,9 +22,17 @@ type EncodeOptions struct {
 	// header, which the encoder never sees (DESIGN §10.1).
 	Loss *canonical.LossReport
 
-	// ToolNames records tool-name shortening (COMPATIBILITY 5.3). If nil and
-	// shortening is needed, the encoder allocates one and stores it here so the
-	// response decoder of the same exchange can restore the names.
+	// ToolNames records tool-name shortening (COMPATIBILITY 5.3). It must be the
+	// SAME value the response decoder of this exchange is given: the rule has two
+	// halves and a mapping only one of them can reach is worse than no mapping at
+	// all.
+	//
+	// A nil ToolNames does not shorten. That is deliberate and it is the reason
+	// this field is no longer filled in lazily: an encoder that allocates its own
+	// mapping shortens the name, discards the mapping with its options struct,
+	// and leaves the caller holding a truncated name it never declared and cannot
+	// match. An over-long name forwarded intact is refused by the upstream with a
+	// message naming the tool, which is a failure an operator can act on.
 	ToolNames *ToolNames
 
 	// Model overrides the model field, which is how the real upstream id
@@ -74,13 +82,10 @@ func (o *EncodeOptions) warn() WarnFunc {
 	return o.Warn
 }
 
-// toolNames returns the mapping, allocating one on first need.
+// toolNames returns the caller's mapping, which may be nil.
 func (o *EncodeOptions) toolNames() *ToolNames {
 	if o == nil {
 		return nil
-	}
-	if o.ToolNames == nil {
-		o.ToolNames = NewToolNames()
 	}
 	return o.ToolNames
 }
@@ -156,6 +161,10 @@ func EncodeRequest(req *canonical.Request, opt *EncodeOptions) (*Request, error)
 			out.Tools = make([]Tool, 0, len(req.Tools))
 			for i := range req.Tools {
 				t := &req.Tools[i]
+				// Declared whether or not it needs shortening: the set is what
+				// tells a fragmented name on the way back from a shorter name
+				// that happens to be a prefix of it (COMPATIBILITY 5.3).
+				names.Declare(t.Name)
 				wt := Tool{Type: t.Type, Extra: t.Extra}
 				if wt.Type == "" {
 					wt.Type = "function"

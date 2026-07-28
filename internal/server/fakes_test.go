@@ -22,11 +22,13 @@ type fakePrincipal struct {
 	models  []string // nil allows everything
 	refuse  error
 	nRoutes []string
+	admin   bool
 }
 
 func (p *fakePrincipal) KeyID() string  { return p.id }
 func (p *fakePrincipal) UserID() string { return p.user }
 func (p *fakePrincipal) TeamID() string { return p.team }
+func (p *fakePrincipal) IsAdmin() bool  { return p.admin }
 
 func (p *fakePrincipal) Authorize(a Access) error {
 	if p.refuse != nil {
@@ -63,13 +65,21 @@ type fakeAuth struct {
 	seen []string
 }
 
+// newFakeAuth accepts the named tokens as ordinary keys, plus the fixed token
+// "root" as an administrative one. Two identities rather than one, because
+// "authenticated" and "may read the administrative surface" are now different
+// answers and a fake that conflated them could not tell them apart.
 func newFakeAuth(tokens ...string) *fakeAuth {
 	a := &fakeAuth{keys: map[string]*fakePrincipal{}}
 	for _, t := range tokens {
 		a.keys[t] = &fakePrincipal{id: "key-" + t}
 	}
+	a.keys[adminToken] = &fakePrincipal{id: "key-root", admin: true}
 	return a
 }
+
+// adminToken is the fake administrative credential.
+const adminToken = "root"
 
 func (a *fakeAuth) AuthenticateHeader(_ context.Context, h http.Header) (Principal, error) {
 	tok, name := extractToken(h)
@@ -207,5 +217,12 @@ func post(path, body string) *http.Request {
 func get(path string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, path, nil)
 	r.Header.Set(HeaderAuthorization, "Bearer good")
+	return r
+}
+
+// getAdmin builds a GET carrying the administrative credential.
+func getAdmin(path string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	r.Header.Set(HeaderAuthorization, "Bearer "+adminToken)
 	return r
 }

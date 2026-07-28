@@ -526,7 +526,10 @@ func TestRegistryReplacesTheBuiltInBlock(t *testing.T) {
 	q := NewRequests(RequestsOptions{})
 	reg.Register(q)
 
-	srv, err := server.New(server.Options{Metrics: reg})
+	// MetricsPublic, because this test is about which renderer produced the
+	// body rather than about who may read it. The access rule has its own tests
+	// in internal/server and internal/app.
+	srv, err := server.New(server.Options{Metrics: reg, MetricsAccess: server.MetricsPublic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +554,7 @@ func TestRegistryReplacesTheBuiltInBlock(t *testing.T) {
 // working: a deployment that never assembles a registry still has a usable
 // endpoint.
 func TestBuiltInBlockSurvivesWithoutARegistry(t *testing.T) {
-	srv, err := server.New(server.Options{})
+	srv, err := server.New(server.Options{MetricsAccess: server.MetricsPublic})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -615,13 +618,19 @@ func TestCollectionDoesNotBlockARequest(t *testing.T) {
 // reason.
 func TestScrapeCompletesWhileTheConfigMutexIsHeld(t *testing.T) {
 	reg := New(nil)
-	srv, err := server.New(server.Options{Metrics: reg})
+	srv, err := server.New(server.Options{Metrics: reg, MetricsAccess: server.MetricsPublic})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reg.Register(NewServerCollector(srv))
 
 	stop := make(chan struct{})
+	// running closes once the reload loop has actually reloaded once. Without
+	// it the scrape loop below can finish its two hundred iterations before the
+	// goroutine is ever scheduled, and the test then fails on its own
+	// "no reload ran" guard — which is the guard doing its job, so the fix
+	// belongs here rather than in the guard.
+	running := make(chan struct{})
 	var reloads atomic.Int64
 	go func() {
 		for {
@@ -631,10 +640,13 @@ func TestScrapeCompletesWhileTheConfigMutexIsHeld(t *testing.T) {
 			default:
 			}
 			_ = srv.Reload(server.Options{Metrics: reg})
-			reloads.Add(1)
+			if reloads.Add(1) == 1 {
+				close(running)
+			}
 		}
 	}()
 	defer close(stop)
+	<-running
 
 	done := make(chan int, 1)
 	go func() {

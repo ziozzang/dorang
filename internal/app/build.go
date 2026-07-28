@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -86,14 +85,28 @@ func brokerConfig(cfg *config.Config, now func() time.Time) capacity.Config {
 	if cfg.Capacity.Global != nil {
 		c.Global = cfg.Capacity.Global.MaxConcurrency
 	}
+	c.Queues = capacity.QueueConfig{
+		ProviderGroups:   map[string]int{},
+		CredentialGroups: map[string]int{},
+		Routes:           map[string]int{},
+		Principals:       map[string]int{},
+		MaxWait:          map[string]time.Duration{},
+	}
+	if cfg.Capacity.Global != nil {
+		c.Queues.Global = cfg.Capacity.Global.MaxQueue
+	}
 	for name, l := range cfg.Capacity.ProviderGroups {
 		c.ProviderGroups[name] = l.MaxConcurrency
+		c.Queues.ProviderGroups[name] = l.MaxQueue
 	}
 	for name, l := range cfg.Capacity.CredentialGroups {
 		c.CredentialGroups[name] = l.MaxConcurrency
+		c.Queues.CredentialGroups[name] = l.MaxQueue
 	}
 	for name, l := range cfg.Capacity.Principals {
 		c.Principals[name] = l.MaxConcurrent
+		c.Queues.Principals[name] = l.MaxQueue
+		c.Queues.MaxWait[name] = l.MaxQueueWait.Duration()
 	}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
@@ -105,6 +118,11 @@ func brokerConfig(cfg *config.Config, now func() time.Time) capacity.Config {
 		c.Models = append(c.Models, capacity.ModelLimit{
 			Provider: m.Provider, Model: m.Model, Max: m.Limits.MaxConcurrency,
 		})
+		if m.Limits.MaxQueue > 0 {
+			c.Queues.Models = append(c.Queues.Models, capacity.ModelLimit{
+				Provider: m.Provider, Model: m.Model, Max: m.Limits.MaxQueue,
+			})
+		}
 	}
 	return c
 }
@@ -220,6 +238,7 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 				Priority:      d.Priority,
 				Timeout:       d.Timeout.Duration(),
 				Capabilities:  capabilitiesFor(cat, p.Kind),
+				PrefixTTL:     cfg.PrefixTTLFor(d.Provider, d).TableTTL(),
 			}
 			if rd.Timeout == 0 {
 				rd.Timeout = p.Timeout.Duration()
@@ -252,6 +271,12 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 		Now:      deps.now,
 	}
 	rc.OnCapacity = onCapacity(cfg)
+	if rot, ok := router.ParseRotation(cfg.KeyRotation.Strategy); ok {
+		rc.Rotation = rot
+	} else if cfg.KeyRotation.Strategy != "" {
+		return nil, fmt.Errorf("app: key_rotation.strategy: unknown strategy %q",
+			cfg.KeyRotation.Strategy)
+	}
 
 	return router.New(rc, router.Deps{
 		Capacity: deps.broker,
@@ -261,6 +286,7 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 		Pricing:  deps.pricing,
 		Catalog:  deps.catalog,
 		Quota:    deps.quota,
+		Urgency:  deps.quota.ranker(),
 	})
 }
 
@@ -350,6 +376,29 @@ func priorityConfig(cfg *config.Config) router.PriorityConfig {
 	if cfg.PriorityMapping.Emit.Header != "" {
 		pc.Header = cfg.PriorityMapping.Emit.Header
 	}
+	// §10.5's grant, per principal. Without this the ignore half was implemented
+	// twice over — DefaultPriority ships Min == Max == 0, and nothing set them —
+	// so the allow half could not be selected from configuration at all.
+	for name, p := range cfg.Capacity.Principals {
+		if !p.GrantsClientPriority() || len(p.Range) != 2 {
+			continue
+		}
+		lo, ok1 := pc.Classes[p.Range[0]]
+		hi, ok2 := pc.Classes[p.Range[1]]
+		if !ok1 || !ok2 {
+			continue // refused at validation; skipped here rather than guessed
+		}
+		// The pair is a closed interval on the canonical scale and the file may
+		// write it in either order — §10.5's own examples do both, because an
+		// operator thinks in "batch to interactive", not in "low to high".
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		if pc.Grants == nil {
+			pc.Grants = map[string]router.PriorityGrant{}
+		}
+		pc.Grants[name] = router.PriorityGrant{Min: lo, Max: hi}
+	}
 	for kind, b := range cfg.PriorityMapping.Emit.Backends {
 		rule := pc.Emit[kind]
 		rule.Field = b.Field
@@ -436,7 +485,26 @@ func newQuotaSet(cfg *config.Config, now func() time.Time) (*quotaSet, error) {
 		}
 		meters[cid] = m
 	}
-	return &quotaSet{meters: meters}, nil
+	qs := &quotaSet{meters: meters}
+	// The §7.5a(c) scorer. It is built only when something can actually score:
+	// a Ranker over meters with no resetting window answers zero for every
+	// credential, and a strategy that always answers zero is silence with a
+	// per-request cost.
+	if len(meters) > 0 {
+		rank := quota.NewRanker(quota.RankerConfig{NodeID: nodeID(cfg)})
+		tracked := 0
+		for cid, m := range meters {
+			if m == nil {
+				continue
+			}
+			rank.Track(cid, m)
+			tracked++
+		}
+		if tracked > 0 {
+			qs.rank = rank
+		}
+	}
+	return qs, nil
 }
 
 func strictest(a, b int64) int64 {
@@ -567,6 +635,9 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 
 		Op     string `yaml:"op,omitempty"`
 		Amount string `yaml:"amount,omitempty"`
+
+		Source string `yaml:"source,omitempty"`
+		AsOf   string `yaml:"as_of,omitempty"`
 	}
 	out := rule{
 		ID:       r.ID,
@@ -581,15 +652,17 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 		},
 	}
 	for name, v := range r.Rates {
-		switch name {
+		// The main file has always spelled the cached-input component
+		// "cached_read" and the price catalog "cache_read". Both spellings are
+		// now accepted in both files and resolved to the catalog's here, so a
+		// rule copied from one file to the other keeps pricing instead of
+		// failing to load on an underscore.
+		switch config.CanonicalComponent(name) {
 		case "input":
 			out.Input = v.String()
 		case "output":
 			out.Output = v.String()
-		// The main file spells the cached-input component "cached_read"; the
-		// price catalog spells it "cache_read". Both are load-bearing in their
-		// own file, so the name is translated rather than one of them changed.
-		case "cached_read":
+		case "cache_read":
 			out.CacheRead = v.String()
 		case "cache_write":
 			out.CacheWrite = v.String()
@@ -601,12 +674,10 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 			out.Characters = v.String()
 		case "seconds":
 			out.Seconds = v.String()
-		case "images":
-			// §8.3 lists images among the priced quantities; internal/pricing
-			// has no per-image unit, so the rate is reported rather than
-			// silently priced at zero.
-			return nil, fmt.Errorf("app: pricing rule %s: the images component is not priced by this build", r.ID)
 		default:
+			// Unreachable from a loaded configuration: internal/config refuses
+			// an unknown component, and `images` with it. It stays as a guard
+			// for a Config built in code rather than parsed.
 			return nil, fmt.Errorf("app: pricing rule %s: unknown rate component %q", r.ID, name)
 		}
 	}
@@ -617,6 +688,13 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 	case config.PricingAdjustment:
 		out.Op = "percent"
 		out.Amount = r.Percent.String()
+	case config.PricingNotionalRate:
+		// §8.5's provenance. internal/pricing refuses a notional rule without
+		// both, so dropping them here would have made the class unusable inline
+		// even once the validator accepted it — which is why adding the class
+		// name alone would not have been a fix.
+		out.Source = r.Source
+		out.AsOf = r.AsOf
 	}
 	var n yaml.Node
 	if err := n.Encode(out); err != nil {
@@ -628,7 +706,13 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 // passthroughRoutes renders passthrough.* onto the server's route set (§10.6).
 // An unmapped prefix is not served, and a route whose provider has no base URL
 // is dropped rather than pointed at nothing.
-func passthroughRoutes(cfg *config.Config, cat *catalog.Catalog) []server.PassthroughRoute {
+//
+// It takes the resolved provider table rather than the catalog because the one
+// thing it has to get right — how dorang's own credential is spelled for this
+// provider — is the backend adapter's answer, and asking a second implementation
+// would produce a relay that authenticates differently from every other request
+// to the same host.
+func passthroughRoutes(cfg *config.Config, table *upstreamTable) []server.PassthroughRoute {
 	if !cfg.Passthrough.Enabled {
 		return nil
 	}
@@ -666,9 +750,10 @@ func passthroughRoutes(cfg *config.Config, cat *catalog.Catalog) []server.Passth
 			Timeout:  timeout,
 		}
 		if mode == config.PassthroughAuthDorang {
-			if c := byProvider[r.Provider]; c != nil && c.secret != "" {
-				secret, api := c.secret, apiFor(cat, p.Kind)
-				route.Credential = func(h http.Header) { applyCredential(api, secret, h) }
+			prov, known := table.provider(r.Provider)
+			if c := byProvider[r.Provider]; known && c != nil && c.secret != "" {
+				secret := c.secret
+				route.Credential = func(h http.Header) { _ = prov.ApplyCredential(secret, nil, h) }
 			}
 		}
 		out = append(out, route)
@@ -712,6 +797,3 @@ func (m *modelList) Models() []server.Model {
 	}
 	return nil
 }
-
-// trimBase normalizes a configured base URL for endpoint joining.
-func trimBase(s string) string { return strings.TrimRight(s, "/") }

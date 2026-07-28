@@ -9,7 +9,6 @@
 #
 #   key_env:  NAME          read from the process environment
 #   key_file: /path/to/key  read from a file, trailing newline trimmed
-#   key_ref:  vault:…       handed to an external resolver
 #   key:      literal       accepted ONLY when server.env is "development"
 #
 # Sizes accept B / KB / MB / GB and KiB / MiB / GiB. Durations accept
@@ -71,6 +70,8 @@ providers:
       enabled: false              # poll the provider's own view of quota (§6.2)
       fetcher: glm
       interval: 60s
+    prefix_ttl: until_evicted     # a self-hosted engine evicts prefix blocks by
+                                  # memory pressure, never by a clock (§7.4b)
 
   - name: cloud-a
     kind: openai
@@ -78,6 +79,9 @@ providers:
     timeout: 120s
     max_concurrency: 12
     capacity_group: shared-pool
+    prefix_ttl: 5m                # this vendor's automatic prompt cache is minutes,
+                                  # so an hour of affinity would pin conversations
+                                  # to a node that no longer holds the prefix
     metrics:
       enabled: false              # scrape backend metrics for least_busy / highest_tps (§12.4)
       endpoint: http://127.0.0.1:8000/metrics
@@ -138,6 +142,14 @@ models:
   - name: model-x
     class: chat-large
     strategy: [prefix_sticky, lowest_cost, least_busy]   # a tie-break chain (§7.3)
+    filters:
+      # Attach a plugin declared under `filters:` below (§10.5b). A pattern is
+      # either a built-in name or a {name, regexp} pair:
+      #   patterns: [krrn, email, {name: employee_id, regexp: 'EMP-\d{6}'}]
+      - plugin: pii-mask
+        on: [request, response]   # both halves — a mask that is never undone is a redaction
+        scope: conversation       # conversation | principal | tenant | request
+        patterns: [krrn, email]
     deployments:
       - provider: plan-a
         upstream_model: model-x
@@ -183,7 +195,11 @@ routing:
     chunk_bytes: 4096             # BYTE boundaries — no tokenizer on the hot path (§7.4b)
     checkpoints: logarithmic      # logarithmic | fixed
     max_bytes: 64MiB              # budget by retained memory, not by entry count
-    ttl: 1h
+    ttl: 1h                       # DEFAULT lifetime; providers[].prefix_ttl and
+                                  # deployments[].prefix_ttl override it, because
+                                  # what this models is how long the BACKEND still
+                                  # holds those KV blocks — minutes for a hosted
+                                  # cache, no clock at all for vLLM or SGLang
 
 fallbacks:
   on:
@@ -244,6 +260,27 @@ extensions:
     dir: /etc/dorang/lua
     hooks: [on_request, on_route, on_response, on_email]
     limits: {instructions: 5000000, memory_mb: 32, timeout: 200ms}
+
+filters:
+  # Transform filters sit between the canonical request and the backend: they
+  # may rewrite the request on the way out and the response on the way back
+  # (§10.5b). The motivating case is reversible PII masking — an identity number
+  # never leaves the operator's control, and the caller never notices.
+  #
+  # The seed a placeholder is derived from. It must be the SAME value on every
+  # node and across restarts: a per-process seed masks the same text differently
+  # everywhere, so the bodies that reach a backend differ byte for byte and every
+  # prefix cache cold-starts (§7.4b). Unset is only allowed when every filter
+  # uses `scope: request`.
+  secret:
+    key_env: DORANG_EXAMPLE_FILTER_SECRET
+  plugins:
+    # A filter is loaded because it is named here, never because it was found in
+    # a directory (§11.5).
+    - name: pii-mask
+      path: /etc/dorang/plugins/pii_mask.lua
+      fail: closed                # closed | open — a mask that failed must stop the request
+      config: {skip_system: "true"}  # handed to the plugin verbatim; it holds no secret
 
 passthrough:
   # Provider-native routes, opened by configuration rather than by an adapter.

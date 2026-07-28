@@ -107,19 +107,27 @@ var (
 	onCapacityModes  = []string{"wait", "spill"}
 	strategies       = []string{
 		"round_robin", "least_busy", "lowest_cost", "lowest_latency", "highest_tps",
-		"sticky", "prefix_sticky", "priority", "weighted_random",
+		"sticky", "prefix_sticky", "priority", "weighted_random", "quota_urgency",
 	}
-	stickyKeyParts  = []string{"api_key", "session_id", "user", "team", "tenant"}
-	checkpointKinds = []string{"logarithmic", "fixed"}
-	fallbackCauses  = []string{
+	clientPriorityModes = []string{ClientPriorityIgnore, ClientPriorityAllow}
+	stickyKeyParts      = []string{"api_key", "session_id", "user", "team", "tenant"}
+	checkpointKinds     = []string{"logarithmic", "fixed"}
+	fallbackCauses      = []string{
 		CauseRateLimit, CauseQuotaExhausted, CauseContextWindow, CauseContentPolicy,
 		CauseUpstream5xx, CauseTimeout, CauseBudgetExceeded, CauseAuth,
 	}
 	fallbackTargets = []string{TargetSameGroup, TargetSameClass, TargetSameClassLarger}
-	pricingClasses  = []string{PricingMarginalUsage, PricingFixedSubscription, PricingAdjustment}
+	pricingClasses  = []string{
+		PricingMarginalUsage, PricingFixedSubscription, PricingAdjustment, PricingNotionalRate,
+	}
 	storeMessages   = []string{StoreMessagesNone, StoreMessagesHash, StoreMessagesTruncated}
 	logLevels       = []string{"debug", "info", "warn", "error"}
 	logFormats      = []string{"json", "text"}
+	filterFailModes = []string{FilterFailClosed, FilterFailOpen}
+	filterPhases    = []string{FilterOnRequest, FilterOnResponse}
+	filterScopes    = []string{
+		FilterScopeConversation, FilterScopePrincipal, FilterScopeTenant, FilterScopeRequest,
+	}
 	passthroughAuth = []string{PassthroughAuthDorang, PassthroughAuthClient, PassthroughAuthNone}
 	shadowModes     = []string{ShadowModeOff, ShadowModeMirror, ShadowModeCompare}
 	metricNames     = []string{MetricMaxConcurrent, MetricRPM, MetricTPM, MetricMaxQueue}
@@ -181,6 +189,7 @@ func (c *Config) validate(col *collector) {
 	c.validateMetering(col)
 	c.validateObservability(col)
 	c.validateExtensions(col)
+	c.validateFilters(col)
 	c.validatePassthrough(col, providers)
 	c.validateShadow(col)
 	c.validateNotifications(col)
@@ -250,6 +259,10 @@ func (c *Config) validateCluster(col *collector) {
 }
 
 func (c *Config) validateAuth(col *collector) {
+	c.validateRotation(col)
+	c.validateRevocation(col)
+	c.validateTiers(col)
+	c.validateTokenGuard(col)
 	if !c.Auth.Legacy.Enabled {
 		return
 	}
@@ -270,6 +283,159 @@ func (c *Config) validateAuth(col *collector) {
 		col.add("auth.legacy.until",
 			"the legacy migration window closed at %s: legacy verification is refused after that date (§2.4)",
 			until.UTC().Format(time.RFC3339))
+	}
+}
+
+// validateRotation checks the §11.2c block.
+func (c *Config) validateRotation(col *collector) {
+	r := c.Auth.Rotation
+	nonNegative(col, "auth.rotation.grace", int64(r.Grace))
+	nonNegative(col, "auth.rotation.max_age", int64(r.MaxAge))
+	if r.MaxSecrets < 2 {
+		// One secret means a rotation has to cut the old one in the same
+		// instant it mints the new one, which is a re-provisioning wearing a
+		// rotation's name: there is no window in which a client can roll.
+		col.add("auth.rotation.max_secrets",
+			"must be at least 2: rotation mints a new secret and leaves the old one valid for a "+
+				"grace period, and %d leaves no overlap in flight (§11.2c)", r.MaxSecrets)
+	}
+	if r.MaxAge > 0 && r.Grace > 0 && time.Duration(r.Grace) >= time.Duration(r.MaxAge) {
+		col.add("auth.rotation.grace",
+			"the grace period (%s) is not shorter than max_age (%s), so a secret would be overdue "+
+				"for rotation before the previous rotation's window had closed",
+			time.Duration(r.Grace), time.Duration(r.MaxAge))
+	}
+}
+
+// validateRevocation checks the §11.2c / W11 block.
+func (c *Config) validateRevocation(col *collector) {
+	r := c.Auth.Revocation
+	for path, v := range map[string]Duration{
+		"auth.revocation.entry_ttl":     r.EntryTTL,
+		"auth.revocation.negative_ttl":  r.NegativeTTL,
+		"auth.revocation.poll":          r.Poll,
+		"auth.revocation.retain":        r.Retain,
+		"auth.revocation.store_latency": r.StoreLatency,
+	} {
+		nonNegative(col, path, int64(v))
+	}
+	if r.NegativeTTL > r.EntryTTL {
+		// §11.2c rule 3, refused rather than clamped: a key that was refused is
+		// cheap to re-check and a key that is serving is not, and holding
+		// refusals for longer inverts the rule rather than merely weakening it.
+		col.add("auth.revocation.negative_ttl",
+			"must not exceed entry_ttl (%s): a refused key is cheap to re-check and a serving one "+
+				"is not, and holding refusals longer is what makes a revocation window wide (§11.2c)",
+			time.Duration(r.EntryTTL))
+	}
+	if r.Poll > 0 && r.Retain > 0 && r.Retain <= r.Poll {
+		col.add("auth.revocation.retain",
+			"must be longer than poll (%s), or a message can be pruned before every node has read it",
+			time.Duration(r.Poll))
+	}
+	if r.EntryTTL > 0 && r.Poll+r.StoreLatency >= r.EntryTTL {
+		// The invalidation path exists to be faster than the TTL it falls back
+		// to. A configuration where it is not has the mechanism as decoration
+		// on top of the thing it was built to replace.
+		col.add("auth.revocation.poll",
+			"poll + store_latency (%s) is not below entry_ttl (%s): the published revocation bound "+
+				"would be no better than the cache TTL it is supposed to replace (§11.2c)",
+			time.Duration(r.Poll+r.StoreLatency), time.Duration(r.EntryTTL))
+	}
+}
+
+// validateTiers checks the §11.6 tier set.
+//
+// It does NOT check that a tier's limits are ordered against its neighbours'.
+// An operator may legitimately grant a lower tier more of one axis and less of
+// another, and inventing a monotonicity rule here would refuse configurations
+// the design permits. What the ordering fixes is scheduling, and that is
+// computed from position rather than declared.
+func (c *Config) validateTiers(col *collector) {
+	seen := map[string]bool{}
+	for i, t := range c.Auth.Tiers {
+		path := fmt.Sprintf("auth.tiers[%d]", i)
+		name := strings.TrimSpace(t.Name)
+		if name == "" {
+			col.add(path+".name", "a tier must have a name")
+			continue
+		}
+		if seen[name] {
+			col.add(path+".name", "tier %q is defined twice", name)
+		}
+		seen[name] = true
+		if t.RPMLimit != nil {
+			nonNegative(col, path+".rpm_limit", *t.RPMLimit)
+		}
+		if t.TPMLimit != nil {
+			nonNegative(col, path+".tpm_limit", *t.TPMLimit)
+		}
+		if t.MaxParallel != nil {
+			nonNegative(col, path+".max_parallel_requests", *t.MaxParallel)
+		}
+		if t.PriorityClass != "" && len(c.PriorityMapping.Classes) > 0 {
+			if _, ok := c.PriorityMapping.Classes[t.PriorityClass]; !ok {
+				col.add(path+".priority_class",
+					"%q is not one of priority_mapping.classes %v", t.PriorityClass,
+					sortedKeys(c.PriorityMapping.Classes))
+			}
+		}
+	}
+	if d := strings.TrimSpace(c.Auth.DefaultTier); d != "" && len(c.Auth.Tiers) > 0 && !seen[d] {
+		col.add("auth.default_tier",
+			"%q is not one of auth.tiers %v; a default that names nothing is how every unassigned "+
+				"key silently becomes unrestricted", d, sortedKeys(seen))
+	}
+}
+
+// tokenGuardActions are the actions of §11.6. `throttle` is designed and not
+// implemented, and it is listed so that naming it is refused with an
+// explanation rather than silently downgraded to alert_only.
+var tokenGuardActions = []string{"pend", "revoke", "alert_only", "throttle"}
+
+// validateTokenGuard checks the §11.6 block.
+func (c *Config) validateTokenGuard(col *collector) {
+	g := c.TokenGuard
+	mustBeOneOf(col, "token_guard.action", g.Action, tokenGuardActions)
+	if g.Action == "throttle" {
+		col.add("token_guard.action",
+			"throttle is designed (§11.6) and not implemented; configure pend, revoke or "+
+				"alert_only rather than have the guard do less than you asked")
+	}
+	nonNegative(col, "token_guard.baseline_window", int64(g.BaselineWindow))
+	nonNegative(col, "token_guard.window", int64(g.Window))
+	nonNegative(col, "token_guard.min_history", int64(g.MinHistory))
+	nonNegative(col, "token_guard.cooldown", int64(g.Cooldown))
+	nonNegative(col, "token_guard.trigger.min_absolute", g.Trigger.MinAbsolute)
+	if g.Trigger.Factor < 0 {
+		col.add("token_guard.trigger.factor", "must not be negative")
+	}
+	if !g.Enabled {
+		return
+	}
+	// Both conditions must hold, so a guard configured with either one disabled
+	// is a guard that fires on one condition — which is precisely the shape
+	// §11.6 rules out. Refusing is better than firing hardest on the quietest
+	// keys.
+	if g.Trigger.Factor <= 1 {
+		col.add("token_guard.trigger.factor",
+			"must be greater than 1 when the guard is enabled: a factor of %g makes the relative "+
+				"condition hold for any key at or above its own baseline (§11.6)", g.Trigger.Factor)
+	}
+	if g.Trigger.MinAbsolute <= 0 {
+		col.add("token_guard.trigger.min_absolute",
+			"must be greater than zero when the guard is enabled: without an absolute floor the "+
+				"guard fires hardest on the quietest keys (§11.6)")
+	}
+	if g.BaselineWindow > 0 && g.Window > g.BaselineWindow {
+		col.add("token_guard.window",
+			"is longer than baseline_window (%s); the baseline would be computed from less traffic "+
+				"than it is compared against", time.Duration(g.BaselineWindow))
+	}
+	if g.MinHistory <= 0 {
+		col.add("token_guard.min_history",
+			"must be greater than zero when the guard is enabled: a new key has no baseline, and "+
+				"without a stated minimum of history every key trips on its first busy hour (§11.6)")
 	}
 }
 
@@ -319,6 +485,7 @@ func (c *Config) validateProviders(col *collector, providers map[string]*Provide
 		if p.Metrics.Enabled && p.Metrics.Endpoint == "" {
 			col.add(path+".metrics.endpoint", "must be set when provider metrics collection is enabled")
 		}
+		checkCacheTTL(col, path+".prefix_ttl", p.PrefixTTL, false)
 		for j, d := range p.Params.Drop {
 			if strings.TrimSpace(d) == "" {
 				col.add(fmt.Sprintf("%s.params.drop[%d]", path, j), "must not be empty")
@@ -388,9 +555,9 @@ func (c *Config) validateCapacity(col *collector, providers map[string]*Provider
 		path := fmt.Sprintf("capacity.principals[%q]", name)
 		nonNegative(col, path+".max_concurrent", int64(p.MaxConcurrent))
 		nonNegative(col, path+".max_queue_wait", int64(p.MaxQueueWait))
-		nonNegative(col, path+".rpm", int64(p.RPM))
-		nonNegative(col, path+".tpm", p.TPM)
 		nonNegative(col, path+".max_queue", int64(p.MaxQueue))
+		refuseRate(col, path, int64(p.RPM), p.TPM, principalRateHome)
+		c.validateClientPriority(col, path, p)
 	}
 	if c.Capacity.Global != nil {
 		validateLimits(col, "capacity.global", *c.Capacity.Global)
@@ -403,9 +570,88 @@ func (c *Config) validateCapacity(col *collector, providers map[string]*Provider
 
 func validateLimits(col *collector, path string, l CapacityLimits) {
 	nonNegative(col, path+".max_concurrency", int64(l.MaxConcurrency))
-	nonNegative(col, path+".rpm", int64(l.RPM))
-	nonNegative(col, path+".tpm", l.TPM)
 	nonNegative(col, path+".max_queue", int64(l.MaxQueue))
+	refuseRate(col, path, int64(l.RPM), l.TPM, groupRateHome)
+}
+
+// The two homes a rate ceiling actually has. Both are enforced by
+// internal/quota, which is the package that owns time windows; internal/capacity
+// counts gauges and has no window at all.
+const (
+	groupRateHome = "put the ceiling on the deployment instead — " +
+		"models[].deployments[].limits[] with metric: rpm or tpm, which becomes a " +
+		"rolling-minute quota on every credential the deployment names (§10.2)"
+	principalRateHome = "a per-caller rate ceiling belongs on the api key itself — " +
+		"`dorangctl key create --rpm N --tpm N`, or rpm_limit/tpm_limit through the " +
+		"admin API, both of which internal/quota enforces on the request path"
+)
+
+// refuseRate rejects a rate ceiling written on a capacity axis.
+//
+// §5.2 writes rpm and tpm beside max_concurrency, and the two are not the same
+// mechanism: a gauge is released when a request finishes, a rate is not, so a
+// rate needs a time window that the capacity broker does not have and should not
+// grow. Accepting the key and counting nothing is the failure mode this rule
+// exists to remove — an operator who believes they capped a rate has capped
+// nothing, and finds out from the provider's bill.
+func refuseRate(col *collector, path string, rpm, tpm int64, home string) {
+	if rpm != 0 {
+		col.add(path+".rpm",
+			"a rate ceiling is not enforced on a capacity axis: capacity counts concurrent "+
+				"reservations, which are released when a request finishes, and has no time "+
+				"window to count a rate over. %s", home)
+	}
+	if tpm != 0 {
+		col.add(path+".tpm",
+			"a rate ceiling is not enforced on a capacity axis: capacity counts concurrent "+
+				"reservations, which are released when a request finishes, and has no time "+
+				"window to count a rate over. %s", home)
+	}
+}
+
+// validateClientPriority checks the §10.5 grant.
+//
+// The range is written as class names because that is what §10.5 writes, and
+// because a caller's grant is expressed in the same vocabulary as the class the
+// operator assigned them. A range naming a class that does not exist is refused
+// rather than silently clamped to nothing.
+func (c *Config) validateClientPriority(col *collector, path string, p PrincipalLimits) {
+	if p.ClientPriority != "" {
+		mustBeOneOf(col, path+".client_priority", p.ClientPriority, clientPriorityModes)
+	}
+	if len(p.Range) == 0 {
+		if p.GrantsClientPriority() {
+			col.add(path+".range",
+				"client_priority: allow requires a range of two priority class names "+
+					"(§10.5), for example [batch, interactive]: an unbounded grant is the "+
+					"self-elevation the default exists to prevent")
+		}
+		return
+	}
+	if !p.GrantsClientPriority() {
+		col.add(path+".range",
+			"a range is only meaningful with client_priority: allow (it is %q here): "+
+				"a range that grants nothing is a setting that does nothing",
+			cmp(p.ClientPriority, ClientPriorityIgnore))
+	}
+	if len(p.Range) != 2 {
+		col.add(path+".range", "must name exactly two priority classes (has %d)", len(p.Range))
+	}
+	for i, class := range p.Range {
+		if _, ok := c.PriorityMapping.Classes[class]; !ok {
+			col.add(fmt.Sprintf("%s.range[%d]", path, i),
+				"%q is not a declared priority class: want one of %s",
+				class, strings.Join(sortedKeys(c.PriorityMapping.Classes), ", "))
+		}
+	}
+}
+
+// cmp returns v, or fallback when v is empty.
+func cmp(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 func (c *Config) validateKeyRotation(col *collector, providers map[string]*Provider,
@@ -519,6 +765,7 @@ func (c *Config) validateModels(col *collector, providers map[string]*Provider,
 			nonNegative(col, dpath+".priority", int64(d.Priority))
 			nonNegative(col, dpath+".timeout", int64(d.Timeout))
 			nonNegative(col, dpath+".stream_timeout", int64(d.StreamTimeout))
+			checkCacheTTL(col, dpath+".prefix_ttl", d.PrefixTTL, false)
 			for k, l := range d.Limits {
 				lpath := fmt.Sprintf("%s.limits[%d]", dpath, k)
 				mustBeOneOf(col, lpath+".metric", l.Metric, metricNames)
@@ -611,9 +858,24 @@ func (c *Config) validateRouting(col *collector) {
 			col.add("routing.prefix.max_bytes",
 				"must be greater than zero: the prefix table is budgeted by retained bytes (§7.4b)")
 		}
-		if c.Routing.Prefix.TTL <= 0 {
-			col.add("routing.prefix.ttl", "must be greater than zero when prefix affinity is enabled")
+		checkCacheTTL(col, "routing.prefix.ttl", c.Routing.Prefix.TTL, true)
+	}
+}
+
+// checkCacheTTL validates one affinity lifetime. required marks the global
+// default, which must say something: an unset default would leave every
+// deployment with no lifetime at all rather than with an inherited one.
+func checkCacheTTL(col *collector, path string, v CacheTTL, required bool) {
+	switch {
+	case v.IsZero():
+		if required {
+			col.add(path, "must be a duration such as \"5m\" or %q when prefix affinity "+
+				"is enabled (§7.4b)", UntilEvicted)
 		}
+	case v.IsForever():
+	case v.Duration() <= 0:
+		col.add(path, "must be greater than zero, or %q for a backend whose prefix cache "+
+			"has no clock (vLLM and SGLang evict by memory pressure, not by time)", UntilEvicted)
 	}
 }
 
@@ -667,20 +929,37 @@ func (c *Config) validatePricing(col *collector, providers map[string]*Provider,
 					r.Match.Credential)
 			}
 		}
+		seenComp := map[string]string{}
 		for _, comp := range sortedKeys(r.Rates) {
 			cpath := fmt.Sprintf("%s.rates[%q]", path, comp)
-			if !oneOf(comp, pricingComponents) {
+			switch {
+			case comp == "images":
+				// It used to pass here and fail at assembly, which is a load
+				// error delivered one layer too late: `dorangctl config lint`
+				// said the file was good and the server refused to start.
+				col.add(cpath, "the images component is not priced by this build: "+
+					"§8.3 lists it, internal/pricing has no per-image unit, and there is no "+
+					"rate that would be applied. Price the request instead (rates.request)")
+			case !oneOf(comp, pricingComponents):
 				col.add(cpath, "%q is not a priced component: want one of %s",
 					comp, strings.Join(pricingComponents, ", "))
+			default:
+				canon := CanonicalComponent(comp)
+				if prev, dup := seenComp[canon]; dup {
+					col.add(cpath, "%q and %q are the same component (%q) priced twice",
+						prev, comp, canon)
+				}
+				seenComp[canon] = comp
 			}
 			if err := checkDecimal(string(r.Rates[comp])); err != nil {
 				col.add(cpath, "%v", err)
 			}
 		}
+		c.validateProvenance(col, path, r)
 		switch r.Class {
-		case PricingMarginalUsage:
+		case PricingMarginalUsage, PricingNotionalRate:
 			if len(r.Rates) == 0 {
-				col.add(path+".rates", "a marginal_usage rule must price at least one component")
+				col.add(path+".rates", "a %s rule must price at least one component", r.Class)
 			}
 		case PricingFixedSubscription:
 			if r.Period == "" {
@@ -697,6 +976,39 @@ func (c *Config) validatePricing(col *collector, providers map[string]*Provider,
 			} else if err := checkDecimal(string(r.Percent)); err != nil {
 				col.add(path+".percent", "%v", err)
 			}
+		}
+	}
+}
+
+// validateProvenance enforces §8.5's two load errors, in the main file rather
+// than only in the catalog file.
+//
+// Both directions are checked. A notional_rate rule without provenance is a
+// guess wearing a currency symbol; provenance on any other class is a rule that
+// looks audited and is not, since only the notional class is excluded from the
+// bill.
+func (c *Config) validateProvenance(col *collector, path string, r *PricingRule) {
+	if r.Class != PricingNotionalRate {
+		if r.Source != "" || r.AsOf != "" {
+			col.add(path+".source",
+				"source and as_of belong to a notional_rate rule (§8.5); this rule is %q",
+				cmp(r.Class, PricingMarginalUsage))
+		}
+		return
+	}
+	if strings.TrimSpace(r.Source) == "" {
+		col.add(path+".source",
+			"a notional_rate rule must name where the list price came from: "+
+				"an estimate without provenance is not auditable (§8.5)")
+	}
+	switch {
+	case strings.TrimSpace(r.AsOf) == "":
+		col.add(path+".as_of",
+			"a notional_rate rule must carry the date the list price was read: "+
+				"a rate with no date cannot be judged stale (§8.5)")
+	default:
+		if _, err := parseUntil(r.AsOf); err != nil {
+			col.add(path+".as_of", "%v: want a date such as \"2026-07-28\" or an RFC 3339 timestamp", err)
 		}
 	}
 }
@@ -743,6 +1055,103 @@ func (c *Config) validateExtensions(col *collector) {
 			col.add("extensions.lua.limits",
 				"an enabled hook needs instruction, memory and wall-clock ceilings (§11.5)")
 		}
+	}
+}
+
+// validateFilters checks the transform-filter surface of §10.5b: the plugins a
+// deployment may load, and every model that attaches one.
+func (c *Config) validateFilters(col *collector) {
+	plugins := map[string]*FilterPlugin{}
+	for i := range c.Filters.Plugins {
+		p := &c.Filters.Plugins[i]
+		path := fmt.Sprintf("filters.plugins[%d]", i)
+		switch {
+		case p.Name == "":
+			col.add(path+".name", "must name the plugin: a model attaches a filter by this name")
+		default:
+			if _, dup := plugins[p.Name]; dup {
+				col.add(path+".name", "duplicate filter plugin name %q", p.Name)
+			} else {
+				plugins[p.Name] = p
+			}
+		}
+		if p.Path == "" {
+			col.add(path+".path",
+				"must name the plugin file: a filter is loaded because it is written here, never "+
+					"because it was found in a directory (§11.5)")
+		}
+		mustBeOneOf(col, path+".fail", p.Fail, filterFailModes)
+	}
+
+	// The first model filter whose placeholders outlive the request, recorded so
+	// the missing-seed message can name a concrete offender rather than the
+	// whole file.
+	var seedModel, seedPlugin, seedScope string
+	for i := range c.Models {
+		m := &c.Models[i]
+		for j := range m.Filters {
+			f := &m.Filters[j]
+			path := fmt.Sprintf("models[%d].filters[%d]", i, j)
+			switch {
+			case f.Plugin == "":
+				col.add(path+".plugin", "must name a plugin declared under filters.plugins")
+			default:
+				if _, ok := plugins[f.Plugin]; !ok {
+					col.add(path+".plugin",
+						"model %q attaches filter plugin %q, which is not declared under "+
+							"filters.plugins", m.Name, f.Plugin)
+				}
+			}
+			for k, phase := range f.On {
+				mustBeOneOf(col, fmt.Sprintf("%s.on[%d]", path, k), phase, filterPhases)
+			}
+			// §10.5b: a mask is not a redaction — it has to come back. The
+			// mask → original table is built while the REQUEST is rewritten and
+			// never persisted, so a filter that runs only on the way back has an
+			// empty table to unmask against.
+			if containsString(f.On, FilterOnResponse) && !containsString(f.On, FilterOnRequest) {
+				col.add(path+".on",
+					"model %q attaches filter %q on the response only, which has nothing to "+
+						"unmask: the mask → original table is built while the request is "+
+						"rewritten and lives for that one request (§10.5b). Add \"request\", or "+
+						"drop the filter", m.Name, f.Plugin)
+			}
+			mustBeOneOf(col, path+".scope", f.Scope, filterScopes)
+			nonNegative(col, path+".retain", int64(f.Retain))
+			for k := range f.Patterns {
+				pt := f.Patterns[k]
+				ppath := fmt.Sprintf("%s.patterns[%d]", path, k)
+				if pt.Name == "" {
+					col.add(ppath+".name", "must name the pattern")
+					continue
+				}
+				if pt.Regexp == "" && !oneOf(pt.Name, builtinFilterPatterns) {
+					col.add(ppath,
+						"pattern %q has no regexp and is not built in: the built-in patterns are "+
+							"%s. Give it a regexp, or name one of those (§10.5b)",
+						pt.Name, strings.Join(builtinFilterPatterns, ", "))
+				}
+			}
+			if seedModel == "" && f.Scope != "" && f.Scope != FilterScopeRequest {
+				seedModel, seedPlugin, seedScope = m.Name, f.Plugin, f.Scope
+			}
+		}
+	}
+
+	if !c.Filters.Secret.IsZero() {
+		c.Filters.Secret.validate(c.Server.Env, "filters.secret", col)
+		return
+	}
+	if seedModel != "" {
+		col.add("filters.secret",
+			"must be set: model %q attaches filter %q with scope %q, and a placeholder is derived "+
+				"from this seed. With no seed — or with one invented per process — the same text "+
+				"masks to a different placeholder on every node and again after every restart, so "+
+				"the bodies that reach a backend differ byte for byte and every backend's prefix "+
+				"cache cold-starts on each hop and each restart (§7.4b). Set filters.secret "+
+				"cluster-wide with key_env or key_file, the same value on every node, or use "+
+				"scope: %q, which is per-request by construction and needs no seed",
+			seedModel, seedPlugin, seedScope, FilterScopeRequest)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -38,11 +39,31 @@ type exchange struct {
 	// attempt is the in-provider attempt number, used only to keep a retried
 	// multipart body's boundary distinct from the first one's.
 	attempt int
+	// names is the request's tool-name registry, shared by the encoder that
+	// shortens an over-long name and by every decoder that has to restore it
+	// (COMPATIBILITY 5.3). It lives on the exchange because that is the only
+	// object whose lifetime spans both directions of one call: an encoder-local
+	// mapping is written, used once and thrown away, which shortens on every
+	// request and restores on none.
+	names *openai.ToolNames
 	// secrets is what was actually put on the outbound request's credential
 	// headers, kept so that anything the upstream echoes back can be scrubbed
 	// before it reaches a client (DESIGN §10.6 rule 4). It is never logged, never
 	// compared, and never leaves this package.
 	secrets []string
+}
+
+// toolNames returns the shared tool-name registry, allocating it on first use.
+//
+// It is allocated eagerly rather than lazily by the encoder because the encoder
+// is not the only reader: a stream's decoder runs long after the encoder
+// returned, and a mapping the encoder allocated into its own options struct is
+// gone by then.
+func (x *exchange) toolNames() *openai.ToolNames {
+	if x.names == nil {
+		x.names = openai.NewToolNames()
+	}
+	return x.names
 }
 
 // boundary returns this exchange's multipart boundary, generating it on first

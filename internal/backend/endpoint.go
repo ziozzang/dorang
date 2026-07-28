@@ -100,7 +100,6 @@ func (p *Provider) Endpoint(op Operation, model string, stream bool) (string, er
 const (
 	pathChatCompletions = "/chat/completions"
 	pathCompletions     = "/completions"
-	pathResponses       = "/responses"
 	pathEmbeddings      = "/embeddings"
 	pathRerank          = "/rerank"
 	pathMessages        = "/messages"

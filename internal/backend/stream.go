@@ -47,7 +47,21 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 
 	fw := &flushWriter{w: w}
 
-	if x.call.ClientAPI == catalog.APIOpenAIChat && x.prov.api == catalog.APIOpenAIChat {
+	// The byte relay can only run when nothing in the body has to change beyond
+	// the model name. Two things are exactly such a change:
+	//
+	//   - A tool name that was shortened on the way out. The upstream calls the
+	//     short name, the client never saw it, and no amount of scanning for
+	//     "model" restores it. One over-long tool name therefore costs this
+	//     request its fast path — and nothing else does, because the registry is
+	//     empty on every request that had none.
+	//   - A §10.5b transform. The relay rewrites one field per line without
+	//     decoding, and unmasking needs a bounded tail carried *inside* a JSON
+	//     string across frames — surgery on a scanner that deliberately does not
+	//     parse. §10.5 settles the trade: reconstruction is the normal case, so a
+	//     filtered request takes the neutral path, and only a filtered one pays.
+	if x.call.ClientAPI == catalog.APIOpenAIChat && x.prov.api == catalog.APIOpenAIChat &&
+		x.names.Len() == 0 && x.call.Transform == nil {
 		sc := openai.NewScanner(fw, openai.ScannerOptions{
 			From:         x.target.UpstreamModel,
 			To:           x.call.Model,
@@ -71,16 +85,53 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	if err != nil {
 		return canonical.Usage{}, err
 	}
+	// The transform composes into this one pass (§10.5): it takes decoded events
+	// and returns decoded events, holding at most a placeholder's width minus one
+	// byte across a frame boundary. Nil is the ordinary case and every call
+	// through tr below is one nil check.
+	var tr StreamTransform
+	if x.call.Transform != nil {
+		tr = x.call.Transform.Stream()
+	}
 	for {
 		batch, err := src.next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			// The client has already seen output, so the status is spent
+			// (DESIGN §7.6) and the only channel left is the stream itself
+			// (COMPATIBILITY 1.3). Ending the body without saying anything leaves
+			// a client waiting on a terminator that will never come.
+			_ = sink.write(canonical.StreamEvent{
+				Type: canonical.EventError,
+				Err: &canonical.Error{
+					StatusCode: http.StatusBadGateway,
+					Type:       "api_error",
+					Message:    "the upstream stream could not be read: " + err.Error(),
+					Code:       CodeUpstreamDecode,
+				},
+			})
 			return sink.usage(), err
 		}
 		for i := range batch {
+			if tr != nil {
+				if flush := tr.Rewrite(&batch[i]); flush != nil {
+					if err := sink.write(*flush); err != nil {
+						return sink.usage(), err
+					}
+				}
+			}
 			if err := sink.write(batch[i]); err != nil {
+				return sink.usage(), err
+			}
+		}
+	}
+	// Whatever the tail still holds is the caller's text: it only looked like the
+	// beginning of a placeholder.
+	if tr != nil {
+		if flush := tr.Flush(); flush != nil {
+			if err := sink.write(*flush); err != nil {
 				return sink.usage(), err
 			}
 		}
@@ -139,30 +190,83 @@ type openaiSource struct {
 	data   strings.Builder
 	done   bool
 	engine Engine
+
+	// opt carries the per-stream tool state. It is ONE value for the whole
+	// stream, not one per frame: a tool name can arrive split across frames and
+	// cannot be restored from either half alone.
+	opt *openai.DecodeOptions
+	// flushed records that the held tool fragments have already been drained.
+	flushed bool
+	// id, model and created are the stream identity, kept so the flush events
+	// carry the same values every other frame did.
+	id      string
+	model   string
+	created int64
+}
+
+func newOpenAISource(r io.Reader, x *exchange) *openaiSource {
+	return &openaiSource{
+		br:     bufio.NewReaderSize(r, 8<<10),
+		engine: x.prov.engine,
+		opt: &openai.DecodeOptions{
+			ToolNames: x.names,
+			Tools:     openai.NewToolStream(x.names, nil),
+		},
+	}
 }
 
 func (s *openaiSource) next() ([]canonical.StreamEvent, error) {
 	for {
 		if s.done {
-			return nil, io.EOF
+			return s.flush()
 		}
 		payload, err := nextSSEData(s.br, &s.data)
 		if err != nil {
 			s.done = true
-			return nil, err
+			if err != io.EOF {
+				return nil, err
+			}
+			return s.flush()
 		}
 		if payload == "[DONE]" {
 			s.done = true
-			return nil, io.EOF
+			return s.flush()
 		}
 		raw := []byte(payload)
-		_, events, derr := openai.DecodeChunk(raw, nil)
+		_, events, derr := openai.DecodeChunk(raw, s.opt)
 		if derr != nil {
 			return nil, derr
 		}
 		events = s.adoptReasoning(raw, events)
 		if len(events) > 0 {
+			s.note(events)
 			return events, nil
+		}
+	}
+}
+
+// flush drains the tool fragments the tracker held back — a name that never
+// settled because its call carried no arguments, or arrived after them — and
+// then reports the end of the stream.
+func (s *openaiSource) flush() ([]canonical.StreamEvent, error) {
+	if s.flushed {
+		return nil, io.EOF
+	}
+	s.flushed = true
+	if evs := s.opt.Tools.Flush(s.id, s.model, s.created); len(evs) > 0 {
+		return evs, nil
+	}
+	return nil, io.EOF
+}
+
+func (s *openaiSource) note(evs []canonical.StreamEvent) {
+	if s.id != "" {
+		return
+	}
+	for i := range evs {
+		if evs[i].ID != "" {
+			s.id, s.model, s.created = evs[i].ID, evs[i].Model, evs[i].Created
+			return
 		}
 	}
 }

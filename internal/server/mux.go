@@ -176,9 +176,18 @@ type Route struct {
 	Name string
 	// Family labels the protocol shape.
 	Family Family
-	// Public skips authentication. Container probes and the metrics scrape
-	// are the only public routes; everything else authenticates.
+	// Public skips authentication. Container probes are the only public routes
+	// by default; everything else authenticates.
 	Public bool
+	// Admin requires an administrative caller on top of authentication: the
+	// master credential, or a key an [AdminPrincipal] reports as admin.
+	//
+	// It exists because /metrics is neither public nor ordinary. The scrape
+	// carries per-key spend, per-credential quota state and every configured
+	// model name, which is a description of a deployment's commercial
+	// arrangements — so any authenticated tenant reading it would be reading
+	// every other tenant's numbers.
+	Admin bool
 	// NeedsBody makes the server read and cap the request body before the
 	// handler runs. Passthrough sets it false: it streams.
 	NeedsBody bool

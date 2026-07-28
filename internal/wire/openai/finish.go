@@ -31,7 +31,38 @@ const (
 	WarnSynthesizedTerminal  = "synthesized_terminal_chunk"
 	WarnLateUsage            = "late_usage_after_finish"
 	WarnToolNameTruncated    = "tool_name_truncated"
-	WarnNumericErrorCode     = "numeric_error_code"
+	// WarnToolNameUnshortened fires when an over-long name was forwarded intact
+	// because the encoder was given no registry to record the shortening in.
+	// Truncating without one destroys the name: the caller cannot match the call
+	// it gets back to the tool it declared, and nothing anywhere says why.
+	WarnToolNameUnshortened = "tool_name_not_shortened"
+	WarnNumericErrorCode    = "numeric_error_code"
+	// WarnToolCallIndexReused fires when a second tool-call id appears under an
+	// index a live call already holds. A backend that omits index — or always
+	// sends zero — otherwise merges every parallel call into one whose arguments
+	// are several JSON documents end to end.
+	WarnToolCallIndexReused = "tool_call_index_reused"
+	// WarnToolCallIndexInvalid fires on a negative wire index.
+	WarnToolCallIndexInvalid = "tool_call_index_invalid"
+	// WarnRepeatedToolName fires when name metadata arrives more than once for
+	// one call. Whether that is a restatement or a fragment is not decidable from
+	// the bytes; see ToolStream.mergeName.
+	WarnRepeatedToolName = "repeated_tool_name"
+	// WarnNonFunctionToolCall fires on a tool call whose type is not "function".
+	WarnNonFunctionToolCall = "non_function_tool_call"
+	// WarnMalformedToolArguments fires when a tool call's accumulated arguments
+	// are not valid JSON at the end of the stream. dorang cannot repair the call
+	// — it does not execute tools — so the client is told, in band, rather than
+	// handed a terminal chunk that says the call is ready.
+	WarnMalformedToolArguments = "malformed_tool_arguments"
+	// WarnDataAfterFinish fires when a backend sends semantic content after it
+	// already reported a finish_reason for that choice. The content is forwarded;
+	// dropping what the model produced is worse than a frame out of order.
+	WarnDataAfterFinish = "data_after_finish_reason"
+	// WarnToolCallMissingID fires on a tool call the backend never named with an
+	// id. dorang does not invent one: the id is what the client sends back, and a
+	// gateway-minted id is a correlation the backend never agreed to.
+	WarnToolCallMissingID = "tool_call_missing_id"
 )
 
 // WarnFunc receives a compatibility warning. It must not block and must not

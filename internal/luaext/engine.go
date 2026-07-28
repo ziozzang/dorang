@@ -43,11 +43,17 @@ type Options struct {
 	Dir string
 	// Hooks restricts which hook points are active. Empty means all four. A
 	// program for a hook that is not listed is a load error, not a silent skip.
+	//
+	// It does not gate [HookFilterRequest]: a filter is attached to a model, so
+	// the operator has already said where it runs.
 	Hooks []string
 	// Limits are the three ceilings. Zero fields take package defaults.
 	Limits Limits
 	// Native are Go-implemented hooks.
 	Native []Native
+	// Plugins are the Lua plugins, named one by one. There is no directory
+	// scan; see [Plugin].
+	Plugins []Plugin
 	// Logf receives the skip-and-warn diagnostics, rate-limited per hook.
 	Logf func(string, ...any)
 	// Now overrides the clock for the warning throttle.
@@ -79,6 +85,7 @@ type Engine struct {
 
 	progs   [numHooks][]*Program
 	natives [numHooks][]Native
+	lua     *luaRuntime
 
 	logf func(string, ...any)
 	now  func() time.Time
@@ -183,21 +190,44 @@ func New(opts Options) (*Engine, error) {
 		}
 	}
 
+	if len(opts.Plugins) > 0 {
+		rt, err := newLuaRuntime(opts.Plugins, e.limits, e.logf)
+		if err != nil {
+			return nil, err
+		}
+		for h := 0; h < numHooks; h++ {
+			if rt.hookMask&(1<<uint(h)) == 0 {
+				continue
+			}
+			if allowed&(1<<uint(h)) == 0 {
+				return nil, fmt.Errorf("luaext: a plugin registers at %s, which extensions.lua.hooks does not list",
+					Hook(h))
+			}
+		}
+		e.lua = rt
+	}
+
 	for h := 0; h < numHooks; h++ {
 		if len(e.progs[h]) > 0 || len(e.natives[h]) > 0 {
 			e.mask |= 1 << uint(h)
 		}
 	}
+	if e.lua != nil {
+		e.mask |= e.lua.hookMask
+	}
 	return e, nil
 }
 
 // hookSet turns the configured hook names into a bitmask. An empty list means
-// all four, which matches internal/config's default.
+// all of them, which matches internal/config's default.
+//
+// HookFilterRequest is always set: extensions.lua.hooks lists the notification
+// and policy hooks, and a filter is declared where it is used, on the model.
 func hookSet(names []string) (uint8, error) {
 	if len(names) == 0 {
 		return (1 << numHooks) - 1, nil
 	}
-	var m uint8
+	m := uint8(1) << uint(HookFilterRequest)
 	for _, n := range names {
 		h, ok := ParseHook(n)
 		if !ok {

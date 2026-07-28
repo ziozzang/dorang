@@ -381,7 +381,7 @@ func TestCredentialSpellingPerFamily(t *testing.T) {
 				t.Fatal(err)
 			}
 			h := http.Header{}
-			if err := p.applyCredential(plantedSecret, nil, h); err != nil {
+			if err := p.ApplyCredential(plantedSecret, nil, h); err != nil {
 				t.Fatalf("applyCredential: %v", err)
 			}
 			if got := h.Get(tc.header); got != tc.value {

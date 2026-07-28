@@ -59,6 +59,13 @@ const (
 	defaultLuaMemoryMB     = 32
 	defaultLuaTimeout      = 200 * time.Millisecond
 
+	// §10.5b. A filter that was supposed to remove an identity number and did
+	// not must stop the request, so failure is closed unless the operator says
+	// otherwise; and one placeholder holds for a conversation, which is the
+	// scope at which a masked answer still reads as one conversation.
+	defaultFilterFail  = FilterFailClosed
+	defaultFilterScope = FilterScopeConversation
+
 	defaultPassthroughAuth    = PassthroughAuthDorang
 	defaultPassthroughTimeout = 600 * time.Second
 
@@ -112,8 +119,58 @@ const (
 // defaultStickyKey is the composite stickiness key of §4.2.
 var defaultStickyKey = []string{"api_key", "session_id"}
 
+// defaultFilterOn is the phase pair of §10.5b: a mask is applied on the way out
+// and undone on the way back, so both halves run unless the file narrows it.
+var defaultFilterOn = []string{FilterOnRequest, FilterOnResponse}
+
 // defaultPriorityClasses are the classes of §7.5.
 var defaultPriorityClasses = map[string]int{"realtime": 0, "interactive": 2, "batch": 10}
+
+// Rotation, revocation and token-guard defaults (§11.2c, §11.6).
+//
+// The rotation and trigger numbers are §11.6's and §11.2c's own example blocks.
+// The ones the design leaves unstated are marked as such where they are
+// defined, because a default nobody argued for is a default nobody can check.
+const (
+	defaultRotationGrace  = 24 * time.Hour
+	defaultMaxSecrets     = 2
+	defaultRotationMaxAge = 90 * 24 * time.Hour
+
+	// defaultAuthEntryTTL and defaultAuthNegativeTTL match internal/auth's own
+	// defaults. The negative one is deliberately an order of magnitude shorter:
+	// §11.2c rule 3 is that a refused key is cheap to re-check and a serving one
+	// is not, and treating them alike is what made the revocation window wide.
+	defaultAuthEntryTTL    = 60 * time.Second
+	defaultAuthNegativeTTL = 5 * time.Second
+
+	// defaultRevocationPoll is the dominant term in the published clustered
+	// revocation bound, so it is set by what an operator is owed after a
+	// compromise rather than by what is cheapest: it is one indexed range scan
+	// returning nothing in the normal case.
+	defaultRevocationPoll   = time.Second
+	defaultRevocationRetain = time.Hour
+	// defaultRevocationStoreLatency is deliberately generous. A bound computed
+	// from an optimistic figure is wrong exactly when the database is slow,
+	// which is when an operator is most likely to be revoking something.
+	defaultRevocationStoreLatency = 250 * time.Millisecond
+
+	defaultGuardBaselineWindow = 7 * 24 * time.Hour
+	// defaultGuardWindow is not in §11.6's block. Without an observation window
+	// "factor: 10" has no unit.
+	defaultGuardWindow      = time.Hour
+	defaultGuardFactor      = 10.0
+	defaultGuardMinAbsolute = int64(100_000)
+	// defaultGuardMinHistory is not in §11.6's block either; §11.6 requires "a
+	// stated minimum of history" and does not state it. A day is the shortest
+	// span containing a whole daily cycle, and a baseline without one would call
+	// every key's morning anomalous.
+	defaultGuardMinHistory = 24 * time.Hour
+	defaultGuardCooldown   = time.Hour
+	// defaultGuardAction is pend, never revoke: an automated revocation is an
+	// outage the operator did not choose and is not reversible in the same
+	// sense.
+	defaultGuardAction = "pend"
+)
 
 // defaultFallbackChains is the "Default chain" column of §7.6. budget_exceeded
 // and auth have no chain: failing is the correct outcome.
@@ -152,6 +209,30 @@ func (c *Config) ApplyDefaults() {
 	setStr(&c.Storage.SQLite.Path, defaultSQLitePath)
 	setStr(&c.Storage.Postgres.URLEnv, defaultPostgresEnv)
 	setInt(&c.Storage.Postgres.MaxConns, defaultPostgresConns)
+
+	// auth: rotation (§11.2c) and revocation latency (§11.2c, risk W11)
+	setDur(&c.Auth.Rotation.Grace, defaultRotationGrace)
+	setInt(&c.Auth.Rotation.MaxSecrets, defaultMaxSecrets)
+	setDur(&c.Auth.Rotation.MaxAge, defaultRotationMaxAge)
+	setDur(&c.Auth.Revocation.EntryTTL, defaultAuthEntryTTL)
+	setDur(&c.Auth.Revocation.NegativeTTL, defaultAuthNegativeTTL)
+	setDur(&c.Auth.Revocation.Poll, defaultRevocationPoll)
+	setDur(&c.Auth.Revocation.Retain, defaultRevocationRetain)
+	setDur(&c.Auth.Revocation.StoreLatency, defaultRevocationStoreLatency)
+
+	// token guard (§11.6). Filled whether or not it is enabled, so that a
+	// rendered configuration shows what turning it on would do.
+	setDur(&c.TokenGuard.BaselineWindow, defaultGuardBaselineWindow)
+	setDur(&c.TokenGuard.Window, defaultGuardWindow)
+	setDur(&c.TokenGuard.MinHistory, defaultGuardMinHistory)
+	setDur(&c.TokenGuard.Cooldown, defaultGuardCooldown)
+	setStr(&c.TokenGuard.Action, defaultGuardAction)
+	if c.TokenGuard.Trigger.Factor == 0 {
+		c.TokenGuard.Trigger.Factor = defaultGuardFactor
+	}
+	if c.TokenGuard.Trigger.MinAbsolute == 0 {
+		c.TokenGuard.Trigger.MinAbsolute = defaultGuardMinAbsolute
+	}
 
 	// cluster
 	setStr(&c.Cluster.RedisURLEnv, defaultRedisURLEnv)
@@ -216,7 +297,9 @@ func (c *Config) ApplyDefaults() {
 	if c.Routing.Prefix.MaxBytes == 0 {
 		c.Routing.Prefix.MaxBytes = defaultPrefixMaxByte
 	}
-	setDur(&c.Routing.Prefix.TTL, defaultPrefixTTL)
+	if c.Routing.Prefix.TTL.IsZero() {
+		c.Routing.Prefix.TTL = TTL(defaultPrefixTTL)
+	}
 
 	// fallbacks
 	if c.Fallbacks.On == nil {
@@ -272,6 +355,20 @@ func (c *Config) ApplyDefaults() {
 	}
 	setInt(&c.Extensions.Lua.Limits.MemoryMB, defaultLuaMemoryMB)
 	setDur(&c.Extensions.Lua.Limits.Timeout, defaultLuaTimeout)
+
+	// filters (§10.5b)
+	for i := range c.Filters.Plugins {
+		setStr(&c.Filters.Plugins[i].Fail, defaultFilterFail)
+	}
+	for i := range c.Models {
+		for j := range c.Models[i].Filters {
+			f := &c.Models[i].Filters[j]
+			if len(f.On) == 0 {
+				f.On = append([]string(nil), defaultFilterOn...)
+			}
+			setStr(&f.Scope, defaultFilterScope)
+		}
+	}
 
 	// passthrough
 	setStr(&c.Passthrough.Default.Auth, defaultPassthroughAuth)

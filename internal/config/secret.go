@@ -24,8 +24,12 @@ type SecretRef struct {
 	Env string `yaml:"key_env,omitempty"`
 	// File names a file holding the secret; a trailing newline is trimmed.
 	File string `yaml:"key_file,omitempty"`
-	// Ref is an external reference such as "vault:secret/data/x#key". It is
-	// recorded verbatim and left for a resolver outside this package.
+	// Ref is an external reference such as "vault:secret/data/x#key".
+	//
+	// It is REFUSED at validation. The field is kept so that the refusal can
+	// name the key and say what to use instead; deleting it would make a
+	// key_ref: line an unknown-field error that reads like a typo, which is the
+	// wrong diagnosis for a deployment migrating off a vault-integrated proxy.
 	Ref string `yaml:"key_ref,omitempty"`
 	// Inline is a literal secret, accepted only when server.env is
 	// "development". Resolution moves the literal out of this field so it
@@ -118,10 +122,24 @@ func (s SecretRef) Reference() string { return s.Ref }
 func (s SecretRef) validate(env, path string, c *collector) {
 	switch n := s.sources(); {
 	case n == 0:
-		c.add(path, "no secret source: set one of key_env, key_file or key_ref")
+		c.add(path, "no secret source: set one of key_env or key_file")
 		return
 	case n > 1:
-		c.add(path, "%d secret sources set: set exactly one of key_env, key_file, key_ref or key", n)
+		c.add(path, "%d secret sources set: set exactly one of key_env, key_file or key", n)
+		return
+	}
+	// A key_ref is recorded and never fetched: this build ships no resolver, so
+	// the secret it names does not exist at request time. Accepting it meant a
+	// credential that loaded, validated, and then sent every upstream request
+	// with no Authorization header at all — the failure arriving as a 401 from
+	// the provider, hours later, with nothing in the configuration to explain it.
+	// It is refused here rather than resolved to nothing.
+	if s.Ref != "" {
+		c.add(path+".key_ref",
+			"key_ref is not resolved by this build: no secret resolver ships with it, so a "+
+				"credential declared this way would load with no usable secret and send "+
+				"unauthenticated requests upstream. Use key_env or key_file — a vault agent "+
+				"that writes a file or exports a variable satisfies both")
 		return
 	}
 	if s.Inline != "" && env != EnvDevelopment {
@@ -185,19 +203,52 @@ func redactPathError(err error, path string) string {
 	return path
 }
 
-// ExpandPath expands a leading "~" to the current user's home directory. It is
-// applied to paths this package reads; other packages should call it on the
-// paths they read (storage.sqlite.path, metering.spool.dir).
+// EnvStateDir relocates dorang's writable state: the embedded database, the
+// trace spool, the generated key pepper, batch blobs and the shadow report.
+//
+// It exists because the container image declares
+// `VOLUME ["/var/lib/dorang"]` and `ENV DORANG_STATE_DIR=/var/lib/dorang`, and
+// nothing read the variable. The shipped defaults are all under `~`, which for
+// the image's `nonroot` user is /home/nonroot — so every container wrote its
+// database, its spool and its generated pepper OUTSIDE the declared volume, into
+// the container's writable layer, and lost all of it on restart. The pepper is
+// the sharp end of that: regenerating it makes every issued api key
+// unverifiable.
+const EnvStateDir = "DORANG_STATE_DIR"
+
+// ExpandPath resolves a configured path.
+//
+// A leading "~" becomes the state directory when [EnvStateDir] is set, and the
+// current user's home directory otherwise. Nothing else moves: an absolute path
+// in the file is an instruction, and silently re-rooting it would make the
+// variable a way to redirect a deliberate choice rather than a way to place the
+// defaults.
+//
+// It is applied to paths this package reads; other packages call it on the paths
+// they read (storage.sqlite.path, metering.spool.dir, shadow.report.path).
 func ExpandPath(p string) string {
 	if p != "~" && !strings.HasPrefix(p, "~/") {
 		return p
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	root := StateDir()
+	if root == "" {
 		return p
 	}
 	if p == "~" {
-		return home
+		return root
 	}
-	return home + string(os.PathSeparator) + p[2:]
+	return root + string(os.PathSeparator) + p[2:]
+}
+
+// StateDir is where "~"-rooted state paths resolve to: DORANG_STATE_DIR when it
+// is set, else the user's home directory, else "" when neither is available.
+func StateDir() string {
+	if v := strings.TrimSpace(os.Getenv(EnvStateDir)); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
 }

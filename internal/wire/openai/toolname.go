@@ -19,14 +19,53 @@ const hashHexLen = 8
 // A ToolNames is safe for concurrent use so that one instance can be shared by
 // the request encoder and the response decoder of a streaming exchange, which
 // run on different goroutines.
+//
+// It also records every name the request DECLARED, whether or not it had to be
+// shortened. That set is not needed to restore a name; it is needed to read one
+// off a stream. A name can arrive split across frames, and the only evidence a
+// gateway has about whether "aa" is a whole name or the first half of "aaaa" is
+// which of the two the caller declared (see [ToolNames.Known]).
 type ToolNames struct {
-	mu      sync.RWMutex
-	toShort map[string]string
-	toLong  map[string]string
+	mu       sync.RWMutex
+	toShort  map[string]string
+	toLong   map[string]string
+	declared map[string]struct{}
 }
 
 // NewToolNames returns an empty mapping.
 func NewToolNames() *ToolNames { return &ToolNames{} }
+
+// Declare records a tool name the request carried. It is called for every tool,
+// not only the over-long ones: the set is what disambiguates a fragmented name
+// on the way back.
+func (t *ToolNames) Declare(name string) {
+	if t == nil || name == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.declared == nil {
+		t.declared = make(map[string]struct{}, 8)
+	}
+	t.declared[name] = struct{}{}
+}
+
+// Known reports whether name is one the caller declared, or a short form this
+// mapping issued. An empty registry knows nothing and answers false for
+// everything, which is what keeps the fragment heuristics falling back to their
+// no-evidence branch rather than guessing from an empty table.
+func (t *ToolNames) Known(name string) bool {
+	if t == nil || name == "" {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if _, ok := t.declared[name]; ok {
+		return true
+	}
+	_, ok := t.toLong[name]
+	return ok
+}
 
 // Shorten returns a name of at most [MaxToolNameLen] bytes, recording the
 // mapping when it had to shorten. Names that already fit are returned unchanged
@@ -46,6 +85,7 @@ func (t *ToolNames) Shorten(name string, warn WarnFunc) string {
 		// No mapping to record into. Shortening here would produce a name that
 		// can never be restored, which is worse than a name the upstream will
 		// reject with a clear message.
+		warn.warn(WarnToolNameUnshortened, name)
 		return name
 	}
 

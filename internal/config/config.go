@@ -34,11 +34,15 @@ type Config struct {
 	Metering      Metering            `yaml:"metering"`
 	Observability Observability       `yaml:"observability"`
 	Extensions    Extensions          `yaml:"extensions"`
+	Filters       Filters             `yaml:"filters"`
 
 	Passthrough     Passthrough     `yaml:"passthrough"`
 	Shadow          Shadow          `yaml:"shadow"`
 	Notifications   Notifications   `yaml:"notifications"`
 	PriorityMapping PriorityMapping `yaml:"priority_mapping"`
+	// TokenGuard is §11.6's per-key anomaly guard. Off by default: an automated
+	// refusal is a thing an operator opts into.
+	TokenGuard TokenGuard `yaml:"token_guard,omitempty"`
 
 	// idx is built once, after validation, and never mutated afterwards.
 	idx *index
@@ -95,10 +99,125 @@ const (
 	CapacityModeLeased      = "leased"
 )
 
-// Auth configures credential verification (§2.4).
+// Auth configures credential verification (§2.4), key rotation (§11.2c) and
+// the tier set a key may belong to (§11.6).
 type Auth struct {
 	Legacy      LegacyAuth `yaml:"legacy"`
 	RehashOnUse *bool      `yaml:"rehash_on_use,omitempty"`
+	Rotation    Rotation   `yaml:"rotation,omitempty"`
+	// Tiers is the operator's tier set, most privileged LAST. Empty means the
+	// built-in `free < commercial < unlimited`.
+	//
+	// What is configuration here is the SET and the ORDERING. What is not is
+	// that a tier belongs to the key and is assigned by an operator: there is
+	// no request field anywhere that writes one (§10.5, §11.6).
+	Tiers []Tier `yaml:"tiers,omitempty"`
+	// DefaultTier names the tier a key whose row names none belongs to. Empty
+	// means the LEAST privileged tier, because defaulting upward is how an
+	// unassigned key silently becomes unlimited.
+	DefaultTier string `yaml:"default_tier,omitempty"`
+	// Revocation configures how fast a revocation, a pend or an early grace cut
+	// actually takes effect across a cluster (§11.2c, risk W11).
+	Revocation Revocation `yaml:"revocation,omitempty"`
+}
+
+// Rotation is the `auth.rotation` block of §11.2c.
+//
+// The identity is durable and the secret is not. A rotation mints a new secret
+// and leaves everything else — tier, budget, spend, allow-list, rate limits,
+// team, ledger history — attached to the key id, because a rotation that also
+// reset the limits would be a re-provisioning, and an operator facing that puts
+// it off.
+type Rotation struct {
+	// Grace is how long the old secret stays valid after a rotation.
+	Grace Duration `yaml:"grace,omitempty"`
+	// MaxSecrets is how many secrets a key may have in flight. Two means one
+	// overlap.
+	MaxSecrets int `yaml:"max_secrets,omitempty"`
+	// MaxAge is a POLICY: dorang warns and reports. It does not silently break
+	// a working integration on a timer, and there is deliberately no setting
+	// that makes it do so.
+	MaxAge Duration `yaml:"max_age,omitempty"`
+}
+
+// Revocation is the `auth.revocation` block of §11.2c.
+//
+// The auth hot path answers from a snapshot with a TTL, so a revoked, pended or
+// rotation-cut key keeps serving until the snapshot refreshes — on every node
+// independently. These are the numbers that bound that.
+type Revocation struct {
+	// EntryTTL is how long a SERVING row stays cached. It is the FALLBACK bound
+	// for a node that missed the published invalidation, not the mechanism.
+	EntryTTL Duration `yaml:"entry_ttl,omitempty"`
+	// NegativeTTL is how long a REFUSAL stays cached. It must not exceed
+	// entry_ttl: a refused key is cheap to re-check and a serving one is not,
+	// and holding both the same is what made the revocation window wide.
+	NegativeTTL Duration `yaml:"negative_ttl,omitempty"`
+	// Poll is how often a node reads the invalidation table. It is the dominant
+	// term in the published clustered bound.
+	Poll Duration `yaml:"poll,omitempty"`
+	// Retain is how long invalidation messages are kept for a node catching up.
+	Retain Duration `yaml:"retain,omitempty"`
+	// StoreLatency is the deployment's measured worst-case store round trip,
+	// the second term of the published bound. It is configuration because it is
+	// a property of the database, not of dorang.
+	StoreLatency Duration `yaml:"store_latency,omitempty"`
+}
+
+// Tier is one entry of `auth.tiers` (§11.6).
+//
+// Every limit is a CEILING. A per-key setting may narrow it and may never widen
+// it, and batch work of any tier ranks below interactive work of every tier.
+type Tier struct {
+	Name string `yaml:"name"`
+	// PriorityClass is the class a key of this tier is scheduled in. A key may
+	// name a LESS urgent class of its own; it may not name a more urgent one.
+	PriorityClass string `yaml:"priority_class,omitempty"`
+	// MaxBudget is the spend ceiling in USD. Absent means the tier imposes
+	// none, which is what `unlimited` looks like.
+	MaxBudget *Decimal `yaml:"max_budget,omitempty"`
+	RPMLimit  *int64   `yaml:"rpm_limit,omitempty"`
+	TPMLimit  *int64   `yaml:"tpm_limit,omitempty"`
+	// MaxParallel is the concurrency ceiling.
+	MaxParallel *int64 `yaml:"max_parallel_requests,omitempty"`
+	// Models is the model set the tier grants. Empty grants every model.
+	Models []string `yaml:"models,omitempty"`
+}
+
+// TokenGuard is the `token_guard` block of §11.6.
+//
+// It watches a key against its OWN baseline rather than a fixed threshold,
+// because a fixed threshold is wrong for every key except the one it was set
+// for. It is not a budget: a budget is a stated ceiling the caller agreed to,
+// and this is a statistical judgement that might be wrong — which is why its
+// default action is the reversible one.
+type TokenGuard struct {
+	Enabled        bool     `yaml:"enabled"`
+	BaselineWindow Duration `yaml:"baseline_window,omitempty"`
+	// Window is the interval the observed rate is measured over, and the unit
+	// both rates are expressed in. §11.6's example block does not name it;
+	// without it `factor: 10` compares a number to a number of a different
+	// kind.
+	Window  Duration          `yaml:"window,omitempty"`
+	Trigger TokenGuardTrigger `yaml:"trigger,omitempty"`
+	// MinHistory is the stated minimum of history below which the guard only
+	// alerts. A new key has no baseline, and without this every key trips on
+	// its first busy hour.
+	MinHistory Duration `yaml:"min_history,omitempty"`
+	// Action is pend, revoke or alert_only. `pend` is the default and `throttle`
+	// is refused rather than silently downgraded.
+	Action   string   `yaml:"action,omitempty"`
+	Cooldown Duration `yaml:"cooldown,omitempty"`
+}
+
+// TokenGuardTrigger is the pair of conditions, BOTH of which must hold.
+//
+// A key that used 10 tokens yesterday and 200 today has grown twentyfold and is
+// not a problem. Without the absolute floor the guard fires hardest on the
+// quietest keys.
+type TokenGuardTrigger struct {
+	Factor      float64 `yaml:"factor,omitempty"`
+	MinAbsolute int64   `yaml:"min_absolute,omitempty"`
 }
 
 // RehashesOnUse reports whether a successful legacy verification schedules an
@@ -124,6 +243,21 @@ type Provider struct {
 	Retry          Retry           `yaml:"retry,omitempty"`
 	UsageProbe     UsageProbe      `yaml:"usage_probe,omitempty"`
 	Metrics        ProviderMetrics `yaml:"metrics,omitempty"`
+
+	// PrefixTTL is how long this provider's prefix affinity stays believable,
+	// overriding routing.prefix.ttl (§7.4b).
+	//
+	// It belongs here because it is a fact about the backend, not about dorang.
+	// A hosted service holds a cached prefix for a vendor-set window — around
+	// five minutes for OpenAI's automatic caching, five minutes on Anthropic's
+	// default tier and an hour on its extended one — while vLLM and SGLang hold
+	// blocks until LRU eviction under memory pressure and have no window at all.
+	// One global hour is wrong in both directions: too long for the hosted case,
+	// where it pins a conversation to a node that no longer has the prefix and
+	// costs load balance for nothing, and too short for the self-hosted case,
+	// where it discards hits that were still there. Write `until_evicted` for
+	// the self-hosted class.
+	PrefixTTL CacheTTL `yaml:"prefix_ttl,omitempty"`
 }
 
 // Params controls parameter conversion for a provider (§10.3).
@@ -190,11 +324,21 @@ func (c Capacity) Reserve() float64 {
 
 // CapacityLimits is one axis ceiling, per metric (§5.2). A zero metric is not a
 // ceiling of zero: it means this axis does not constrain that metric.
+//
+// RPM and TPM are declared here because §5.2 writes them here, and they are
+// REFUSED at validation. A rate ceiling and a concurrency ceiling are different
+// mechanisms — the first needs a time window, the second a counted gauge — and
+// internal/capacity implements only the second. The rate half has a working
+// home in internal/quota, reached from `models[].deployments[].limits[]`, and
+// accepting a second spelling that does nothing is the defect this whole
+// section exists to prevent. See [Config.validateCapacity].
 type CapacityLimits struct {
 	MaxConcurrency int   `yaml:"max_concurrency,omitempty"`
 	RPM            int   `yaml:"rpm,omitempty"`
 	TPM            int64 `yaml:"tpm,omitempty"`
-	MaxQueue       int   `yaml:"max_queue,omitempty"`
+	// MaxQueue bounds how many requests may wait on this axis. Past it,
+	// admission fails immediately rather than joining an unbounded queue.
+	MaxQueue int `yaml:"max_queue,omitempty"`
 }
 
 // ModelCapacity is the per-(key, model) axis: a ceiling that counts one
@@ -233,11 +377,43 @@ func (m ModelCapacity) MarshalYAML() (any, error) {
 // metric "max_concurrent" here and "max_concurrency" on the group axes; both
 // spellings are kept as written.
 type PrincipalLimits struct {
-	MaxConcurrent int      `yaml:"max_concurrent,omitempty"`
-	MaxQueueWait  Duration `yaml:"max_queue_wait,omitempty"`
-	RPM           int      `yaml:"rpm,omitempty"`
-	TPM           int64    `yaml:"tpm,omitempty"`
-	MaxQueue      int      `yaml:"max_queue,omitempty"`
+	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+	// MaxQueueWait bounds how long one of this principal's requests may wait
+	// for capacity before it is refused. Zero means it never waits.
+	MaxQueueWait Duration `yaml:"max_queue_wait,omitempty"`
+	// RPM and TPM are refused, for the reason given on [CapacityLimits]: a
+	// per-caller rate ceiling is carried by the api key's own rpm_limit and
+	// tpm_limit, which internal/quota enforces.
+	RPM int   `yaml:"rpm,omitempty"`
+	TPM int64 `yaml:"tpm,omitempty"`
+	// MaxQueue bounds how many of this principal's requests may wait at once.
+	MaxQueue int `yaml:"max_queue,omitempty"`
+
+	// ClientPriority is the §10.5 grant: "ignore" (the default) drops a
+	// client-supplied priority hint and reports the drop; "allow" honours it,
+	// clamped to Range.
+	//
+	// An operator can grant urgency, a caller cannot claim it. That asymmetry
+	// is the whole point: priority is a claim on shared capacity, so a caller
+	// permitted to set it eventually sets the most urgent value.
+	ClientPriority string `yaml:"client_priority,omitempty"`
+	// Range is the two priority CLASS NAMES a granted hint is clamped between,
+	// written as §10.5 writes it: [batch, interactive]. Both must name a key of
+	// priority_mapping.classes. Order does not matter — the pair is a closed
+	// interval on the canonical scale, not a direction.
+	Range []string `yaml:"range,omitempty"`
+}
+
+// Client-priority grants (§10.5).
+const (
+	ClientPriorityIgnore = "ignore"
+	ClientPriorityAllow  = "allow"
+)
+
+// GrantsClientPriority reports whether this principal's callers may set their
+// own priority. The zero value does not: the hint is ignored by default.
+func (p PrincipalLimits) GrantsClientPriority() bool {
+	return p.ClientPriority == ClientPriorityAllow
 }
 
 // KeyRotation configures how several keys of one provider are chosen between.
@@ -276,6 +452,9 @@ type Model struct {
 	Class       string       `yaml:"class,omitempty"`
 	Strategy    []string     `yaml:"strategy,omitempty"`
 	Deployments []Deployment `yaml:"deployments,omitempty"`
+	// Filters attaches transform filters to this model (§10.5b). They run
+	// between the canonical request and the backend, in the order written.
+	Filters []ModelFilter `yaml:"filters,omitempty"`
 }
 
 // Deployment is one routing candidate: a provider, a credential pool and an
@@ -289,6 +468,26 @@ type Deployment struct {
 	Timeout       Duration `yaml:"timeout,omitempty"`
 	StreamTimeout Duration `yaml:"stream_timeout,omitempty"`
 	Limits        []Limit  `yaml:"limits,omitempty"`
+	// PrefixTTL overrides the provider's affinity lifetime for this deployment.
+	// It is the most specific of the three levels and wins over both.
+	//
+	// A deployment is the level at which a per-request cache tier is visible:
+	// two deployments can point at the same vendor with different caching
+	// arrangements, and only the deployment knows which.
+	PrefixTTL CacheTTL `yaml:"prefix_ttl,omitempty"`
+}
+
+// PrefixTTLFor resolves the affinity lifetime of one deployment: the
+// deployment's own value, else its provider's, else the global default.
+func (c *Config) PrefixTTLFor(provider string, d *Deployment) CacheTTL {
+	out := CacheTTL{}
+	if d != nil {
+		out = d.PrefixTTL
+	}
+	if p, ok := c.Provider(provider); ok {
+		out = out.Or(p.PrefixTTL)
+	}
+	return out.Or(c.Routing.Prefix.TTL)
 }
 
 // Limit is one (metric, ceiling) pair on a deployment (§2.2, §5.2).
@@ -329,7 +528,11 @@ type PrefixRouting struct {
 	ChunkBytes  ByteSize `yaml:"chunk_bytes,omitempty"`
 	Checkpoints string   `yaml:"checkpoints,omitempty"`
 	MaxBytes    ByteSize `yaml:"max_bytes,omitempty"`
-	TTL         Duration `yaml:"ttl,omitempty"`
+	// TTL is the DEFAULT affinity lifetime. It is overridden per provider and
+	// per deployment, because the thing it models — how long the backend still
+	// holds the KV blocks for this prefix — is a property of the backend and not
+	// of the gateway. See [Provider.PrefixTTL].
+	TTL CacheTTL `yaml:"ttl,omitempty"`
 }
 
 // IsEnabled reports whether prefix affinity is on.
@@ -382,6 +585,13 @@ type PricingRule struct {
 	Amount Decimal `yaml:"amount,omitempty"`
 	// Percent adjusts a computed cost, for an adjustment rule.
 	Percent Decimal `yaml:"percent,omitempty"`
+	// Source and AsOf are the provenance a notional_rate rule must carry
+	// (§8.5). They are load errors rather than warnings on that class, and they
+	// are refused on every other class: a rate with no date cannot be judged
+	// stale, and an estimate with no source is a guess wearing a currency
+	// symbol.
+	Source string `yaml:"source,omitempty"`
+	AsOf   string `yaml:"as_of,omitempty"`
 }
 
 // PricingMatch selects which requests a rule applies to. The dimensions are the
@@ -394,17 +604,37 @@ type PricingMatch struct {
 	Deployment  string `yaml:"deployment,omitempty"`
 }
 
-// Pricing rule classes (§8.1).
+// Pricing rule classes (§8.1, §8.5).
 const (
 	PricingMarginalUsage     = "marginal_usage"
 	PricingFixedSubscription = "fixed_subscription"
 	PricingAdjustment        = "adjustment"
+	PricingNotionalRate      = "notional_rate"
 )
 
 // pricingComponents are the priced quantities of §8.3.
+//
+// Both spellings of the cached-input component are accepted here. The main file
+// has always written `cached_read` and the price catalog has always written
+// `cache_read`; a rule moved between the two files should not stop pricing
+// because of the underscore, so the two are synonyms and [CanonicalComponent]
+// resolves them.
+//
+// `images` is NOT here. §8.3 lists it among the priced quantities and
+// internal/pricing has no per-image unit, so a rule that priced images passed
+// validation and then failed to assemble — a load error one layer too late.
 var pricingComponents = []string{
-	"input", "output", "cached_read", "cache_write", "reasoning",
-	"request", "characters", "images", "seconds",
+	"input", "output", "cached_read", "cache_read", "cache_write", "reasoning",
+	"request", "characters", "seconds",
+}
+
+// CanonicalComponent maps a priced-component name onto the price catalog's
+// spelling, which is the one internal/pricing understands.
+func CanonicalComponent(name string) string {
+	if name == "cached_read" {
+		return "cache_read"
+	}
+	return name
 }
 
 // Metering configures the two metering queues (§12.1).
@@ -456,17 +686,38 @@ type MeteringSpool struct {
 
 // Observability configures metrics, tracing export and logs (§12).
 type Observability struct {
-	Prometheus   *bool  `yaml:"prometheus,omitempty"`
-	OTLPEndpoint string `yaml:"otlp_endpoint,omitempty"`
-	LogLevel     string `yaml:"log_level,omitempty"`
-	LogFormat    string `yaml:"log_format,omitempty"`
+	// Prometheus serves GET /metrics. False removes the route entirely: a
+	// disabled scrape endpoint answers 501 like any other route this build does
+	// not serve, rather than 200 with an empty body.
+	Prometheus   *bool          `yaml:"prometheus,omitempty"`
+	Metrics      MetricsSurface `yaml:"metrics,omitempty"`
+	OTLPEndpoint string         `yaml:"otlp_endpoint,omitempty"`
+	LogLevel     string         `yaml:"log_level,omitempty"`
+	LogFormat    string         `yaml:"log_format,omitempty"`
 	// AlwaysFullHeaders attaches the full extension header set to every
 	// response instead of only on request (§10.4).
 	AlwaysFullHeaders bool `yaml:"always_full_headers,omitempty"`
 }
 
+// MetricsSurface configures who may read GET /metrics.
+//
+// The scrape carries per-key spend, per-credential quota state and every
+// configured model name. That is a description of a deployment's commercial
+// arrangements, so it authenticates by default and is opened deliberately.
+type MetricsSurface struct {
+	// Public serves /metrics to anyone who can reach the listener. It is a
+	// deliberate downgrade for a deployment whose listener is already private —
+	// a scrape sidecar on a pod network, or a bound loopback address — and it is
+	// spelled out rather than being the default, because "the network is
+	// private" is a claim the gateway cannot check.
+	Public bool `yaml:"public,omitempty"`
+}
+
 // PrometheusEnabled reports whether /metrics is served.
 func (o Observability) PrometheusEnabled() bool { return o.Prometheus == nil || *o.Prometheus }
+
+// MetricsPublic reports whether /metrics skips authentication.
+func (o Observability) MetricsPublic() bool { return o.Metrics.Public }
 
 // Extensions holds the optional Lua extension points (§11.5).
 type Extensions struct {
@@ -491,6 +742,152 @@ type LuaLimits struct {
 
 // luaHooks are the hook points of §11.5.
 var luaHooks = []string{"on_request", "on_route", "on_response", "on_email"}
+
+// Filter failure modes (§10.5b). A filter that cannot enrich a request may be
+// skipped; a filter that was supposed to remove an identity number and did not
+// must stop the request. `closed` is the safe declaration and the default.
+const (
+	FilterFailClosed = "closed"
+	FilterFailOpen   = "open"
+)
+
+// Filter phases (§10.5b). A mask is applied on the way out and undone on the
+// way back, so the two halves are named separately.
+const (
+	FilterOnRequest  = "request"
+	FilterOnResponse = "response"
+)
+
+// Filter placeholder scopes (§10.5b). The scope is how widely one original
+// value keeps the same placeholder: within one conversation, across everything
+// a principal or a tenant sends, or not at all beyond a single request.
+const (
+	FilterScopeConversation = "conversation"
+	FilterScopePrincipal    = "principal"
+	FilterScopeTenant       = "tenant"
+	FilterScopeRequest      = "request"
+)
+
+// builtinFilterPatterns are the pattern names a filter may name without writing
+// a regexp. Anything else needs one: an operator's disclosure rules are theirs,
+// and a gateway cannot ship the right pattern set for every jurisdiction
+// (§10.5b).
+var builtinFilterPatterns = []string{"krrn", "email"}
+
+// BuiltinFilterPatterns returns the pattern names that need no regexp. It
+// returns a copy: the list is a contract between this package and whatever
+// compiles the patterns, not a variable to edit.
+func BuiltinFilterPatterns() []string {
+	return append([]string(nil), builtinFilterPatterns...)
+}
+
+// Filters is the transform-filter plugin surface (§10.5b): filters that sit
+// between the canonical request and the backend, may rewrite the request, and
+// may rewrite the response on the way back. The motivating case is reversible
+// PII masking.
+type Filters struct {
+	// Secret is the cluster-wide seed a placeholder is derived from.
+	//
+	// It is a secret rather than a generated value because it must be the SAME
+	// on every node and across every restart. A per-process seed makes the same
+	// original text mask to a different placeholder on each node, so the bodies
+	// that reach a backend differ byte for byte and every backend's prefix cache
+	// cold-starts (§7.4b). It is a [SecretRef] like every other secret, so it is
+	// spelled key_env or key_file and never written in the file (§4.1).
+	Secret SecretRef `yaml:"secret,omitempty"`
+	// Plugins are the loadable filters. Loading is explicit configuration and
+	// never a directory scan (§11.5).
+	Plugins []FilterPlugin `yaml:"plugins,omitempty"`
+}
+
+// FilterPlugin declares one loadable plugin.
+type FilterPlugin struct {
+	// Name is what a model's filter list refers to.
+	Name string `yaml:"name"`
+	// Path is the plugin file. Nothing is loaded that is not named here.
+	Path string `yaml:"path"`
+	// Fail is "closed" or "open"; see [FilterFailClosed]. Defaults to closed.
+	Fail string `yaml:"fail,omitempty"`
+	// Config is handed to the plugin verbatim. It holds no secret: a plugin
+	// reaches no credential (§11.5).
+	Config map[string]string `yaml:"config,omitempty"`
+}
+
+// ModelFilter attaches a declared plugin to one model (§10.5b).
+type ModelFilter struct {
+	// Plugin names an entry of filters.plugins.
+	Plugin string `yaml:"plugin"`
+	// On lists the phases the filter runs in, a subset of "request" and
+	// "response". It defaults to both, and a response-only filter is refused:
+	// the mask → original table is built when the request is rewritten, so
+	// there is nothing to unmask if nothing was masked.
+	On []string `yaml:"on,omitempty"`
+	// Scope is how widely one original value keeps one placeholder. It defaults
+	// to "conversation"; see [FilterScopeConversation].
+	Scope string `yaml:"scope,omitempty"`
+	// Patterns are what to look for. Each is either the name of a built-in (see
+	// [BuiltinFilterPatterns]) or a name and a regexp.
+	Patterns []FilterPattern `yaml:"patterns,omitempty"`
+	// Retain bounds how long a scope's placeholder assignment stays usable.
+	// Zero, the default, is off: nothing outlives the request.
+	Retain Duration `yaml:"retain,omitempty"`
+}
+
+// FilterPattern is one pattern. It reads both spellings the design writes:
+//
+//	patterns: [krrn, email]
+//	patterns: [{name: employee_id, regexp: 'EMP-\d{6}'}]
+//
+// A bare scalar is a name; a mapping carries a name and a regexp. The regexp is
+// not compiled here — this package performs no I/O and holds no matcher; it
+// only checks that a pattern is nameable.
+type FilterPattern struct {
+	Name   string `yaml:"name"`
+	Regexp string `yaml:"regexp,omitempty"`
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (p *FilterPattern) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		if n.Tag == "!!null" {
+			return fmt.Errorf("line %d: a filter pattern must not be empty", n.Line)
+		}
+		*p = FilterPattern{Name: n.Value}
+		return nil
+	case yaml.MappingNode:
+		// A custom unmarshaler is not reached by the decoder's KnownFields
+		// setting, so the keys are checked here: a typo in a pattern is
+		// otherwise a pattern that silently never matches.
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			switch n.Content[i].Value {
+			case "name", "regexp":
+			default:
+				return fmt.Errorf("line %d: field %s not known in a filter pattern",
+					n.Content[i].Line, n.Content[i].Value)
+			}
+		}
+		type plain FilterPattern
+		var v plain
+		if err := n.Decode(&v); err != nil {
+			return err
+		}
+		*p = FilterPattern(v)
+		return nil
+	}
+	return fmt.Errorf("line %d: a filter pattern must be a built-in name such as \"krrn\", "+
+		"or a mapping with a \"name\" and a \"regexp\"", n.Line)
+}
+
+// MarshalYAML implements yaml.Marshaler. A pattern with no regexp writes back
+// as the bare name it was read as.
+func (p FilterPattern) MarshalYAML() (any, error) {
+	if p.Regexp == "" {
+		return p.Name, nil
+	}
+	type plain FilterPattern
+	return plain(p), nil
+}
 
 // Passthrough opens provider-native routes by configuration (§10.6).
 // Unmapped prefixes are not served: this is not an open proxy.

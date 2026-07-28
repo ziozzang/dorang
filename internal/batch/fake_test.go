@@ -120,6 +120,43 @@ func (g *gate) allow(n int) {
 
 func (g *gate) openAll() { g.once.Do(func() { close(g.open) }) }
 
+// feed supplies tokens for as long as the returned stop function has not been
+// called, then removes whatever surplus is left so the gate is back to a known
+// state.
+//
+// A fixed count cannot be used to cover a drain. Every token released admits
+// another row, which then wants a token of its own, so the number consumed
+// before a shutdown signal takes effect is a function of scheduling and not of
+// anything the test can compute. Handing out a count that happened to be right
+// on an idle machine is how TestRestartResumesWithoutRerunningFinishedRows came
+// to pass alone and fail inside the full suite, where it competes for CPU: the
+// drain starved and Close hit its deadline.
+func (g *gate) feed() (stop func()) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-done:
+				return
+			case g.tokens <- struct{}{}:
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+		for {
+			select {
+			case <-g.tokens:
+			default:
+				return
+			}
+		}
+	}
+}
+
 func (g *gate) counts() (started, finished int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

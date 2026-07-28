@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 )
@@ -82,14 +81,28 @@ type Emitter struct {
 	open      bool
 	openIndex int
 	openKind  blockKind
-	openTool  int
 	next      int
 
 	sawTool bool
-	// tools remembers each tool call's identity by its neutral index, so a
-	// backend that interleaves two calls can have its block reopened with the
-	// right id instead of an empty one.
-	tools map[int]toolMeta
+	// tools is the call currently bound to each neutral tool index, and order is
+	// every call in the order it was first seen. A call is a unit here, not a
+	// stream of fragments: this protocol's tool_use block carries ONE input
+	// document, and a block that carries a slice of one is not a smaller version
+	// of it — it is a parse error at the client.
+	tools map[int]*toolBlock
+	order []*toolBlock
+	// live is the call whose block is currently open and streaming. At most one
+	// exists, because this protocol has at most one open block.
+	live *toolBlock
+	// lastTool is the call the previous tool fragment belonged to, which is how
+	// interleaving is told from two calls sent one after the other.
+	lastTool *toolBlock
+	// interleaved records that a backend went back to a call after starting
+	// another, which is the shape that cannot be streamed through at all.
+	interleaved bool
+	// badArgs records that the stream ended on a tool call whose arguments do
+	// not parse.
+	badArgs bool
 
 	haveStop bool
 	stop     canonical.StopReason
@@ -99,9 +112,25 @@ type Emitter struct {
 	haveUsage bool
 }
 
-type toolMeta struct {
+// toolBlock is one tool call being assembled.
+type toolBlock struct {
 	id   string
 	name string
+	// args is the whole argument document, accumulated. sent is how much of it
+	// has already gone out as input_json_delta.
+	args []byte
+	sent int
+
+	started bool
+	closed  bool
+	// sawFragment records that at least one fragment for this call has arrived,
+	// which is what makes a later one an interleaving rather than a start.
+	sawFragment bool
+}
+
+// empty reports a fragment that named no call at all.
+func (t *toolBlock) empty() bool {
+	return t.id == "" && t.name == "" && len(t.args) == 0
 }
 
 // NewEmitter returns an emitter for one stream.
@@ -146,6 +175,10 @@ func (e *Emitter) NativeStopReason() string { return e.native }
 // every agentic client.
 func (e *Emitter) SawToolCall() bool { return e.sawTool }
 
+// MalformedToolArguments reports that the stream was failed because a tool
+// call's arguments never became valid JSON.
+func (e *Emitter) MalformedToolArguments() bool { return e.badArgs }
+
 // Push converts one neutral stream event, appending to dst.
 func (e *Emitter) Push(dst []Event, ev canonical.StreamEvent) []Event {
 	if e.stopped || e.failed {
@@ -189,6 +222,11 @@ func (e *Emitter) Push(dst []Event, ev canonical.StreamEvent) []Event {
 
 	default: // canonical.EventDelta
 		dst = e.ensureStart(dst, ev.ID, ev.Model)
+		if e.haveStop {
+			// Out of contract, and still delivered: the held message_delta exists
+			// so that late content lands in the message rather than after it.
+			e.cfg.warn().warn(WarnDataAfterFinish, string(e.stop))
+		}
 		return e.pushDelta(dst, &ev.Delta)
 	}
 }
@@ -199,7 +237,7 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 		switch b.Kind {
 		case canonical.KindThinking:
 			if b.Text != "" {
-				dst = e.ensureBlock(dst, blockKindThinking, 0)
+				dst = e.ensureBlock(dst, blockKindThinking)
 				dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
 					Type:  EventContentBlockDelta,
 					Index: e.openIndex,
@@ -209,7 +247,7 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 			if b.Thinking != nil && b.Thinking.Signature != "" {
 				// Integrity material, forwarded byte-identically. dorang never
 				// mints one (DESIGN §10.2).
-				dst = e.ensureBlock(dst, blockKindThinking, 0)
+				dst = e.ensureBlock(dst, blockKindThinking)
 				dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
 					Type:  EventContentBlockDelta,
 					Index: e.openIndex,
@@ -220,7 +258,7 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 			if b.Text == "" {
 				continue
 			}
-			dst = e.ensureBlock(dst, blockKindText, 0)
+			dst = e.ensureBlock(dst, blockKindText)
 			dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
 				Type:  EventContentBlockDelta,
 				Index: e.openIndex,
@@ -233,7 +271,7 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 			if b.Text == "" {
 				continue
 			}
-			dst = e.ensureBlock(dst, blockKindText, 0)
+			dst = e.ensureBlock(dst, blockKindText)
 			dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
 				Type:  EventContentBlockDelta,
 				Index: e.openIndex,
@@ -246,7 +284,7 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 		// No refusal block exists here. Dropping the text would leave the client
 		// with an empty turn; the stop reason carries the fact that it was a
 		// refusal, and 6.4 moves that to a header.
-		dst = e.ensureBlock(dst, blockKindText, 0)
+		dst = e.ensureBlock(dst, blockKindText)
 		dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
 			Type:  EventContentBlockDelta,
 			Index: e.openIndex,
@@ -255,31 +293,185 @@ func (e *Emitter) pushDelta(dst []Event, d *canonical.Delta) []Event {
 	}
 
 	for i := range d.ToolCalls {
-		tc := &d.ToolCalls[i]
-		e.sawTool = true
-		if tc.ID != "" || tc.Name != "" {
-			if e.tools == nil {
-				e.tools = make(map[int]toolMeta, 2)
-			}
-			m := e.tools[tc.Index]
-			if tc.ID != "" {
-				m.id = tc.ID
-			}
-			if tc.Name != "" {
-				m.name = tc.Name
-			}
-			e.tools[tc.Index] = m
-		}
-		dst = e.ensureBlock(dst, blockKindToolUse, tc.Index)
-		if tc.Arguments != "" {
-			dst = append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
-				Type:  EventContentBlockDelta,
-				Index: e.openIndex,
-				Delta: BlockDelta{Type: DeltaInputJSON, PartialJSON: tc.Arguments},
-			}})
-		}
+		dst = e.pushToolCall(dst, &d.ToolCalls[i])
 	}
 	return dst
+}
+
+// pushToolCall folds one neutral tool-call fragment into the call it belongs to.
+//
+// # Why fragments are accumulated and not forwarded
+//
+// In the chat-completions shape one frame routinely carries argument fragments
+// for SEVERAL parallel calls at once. Forwarding each fragment as it arrives
+// means closing and reopening a block per fragment, which produces one tool_use
+// block per fragment: the same id repeated, each block holding a slice of JSON
+// that does not parse on its own. The client then has several broken calls where
+// the model made two good ones.
+//
+// So a call is assembled here and emitted as ONE block. The first call to
+// produce arguments still streams through live, because that is the ordinary
+// case and buffering it would delay every tool call by the length of the stream;
+// every other call is held and emitted whole by [Emitter.Finish].
+func (e *Emitter) pushToolCall(dst []Event, tc *canonical.ToolCallDelta) []Event {
+	e.sawTool = true
+	t := e.toolAt(tc.Index, tc.ID)
+
+	// Interleaving, defined exactly: a fragment for a call that had already
+	// received one, arriving after some OTHER call's fragment. Two calls sent one
+	// after the other are not interleaved and must not be reported as such.
+	if e.lastTool != nil && e.lastTool != t && t.sawFragment {
+		e.noteInterleaved(t)
+	}
+	t.sawFragment = true
+	e.lastTool = t
+
+	if tc.ID != "" {
+		t.id = tc.ID
+	}
+	if tc.Name != "" {
+		// APPEND, not assign. A name can arrive split across frames, and an
+		// assignment keeps only the last piece — after content_block_start has
+		// already gone out carrying the first.
+		t.name = mergeToolName(t.name, tc.Name, e.cfg.warn())
+	}
+	if tc.Arguments == "" {
+		return dst
+	}
+
+	switch {
+	case e.live == t && e.open && e.openKind == blockKindToolUse:
+		// The live call. Stream it.
+	case e.live == nil && !t.closed && t.name != "" && e.firstUnstarted() == t:
+		// Nothing is streaming and this is the next call in order, so it becomes
+		// the live one. This is what opens the block, and it is deliberately here
+		// rather than on the fragment that carried the name: by the time arguments
+		// arrive the name is complete, and content_block_start carries a name that
+		// cannot later turn out to have been half of one.
+		//
+		// A call whose arguments arrive BEFORE its name is held instead. Opening
+		// now would put an empty name in content_block_start, and the name that
+		// follows would have nowhere to go.
+		dst = e.openToolBlock(dst, t)
+	case t.closed:
+		// A call whose block was already closed by intervening content. There is
+		// nowhere else for this fragment to go: the block is behind us and the
+		// protocol has no way to amend it. Reopening under the same id is the one
+		// shape a client can still make sense of, and it is the ONLY case in which
+		// this emitter reopens anything.
+		e.noteInterleaved(t)
+		dst = e.openToolBlock(dst, t)
+	default:
+		// Another call holds the open block. Hold this one; [Emitter.Finish] emits
+		// it whole.
+		t.args = append(t.args, tc.Arguments...)
+		return dst
+	}
+
+	t.args = append(t.args, tc.Arguments...)
+	return e.flushToolArgs(dst, t)
+}
+
+// noteInterleaved reports a backend that went back to a call after another one
+// had already started. It is the only shape this protocol genuinely cannot
+// stream, as opposed to merely cannot stream in parallel.
+func (e *Emitter) noteInterleaved(t *toolBlock) {
+	if e.interleaved {
+		return
+	}
+	e.interleaved = true
+	e.cfg.warn().warn(WarnInterleavedToolCalls, t.id)
+}
+
+// flushToolArgs emits the part of a live block's arguments not yet on the wire.
+func (e *Emitter) flushToolArgs(dst []Event, t *toolBlock) []Event {
+	if t.sent >= len(t.args) {
+		return dst
+	}
+	part := string(t.args[t.sent:])
+	t.sent = len(t.args)
+	return append(dst, Event{Type: EventContentBlockDelta, Payload: &ContentBlockDeltaEvent{
+		Type:  EventContentBlockDelta,
+		Index: e.openIndex,
+		Delta: BlockDelta{Type: DeltaInputJSON, PartialJSON: part},
+	}})
+}
+
+// toolAt returns the call bound to a neutral index, binding a new one when an
+// id appears that the current occupant does not have.
+//
+// The rebinding is COMPATIBILITY 5.1 read from the other side: a backend that
+// omits index — or sends zero for everything — otherwise merges every parallel
+// call into one whose arguments are two JSON documents end to end. The id is the
+// identity a client matches on, so a second id is a second call.
+func (e *Emitter) toolAt(index int, id string) *toolBlock {
+	if e.tools == nil {
+		e.tools = make(map[int]*toolBlock, 2)
+	}
+	t := e.tools[index]
+	if t == nil {
+		t = &toolBlock{}
+		e.tools[index] = t
+		e.order = append(e.order, t)
+		return t
+	}
+	if id != "" && t.id != "" && id != t.id {
+		e.cfg.warn().warn(WarnToolCallIndexReused, id)
+		t = &toolBlock{}
+		e.tools[index] = t
+		e.order = append(e.order, t)
+	}
+	return t
+}
+
+// firstUnstarted is the next call in first-seen order that has no block yet.
+func (e *Emitter) firstUnstarted() *toolBlock {
+	for _, t := range e.order {
+		if !t.started {
+			return t
+		}
+	}
+	return nil
+}
+
+// openToolBlock opens a block for one call and makes it the live one.
+func (e *Emitter) openToolBlock(dst []Event, t *toolBlock) []Event {
+	dst = e.ensureBlock(dst, blockKindToolUse)
+	if t.id == "" {
+		// dorang does not mint one. The id is what the client sends back in its
+		// tool_result and what the backend matches on the next turn; a
+		// gateway-invented id is a correlation neither end agreed to.
+		e.cfg.warn().warn(WarnToolCallMissingID, t.name)
+	}
+	t.started, t.closed = true, false
+	e.live = t
+	return append(dst, Event{Type: EventContentBlockStart, Payload: &ContentBlockStartEvent{
+		Type:  EventContentBlockStart,
+		Index: e.openIndex,
+		ContentBlock: ContentBlock{
+			Type: BlockToolUse, ID: t.id, Name: t.name, Input: json.RawMessage("{}"),
+		},
+	}})
+}
+
+// mergeToolName folds a name fragment into the name accumulated so far.
+//
+// A repeated fragment is ambiguous — a backend restating a whole name and a
+// backend splitting "aaaa" into "aa" and "aa" produce identical bytes — and this
+// side of the crossing has no tool table to settle it with. The OpenAI decoder
+// does have one and resolves the name before it reaches here (see
+// openai.ToolStream); this is the defence for every other producer, and it
+// prefers restatement, which is the shape that actually occurs.
+func mergeToolName(have, frag string, warn WarnFunc) string {
+	switch {
+	case have == "":
+		return frag
+	case frag == have:
+		warn.warn(WarnRepeatedToolName, frag)
+		return have
+	default:
+		return have + frag
+	}
 }
 
 // ensureStart emits message_start exactly once.
@@ -316,30 +508,31 @@ func (e *Emitter) ensureStart(dst []Event, id, model string) []Event {
 //
 // This is the synthesis DESIGN §10.7 describes: the boundary did not exist
 // upstream and is manufactured here, in the one place that knows what is open.
-func (e *Emitter) ensureBlock(dst []Event, kind blockKind, toolIndex int) []Event {
+//
+// A tool block is never returned as "already open": [Emitter.openToolBlock] owns
+// that decision, because whether a tool fragment belongs in the open block
+// depends on WHICH call it belongs to and not merely on the kind.
+func (e *Emitter) ensureBlock(dst []Event, kind blockKind) []Event {
 	if e.open {
-		if e.openKind == kind && (kind != blockKindToolUse || e.openTool == toolIndex) {
+		if e.openKind == kind && kind != blockKindToolUse {
 			return dst
-		}
-		if kind == blockKindToolUse && e.openKind == blockKindToolUse {
-			e.cfg.warn().warn(WarnInterleavedToolCalls, strconv.Itoa(toolIndex))
 		}
 		dst = e.closeBlock(dst)
 	}
 	e.open = true
 	e.openKind = kind
-	e.openTool = toolIndex
 	e.openIndex = e.next
 	e.next++
 
+	if kind == blockKindToolUse {
+		// The caller emits content_block_start itself: only it knows the id and
+		// the settled name.
+		return dst
+	}
 	var cb ContentBlock
-	switch kind {
-	case blockKindThinking:
+	if kind == blockKindThinking {
 		cb = ContentBlock{Type: BlockThinking, Thinking: ptr("")}
-	case blockKindToolUse:
-		m := e.tools[toolIndex]
-		cb = ContentBlock{Type: BlockToolUse, ID: m.id, Name: m.name, Input: json.RawMessage("{}")}
-	default:
+	} else {
 		cb = ContentBlock{Type: BlockText, Text: ptr("")}
 	}
 	return append(dst, Event{Type: EventContentBlockStart, Payload: &ContentBlockStartEvent{
@@ -352,6 +545,10 @@ func (e *Emitter) closeBlock(dst []Event) []Event {
 		return dst
 	}
 	e.open = false
+	if e.live != nil {
+		e.live.closed = true
+		e.live = nil
+	}
 	return append(dst, Event{Type: EventContentBlockStop, Payload: &ContentBlockStopEvent{
 		Type: EventContentBlockStop, Index: e.openIndex,
 	}})
@@ -370,6 +567,22 @@ func (e *Emitter) Finish(dst []Event) []Event {
 		return dst
 	}
 	dst = e.ensureStart(dst, "", "")
+
+	// A tool call whose arguments never became a JSON document is the one thing
+	// that must not be finished normally. The stop reason is about to be upgraded
+	// to tool_use, which tells an agentic client a call is ready — and it is not.
+	// dorang cannot repair it: it does not execute tools, and inventing the
+	// missing bytes would invent an argument the model never produced. So the
+	// stream fails in band (COMPATIBILITY 1.3) instead of ending in a message the
+	// client would act on.
+	if bad := e.malformedToolCall(); bad != nil {
+		e.cfg.warn().warn(WarnMalformedToolArguments, toolLabel(bad))
+		e.badArgs = true
+		dst = e.closeBlock(dst)
+		return e.Fail(dst, malformedArgumentsError(bad))
+	}
+	// Every call that was held while another streamed goes out now, whole.
+	dst = e.flushHeldToolCalls(dst)
 	// 6.6: a content_block_stop must ALWAYS precede the terminal message_delta.
 	dst = e.closeBlock(dst)
 	e.stopped = true
@@ -405,6 +618,58 @@ func (e *Emitter) Finish(dst []Event) []Event {
 	dst = append(dst, Event{Type: EventMessageDelta, Payload: md})
 	return append(dst, Event{Type: EventMessageStop, Payload: &MessageStopEvent{Type: EventMessageStop}})
 }
+
+// flushHeldToolCalls emits every call that never got the open block, each as one
+// complete tool_use block.
+func (e *Emitter) flushHeldToolCalls(dst []Event) []Event {
+	for _, t := range e.order {
+		if t.started || t.empty() {
+			continue
+		}
+		dst = e.openToolBlock(dst, t)
+		dst = e.flushToolArgs(dst, t)
+		dst = e.closeBlock(dst)
+	}
+	return dst
+}
+
+// malformedToolCall returns the first call whose accumulated arguments are not a
+// JSON value, in first-seen order.
+//
+// An empty body is not malformed: a zero-argument call sends no argument
+// fragments and content_block_start already carries input:{}.
+func (e *Emitter) malformedToolCall() *toolBlock {
+	for _, t := range e.order {
+		if len(bytes.TrimSpace(t.args)) == 0 {
+			continue
+		}
+		if !json.Valid(t.args) {
+			return t
+		}
+	}
+	return nil
+}
+
+func toolLabel(t *toolBlock) string {
+	if t.name != "" {
+		return t.name
+	}
+	return t.id
+}
+
+func malformedArgumentsError(t *toolBlock) *Error {
+	msg := "the upstream ended a tool call whose arguments are not valid JSON"
+	if l := toolLabel(t); l != "" {
+		msg += ": " + l
+	}
+	return NewError(502, TypeAPIError, msg).WithCode(WarnMalformedToolArguments)
+}
+
+// ErrMalformedToolArguments reports that the stream carried a tool call whose
+// arguments never became valid JSON. The in-band error frame has already been
+// written when it is returned; it exists so the exchange is counted as failed
+// rather than logged as a clean 200.
+var ErrMalformedToolArguments = errorString("anthropic: a tool call's arguments are not valid JSON")
 
 // Fail delivers an error in band (COMPATIBILITY 1.3) and ends the stream.
 //
@@ -532,13 +797,24 @@ func (s *StreamWriter) WriteError(e *Error) error {
 }
 
 // Close completes the stream.
+//
+// It returns [ErrMalformedToolArguments] when the stream ended on a tool call
+// whose arguments do not parse. The error frame has already been written by
+// then; the return exists so the exchange is counted as failed rather than
+// recorded as a clean 200 (DESIGN §12.4).
 func (s *StreamWriter) Close() error {
 	if s.closed {
 		return nil
 	}
 	s.closed = true
 	s.queue = s.em.Finish(s.queue[:0])
-	return s.flush()
+	if err := s.flush(); err != nil {
+		return err
+	}
+	if s.em.MalformedToolArguments() {
+		return ErrMalformedToolArguments
+	}
+	return nil
 }
 
 func (s *StreamWriter) flush() error {

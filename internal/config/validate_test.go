@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -75,7 +76,7 @@ func TestValidationRules(t *testing.T) {
 		},
 		{
 			name: "credential names an undeclared provider",
-			f:    fragments{credentials: "  - {id: c2, provider: nope, key_ref: \"vault:x\"}\n"},
+			f:    fragments{credentials: "  - {id: c2, provider: nope, key_env: DORANG_TEST_FIXTURE_KEY}\n"},
 			path: "credentials[1].provider",
 			want: `provider "nope" is not declared`,
 		},
@@ -90,7 +91,7 @@ func TestValidationRules(t *testing.T) {
 			name: "deployment uses a credential of another provider",
 			f: fragments{
 				providers:   "  - {name: p2, kind: openai}\n",
-				credentials: "  - {id: c2, provider: p2, key_ref: \"vault:x\"}\n",
+				credentials: "  - {id: c2, provider: p2, key_env: DORANG_TEST_FIXTURE_KEY}\n",
 				models: "  - name: m2\n" +
 					"    deployments: [{provider: p1, upstream_model: u, credentials: [c2]}]\n",
 			},
@@ -105,7 +106,7 @@ func TestValidationRules(t *testing.T) {
 		},
 		{
 			name: "credential capacity group is not declared",
-			f:    fragments{credentials: "  - {id: c2, provider: p1, key_ref: \"vault:x\", capacity_group: acct}\n"},
+			f:    fragments{credentials: "  - {id: c2, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY, capacity_group: acct}\n"},
 			path: "credentials[1].capacity_group",
 			want: "capacity.credential_groups",
 		},
@@ -113,7 +114,7 @@ func TestValidationRules(t *testing.T) {
 			name: "declared capacity groups resolve",
 			f: fragments{
 				providers:   "  - {name: p2, kind: openai, capacity_group: pool}\n",
-				credentials: "  - {id: c2, provider: p2, key_ref: \"vault:x\", capacity_group: acct}\n",
+				credentials: "  - {id: c2, provider: p2, key_env: DORANG_TEST_FIXTURE_KEY, capacity_group: acct}\n",
 				top: "capacity:\n  provider_groups: {pool: {max_concurrency: 6}}\n" +
 					"  credential_groups: {acct: {max_concurrency: 3}}\n",
 			},
@@ -126,14 +127,14 @@ func TestValidationRules(t *testing.T) {
 		},
 		{
 			name: "rotation pool names an undeclared provider",
-			f:    fragments{top: "key_rotation: {providers: {nope: {keys: [{id: c1, key_ref: \"vault:x\"}]}}}\n"},
+			f:    fragments{top: "key_rotation: {providers: {nope: {keys: [{id: c1, key_env: DORANG_TEST_FIXTURE_KEY}]}}}\n"},
 			path: `key_rotation.providers["nope"]`,
 			want: `provider "nope" is not declared`,
 		},
 		{
 			name: "rotation key capacity group is not declared",
 			f: fragments{top: "key_rotation:\n  providers:\n    p1:\n      keys:\n" +
-				"        - {id: c1, key_ref: \"vault:x\", capacity_group: acct}\n"},
+				"        - {id: c1, key_env: DORANG_TEST_FIXTURE_KEY, capacity_group: acct}\n"},
 			path: `key_rotation.providers["p1"].keys[0].capacity_group`,
 			want: "capacity.credential_groups",
 		},
@@ -141,7 +142,7 @@ func TestValidationRules(t *testing.T) {
 			name: "rotation key belongs to another provider",
 			f: fragments{
 				providers: "  - {name: p2, kind: openai}\n",
-				top:       "key_rotation: {providers: {p2: {keys: [{id: c1, key_ref: \"vault:x\"}]}}}\n",
+				top:       "key_rotation: {providers: {p2: {keys: [{id: c1, key_env: DORANG_TEST_FIXTURE_KEY}]}}}\n",
 			},
 			path: `key_rotation.providers["p2"].keys[0].id`,
 			want: "rotation pool is for provider",
@@ -211,7 +212,7 @@ func TestValidationRules(t *testing.T) {
 		},
 		{
 			name: "duplicate credential id",
-			f:    fragments{credentials: "  - {id: c1, provider: p1, key_ref: \"vault:y\"}\n"},
+			f:    fragments{credentials: "  - {id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}\n"},
 			path: "credentials[1].id",
 			want: "duplicate credential id",
 		},
@@ -565,6 +566,168 @@ func TestValidationRules(t *testing.T) {
 				"          - {metric: rpm, value: 100}\n          - {metric: tpm, value: 100000}\n" +
 				"          - {metric: max_concurrent, value: 5}\n"},
 		},
+
+		// --- §10.5b transform filters ---------------------------------------
+		{
+			name: "filter plugin without a name",
+			f:    fragments{top: "filters: {plugins: [{path: /opt/dorang/pii.so}]}\n"},
+			path: "filters.plugins[0].name",
+			want: "must name the plugin",
+		},
+		{
+			name: "duplicate filter plugin name",
+			f: fragments{top: "filters:\n  plugins:\n" +
+				"    - {name: pii-mask, path: /opt/dorang/a.so}\n" +
+				"    - {name: pii-mask, path: /opt/dorang/b.so}\n"},
+			path: "filters.plugins[1].name",
+			want: `duplicate filter plugin name "pii-mask"`,
+		},
+		{
+			name: "filter plugin without a path",
+			f:    fragments{top: "filters: {plugins: [{name: pii-mask}]}\n"},
+			path: "filters.plugins[0].path",
+			want: "never because it was found in a directory",
+		},
+		{
+			name: "unknown filter failure mode",
+			f:    fragments{top: "filters: {plugins: [{name: pii-mask, path: /a.so, fail: maybe}]}\n"},
+			path: "filters.plugins[0].fail",
+			want: "not a known value",
+		},
+		{
+			name: "fail open is a declaration the design allows",
+			f:    fragments{top: "filters: {plugins: [{name: enrich, path: /a.so, fail: open}]}\n"},
+		},
+		{
+			name: "model attaches an undeclared plugin",
+			f: fragments{
+				models: filterModel("{plugin: nope}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].plugin",
+			want: `model "m2" attaches filter plugin "nope", which is not declared under filters.plugins`,
+		},
+		{
+			name: "model filter names no plugin at all",
+			f: fragments{
+				models: filterModel("{}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].plugin",
+			want: "must name a plugin declared under filters.plugins",
+		},
+		{
+			name: "unknown filter phase",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, on: [stream]}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].on[0]",
+			want: "not a known value",
+		},
+		{
+			name: "a response-only filter has nothing to unmask",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, on: [response]}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].on",
+			want: "nothing to unmask",
+		},
+		{
+			name: "a request-only filter is allowed",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, on: [request]}"),
+				top:    filterSection,
+			},
+		},
+		{
+			name: "unknown filter scope",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, scope: galaxy}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].scope",
+			want: "not a known value",
+		},
+		{
+			name: "filter pattern without a name",
+			f: fragments{
+				models: filterModel(`{plugin: pii-mask, patterns: [{regexp: "EMP-[0-9]{6}"}]}`),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].patterns[0].name",
+			want: "must name the pattern",
+		},
+		{
+			name: "a pattern that is neither built in nor given a regexp",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, patterns: [passport]}"),
+				top:    filterSection,
+			},
+			path: "models[1].filters[0].patterns[0]",
+			want: "the built-in patterns are krrn, email",
+		},
+		{
+			name: "built-in names and a named regexp side by side",
+			f: fragments{
+				models: filterModel(
+					`{plugin: pii-mask, patterns: [krrn, email, {name: employee_id, regexp: "EMP-[0-9]{6}"}]}`),
+				top: filterSection,
+			},
+		},
+		{
+			name: "a scope beyond the request needs the cluster-wide seed",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, scope: tenant}"),
+				top:    "filters: {plugins: [{name: pii-mask, path: /opt/dorang/pii.so}]}\n",
+			},
+			path: "filters.secret",
+			want: "cold-starts",
+		},
+		{
+			name: "the default conversation scope needs the seed too",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask}"),
+				top:    "filters: {plugins: [{name: pii-mask, path: /opt/dorang/pii.so}]}\n",
+			},
+			path: "filters.secret",
+			want: "must be set",
+		},
+		{
+			name: "scope request needs no seed: it is per-request by construction",
+			f: fragments{
+				models: filterModel("{plugin: pii-mask, scope: request}"),
+				top:    "filters: {plugins: [{name: pii-mask, path: /opt/dorang/pii.so}]}\n",
+			},
+		},
+		{
+			name: "a seed with two sources is refused like any other secret",
+			f: fragments{top: "filters:\n" +
+				"  secret: {key_env: DORANG_TEST_FIXTURE_KEY, key_file: /etc/dorang/seed}\n"},
+			path: "filters.secret",
+			want: "set exactly one of",
+		},
+		{
+			name: "the whole §10.5b surface as the design writes it",
+			f: fragments{
+				models: "  - name: m2\n" +
+					"    deployments: [{provider: p1, upstream_model: u, credentials: [c1]}]\n" +
+					"    filters:\n" +
+					"      - plugin: pii-mask\n" +
+					"        on: [request, response]\n" +
+					"        scope: conversation\n" +
+					"        retain: 15m\n" +
+					"        patterns: [krrn, email]\n",
+				top: "filters:\n" +
+					"  secret: {key_env: DORANG_TEST_FIXTURE_KEY}\n" +
+					"  plugins:\n" +
+					"    - name: pii-mask\n" +
+					"      path: /opt/dorang/pii.so\n" +
+					"      fail: closed\n" +
+					"      config: {locale: kr}\n",
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -583,6 +746,138 @@ func TestValidationRules(t *testing.T) {
 				t.Errorf("want %s: %q\ngot:\n%v", tc.path, tc.want, err)
 			}
 		})
+	}
+}
+
+// filterSection declares one plugin and the cluster-wide seed §10.5b requires
+// for any scope but "request".
+const filterSection = "filters:\n" +
+	"  secret: {key_env: DORANG_TEST_FIXTURE_KEY}\n" +
+	"  plugins: [{name: pii-mask, path: /opt/dorang/pii.so}]\n"
+
+// filterModel is a second model carrying exactly one filter, written in flow
+// style so a case reads as the one line it is about.
+func filterModel(filter string) string {
+	return "  - name: m2\n" +
+		"    deployments: [{provider: p1, upstream_model: u, credentials: [c1]}]\n" +
+		"    filters: [" + filter + "]\n"
+}
+
+// TestFilterPatternSpellings checks both spellings §10.5b writes, and that a
+// typo inside a pattern mapping is refused rather than quietly dropped: a
+// custom unmarshaler is not reached by the decoder's KnownFields setting, so a
+// misspelled key would otherwise be a pattern that never matches.
+func TestFilterPatternSpellings(t *testing.T) {
+	c, err := loadFragments(t, fragments{
+		models: filterModel(
+			`{plugin: pii-mask, patterns: [krrn, {name: employee_id, regexp: "EMP-[0-9]{6}"}]}`),
+		top: filterSection,
+	})
+	if err != nil {
+		t.Fatalf("both spellings must load: %v", err)
+	}
+	got := c.Models[1].Filters[0].Patterns
+	want := []FilterPattern{{Name: "krrn"}, {Name: "employee_id", Regexp: "EMP-[0-9]{6}"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("patterns decoded as %#v, want %#v", got, want)
+	}
+
+	_, err = loadFragments(t, fragments{
+		models: filterModel(`{plugin: pii-mask, patterns: [{name: x, regex: "y"}]}`),
+		top:    filterSection,
+	})
+	if !hasProblem(err, "", "field regex not known in a filter pattern") {
+		t.Errorf("a misspelled pattern key must be refused, got: %v", err)
+	}
+
+	_, err = loadFragments(t, fragments{
+		models: filterModel(`{plugin: pii-mask, patterns: [[krrn]]}`),
+		top:    filterSection,
+	})
+	if !hasProblem(err, "", "must be a built-in name") {
+		t.Errorf("a pattern that is neither a scalar nor a mapping must be refused, got: %v", err)
+	}
+}
+
+// TestFilterRetainMustNotBeNegative covers both doors into the field: the
+// parser, and a Config assembled in Go.
+func TestFilterRetainMustNotBeNegative(t *testing.T) {
+	_, err := loadFragments(t, fragments{
+		models: filterModel("{plugin: pii-mask, retain: -15m}"),
+		top:    filterSection,
+	})
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Errorf("a negative retain must be refused while parsing, got: %v", err)
+	}
+
+	c := &Config{
+		Version: 1,
+		Models: []Model{{
+			Name:        "m1",
+			Deployments: []Deployment{{Provider: "p1", UpstreamModel: "u"}},
+			Filters: []ModelFilter{{
+				Plugin: "pii-mask",
+				Scope:  FilterScopeRequest,
+				Retain: Duration(-time.Minute),
+			}},
+		}},
+		Filters: Filters{Plugins: []FilterPlugin{{Name: "pii-mask", Path: "/opt/dorang/pii.so"}}},
+	}
+	c.ApplyDefaults()
+	if !hasProblem(c.Validate(), "models[0].filters[0].retain", "must not be negative") {
+		t.Errorf("validation must guard the field too, got: %v", c.Validate())
+	}
+}
+
+// TestFilterDefaults pins the three §10.5b defaults, since a filter that is
+// silently narrower than the operator thought is a filter that leaks.
+func TestFilterDefaults(t *testing.T) {
+	c, err := loadFragments(t, fragments{
+		models: filterModel("{plugin: pii-mask}"),
+		top:    filterSection,
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := c.Filters.Plugins[0].Fail; got != FilterFailClosed {
+		t.Errorf("plugin fail defaulted to %q, want %q", got, FilterFailClosed)
+	}
+	f := c.Models[1].Filters[0]
+	if !reflect.DeepEqual(f.On, []string{FilterOnRequest, FilterOnResponse}) {
+		t.Errorf("on defaulted to %v, want both phases", f.On)
+	}
+	if f.Scope != FilterScopeConversation {
+		t.Errorf("scope defaulted to %q, want %q", f.Scope, FilterScopeConversation)
+	}
+	if f.Retain != 0 {
+		t.Errorf("retain defaulted to %v, want 0 (off)", f.Retain)
+	}
+}
+
+// TestFilterSecretMessageExplainsTheCacheCost pins the wording of the missing
+// seed: an operator who reads only this line has to learn why a masking secret
+// is a routing concern, not just a cryptographic one (§7.4b).
+func TestFilterSecretMessageExplainsTheCacheCost(t *testing.T) {
+	_, err := loadFragments(t, fragments{
+		models: filterModel("{plugin: pii-mask}"),
+		top:    "filters: {plugins: [{name: pii-mask, path: /opt/dorang/pii.so}]}\n",
+	})
+	if err == nil {
+		t.Fatal("a conversation-scoped filter with no seed must be refused")
+	}
+	var msg string
+	for _, p := range Problems(err) {
+		if p.Path == "filters.secret" {
+			msg = p.Message
+		}
+	}
+	for _, want := range []string{
+		"placeholder is derived", "every node", "every restart", "prefix cache",
+		"cold-start", "§7.4b", "key_env", `scope: "request"`,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message does not mention %q:\n%s", want, msg)
+		}
 	}
 }
 
@@ -621,7 +916,7 @@ providers:
   - {name: p1, kind: openai}
   - {name: p1, kind: openai}
 credentials:
-  - {id: c1, provider: nope, key_ref: "vault:x"}
+  - {id: c1, provider: nope, key_env: DORANG_TEST_FIXTURE_KEY}
 models:
   - name: m1
     strategy: [cheapest]

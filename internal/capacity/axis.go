@@ -87,4 +87,9 @@ type modelIdent struct {
 type axisNeed struct {
 	key   axisKey
 	limit int
+	// queue is the configured `max_queue` for this key, 0 for unbounded. It
+	// rides along with the concurrency limit because the two are looked up from
+	// the same name at the same moment, and a second pass over the axes to
+	// fetch it would double the map lookups on the hot path.
+	queue int
 }

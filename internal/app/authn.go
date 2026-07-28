@@ -3,13 +3,16 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/auth"
+	"github.com/ziozzang/dorang/internal/cluster"
+	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/keyguard"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
-	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
 // authStore adapts *store.Store onto auth.Store and auth.Rehasher.
@@ -25,18 +28,29 @@ import (
 // downtime" becomes a legacy window that never narrows.
 type authStore struct {
 	st *store.Store
+	// tiers is the operator's tier configuration (DESIGN §11.6). It is applied
+	// as each record is built, so the envelope the hot path enforces is already
+	// narrowed to what the key's tier grants. A tier that only decided a default
+	// elsewhere would be a tier the request path never sees.
+	tiers *auth.TierSet
 }
 
 // LoadByLookup implements auth.Store.
+//
+// It resolves the index key to a (key, secret) PAIR rather than to a key. A
+// rotation leaves two live index keys behind one durable id (DESIGN §11.2c) and
+// both must authenticate to the same principal; a lookup that resolved only the
+// current secret would refuse the caller who has not rolled yet as an unknown
+// key, which is the failure a grace period exists to prevent.
 func (s *authStore) LoadByLookup(ctx context.Context, lookup string) (auth.Record, error) {
-	k, err := s.st.GetAPIKeyByLookup(ctx, lookup)
+	k, sec, err := s.st.ResolveKeyByLookup(ctx, lookup)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return auth.Record{}, auth.ErrNotFound
 		}
 		return auth.Record{}, err
 	}
-	return recordFromAPIKey(k)
+	return cluster.AuthRecord(k, sec, s.tiers)
 }
 
 // Rehash implements auth.Rehasher.
@@ -50,56 +64,15 @@ func (s *authStore) Rehash(ctx context.Context, keyID, lookup string, digest aut
 	return s.st.SetKeyDigest(ctx, keyID, lookup, digest.Hex(), store.SchemeDorangV1)
 }
 
-// recordFromAPIKey converts a stored row into the authenticator's view of it.
-//
-// Every authorization field of DESIGN §2.4 is carried across. A field that is
-// dropped here is a field the gateway fails open on, which is exactly what
-// R1-A recorded, so the conversion is exhaustive rather than convenient.
-func recordFromAPIKey(k *store.APIKey) (auth.Record, error) {
-	digest, err := auth.ParseDigest(k.TokenHash)
-	if err != nil {
-		return auth.Record{}, err
-	}
-	scheme, err := auth.ParseScheme(string(k.HashScheme))
-	if err != nil {
-		return auth.Record{}, err
-	}
-	return auth.Record{
-		Lookup: k.Lookup,
-		Digest: digest,
-		Scheme: scheme,
-		Principal: auth.Principal{
-			KeyID:         k.ID,
-			Label:         k.KeyLabel,
-			UserID:        k.UserID,
-			TeamID:        k.TeamID,
-			PriorityClass: k.PriorityClass,
-			Tags:          k.Tags,
-			Key: auth.Limits{
-				Blocked:          k.Blocked,
-				ExpiresAt:        k.ExpiresAt,
-				Models:           k.Models,
-				AllowedRoutes:    k.AllowedRoutes,
-				MaxBudgetNanoUSD: k.MaxBudgetNano,
-				SpentNanoUSD:     k.SpendNano,
-				BudgetPeriod:     k.BudgetPeriod,
-				BudgetResetAt:    k.BudgetResetAt,
-				RPMLimit:         k.RPMLimit,
-				TPMLimit:         k.TPMLimit,
-				MaxParallel:      k.MaxParallel,
-			},
-		},
-	}, nil
-}
-
 // authAdapter satisfies server.Authenticator with the real authenticator.
 //
 // The two differ in one place only: internal/server's Principal is an
 // interface, and internal/auth's is a struct with a KeyID FIELD. A method and a
 // field cannot share a name, so the struct is wrapped rather than embedded.
 type authAdapter struct {
-	a   *auth.Authenticator
-	now func() time.Time
+	a     *auth.Authenticator
+	now   func() time.Time
+	rates *keyRates
 }
 
 // AuthenticateHeader implements server.Authenticator.
@@ -108,17 +81,81 @@ func (ad *authAdapter) AuthenticateHeader(ctx context.Context, h http.Header) (s
 	if err != nil {
 		return nil, authError(err)
 	}
-	return &principal{p: p, now: ad.now}, nil
+	return &principal{p: p, now: ad.now, rates: ad.rates}, nil
 }
 
 // principal is the server's view of an authenticated caller.
 type principal struct {
 	p   *auth.Principal
 	now func() time.Time
+	// rates supplies the rolling-minute counts a key's rpm_limit and tpm_limit
+	// are compared against. Nil leaves both unenforced, which is what the whole
+	// gateway did before it existed.
+	rates *keyRates
+}
+
+// maxParallel is the key's max_parallel_requests, or 0 when it has none.
+//
+// It is read here rather than in internal/capacity because the broker keys its
+// principal axis by api key id and takes its limits from a static configuration
+// map. A per-key column cannot ride that channel: it is not in the file, it
+// changes when an operator edits the key, and it belongs to the caller rather
+// than to the deployment. So the limit travels with the request instead.
+func (p *principal) maxParallel() int {
+	if p == nil || p.p == nil || p.p.Master {
+		return 0
+	}
+	best := int64(0)
+	for _, l := range []*auth.Limits{&p.p.Key, p.p.User, p.p.Team} {
+		if l == nil || l.MaxParallel == nil {
+			continue
+		}
+		// Most restrictive wins across key, user and team (DESIGN §11.2), and a
+		// configured zero really is zero: it refuses everything, which is why
+		// the column is a pointer.
+		if v := *l.MaxParallel; best == 0 || v < best {
+			best = v
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	return int(best)
+}
+
+// priorityClass is the class an operator assigned this key (§7.5). It reaches
+// the router through the dispatcher; before this it was loaded from the store,
+// carried on the principal, and read by nothing but the Lua hook view — so every
+// request routed as the default class regardless of what its key said.
+func (p *principal) priorityClass() string {
+	if p == nil || p.p == nil {
+		return ""
+	}
+	return p.p.PriorityClass
 }
 
 // KeyID implements server.Principal.
 func (p *principal) KeyID() string { return p.p.KeyID }
+
+// SecretID implements server.SecretPrincipal (DESIGN §11.2c).
+//
+// It is the api_key_secrets row id, never any part of the secret. It reaches
+// the ledger so an operator can see which credential a client is still
+// presenting during a rotation's grace period, rather than finding out when the
+// window shuts.
+func (p *principal) SecretID() string { return p.p.SecretID }
+
+// Tier implements the §11.6 tier accessor. The tier comes from the stored row
+// and from nowhere else: an operator grants it, a caller cannot claim it.
+func (p *principal) Tier() string { return p.p.Tier }
+
+// IsAdmin implements server.AdminPrincipal.
+//
+// Only the master credential qualifies. There is no per-key administrative flag
+// in the store yet, and inventing one here — reading a tag, say — would make the
+// administrative boundary depend on a string a key-creation API already lets
+// callers set. When a real flag exists this is the one place that reads it.
+func (p *principal) IsAdmin() bool { return p.p.IsMaster() }
 
 // UserID implements server.Principal.
 func (p *principal) UserID() string { return p.p.UserID }
@@ -127,12 +164,40 @@ func (p *principal) UserID() string { return p.p.UserID }
 func (p *principal) TeamID() string { return p.p.TeamID }
 
 // Authorize implements server.Principal.
+//
+// The observed rates are supplied HERE, at the one production construction of
+// auth.Access, because this is the only place that has both the principal and a
+// clock. Omitting them — which is what this function did — left every positive
+// rpm_limit and tpm_limit comparing a configured ceiling against a hard-coded
+// zero, so the check ran on every request and could never fire.
 func (p *principal) Authorize(a server.Access) error {
-	err := p.p.Authorize(auth.Access{Now: p.now(), Model: a.Model, Route: a.Route})
-	if err != nil {
+	ac := auth.Access{Now: p.now(), Model: a.Model, Route: a.Route}
+	// The master credential is authorized unconditionally and has no stored row
+	// to carry limits, so it is not counted either: counting it would let an
+	// administrative probe consume a tenant's window under a shared id.
+	if !p.p.IsMaster() {
+		req, tok := p.rates.observe(p.p.KeyID)
+		ac.ObservedRPM, ac.ObservedTPM = clampInt(req), clampInt(tok)
+	}
+	if err := p.p.Authorize(ac); err != nil {
 		return authError(err)
 	}
 	return nil
+}
+
+// clampInt narrows an int64 count to the int auth.Access carries, saturating
+// rather than wrapping. A wrapped count would read as a small number and turn an
+// exceeded ceiling into an allowed request, which is the one direction a limit
+// must never fail in.
+func clampInt(v int64) int {
+	const maxInt = int64(^uint(0) >> 1)
+	switch {
+	case v < 0:
+		return 0
+	case v > maxInt:
+		return int(maxInt)
+	}
+	return int(v)
 }
 
 // AllowsModel implements server.Principal.
@@ -184,28 +249,79 @@ func authError(err error) error {
 	return err
 }
 
-// applyCredential puts a provider credential on an outbound request in the
-// spelling that provider kind expects.
+// How a provider credential is spelled on an outbound request lives in
+// internal/backend, with the adapter that decides it: [backend.Provider.ApplyCredential].
+// There is no second spelling here, because the two would only ever be found to
+// disagree by an upstream answering 401.
+
+// --- tiers, rotation and the guard (DESIGN §11.6, §11.2c) --------------------
+
+// tierSet builds the operator's tier set from configuration.
 //
-// The client's own credential never travels upstream — internal/auth strips all
-// six accepted headers — so this is the only thing that authenticates dorang to
-// a backend.
-func applyCredential(api catalog.API, secret string, h http.Header) {
-	if secret == "" {
-		return
+// An empty `auth.tiers` takes the built-in `free < commercial < unlimited`.
+// What is configuration is the set and the ordering; what is not is that a tier
+// belongs to the key and is assigned by an operator — there is no path from a
+// request to any of this (§10.5, §11.6).
+//
+// Position in the list IS the ordering, most privileged last, so an operator
+// expresses "unlimited outranks commercial" by writing it in that order rather
+// than by maintaining a number beside it.
+func tierSet(cfg *config.Config) (*auth.TierSet, error) {
+	if len(cfg.Auth.Tiers) == 0 {
+		return auth.DefaultTiers(), nil
 	}
-	switch api {
-	case catalog.APIAnthropicMessages:
-		h.Set("x-api-key", secret)
-		if h.Get("anthropic-version") == "" {
-			h.Set("anthropic-version", DefaultAnthropicVersion)
+	tiers := make([]auth.Tier, 0, len(cfg.Auth.Tiers))
+	for i, t := range cfg.Auth.Tiers {
+		tier := auth.Tier{
+			Name:          t.Name,
+			Rank:          i,
+			PriorityClass: t.PriorityClass,
+			RPMLimit:      t.RPMLimit,
+			TPMLimit:      t.TPMLimit,
+			MaxParallel:   t.MaxParallel,
+			Models:        t.Models,
 		}
-	default:
-		h.Set("Authorization", "Bearer "+secret)
+		if t.MaxBudget != nil {
+			n, err := usdToNano(fmt.Sprintf("auth.tiers[%d].max_budget", i), *t.MaxBudget)
+			if err != nil {
+				return nil, err
+			}
+			// A pointer, because nil is "the tier imposes no ceiling" and 0 is
+			// "a ceiling of zero: allow nothing". Flattening them is how a
+			// configured ceiling quietly stops existing (§2.4).
+			tier.MaxBudgetNanoUSD = &n
+		}
+		tiers = append(tiers, tier)
+	}
+	return auth.NewTierSet(tiers, cfg.Auth.DefaultTier)
+}
+
+// rotationPolicy renders `auth.rotation` (§11.2c).
+func rotationPolicy(cfg *config.Config) store.RotationPolicy {
+	return store.RotationPolicy{
+		Grace:      time.Duration(cfg.Auth.Rotation.Grace),
+		MaxSecrets: cfg.Auth.Rotation.MaxSecrets,
+		MaxAge:     time.Duration(cfg.Auth.Rotation.MaxAge),
 	}
 }
 
-// DefaultAnthropicVersion is the anthropic-version header sent upstream when a
-// deployment does not carry one. The header is mandatory on that surface and a
-// request without it is refused, so it has a default rather than being omitted.
-const DefaultAnthropicVersion = "2023-06-01"
+// guardConfig renders `token_guard` (§11.6). A disabled guard is the zero
+// value, and [keyguard.New] answers it with a typed nil.
+func guardConfig(cfg *config.Config, now func() time.Time) (keyguard.Config, error) {
+	g := cfg.TokenGuard
+	action, err := keyguard.ParseAction(g.Action)
+	if err != nil {
+		return keyguard.Config{}, err
+	}
+	return keyguard.Config{
+		Enabled:        g.Enabled,
+		BaselineWindow: time.Duration(g.BaselineWindow),
+		Window:         time.Duration(g.Window),
+		Factor:         g.Trigger.Factor,
+		MinAbsolute:    g.Trigger.MinAbsolute,
+		MinHistory:     time.Duration(g.MinHistory),
+		Action:         action,
+		Cooldown:       time.Duration(g.Cooldown),
+		Now:            now,
+	}, nil
+}

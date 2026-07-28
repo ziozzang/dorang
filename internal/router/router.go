@@ -63,6 +63,23 @@ type Deps struct {
 	Catalog *catalog.Catalog
 	// Quota refuses an exhausted credential. Nil allows every credential.
 	Quota QuotaSource
+	// Urgency scores a credential's expiring allowance for the quota_urgency
+	// strategy (§7.5a(c)). Nil makes that strategy silent, which leaves the
+	// rest of the chain deciding — the same treatment an unpriced candidate
+	// gets from lowest_cost.
+	Urgency UrgencySource
+}
+
+// UrgencySource scores how close a credential's resetting allowance is to being
+// discarded. It is the narrow view of internal/quota's Ranker the router needs:
+// the windows, the damping and the per-node jitter all live there.
+type UrgencySource interface {
+	// Urgency returns a non-negative score, higher meaning more urgent, and
+	// zero for a credential with nothing resetting — which the router reads as
+	// silence, not as "least urgent". occupancy is the candidate's current load
+	// in [0,1] and damps the score so that every node does not converge on the
+	// same credential at the window edge.
+	Urgency(credential string, occupancy float64, now time.Time) float64
 }
 
 // Router resolves a client-facing model name to a deployment.
@@ -83,6 +100,7 @@ type Router struct {
 	now    func() time.Time
 	rnd    func() float64
 	rr     rrState
+	rot    rotationState
 
 	scratchPool sync.Pool
 	evalPool    sync.Pool
@@ -234,8 +252,48 @@ func New(cfg Config, deps Deps) (*Router, error) {
 		}
 	}
 	r.rr.current = make([]int64, len(r.byID))
+	r.rot.cursor = make([]atomic.Uint64, len(r.byID))
 	r.warmAxes()
+	r.publishPrefixTTLs()
 	return r, nil
+}
+
+// publishPrefixTTLs hands the affinity table each deployment's cache lifetime.
+//
+// It happens here, at compile time, because the router is the only thing that
+// knows both the deployment id and the interned integer the table stores against
+// it — and because a hot reload builds a new router against the SAME table, so
+// this is also what stops a removed deployment's lifetime outliving it.
+//
+// A deployment with no configured lifetime contributes nothing and takes the
+// table's default. That is the difference between "inherit" and "zero", and
+// collapsing the two is how a per-backend setting silently becomes a global one.
+func (r *Router) publishPrefixTTLs() {
+	if r.deps.Prefix == nil {
+		return
+	}
+	var max uint32
+	any := false
+	for _, d := range r.byID {
+		if d.PrefixTTL == 0 {
+			continue
+		}
+		any = true
+		if d.interned > max {
+			max = d.interned
+		}
+	}
+	if !any {
+		r.deps.Prefix.SetTargetTTLs(nil)
+		return
+	}
+	ttls := make([]time.Duration, max+1)
+	for _, d := range r.byID {
+		if d.PrefixTTL != 0 {
+			ttls[d.interned] = d.PrefixTTL
+		}
+	}
+	r.deps.Prefix.SetTargetTTLs(ttls)
 }
 
 // warmAxes commits and immediately releases one reservation per credential, so
@@ -655,7 +713,6 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 	sticky stickyEntry, hasSticky bool, now time.Time) ([]candidate, *Error) {
 
 	need := req.Required.Structural() &^ req.AllowLossy
-	total := req.InputTokens + req.MaxOutputTokens
 
 	var (
 		union      canonical.Capability
@@ -665,6 +722,7 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 		nQuota     int
 		nTried     int
 		largest    int
+		needed     int64
 		quotaReset time.Time
 		quotaCred  string
 	)
@@ -691,13 +749,22 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 			nCap++
 			continue
 		}
+		// The fit check is per deployment, because its output half is: a caller
+		// that named no max_tokens still reserves whatever THIS deployment
+		// generates by default, and charging that request nothing for output is
+		// how a prompt at 99% of the window is admitted and then overflows on the
+		// first generated token. Deployment.MaxOutputTokens is the declared
+		// ceiling, and this is the only place on the routing path that reads it.
+		total := req.InputTokens + outputReserve(req.MaxOutputTokens, d.MaxOutputTokens, d.ContextWindow)
 		if d.ContextWindow > 0 && total > int64(d.ContextWindow) {
 			nCtx++
 			// The largest window that still did not fit is the real limit the
 			// caller has to get under, and it is the number they cannot obtain
-			// anywhere else (§10.5a).
+			// anywhere else (§10.5a). The demand recorded beside it is the one
+			// measured against THAT window, so the two numbers in the refusal are
+			// the two sides of one comparison rather than of two different ones.
 			if d.ContextWindow > largest {
-				largest = d.ContextWindow
+				largest, needed = d.ContextWindow, total
 			}
 			continue
 		}
@@ -747,8 +814,11 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 			Message:    "no deployment of this model can express the request; it is not downgraded silently"}
 	case nCtx > 0 && nQuota == 0 && nCap == 0:
 		return nil, &Error{Status: 400, Code: CodeContextWindow, Cause: CauseContextWindow,
-			Message: "the request needs " + strconv.FormatInt(total, 10) +
-				" tokens and the largest context window behind this model is " +
+			Estimated: !req.InputTokensExact, EstimateMethod: req.InputTokensMethod,
+			Message: sizeVerb(req.InputTokensExact) + strconv.FormatInt(needed, 10) +
+				" tokens including the reserved output" +
+				methodNote(req.InputTokensExact, req.InputTokensMethod) +
+				" and the largest context window behind this model is " +
 				strconv.Itoa(largest) + "; dorang does not compact to make it fit"}
 	case nQuota > 0:
 		return nil, &Error{Status: 429, Code: CodeQuotaExhausted, Cause: CauseQuotaExhausted,
@@ -760,6 +830,70 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 	}
 	return nil, &Error{Status: 503, Code: CodeNoCandidate,
 		Message: "no deployment is eligible for this request"}
+}
+
+// defaultOutputShare bounds how much of a window an UNREQUESTED generation may
+// reserve: at most one quarter of it.
+//
+// The bound exists because the catalogued ceilings are enormous relative to the
+// windows they sit in — 200,000 context against 100,000 max output is an
+// ordinary reasoning-model entry, and 1,000,000 against 128,000 an ordinary
+// frontier one. Reserving the whole ceiling for a caller who asked for nothing
+// would refuse a 150,000-token prompt on a 200,000-token model, which is a
+// request that routes and completes today. That refusal would be the same class
+// of defect this fit check exists to fix, pointed the other way.
+const defaultOutputShare = 4
+
+// outputReserve is how much of a window this attempt has to leave for the
+// answer.
+//
+// max_tokens is optional across the OpenAI family, so "the caller named none"
+// is the common case and not an edge one. Reserving zero for it makes the fit
+// check a statement about the prompt alone, which is not the question the window
+// asks: it has to hold the prompt AND the generation, and a prompt admitted at
+// 99% of the window overflows on the first token generated.
+//
+// A caller who named a ceiling gets exactly it — that is a number they chose and
+// dorang does not second-guess it. A caller who named none gets the deployment's
+// declared ceiling, bounded by [defaultOutputShare]. An undeclared ceiling
+// reserves nothing, because inventing a number would refuse requests against a
+// limit the operator never set.
+func outputReserve(asked int64, declared, window int) int64 {
+	if asked > 0 {
+		return asked
+	}
+	if declared <= 0 {
+		return 0
+	}
+	if limit := int64(window) / defaultOutputShare; window > 0 && int64(declared) > limit {
+		return limit
+	}
+	return int64(declared)
+}
+
+// sizeVerb opens the context-window refusal by saying whether the number that
+// follows was measured or guessed.
+//
+// It is a table rather than a format verb (§15.5), and it exists because a
+// client told "needs 900,000 tokens" for a photograph has no way to tell that
+// from a measurement — and therefore no way to know that the right response is
+// to report it rather than to shrink the conversation.
+func sizeVerb(exact bool) string {
+	if exact {
+		return "the request needs "
+	}
+	return "the request is estimated at "
+}
+
+// methodNote names the rule the size came from, so that "estimated" is
+// actionable rather than merely honest: a caller who knows the count came from
+// the byte fallback knows it can be off by a lot, and one who sees the
+// structural count knows their images were counted as images.
+func methodNote(exact bool, method string) string {
+	if exact || method == "" {
+		return ""
+	}
+	return " (estimate method: " + method + ")"
 }
 
 // eligible returns the credentials of a deployment that may serve, the
@@ -821,6 +955,13 @@ func (r *Router) eligible(sc *scratch, d *Deployment, p pins, sticky stickyEntry
 		if _, ok := d.credIndex[p.softCredential]; ok {
 			pref = p.softCredential
 		}
+	}
+	// key_rotation.strategy, last: a pin and a sticky entry are statements about
+	// THIS conversation and outrank a statement about load. Before this the
+	// strategy was validated against four names and then every one of them
+	// behaved as failover, because nothing outside internal/config ever read it.
+	if pref == "" && r.cfg.Rotation != "" && r.cfg.Rotation != RotationFailover {
+		pref = r.rotate(d, creds)
 	}
 	return creds, pref, true
 }
@@ -903,12 +1044,63 @@ func (r *Router) score(sc *scratch, cands []candidate, chain []Strategy, req *Re
 			cands[i].tps = r.deps.Health.TokensPerSec(cands[i].dep.ID)
 		}
 	}
+	if chainUses(chain, StrategyQuotaUrgency) && r.deps.Urgency != nil {
+		for i := range cands {
+			c := &cands[i]
+			// The signal is per CREDENTIAL and a candidate is a deployment, so
+			// it is scored against the credential that would actually serve —
+			// the same one lowest_cost prices, for the same reason: scoring a
+			// candidate on an account it will not use is scoring the wrong
+			// thing.
+			cred := c.preferred
+			if cred == "" && len(c.creds) > 0 {
+				cred = c.creds[0].ID
+			}
+			if cred == "" {
+				continue
+			}
+			// Occupancy damps the score (§7.5a(c) constraint 3). It is the
+			// least_busy term, computed here rather than reused, because a
+			// chain can name quota_urgency without naming least_busy.
+			occ := 0.0
+			busy, known := c.busy, c.busyKnown
+			if !known {
+				busy, known = r.busy(c.dep)
+			}
+			if known && busy > 0 {
+				occ = occupancy(busy, c.creds)
+			}
+			if u := r.deps.Urgency.Urgency(cred, occ, now); u > 0 {
+				c.urgency, c.urgencyKnown = u, true
+			}
+		}
+	}
 	if chainUses(chain, StrategyRoundRobin) {
 		r.assignRR(cands)
 	}
 	if chainUses(chain, StrategyWeightedRandom) {
 		assignWeightedRandom(cands, r.rnd)
 	}
+}
+
+// occupancy renders a busy count as the [0,1] fraction the urgency damper
+// wants. The denominator is the pool's own ceiling; with no ceiling configured
+// there is no fraction to compute and the damper is left off rather than fed a
+// number invented from nothing.
+func occupancy(busy int, creds []capacity.Candidate) float64 {
+	limit := 0
+	for i := range creds {
+		if creds[i].MaxConcurrent > limit {
+			limit = creds[i].MaxConcurrent
+		}
+	}
+	if limit <= 0 {
+		return 0
+	}
+	if busy >= limit {
+		return 1
+	}
+	return float64(busy) / float64(limit)
 }
 
 // busy reads a deployment's occupancy from the capacity broker.
@@ -1005,6 +1197,7 @@ func (r *Router) acquire(ctx context.Context, req *Request, c *candidate) (*capa
 		Model:         c.dep.UpstreamModel,
 		ProviderGroup: c.dep.ProviderGroup,
 		PrincipalID:   req.Principal,
+		PrincipalMax:  req.PrincipalMax,
 		Candidates:    c.creds,
 		Preferred:     c.preferred,
 		OnCapacity:    r.cfg.OnCapacity,
@@ -1016,13 +1209,30 @@ func (r *Router) acquire(ctx context.Context, req *Request, c *candidate) (*capa
 		// already holds only the pinned account; Wait states the intent so a
 		// future change to that list cannot quietly re-enable spilling.
 		cr.OnCapacity = capacity.Wait
-		if r.cfg.PinnedWait > 0 {
-			wctx, cancel := context.WithTimeout(ctx, r.cfg.PinnedWait)
+		// A pinned request is the one that genuinely has to wait: it may not
+		// spill to another account, so the alternative to waiting is failing.
+		// The budget comes from the principal's max_queue_wait when the router
+		// has no tighter one of its own, which is what gives that setting a
+		// consumer on the interactive path. An UNPINNED request still never
+		// queues — it spills or falls back (§7.4a2, §7.6), and queueing it
+		// instead would trade a fast hop onto a healthy backend for a slow wait
+		// on a saturated one.
+		wait := r.cfg.PinnedWait
+		if wait <= 0 {
+			wait = r.deps.Capacity.WaitBudget(req.Principal)
+		}
+		if wait > 0 {
+			wctx, cancel := context.WithTimeout(ctx, wait)
 			defer cancel()
 			res, err := r.deps.Capacity.Acquire(wctx, cr)
 			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-					return nil, nil // waited out the pin budget; report it as a refusal
+				switch {
+				case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil,
+					errors.Is(err, capacity.ErrQueueTimeout),
+					errors.Is(err, capacity.ErrQueueFull):
+					// Waited out the budget, or was never admitted to the queue.
+					// Both are refusals of this candidate, not of the request.
+					return nil, nil
 				}
 				return nil, err
 			}
@@ -1064,7 +1274,8 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 	// Priority, normalized for THIS engine. The canonical value is kept beside
 	// it so a hop onto a different engine re-normalizes from the class rather
 	// than negating an already-negated number.
-	d.CanonicalPriority = r.cfg.Priority.Canonical(req.PriorityClass, req.PriorityHint)
+	d.CanonicalPriority = r.cfg.Priority.CanonicalFor(req.Principal, req.PriorityClass, req.PriorityHint)
+	d.PriorityHintDropped = req.PriorityHint != nil && !r.cfg.Priority.GrantsHint(req.Principal)
 	if v, field, ok := r.cfg.Priority.Wire(c.dep.Kind, d.CanonicalPriority); ok {
 		d.Priority, d.PriorityField = v, field
 		d.PriorityUnverified = !c.dep.PriorityVerified

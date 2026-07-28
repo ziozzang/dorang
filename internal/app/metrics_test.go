@@ -19,7 +19,7 @@ version: 1
 providers:
   - {name: p1, kind: openai, base_url: "https://example.invalid"}
 credentials:
-  - {id: c1, provider: p1, key_ref: "vault:kv/p1#key"}
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
 models:
   - name: m1
     deployments:
@@ -45,7 +45,7 @@ func TestAssembledScrapeIsValid(t *testing.T) {
 	}
 
 	w = httptest.NewRecorder()
-	a.Server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	a.Server.ServeHTTP(w, adminRequest(httptest.NewRequest(http.MethodGet, "/metrics", nil)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("/metrics answered %d", w.Code)
 	}
@@ -140,12 +140,14 @@ func TestScrapeDoesNotBlockAReload(t *testing.T) {
 
 func newMetricsApp(t *testing.T) *App {
 	t.Helper()
+	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(metricsYAML))
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
 	cfg.Storage.SQLite.Path = filepath.Join(t.TempDir(), "dorang.db")
 	t.Setenv(cfg.Server.KeyPepperEnv, testPepper)
+	t.Setenv(cfg.Server.MasterKeyEnv, testMasterKey)
 
 	a, err := New(context.Background(), Options{Config: cfg})
 	if err != nil {

@@ -50,6 +50,18 @@ type keyView struct {
 	Blocked bool     `json:"blocked"`
 	Expires Stamp    `json:"expires"`
 
+	// Tier is the key's tier (§11.6). It is settable only through this
+	// operator-authenticated surface: §10.5's rule is that an operator can
+	// grant and a caller cannot claim.
+	Tier string `json:"tier"`
+	// Pended and PendReason are §11.6's reversible refusal. They are separate
+	// from `blocked` on the wire for the same reason they are separate in the
+	// store: a caller who cannot tell them apart cannot tell an outage from a
+	// policy.
+	Pended     bool   `json:"pended"`
+	PendedAt   Stamp  `json:"pended_at"`
+	PendReason string `json:"pend_reason,omitempty"`
+
 	HashScheme string `json:"hash_scheme"`
 	Source     string `json:"source"`
 
@@ -79,6 +91,10 @@ func viewKey(k *Key) keyView {
 		Tags:               orEmpty(k.Tags),
 		Blocked:            k.Blocked,
 		Expires:            Stamp(k.ExpiresAt),
+		Tier:               k.Tier,
+		Pended:             !k.PendedAt.IsZero(),
+		PendedAt:           Stamp(k.PendedAt),
+		PendReason:         k.PendReason,
 		HashScheme:         k.HashScheme,
 		Source:             k.Source,
 		CreatedAt:          Stamp(k.CreatedAt),
@@ -145,9 +161,14 @@ type keySpec struct {
 	TPMLimit    *int64 `json:"tpm_limit"`
 	MaxParallel *int64 `json:"max_parallel_requests"`
 
-	PriorityClass *string   `json:"priority_class"`
-	Tags          *[]string `json:"tags"`
-	Blocked       *bool     `json:"blocked"`
+	PriorityClass *string `json:"priority_class"`
+	// Tier is assigned by an operator (§11.6). It appears here and in no
+	// request shape the gateway's data plane reads, which is the whole of
+	// §10.5's asymmetry: an operator can grant a tier, a caller cannot claim
+	// one.
+	Tier    *string   `json:"tier"`
+	Tags    *[]string `json:"tags"`
+	Blocked *bool     `json:"blocked"`
 
 	Expires  *Stamp  `json:"expires"`
 	Duration *string `json:"duration"`
@@ -172,6 +193,7 @@ var clearable = map[string]func(*Key){
 	"tpm_limit":             func(k *Key) { k.TPMLimit = nil },
 	"max_parallel_requests": func(k *Key) { k.MaxParallel = nil },
 	"tags":                  func(k *Key) { k.Tags = nil },
+	"tier":                  func(k *Key) { k.Tier = "" },
 	"expires":               func(k *Key) { k.ExpiresAt = time.Time{} },
 }
 
@@ -191,6 +213,7 @@ func (s *keySpec) apply(k *Key, now time.Time) error {
 	setStrings(&k.AllowedRoutes, s.AllowedRoutes)
 	setStrings(&k.Tags, s.Tags)
 	setString(&k.PriorityClass, s.PriorityClass)
+	setString(&k.Tier, s.Tier)
 	if s.MaxBudget != nil {
 		k.MaxBudgetNano = nanoPtr(s.MaxBudget)
 	}

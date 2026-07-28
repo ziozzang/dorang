@@ -45,6 +45,26 @@ type Principal interface {
 	AllowsModel(model string) bool
 }
 
+// AdminPrincipal is the optional half of [Principal] that answers whether a
+// caller may reach an administrative route.
+//
+// It is an optional interface rather than a sixth method on Principal because
+// the server has no administrative surface of its own: exactly one route asks
+// the question, and a Principal that cannot answer it is not an incomplete
+// implementation, it is a deployment with no administrative credential. A
+// Principal that does not implement this is not an administrator — the absence
+// of an answer is a "no", never a skipped check.
+type AdminPrincipal interface {
+	// IsAdmin reports whether this caller may read administrative routes.
+	IsAdmin() bool
+}
+
+// isAdmin reports whether p may reach an Admin route.
+func isAdmin(p Principal) bool {
+	a, ok := p.(AdminPrincipal)
+	return ok && a.IsAdmin()
+}
+
 // Access describes the request being authorized.
 type Access struct {
 	// Model is the client-facing model name, "" when the route has none.
@@ -107,6 +127,20 @@ type ModelLister interface {
 	Models() []Model
 }
 
+// SecretPrincipal is the optional half of [Principal] that names WHICH of a
+// key's secrets authenticated the request (DESIGN §11.2c).
+//
+// A key has a durable id and one or more secrets; during a rotation's grace
+// period two of them authenticate to the same principal. The ledger records the
+// secret so an operator can see whether the client actually rolled before the
+// window closes, instead of finding out when it shuts — and the key id alone
+// cannot answer that question.
+type SecretPrincipal interface {
+	// SecretID identifies the api_key_secrets row. Fixed cardinality; safe to
+	// log. It is never any part of the secret itself.
+	SecretID() string
+}
+
 // ModelSlice adapts a fixed list to [ModelLister].
 type ModelSlice []Model
 
@@ -119,6 +153,9 @@ func (m ModelSlice) Models() []Model { return m }
 type Event struct {
 	RequestID string
 	KeyID     string
+	// SecretID names which of the key's secrets authenticated, or "" for a
+	// principal that does not track them (DESIGN §11.2c).
+	SecretID string
 	// UserID and TeamID are the calling principal's owners, copied here so the
 	// rollups and the ledger of DESIGN §9.2/§9.4 can be keyed by them. They are
 	// empty for a public route and for a credential that has neither.
@@ -210,6 +247,26 @@ type Observer interface {
 
 	// Metrics appends Prometheus text-exposition lines to dst.
 	Metrics(dst []byte) []byte
+}
+
+// HealthReporter contributes one named object to the health body.
+//
+// It exists because DESIGN §12.1 promises that a metering drop "is never
+// silent", and a Prometheus gauge alone does not keep that promise: an operator
+// diagnosing a gateway looks at /health first, and a subsystem that is losing
+// data while /health says "healthy" is silent in every way that matters at 3am.
+//
+// The contract is the one [Observer.Health] already follows, and for the same
+// reason: a reporter appends raw JSON and returns dst unchanged to omit itself,
+// so a subsystem with nothing to say costs one call and no bytes. A reporter
+// must not block, must not perform I/O, and must not change the status code —
+// degraded metering is not a serving failure and must not take a pod out of
+// rotation.
+type HealthReporter interface {
+	// HealthName is the object key, a fixed string such as "metering".
+	HealthName() string
+	// Health appends a JSON value to dst. Returning dst unchanged omits the key.
+	Health(dst []byte) []byte
 }
 
 // MetricsSource renders the whole Prometheus scrape.

@@ -80,8 +80,14 @@ func TestToolNameTruncationIsUTF8Safe(t *testing.T) {
 	}
 }
 
-// TestToolNameRestoredOnTheWayBack is the end-to-end path: a long name is
-// shortened for the upstream and restored in the stream the client sees.
+// TestToolNameRestoredOnTheWayBack is this package's half of the rule: given
+// one registry, the encoder records into it and the writer reads out of it.
+//
+// It is NOT evidence that the gateway does this. It wires the registry by hand,
+// which is exactly the thing production did not do — see
+// backend.TestToolNameRestoredThroughTheBackend, which constructs nothing and
+// therefore fails when the registry is not threaded. A test that supplies the
+// value under test is a test of the value, not of the code.
 func TestToolNameRestoredOnTheWayBack(t *testing.T) {
 	long := "mcp__github__create_pull_request_review_comment_on_a_specific_line_number"
 	req := &canonical.Request{
@@ -89,7 +95,7 @@ func TestToolNameRestoredOnTheWayBack(t *testing.T) {
 		Messages: []canonical.Message{canonical.TextMessage(canonical.RoleUser, "go")},
 		Tools:    []canonical.Tool{{Name: long}},
 	}
-	opt := &EncodeOptions{}
+	opt := &EncodeOptions{ToolNames: NewToolNames()}
 	w, err := EncodeRequest(req, opt)
 	if err != nil {
 		t.Fatal(err)
@@ -131,5 +137,37 @@ func TestNilToolNamesDoesNotShorten(t *testing.T) {
 	}
 	if got := names.Restore("anything"); got != "anything" {
 		t.Errorf("nil mapping Restore = %q", got)
+	}
+}
+
+// TestEncoderWithoutARegistryDoesNotShorten is the same rule one level up, and
+// it is the shape the defect took.
+//
+// The encoder used to fill this field in lazily, so a caller that passed none
+// still got the shortening — into a mapping that went out of scope with the
+// options struct. Every request shortened and no response restored. Forwarding
+// the name intact instead turns a silent, unattributable client failure into an
+// upstream 400 that names the tool.
+func TestEncoderWithoutARegistryDoesNotShorten(t *testing.T) {
+	long := strings.Repeat("z", 100)
+	req := &canonical.Request{
+		Model:    "m",
+		Messages: []canonical.Message{canonical.TextMessage(canonical.RoleUser, "go")},
+		Tools:    []canonical.Tool{{Name: long}},
+	}
+	var warned []Warning
+	opt := &EncodeOptions{Warn: func(w Warning) { warned = append(warned, w) }}
+	w, err := EncodeRequest(req, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Tools[0].Function.Name; got != long {
+		t.Errorf("name = %q; shortening with nowhere to record it destroys the name", got)
+	}
+	if opt.ToolNames != nil {
+		t.Error("the encoder allocated a registry the caller cannot reach")
+	}
+	if !hasWarning(warned, WarnToolNameUnshortened) {
+		t.Errorf("the condition must be reported: %+v", warned)
 	}
 }

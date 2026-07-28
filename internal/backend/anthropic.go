@@ -12,7 +12,19 @@ type anthropicAdapter struct{}
 
 func (anthropicAdapter) endpoint(p *Provider, op Operation, _ string, _ bool) (string, error) {
 	switch op {
-	case OpChat:
+	case OpChat, OpCompletions, OpResponses:
+		// The three chat-shaped surfaces all reach this family through the same
+		// route, because by the time a request is here it is a [canonical.Request]
+		// and the differences between the three are entirely in how the ANSWER is
+		// rendered (see encodeT1Client). Refusing the legacy and Responses
+		// frontends on a messages deployment would make the choice of backend
+		// visible to a caller who never chose it, which is what §4.4's
+		// single-surface commitment forbids.
+		//
+		// A STREAMING legacy completion is still refused, but not here: the relay
+		// emits chat.completion.chunk frames and a /v1/completions client reads
+		// text_completion ones, so that crossing is turned away by the frontend
+		// before a deployment is chosen at all.
 		return joinVersioned(p.base, "/v1", pathMessages), nil
 	case OpCountTokens:
 		return joinVersioned(p.base, "/v1", pathCountTokens), nil

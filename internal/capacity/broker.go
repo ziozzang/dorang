@@ -21,6 +21,20 @@ var (
 	// leaves batch no slots at all (DESIGN §11.1); waiting for it would block
 	// forever, so it fails immediately instead.
 	ErrUnsatisfiable = errors.New("capacity: request can never be satisfied")
+
+	// ErrQueueFull is returned when every axis the request would wait on is
+	// already holding its configured `max_queue` waiters.
+	//
+	// It is a separate error from ErrQueueTimeout because the two say different
+	// things to an operator: a full queue means the ceiling is doing its job and
+	// shedding, while a timeout means the queue was admitted to and never
+	// served. Collapsing them would hide which of the two knobs is the one set
+	// wrong.
+	ErrQueueFull = errors.New("capacity: the wait queue is full")
+
+	// ErrQueueTimeout is returned when a waiter's queue budget elapsed before
+	// capacity freed. The budget is `capacity.principals.<id>.max_queue_wait`.
+	ErrQueueTimeout = errors.New("capacity: queue wait budget elapsed")
 )
 
 // OnCapacity selects what happens when the preferred credential candidate has
@@ -70,6 +84,39 @@ type ModelLimit struct {
 	Max      int
 }
 
+// QueueConfig bounds the queue in front of each axis: how many callers may wait
+// (`max_queue`) and how long one may wait (`max_queue_wait`).
+//
+// The two are ceilings on the queue, not on the work, and they belong here
+// rather than in internal/quota for the reason the concurrency ceilings do: the
+// queue IS the broker's, nothing else can see its depth, and a wait that is not
+// bounded where the waiting happens is not bounded at all. Before this, a
+// saturated axis grew an unbounded heap of blocked callers and the 30-second
+// budget every principal is defaulted to was computed and thrown away.
+//
+// Every map is keyed exactly as its concurrency counterpart is, so a limit and
+// its queue are configured against the same name.
+type QueueConfig struct {
+	Global           int
+	ProviderGroups   map[string]int
+	CredentialGroups map[string]int
+	Routes           map[string]int
+	Models           []ModelLimit
+	Principals       map[string]int
+
+	// MaxWait bounds how long one of a principal's requests may sit in a queue.
+	// The "default" entry applies to a principal without an explicit one, as it
+	// does for the concurrency ceiling. Zero means no bound.
+	MaxWait map[string]time.Duration
+}
+
+// empty reports whether nothing here constrains anything, which lets the hot
+// path skip the whole mechanism with one boolean.
+func (q QueueConfig) empty() bool {
+	return q.Global <= 0 && len(q.ProviderGroups) == 0 && len(q.CredentialGroups) == 0 &&
+		len(q.Routes) == 0 && len(q.Models) == 0 && len(q.Principals) == 0 && len(q.MaxWait) == 0
+}
+
 // Config is the broker's static configuration. Every limit is a maximum number
 // of concurrent reservations; zero or less means unlimited and is not counted.
 //
@@ -90,6 +137,11 @@ type Config struct {
 	// Principals maps a principal id to its ceiling. The entry "default"
 	// applies to any principal without an explicit one.
 	Principals map[string]int
+
+	// Queues bounds the waiting, as opposed to the running. It is optional and
+	// entirely additive: a zero QueueConfig is the unbounded, never-timing-out
+	// behaviour the broker had before.
+	Queues QueueConfig
 
 	// InteractiveReserve is the fraction of every axis, in [0,1), that batch
 	// work may not occupy (DESIGN §11.1). Values outside the range are clamped.
@@ -157,6 +209,15 @@ type Request struct {
 	ProviderGroup string
 	// PrincipalID is the api key, user or team id. Empty skips the axis.
 	PrincipalID string
+	// PrincipalMax is this caller's OWN concurrency ceiling
+	// (`max_parallel_requests` on the api key), 0 for none.
+	//
+	// It travels with the request because it is not in the configuration file:
+	// Config.Principals is a static map an operator would have to populate with
+	// literal key ids, while this comes from the key's own row and changes when
+	// the key is edited. The stricter of the two applies, so a configured
+	// principal ceiling still bounds a key that was issued a looser one.
+	PrincipalMax int
 	// Candidates are the credentials that may serve this request. An empty
 	// slice is legal and reserves only the non-credential axes.
 	Candidates []Candidate
@@ -173,9 +234,37 @@ type Request struct {
 	TTL time.Duration
 }
 
+// queueLimits is the compiled form of [QueueConfig]'s depth ceilings, in the
+// same shape the concurrency limits take so that [Broker.needs] can fill both in
+// one pass.
+type queueLimits struct {
+	global      int
+	pgroups     map[string]int
+	cgroups     map[string]int
+	routes      map[string]int
+	models      map[modelIdent]int
+	principals  map[string]int
+	hasDefaultP bool
+}
+
+func (q *queueLimits) principal(id string) int {
+	if l, ok := q.principals[id]; ok {
+		return l
+	}
+	if q.hasDefaultP {
+		return q.principals["default"]
+	}
+	return 0
+}
+
 // bucket is one counted axis key and its wait queue.
 type bucket struct {
 	limit int
+	// queueMax is the configured depth ceiling for this key, 0 for unbounded.
+	// It is stamped when the bucket is created and refreshed whenever a need
+	// carries one, because a bucket can be created by an axis that was checked
+	// before the queue ceiling was known.
+	queueMax int
 	// inUse counts committed reservations *plus* the soft reservation, if any.
 	// Counting the claim as occupancy is what keeps it off the hot path: a
 	// request that is not the claimant needs no extra test at all, because the
@@ -218,6 +307,13 @@ type Broker struct {
 	soft        bool
 	softAfter   int
 
+	// queues mirrors the limit maps above for queue depth, and waits holds the
+	// per-principal wait budget. bounded is the one test the hot path makes.
+	queues      queueLimits
+	waits       map[string]time.Duration
+	hasDefaultW bool
+	bounded     bool
+
 	mu      sync.Mutex
 	buckets map[axisKey]*bucket
 	live    map[*Reservation]struct{}
@@ -227,10 +323,12 @@ type Broker struct {
 	closed  bool
 
 	// Instrumentation, guarded by mu.
-	wakeups    uint64
-	grants     uint64
-	expired    uint64
-	softPlaced uint64
+	wakeups       uint64
+	grants        uint64
+	expired       uint64
+	softPlaced    uint64
+	queueRefused  uint64
+	queueTimeouts uint64
 
 	// pending is the work list of buckets a dropped soft reservation has freed
 	// and that still have to be offered to their queues. It turns what would be
@@ -270,6 +368,28 @@ func New(cfg Config) *Broker {
 			b.models[modelIdent{m.Provider, m.Model}] = m.Max
 		}
 	}
+	b.queues = queueLimits{
+		global:     cfg.Queues.Global,
+		pgroups:    copyLimits(cfg.Queues.ProviderGroups),
+		cgroups:    copyLimits(cfg.Queues.CredentialGroups),
+		routes:     copyLimits(cfg.Queues.Routes),
+		principals: copyLimits(cfg.Queues.Principals),
+		models:     make(map[modelIdent]int, len(cfg.Queues.Models)),
+	}
+	for _, m := range cfg.Queues.Models {
+		if m.Max > 0 {
+			b.queues.models[modelIdent{m.Provider, m.Model}] = m.Max
+		}
+	}
+	_, b.queues.hasDefaultP = b.queues.principals["default"]
+	b.waits = make(map[string]time.Duration, len(cfg.Queues.MaxWait))
+	for k, v := range cfg.Queues.MaxWait {
+		if v > 0 {
+			b.waits[k] = v
+		}
+	}
+	_, b.hasDefaultW = b.waits["default"]
+	b.bounded = !cfg.Queues.empty()
 	if b.reserve < 0 {
 		b.reserve = 0
 	}
@@ -374,13 +494,25 @@ func (b *Broker) sweepLoop() {
 // request (DESIGN §5.3). A nil candidate yields only the non-credential axes.
 func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 	out = out[:0]
+	// Every queue lookup below is skipped entirely on a broker that configures
+	// no queue ceilings, which is the common case and the one the benchmark
+	// measures.
+	q := b.bounded
 
 	if b.global > 0 {
-		out = append(out, axisNeed{globalKey(), b.global})
+		n := axisNeed{key: globalKey(), limit: b.global}
+		if q {
+			n.queue = b.queues.global
+		}
+		out = append(out, n)
 	}
 	if req.PrincipalID != "" {
-		if l := b.principalLimit(req.PrincipalID); l > 0 {
-			out = append(out, axisNeed{principalKey(req.PrincipalID), l})
+		if l := strictest(b.principalLimit(req.PrincipalID), req.PrincipalMax); l > 0 {
+			n := axisNeed{key: principalKey(req.PrincipalID), limit: l}
+			if q {
+				n.queue = b.queues.principal(req.PrincipalID)
+			}
+			out = append(out, n)
 		}
 	}
 
@@ -399,30 +531,90 @@ func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 
 	if provider != "" {
 		if l := b.routes[provider]; l > 0 {
-			out = append(out, axisNeed{routeKey(provider), l})
+			n := axisNeed{key: routeKey(provider), limit: l}
+			if q {
+				n.queue = b.queues.routes[provider]
+			}
+			out = append(out, n)
 		}
 	}
 	if pgroup != "" {
 		if l := b.pgroups[pgroup]; l > 0 {
-			out = append(out, axisNeed{pgroupKey(pgroup), l})
+			n := axisNeed{key: pgroupKey(pgroup), limit: l}
+			if q {
+				n.queue = b.queues.pgroups[pgroup]
+			}
+			out = append(out, n)
 		}
 	}
 	if model != "" {
 		if l := b.models[modelIdent{provider, model}]; l > 0 {
-			out = append(out, axisNeed{modelAxisKey(provider, model), l})
+			n := axisNeed{key: modelAxisKey(provider, model), limit: l}
+			if q {
+				n.queue = b.queues.models[modelIdent{provider, model}]
+			}
+			out = append(out, n)
 		}
 	}
 	if c != nil {
 		if c.CapacityGroup != "" {
 			if l := b.cgroups[c.CapacityGroup]; l > 0 {
-				out = append(out, axisNeed{cgroupKey(c.CapacityGroup), l})
+				n := axisNeed{key: cgroupKey(c.CapacityGroup), limit: l}
+				if q {
+					n.queue = b.queues.cgroups[c.CapacityGroup]
+				}
+				out = append(out, n)
 			}
 		}
 		if c.ID != "" && c.MaxConcurrent > 0 {
-			out = append(out, axisNeed{credAxisKey(provider, c.ID), c.MaxConcurrent})
+			out = append(out, axisNeed{key: credAxisKey(provider, c.ID), limit: c.MaxConcurrent})
 		}
 	}
 	return out
+}
+
+// WaitBudget reports how long this principal may sit in a queue before
+// [Broker.Acquire] gives up with [ErrQueueTimeout], or zero when it may wait
+// indefinitely. It is `capacity.principals.<id>.max_queue_wait`.
+//
+// It is exported because the caller has to decide whether to wait at all before
+// it calls Acquire — an unpinned request spills or falls back instead of
+// queueing (§7.4a2, §7.6) — and that decision needs the number.
+func (b *Broker) WaitBudget(principal string) time.Duration { return b.waitBudget(principal) }
+
+// waitBudget is how long this principal may sit in a queue, 0 for no bound.
+func (b *Broker) waitBudget(principal string) time.Duration {
+	if len(b.waits) == 0 {
+		return 0
+	}
+	if d, ok := b.waits[principal]; ok {
+		return d
+	}
+	if b.hasDefaultW {
+		return b.waits["default"]
+	}
+	return 0
+}
+
+// strictest is the tighter of two ceilings, where 0 means "no ceiling" and
+// therefore always loses.
+//
+// A bucket's limit is stamped when it is first created, so two requests with
+// different per-key ceilings on the same principal id cannot disagree in
+// practice: the principal id IS the key id, so every request on that axis
+// carries the same key's number. The general form is written anyway, because the
+// axis is documented as "api key, user or team id" and a future user-scoped
+// principal would break the assumption silently.
+func strictest(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case b < a:
+		return b
+	}
+	return a
 }
 
 func (b *Broker) principalLimit(id string) int {
@@ -532,7 +724,7 @@ func (b *Broker) commitLocked(needs []axisNeed, credID string, ttl time.Duration
 	for _, n := range needs {
 		bk := b.buckets[n.key]
 		if bk == nil {
-			bk = &bucket{limit: n.limit}
+			bk = &bucket{limit: n.limit, queueMax: n.queue}
 			b.buckets[n.key] = bk
 		}
 		if bk.claimant == w {
@@ -703,6 +895,14 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 		b.mu.Unlock()
 		return nil, ErrUnsatisfiable
 	}
+	// max_queue is checked BEFORE the waiter exists, so a refused request has
+	// left nothing behind to unwind. A ceiling is per axis and every axis the
+	// request would block on has to admit it: a waiter sits in all of them at
+	// once, so being over the ceiling on any one of them is being over it.
+	if bk := b.queueFullLocked(blocking); bk != nil {
+		b.mu.Unlock()
+		return nil, ErrQueueFull
+	}
 
 	b.seq++
 	w := &waiter{
@@ -719,8 +919,47 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 	b.enqueueLocked(w, blocking)
 	b.mu.Unlock()
 
+	// max_queue_wait. The budget is the principal's, and it bounds the WAIT
+	// rather than the request: a caller that has already been queued for its
+	// whole budget is told so, instead of holding a connection open until the
+	// request timeout that the operator set for a generation, not for a queue.
+	//
+	// It does not apply to batch. Batch is the work that is SUPPOSED to wait —
+	// §11.1 gives it a lower ceiling on every axis precisely so that it yields
+	// to interactive traffic — and a thirty-second budget, which is the default
+	// every principal carries, would turn ordinary contention into failed rows.
+	// A batch row's bound is its own context, which the scheduler owns.
+	var timeout <-chan time.Time
+	if budget := b.waitBudget(req.PrincipalID); budget > 0 && !req.Batch {
+		t := time.NewTimer(budget)
+		defer t.Stop()
+		timeout = t.C
+	}
+
 	select {
 	case g := <-w.ch:
+		return g.res, g.err
+
+	case <-timeout:
+		b.mu.Lock()
+		if w.state == stateWaiting {
+			b.unqueueLocked(w)
+			w.state = stateCancelled
+			delete(b.waiters, w)
+			b.queueTimeouts++
+			// A soft reservation this waiter held is capacity kept idle for it.
+			// Give it back before dropping the lock, exactly as cancellation
+			// does — a timeout that leaked one would idle a slot per expiry.
+			b.releaseClaimsLocked(w)
+			b.drainPendingLocked()
+			b.mu.Unlock()
+			return nil, ErrQueueTimeout
+		}
+		b.mu.Unlock()
+		// A grant raced with the timer. It is already in the channel; the
+		// request won, so take it rather than discarding capacity nobody else
+		// can be given without a second release.
+		g := <-w.ch
 		return g.res, g.err
 
 	case <-ctx.Done():
@@ -751,6 +990,26 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 // ---------------------------------------------------------------------------
 // Queue membership
 // ---------------------------------------------------------------------------
+
+// queueFullLocked reports the first axis whose queue is already at its
+// configured depth, or nil when every axis can take one more waiter.
+//
+// The count is the heap length, which is the number of waiters currently sitting
+// in that queue — not the number of requests blocked overall, since one waiter
+// on a Spill request sits in several queues at once. That is the right unit: the
+// ceiling exists to bound what one saturated axis makes the process hold.
+func (b *Broker) queueFullLocked(blocking []*bucket) *bucket {
+	if !b.bounded {
+		return nil
+	}
+	for _, bk := range blocking {
+		if bk.queueMax > 0 && bk.q.Len() >= bk.queueMax {
+			b.queueRefused++
+			return bk
+		}
+	}
+	return nil
+}
 
 func (b *Broker) enqueueLocked(w *waiter, axes []*bucket) {
 	for _, bk := range axes {
@@ -1030,6 +1289,8 @@ type AxisState struct {
 	Limit int
 	// Waiting is the queue depth on this key.
 	Waiting int
+	// QueueLimit is the configured max_queue for this key, 0 when unbounded.
+	QueueLimit int
 	// SoftReserved is set when one unit of this key is being held idle for a
 	// named multi-axis waiter (DESIGN §5.4 correction 5). Every other request
 	// sees Limit-1 while it is set. It is never set for more than one waiter at
@@ -1062,6 +1323,14 @@ type Snapshot struct {
 	// SoftReservations is the cumulative number of soft reservations placed.
 	// Zero on a workload of single-axis requests, which never need one.
 	SoftReservations uint64
+	// QueueRefused is the cumulative number of acquisitions refused because an
+	// axis was already holding its configured `max_queue` waiters.
+	QueueRefused uint64
+	// QueueTimeouts is the cumulative number of waiters whose
+	// `max_queue_wait` budget elapsed before capacity freed. A non-zero value
+	// here with QueueRefused at zero says the queue is deep enough and slow,
+	// which is a different remedy from a queue that is too shallow.
+	QueueTimeouts uint64
 }
 
 // Snapshot returns per-axis occupancy. It allocates and is not for the hot path.
@@ -1078,6 +1347,8 @@ func (b *Broker) Snapshot() Snapshot {
 		Expired:          b.expired,
 		SoftReserved:     b.softReservedLocked(),
 		SoftReservations: b.softPlaced,
+		QueueRefused:     b.queueRefused,
+		QueueTimeouts:    b.queueTimeouts,
 	}
 	for k, bk := range b.buckets {
 		s.Axes = append(s.Axes, AxisState{
@@ -1086,6 +1357,7 @@ func (b *Broker) Snapshot() Snapshot {
 			InUse:        bk.committed(),
 			Limit:        bk.limit,
 			Waiting:      bk.q.Len(),
+			QueueLimit:   bk.queueMax,
 			SoftReserved: bk.claimant != nil,
 		})
 	}
@@ -1096,6 +1368,44 @@ func (b *Broker) Snapshot() Snapshot {
 		return s.Axes[i].Key < s.Axes[j].Key
 	})
 	return s
+}
+
+// LeastUsedKey returns the id of the candidate with the fewest reservations
+// outstanding on its own key axis, or "" when cands is empty.
+//
+// It exists as one call rather than a loop over [Broker.InUse] because it runs
+// on the routing hot path: N candidates would otherwise be N mutex round trips
+// per routing decision, which would make `key_rotation.strategy: least_used` —
+// the default whenever a rotation pool is configured — the most expensive thing
+// in the request path.
+//
+// A credential the broker has never seen counts as zero in use, which is
+// correct here and would not be for [Broker.busy]: an account with no
+// reservations really is the least used one, whereas a deployment with no
+// CONFIGURED ceiling has no occupancy to compare at all.
+func (b *Broker) LeastUsedKey(provider string, cands []Candidate) string {
+	if len(cands) == 0 {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	best, bestN := "", 0
+	for i := range cands {
+		id := cands[i].ID
+		if id == "" {
+			continue
+		}
+		n := 0
+		if bk := b.buckets[credAxisKey(provider, id)]; bk != nil {
+			n = bk.committed()
+		}
+		// Strictly less, so ties keep configuration order — the tie-break the
+		// rest of the router already uses, and the only one that is stable.
+		if best == "" || n < bestN {
+			best, bestN = id, n
+		}
+	}
+	return best
 }
 
 // InUse returns the committed count on one axis key and whether that key is

@@ -25,6 +25,14 @@ func (a *API) registerShapeCompatible() {
 	a.write("/key/unblock", keySetBlocked(false))
 	a.write("/key/regenerate", (*call).keyRegenerate)
 
+	// Rotation (§11.2c) and the pend/release pair (§11.6). They are additive:
+	// no existing reader breaks on a route it does not call.
+	a.write("/key/rotate", (*call).keyRotate)
+	a.write("/key/rotate/cut", (*call).keyCutGrace)
+	a.read("/key/secrets", (*call).keySecrets)
+	a.write("/key/pend", keySetPended(true))
+	a.write("/key/release", keySetPended(false))
+
 	// Users.
 	a.write("/user/new", (*call).userNew)
 	a.read("/user/info", (*call).userInfo)

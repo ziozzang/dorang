@@ -505,8 +505,7 @@ func (s *Store) insertImportedKey(ctx context.Context, k *APIKey) (bool, error) 
 	if k.UpdatedAt.IsZero() {
 		k.UpdatedAt = s.now()
 	}
-	const q = `INSERT INTO api_keys (` + apiKeyColumns + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	q := `INSERT INTO api_keys (` + apiKeyColumns + `) VALUES (` + placeholders(apiKeyColumnCount) + `)
 		ON CONFLICT (lookup) DO NOTHING`
 	res, err := s.exec(ctx, q,
 		k.ID, k.Lookup, k.TokenHash, string(k.HashScheme), k.KeyLabel, nullStr(k.KeyAlias),
@@ -516,7 +515,8 @@ func (s *Store) insertImportedKey(ctx context.Context, k *APIKey) (bool, error) 
 		nullMicros(k.BudgetResetAt), k.SpendNano,
 		ptrInt(k.RPMLimit), ptrInt(k.TPMLimit), ptrInt(k.MaxParallel), k.PriorityClass,
 		encodeStrings(k.Tags), k.Blocked, nullMicros(k.ExpiresAt),
-		k.Source, Micros(k.CreatedAt), Micros(k.UpdatedAt))
+		k.Source, Micros(k.CreatedAt), Micros(k.UpdatedAt),
+		k.Tier, nullMicros(k.PendedAt), k.PendReason)
 	if err != nil {
 		return false, err
 	}
@@ -524,7 +524,20 @@ func (s *Store) insertImportedKey(ctx context.Context, k *APIKey) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	if n == 0 {
+		return false, nil
+	}
+	// An imported key gets its existing secret as generation 1, exactly as a
+	// natively issued one does. Without it the key would authenticate through
+	// the denormalized columns and have nothing to rotate (DESIGN §11.2c).
+	if err := s.insertKeySecret(ctx, nil, &KeySecret{
+		ID: k.ID + ".1", KeyID: k.ID, Generation: 1,
+		Lookup: k.Lookup, TokenHash: k.TokenHash, HashScheme: k.HashScheme,
+		KeyLabel: k.KeyLabel, Current: true, CreatedAt: k.CreatedAt,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Store) exists(ctx context.Context, cache map[string]bool, table, id string) (bool, error) {

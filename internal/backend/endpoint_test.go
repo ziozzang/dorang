@@ -43,6 +43,11 @@ func TestEndpointDerivation(t *testing.T) {
 			"https://api.anthropic.com/v1/messages/count_tokens"},
 		{"a vendor path prefix survives", "minimax", catalog.APIAnthropicMessages,
 			"https://api.minimax.io/anthropic", OpChat, "https://api.minimax.io/anthropic/messages"},
+		// The two rerank spellings side by side. The vendor's own route lives at
+		// /v2 on a bare host, so the "/v1" every other OpenAI-shaped route takes
+		// would address /v1/v2/rerank, which 404s.
+		{"self-hosted rerank is an ordinary v1 route", "vllm", catalog.APIOpenAIChat,
+			"https://engine.example.test", OpRerank, "https://engine.example.test/v1/rerank"},
 		{"cohere versions per route", "cohere", catalog.APICohere,
 			"https://api.cohere.com", OpRerank, "https://api.cohere.com/v2/rerank"},
 		{"cohere base already at v2", "cohere", catalog.APICohere,

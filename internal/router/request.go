@@ -108,13 +108,27 @@ type Request struct {
 	// PriorityHint is a client hint, clamped to the principal's permitted range
 	// (§10.5). Nil means the class alone decides.
 	PriorityHint *int
+	// PrincipalMax is the caller's own concurrency ceiling
+	// (`max_parallel_requests` on the api key), 0 for none. It tightens the
+	// principal capacity axis for this request; see capacity.Request.
+	PrincipalMax int
 
 	// InputTokens is the estimated prompt size. §10.5a requires the estimate to
 	// err pessimistic: an over-estimate costs an unnecessary route to a larger
 	// model, an under-estimate costs a hard failure the router cannot see.
 	InputTokens int64
+	// InputTokensExact reports that InputTokens was measured rather than
+	// estimated. It is false for everything internal/tokenest produces, and the
+	// context-window refusal says so rather than presenting a guess as a fact.
+	InputTokensExact bool
+	// InputTokensMethod names the rule that produced InputTokens, matching
+	// internal/tokenest's method constants. It travels onto the refusal so the
+	// caller learns not just that the number is an estimate but which estimate.
+	InputTokensMethod string
 	// MaxOutputTokens is the caller's output ceiling, used for the context
-	// check and for the cost estimate.
+	// check and for the cost estimate. Zero means the caller named none, which
+	// is the common case on the OpenAI family: the fit check then reserves the
+	// target deployment's own declared ceiling instead of reserving nothing.
 	MaxOutputTokens int64
 
 	// Stream reports that the response will be streamed. It arms the fail-back
@@ -192,6 +206,14 @@ type Decision struct {
 	// Dropped names the droppable parameters this deployment cannot apply. They
 	// are reported, not fatal: the request still means what it meant (§10.1).
 	Dropped canonical.Capability
+	// PriorityHintDropped reports that the caller sent a priority hint and this
+	// principal has no §10.5 grant, so the class alone decided.
+	//
+	// §10.5 requires the drop to be reported rather than silent, for the reason
+	// §10.3 exists: silently discarding something a caller sent leaves them
+	// believing it took effect. The dispatcher folds it into
+	// x-dorang-dropped-params.
+	PriorityHintDropped bool
 
 	interned uint32
 	st       *sessionState
@@ -292,4 +314,128 @@ func Classify(status int, err error) Cause {
 		return CauseUpstream5xx
 	}
 	return CauseNone
+}
+
+// ClassifyBody is the half of [Classify] that needs the error body: it
+// recognises an upstream context-window overflow from the decoded code and
+// message of a 4xx.
+//
+// It is separate from Classify, and takes strings rather than bytes, because
+// Classify's contract is that it never looks inside a body. This one is called
+// only by a frontend that has already decoded the envelope — internal/server's
+// Normalize does that for all five upstream shapes — so the body parsing lives
+// where the body already is, and this function only asks what the decoded fields
+// say.
+//
+// Without it §10.5a's "route to a larger window" row can be reached only by
+// dorang's own pre-estimate. A deployment that declares no context window at all
+// is filtered by nothing and has no pre-estimate to trip, which is the ordinary
+// case for the self-hosted engines of docs/VLLM.md and docs/SGLANG.md: for those
+// this is the only overflow signal that exists.
+//
+// It returns CauseNone for anything it does not recognise, so an unrecognised
+// 400 keeps the terminal treatment it had. Content policy is deliberately NOT
+// recognised here: those refusals share no phrase across vendors, and guessing
+// one would send a refused prompt around an entire model class.
+func ClassifyBody(status int, code, message string) Cause {
+	if status < 400 || status >= 500 {
+		return CauseNone
+	}
+	if isContextCode(code) {
+		return CauseContextWindow
+	}
+	return classifyContextMessage(message)
+}
+
+// contextCodes is the set of upstream error codes that mean overflow and
+// nothing else. It is exact-match: a code is a machine-readable token, and
+// substring-matching one is how "not_context_length_exceeded" would classify as
+// an overflow.
+// It is deliberately short. `string_above_max_length` and the other
+// length codes are NOT here: those bound one field, not the window, and a model
+// with a larger context does not accept a longer single string — routing there
+// would burn a hop to reach the identical refusal.
+var contextCodes = [...]string{
+	"context_length_exceeded",
+	"context_window_exceeded",
+}
+
+func isContextCode(code string) bool {
+	for _, c := range contextCodes {
+		if code == c {
+			return true
+		}
+	}
+	return false
+}
+
+// contextPhrases are the message signatures the deployed backends actually
+// emit. They are substrings scanned with strings.Contains rather than matched
+// with a regular expression, which §15.5 forbids here, and they are lowercase
+// because the same engine capitalises differently across its own call paths
+// (SGLANG.md §6.2).
+//
+// Every phrase names the context or the prompt explicitly. That is the filter
+// that keeps this from firing on an unrelated 400: a validation failure about a
+// missing field contains none of them, and neither does "n exceeds the maximum
+// of 128" — which is why no bare "exceeds the maximum" is on the list. The bias
+// is toward missing an overflow, not toward inventing one: a missed overflow
+// fails the request the way it fails today, while a false positive sends the
+// same prompt around an entire model class to be refused by every member of it.
+var contextPhrases = [...]string{
+	"maximum context length",
+	"context length",
+	"context window",
+	"context_length",
+	"too many tokens",
+	"prompt is too long",
+	"input is too long",
+	"reduce the length of the messages",
+	"maximum number of tokens",
+	"input token count",
+}
+
+// classifyContextMessage scans a decoded message for an overflow signature.
+//
+// The scan is case-insensitive without allocating a lowercased copy: the message
+// can be a quoted excerpt of an upstream body, and lowercasing it would allocate
+// on every 4xx.
+func classifyContextMessage(msg string) Cause {
+	if msg == "" {
+		return CauseNone
+	}
+	for _, p := range contextPhrases {
+		if containsFold(msg, p) {
+			return CauseContextWindow
+		}
+	}
+	return CauseNone
+}
+
+// containsFold reports whether s contains sub, comparing ASCII case-insensitively.
+// sub must already be lowercase.
+func containsFold(s, sub string) bool {
+	if len(sub) == 0 || len(s) < len(sub) {
+		return false
+	}
+	last := len(s) - len(sub)
+	for i := 0; i <= last; i++ {
+		if matchFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchFold(s, lower string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != lower[i] {
+			return false
+		}
+	}
+	return true
 }

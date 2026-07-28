@@ -157,9 +157,11 @@ func TestModelsFilteredByKeyAllowList(t *testing.T) {
 	}
 }
 
-// TestModelNotAllowedIs401 records the status the reference proxy answers, which
-// deployed clients branch on even though the caller did authenticate.
-func TestModelNotAllowedIs401(t *testing.T) {
+// TestModelNotAllowedIs403 pins COMPATIBILITY §11.2: the credential
+// authenticated, it is simply not permitted this model, so the answer is 403
+// permission_error. A reference proxy answers 401 here; dorang deliberately does
+// not follow it, because "re-authenticate" is advice that cannot help.
+func TestModelNotAllowedIs403(t *testing.T) {
 	auth := newFakeAuth()
 	auth.keys["limited"] = &fakePrincipal{id: "k1", models: []string{"model-y"}}
 	s := newTestServer(t, func(o *Options) { o.Auth = auth })
@@ -167,8 +169,11 @@ func TestModelNotAllowedIs401(t *testing.T) {
 		strings.NewReader(`{"model":"model-x"}`))
 	r.Header.Set(HeaderXAPIKey, "limited")
 	w := do(s, r)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("status %d, want 401", w.Code)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403 (COMPATIBILITY §11.2)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"type":"permission_error"`) {
+		t.Errorf("type must be permission_error, body %s", w.Body.String())
 	}
 	if !strings.Contains(w.Body.String(), `"code":"model_not_allowed"`) {
 		t.Errorf("body %s", w.Body.String())
@@ -334,7 +339,7 @@ func TestHealthProbes(t *testing.T) {
 func TestMetricsEndpoint(t *testing.T) {
 	s := newTestServer(t, nil)
 	do(s, post("/v1/chat/completions", `{"model":"model-x"}`))
-	w := do(s, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	w := do(s, getAdmin("/metrics"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d", w.Code)
 	}

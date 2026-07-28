@@ -24,13 +24,28 @@ const (
 	// HookEmail runs before a notification is delivered (DESIGN §11.5's `lua`
 	// email driver). It may suppress the message.
 	HookEmail
+	// HookFilterRequest is DESIGN §10.5b's transform filter: it sees the
+	// request's text segments and may rewrite them, which is what a masking
+	// plugin needs and what none of the other four hooks can do.
+	//
+	// It is not part of extensions.lua.hooks. A filter is attached to a model
+	// (`models[].filters`), so the operator has already said where it runs, and
+	// requiring a second, easily forgotten declaration would mean a configured
+	// masking filter that silently does not.
+	//
+	// There is deliberately no on_filter_response. The response side of a
+	// reversible mask is unmasking, and unmasking runs once per streamed frame
+	// inside §10.5's single pass. Calling into an untrusted VM there would put a
+	// sandbox on the token path — per frame, per request — for a hook whose only
+	// legitimate job the host already does exactly.
+	HookFilterRequest
 
-	numHooks = 4
+	numHooks = 5
 )
 
-// hookNames is indexed by Hook. It matches config's luaHooks exactly; a
-// mismatch would let a configured hook name resolve to nothing.
-var hookNames = [numHooks]string{"on_request", "on_route", "on_response", "on_email"}
+// hookNames is indexed by Hook. The first four match config's luaHooks exactly;
+// a mismatch would let a configured hook name resolve to nothing.
+var hookNames = [numHooks]string{"on_request", "on_route", "on_response", "on_email", "on_filter_request"}
 
 // String returns the configuration spelling of the hook.
 func (h Hook) String() string {
@@ -103,10 +118,11 @@ var (
 	// ErrTripped reports that a hook has been switched off because too many of
 	// its invocations were abandoned.
 	ErrTripped = errors.New("luaext: hook tripped off after repeated abandonment")
-	// ErrLuaSource reports a .lua file under the extension directory. It is an
-	// error rather than a skip so that the configuration surface cannot
-	// silently accept Lua that never runs.
-	ErrLuaSource = errors.New("luaext: Lua source is not executable in this build")
+	// ErrLuaSource reports a .lua file under the *policy* directory. Lua is
+	// executable here, but only when an operator names the file in the
+	// configuration: a plugin picked up from a writable directory is the
+	// code-execution primitive §11.5 refuses.
+	ErrLuaSource = errors.New("luaext: a Lua plugin is loaded by explicit configuration, not by a directory scan")
 )
 
 // PanicError wraps a value recovered from a hook. A panicking hook is contained

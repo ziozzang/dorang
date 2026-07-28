@@ -12,6 +12,11 @@ type DecodeOptions struct {
 	// (COMPATIBILITY 5.3). Without it, a call to a shortened name reaches the
 	// caller under a name it never declared.
 	ToolNames *ToolNames
+	// Tools carries the per-STREAM tool-call state. It is required on a
+	// streaming exchange and meaningless on a non-streaming one, where every
+	// name and every argument object arrives whole. Without it a shortened name
+	// split across two frames is restored by neither half; see [ToolStream].
+	Tools *ToolStream
 	// Model overrides the model reported to the caller. DESIGN §7.2: the body
 	// always carries the name the client asked for, never the upstream id.
 	Model string
@@ -23,6 +28,13 @@ func (o *DecodeOptions) names() *ToolNames {
 		return nil
 	}
 	return o.ToolNames
+}
+
+func (o *DecodeOptions) tools() *ToolStream {
+	if o == nil {
+		return nil
+	}
+	return o.Tools
 }
 
 func (o *DecodeOptions) warn() WarnFunc {
@@ -443,6 +455,7 @@ func ChunkToEvents(c *Chunk, opt *DecodeOptions) []canonical.StreamEvent {
 	if opt != nil && opt.Model != "" {
 		model = opt.Model
 	}
+	tools := opt.tools()
 	events := make([]canonical.StreamEvent, 0, len(c.Choices)+1)
 	for i := range c.Choices {
 		ch := &c.Choices[i]
@@ -470,7 +483,13 @@ func ChunkToEvents(c *Chunk, opt *DecodeOptions) []canonical.StreamEvent {
 			}
 			if tc.Function != nil {
 				if tc.Function.Name != nil {
-					cd.Name = opt.names().Restore(*tc.Function.Name)
+					cd.Name = *tc.Function.Name
+					if tools == nil {
+						// No stream state to accumulate into, so the best that can
+						// be done is an exact lookup on this fragment alone. A
+						// fragmented name is returned unchanged.
+						cd.Name = opt.names().Restore(cd.Name)
+					}
 				}
 				if tc.Function.Arguments != nil {
 					cd.Arguments = *tc.Function.Arguments
@@ -499,7 +518,7 @@ func ChunkToEvents(c *Chunk, opt *DecodeOptions) []canonical.StreamEvent {
 			Usage: usageToCanonical(c.Usage),
 		})
 	}
-	return events
+	return tools.Track(events)
 }
 
 // StripToolCallIndexes removes the index field from every tool call of every

@@ -323,12 +323,45 @@ const (
 	// and one was synthesized. It is upgraded to tool_use when a tool call was
 	// seen, which is the mirror of COMPATIBILITY 4.4.
 	WarnSynthesizedStop = "synthesized_stop_reason"
-	// WarnInterleavedToolCalls fires when a backend interleaves fragments of two
-	// tool calls. This protocol has one open block at a time and cannot express
-	// it; the state machine reopens the block rather than dropping the fragment.
+	// WarnInterleavedToolCalls fires when a backend goes back to a tool call
+	// after another one has already started. This protocol has one open block at
+	// a time, so parallel calls are assembled and emitted whole; only a call that
+	// resumes after its block was closed cannot be expressed at all, and that is
+	// what this reports.
 	WarnInterleavedToolCalls = "interleaved_tool_calls"
-	WarnLateUsage            = "late_usage_after_stop"
-	WarnNumericErrorCode     = "numeric_error_code"
+	// WarnToolCallIndexReused fires when a second tool-call id appears under an
+	// index a live call already holds — the shape a backend that omits index, or
+	// always sends zero, produces for parallel calls.
+	WarnToolCallIndexReused = "tool_call_index_reused"
+	// WarnRepeatedToolName fires when name metadata arrives more than once for
+	// one call.
+	WarnRepeatedToolName = "repeated_tool_name"
+	// WarnToolCallMissingID fires on a tool call the backend never named with an
+	// id. dorang does not invent one.
+	WarnToolCallMissingID = "tool_call_missing_id"
+	// WarnMalformedToolArguments fires when a tool call's accumulated arguments
+	// are not valid JSON at the end of the stream. dorang does not execute tools
+	// and cannot repair the call, so the client is told in band rather than
+	// handed a tool_use stop reason over a document that does not parse.
+	WarnMalformedToolArguments = "malformed_tool_arguments"
+	// WarnDataAfterFinish fires when a backend sends semantic content after it
+	// already reported a terminal reason. The content is still delivered — the
+	// held message_delta exists precisely so it can be — and the condition is
+	// reported because it is out of contract.
+	WarnDataAfterFinish = "data_after_stop_reason"
+	// WarnToolInputConflict fires when content_block_start carried a complete
+	// tool input AND input_json_delta frames followed. The two cannot both be the
+	// document; the incremental form wins because it is the one this protocol
+	// defines as cumulative.
+	WarnToolInputConflict = "tool_input_conflict"
+	// WarnDuplicateBlockStop fires on a second content_block_stop for a block
+	// already stopped.
+	WarnDuplicateBlockStop = "duplicate_content_block_stop"
+	// WarnUnknownBlockStop fires on a content_block_stop for a block that never
+	// started. It allocates no tool index: a stray frame must not invent a call.
+	WarnUnknownBlockStop = "content_block_stop_without_start"
+	WarnLateUsage        = "late_usage_after_stop"
+	WarnNumericErrorCode = "numeric_error_code"
 	// WarnDroppedMetadata fires when a metadata member could not be carried
 	// through canonical.Request.Metadata, which is a map[string]string.
 	WarnDroppedMetadata = "dropped_metadata_member"
