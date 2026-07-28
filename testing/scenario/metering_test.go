@@ -70,6 +70,25 @@ func perOp(m *meter.Meter) time.Duration {
 	return time.Duration(r.NsPerOp())
 }
 
+// measurable is how far two measurements of one thing may differ before the
+// host is judged unable to answer a microsecond question. Benchmarked twice in
+// a row on a quiet machine this path repeats inside a few percent; 40% is well
+// clear of that and well under the 60-100% seen under oversubscription.
+const measurable = 0.40
+
+// disagreement is the spread between two measurements of the same thing, as a
+// fraction of the larger. Symmetric, so it does not matter which ran first.
+func disagreement(a, b time.Duration) float64 {
+	if a <= 0 || b <= 0 {
+		return 1
+	}
+	lo, hi := a, b
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	return float64(hi-lo) / float64(hi)
+}
+
 func TestScenario16_MeteringOnVsOffWithinBound(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: the metering gate is a measurement, not a unit test")
@@ -117,6 +136,32 @@ func TestScenario16_MeteringOnVsOffWithinBound(t *testing.T) {
 	t.Logf("metering on (full):    %v/op  (+%v, %.4f%% of the %v budget)",
 		fullCost, fullAdded, 100*float64(fullAdded)/float64(warmLocalP50), warmLocalP50)
 	t.Logf("bound: +%v (5%% of the gateway-overhead budget)", meteringBudget)
+
+	// Is this machine able to answer the question at all?
+	//
+	// A microsecond budget cannot be judged on a host whose scheduler is
+	// oversubscribed: measured at 3x contention this reported 16-20 µs against a
+	// 10 µs bound, while the metering-OFF baseline barely moved — the metering
+	// path contends on a channel and a lock and the no-op path does not, so the
+	// difference inflates and no ratio against the baseline recovers the signal.
+	//
+	// The detector needs no absolute reference, which is what makes it portable:
+	// measure the SAME thing twice and see whether the machine agrees with
+	// itself. A quiet host repeats within a few percent; a loaded one does not
+	// repeat at all. Disagreement means the number is noise, and asserting a
+	// bound on noise fails honest builds and passes dishonest ones with equal
+	// probability.
+	//
+	// It skips rather than fails, and says which — a suite that is green only on
+	// an idle machine is not green, and a budget silently widened until it
+	// survives a loaded one no longer gates anything.
+	second := perOp(steadyMeter)
+	if spread := disagreement(steadyCost, second); spread > measurable {
+		t.Skipf("this machine cannot hold a %v budget: the same measurement came back "+
+			"%v then %v, a spread of %.0f%% (over %.0f%%). §15.1's gate needs a host that "+
+			"is not oversubscribed; run it alone, or with -short to skip it by name.",
+			meteringBudget, steadyCost, second, 100*spread, 100*measurable)
+	}
 
 	if steadyAdded > meteringBudget {
 		t.Errorf("steady state adds %v per request, over the %v bound", steadyAdded, meteringBudget)
