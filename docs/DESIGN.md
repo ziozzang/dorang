@@ -450,6 +450,32 @@ recorded as undeclared rather than filled with a plausible guess, because a wron
 window feeds context-window fallback routing (§7.6) and would silently misroute. Operators
 supply real values per deployment; `UnverifiedModels()` lists what still needs a probe.
 
+#### The error direction is not symmetric
+
+A context window is the one capability where being wrong in each direction costs
+differently, so the tie-break rule is stated rather than left to taste:
+
+- **Too large** — requests between the real limit and the declared one fail outright, and
+  **context-window fallback never fires**, because dorang believes they fit. A hard failure
+  the routing layer is blind to.
+- **Too small** — those requests route to a larger-context model unnecessarily. A cost, not
+  a failure.
+
+**When credible sources disagree, take the smaller.** The larger value can only be adopted
+from a probe, never from a citation.
+
+#### The same model name is not the same limit
+
+Mining several catalogs turned up one name carrying four different context windows across
+four hosts, and another differing 4× between its native API and a reseller. Limits are a
+property of the **deployment**, not of the weights. This is direct evidence for keying
+identity on `(kind, model)` rather than on the model string — and for treating a number
+sourced from a *different* provider's catalog as no evidence at all.
+
+A number that is merely a source's own fallback constant is also no evidence: it records
+that nobody looked. Values equal to a catalog's documented default are rejected for that
+reason, not accepted for convenience.
+
 ---
 
 ## 5. Capacity — multi-axis reservation

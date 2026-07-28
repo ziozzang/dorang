@@ -1,0 +1,267 @@
+# dorang — model catalog OVERLAY, example (DESIGN §4.3, §10.2)
+#
+# Load with catalog.Load("…/model_catalog.overlay.example.yaml"). An overlay
+# merges field by field over the embedded catalog, so an entry here restates
+# only the fields it changes.
+#
+# What this file is
+# -----------------
+# Context-window and max-output values for entries that model_catalog.yaml
+# leaves UNDECLARED, recovered by reading three codebases that already carry
+# the metadata. Every value below carries the `path:line` it came from. Nothing
+# here was probed against a live endpoint by this pass.
+#
+# Sources, in descending order of weight for this gateway:
+#
+#   A. <operator config: jikjicode.yaml>, <operator config: jikji.yaml>,
+#      <operator config: model-catalog.yaml> — the same operator's
+#      configuration in production use, against the SAME base URLs dorang's
+#      kinds name (https://ollama.com, https://api.z.ai/api/coding/paas/v4,
+#      the Qwen token plan).
+#   B. jikji — same author's Go gateway: shipped provider
+#      profiles and config examples, also endpoint-matched.
+#   C. openclaw (TypeScript) and
+#      hermes-agent (Python) — third-party-shaped
+#      catalogs. Used only where they state a value for a specific model on a
+#      specific provider.
+#
+# What is deliberately NOT here
+# -----------------------------
+# * No reasoning block. Not one source in the mining states a reasoning
+#   capability for a specific model on the specific endpoint dorang addresses
+#   in a form that survives cross-checking; where two sources describe the same
+#   model they describe DIFFERENT control shapes (glm-5.2 alone has four).
+#   `unknown` stands. See the accompanying report.
+# * No pricing. No price was verified, and a fabricated one flows into routing
+#   and invoices (model_catalog.yaml header).
+# * No `verified:`. That date means dorang's operator confirmed the entry
+#   against the provider. Reading somebody else's repository is not that.
+# * No supports_tools / supports_streaming. The `ollama-cloud`, `glm` and
+#   `qwen` kinds already default both to true in provider_defaults.yaml and
+#   every source agrees (e.g. <operator config: jikjicode.yaml>:134-135 for
+#   ollama-cloud, :68-69 for glm). Restating them would add no information.
+# * Nothing for the 10 ollama-cloud models, 6 glm models and 3 jina models
+#   still undeclared. Values exist for some of them in the sources, but only as
+#   a provider-wide fallback constant, or for a different provider, or in
+#   mutual contradiction. Those stay undeclared so the probe list stays honest.
+#
+# The `:cloud` name question — read before trusting the ollama-cloud entries
+# ------------------------------------------------------------------------
+# model_catalog.yaml lists ollama-cloud models as the OpenAI-compatible
+# endpoint at https://ollama.com/v1 returns them: `deepseek-v4-pro`, with tags
+# preserved where the provider emits them (`gpt-oss:120b`). Sources A and B
+# configure the same models against the NATIVE base https://ollama.com, where
+# the same models carry a `:cloud` tag: `deepseek-v4-pro:cloud`.
+#
+# That these are one model and not two is stated, not assumed:
+#   hermes-agent/agent/models_dev.py:355-359 — "some
+#   providers (e.g. ollama-cloud) store model IDs with :cloud / -cloud
+#   suffixes in models.dev while the live API returns bare names."
+#
+# Names stay opaque here (DESIGN §2.1, REVIEW C3): nothing in dorang splits on
+# `:`. The mapping was applied once, by hand, when transcribing each citation —
+# it is not a rule, and an operator who disagrees should drop these five
+# entries rather than generalize it.
+
+version: 1
+
+models:
+
+  # =========================================================================
+  # Ollama Cloud — https://ollama.com/v1  (kind: ollama-cloud)
+  #
+  # Sources A and B express these as an operating envelope for the ollama.com
+  # route, not as the model's native maximum. Where a native maximum is also
+  # known it is LARGER (deepseek-v4-pro is 1,000,000 on api.deepseek.com,
+  # openclaw extensions/deepseek/openclaw.plugin.json:56). Under-declaring a
+  # window costs a premature context-window fallback (§7.6); over-declaring
+  # costs a truncated or rejected request. These take the smaller, observed
+  # number.
+  # =========================================================================
+
+  # DIRECT — this exact model on this exact route, four files agreeing.
+  #   context_window 160000:
+  #     <operator config: jikjicode.yaml>:131      (model at :126)
+  #     <operator config: jikji.yaml>:121          (model at :116)
+  #     <operator config: model-catalog.yaml>:49   (id at :46)
+  #     jikji/examples/config/stacked-loops.yaml:31
+  #   max_output_tokens 32000:
+  #     <operator config: jikjicode.yaml>:132
+  #     <operator config: jikji.yaml>:122
+  #     <operator config: model-catalog.yaml>:50
+  #   CONTRADICTED on max output only:
+  #     jikji/examples/config/stacked-loops.yaml:31 says
+  #     max_output 8000 for the same model on the same route. 3:1 for 32000,
+  #     and the three are the configuration actually in use; the outlier is a
+  #     documentation example. Recorded, not resolved.
+  - kind: ollama-cloud
+    model: "deepseek-v4-pro"
+    context_window: 160000
+    max_output_tokens: 32000
+
+  # INHERITED — carried by a YAML anchor from deepseek-v4-pro, not measured on
+  # this model. `- <<: *ollama_reasoning_provider` at
+  #   <operator config: jikjicode.yaml>:136 (model overridden at :138)
+  #   <operator config: jikji.yaml>:126     (model overridden at :128)
+  # merges context_window 160000 / max_output 32000 from :131-132 / :121-122.
+  # The operator overrode the model name and nothing else, so this is what the
+  # running system used — but it is a roster default, not an observation of
+  # deepseek-v4-flash. No source contradicts it on this route.
+  - kind: ollama-cloud
+    model: "deepseek-v4-flash"
+    context_window: 160000
+    max_output_tokens: 32000
+    note: >-
+      Carried by a YAML anchor from deepseek-v4-pro in the source roster
+      (<operator config: jikjicode.yaml>:136-138), not observed on this model. Lowest
+      confidence of the ollama-cloud entries; the first to re-probe.
+
+  # INHERITED — same anchor, at <operator config: jikjicode.yaml>:139
+  # (model at :141) and <operator config: jikji.yaml>:129 (model at :131).
+  # CONTRADICTED off-route, twice, and by a lot: MiniMax's own API is given as
+  # 1,000,000 at
+  #   openclaw/extensions/minimax/provider-models.ts:18
+  #   hermes-agent/agent/model_metadata.py:291
+  # (the latter with an explicit note at :2584-2594 that a 512K figure is
+  # stale). Both describe api.minimax.io, not ollama.com. Kept at the
+  # route-matched value; an operator serving m3 direct should override.
+  - kind: ollama-cloud
+    model: "minimax-m3"
+    context_window: 160000
+    max_output_tokens: 32000
+    note: >-
+      Anchor-inherited operating value for the ollama.com route
+      (<operator config: jikjicode.yaml>:139-141). MiniMax's own API is documented at
+      1,000,000 elsewhere; that is a different provider, not this entry.
+
+  # context_window 260000 is DIRECT — the operator overrode the anchor's
+  # 160000 for this model specifically:
+  #   <operator config: jikjicode.yaml>:145 (model at :144)
+  # max_output_tokens 32000 is INHERITED from the same anchor (:132).
+  # CONTRADICTED off-route: 1,048,576 on Moonshot / Kimi Coding at
+  #   hermes-agent/agent/model_metadata.py:329
+  #   openclaw/extensions/moonshot/openclaw.plugin.json:79
+  # Different provider; the deliberate 260000 override is the ollama.com fact.
+  - kind: ollama-cloud
+    model: "kimi-k3"
+    context_window: 260000
+    max_output_tokens: 32000
+
+  # DIRECT on both fields, and the best-attested entry in this file. Four
+  # independent files, two of them stating both numbers for this exact model
+  # on this exact route:
+  #   <operator config: model-catalog.yaml>:56,57         (id at :53)
+  #   jikji/internal/foundry/configbuilder/provider_catalog.go:133
+  #                                                           (model at :132)
+  #   <operator config: jikjicode.yaml>:149 (ctx; model at :148)
+  #   <operator config: jikji.yaml>:135     (ctx; model at :134)
+  # Near-miss elsewhere: 262144 on Moonshot / opencode-go
+  # (openclaw extensions/moonshot/openclaw.plugin.json:98). 260000 reads as
+  # that rounded down for headroom, which is the safe direction.
+  - kind: ollama-cloud
+    model: "kimi-k2.7-code"
+    context_window: 260000
+    max_output_tokens: 32000
+
+  # DIRECT, but from source C only, and context window only.
+  #   openclaw/extensions/ollama/openclaw.plugin.json:148
+  #     "contextWindow": 1000000, on the entry "glm-5.2:cloud" at :138.
+  # This is model-specific rather than a fallback: the constant exists solely
+  # for this model —
+  #   openclaw/extensions/ollama/src/defaults.ts:7
+  #     export const OLLAMA_GLM52_CONTEXT_WINDOW = 1_000_000;
+  #   openclaw/extensions/ollama/src/provider-models.ts:327-331
+  #     contextWindow ?? (modelId === "glm-5.2:cloud" ? OLLAMA_GLM52_… : …)
+  # Corroborated in shape by hermes-agent/agent/model_metadata.py:299
+  # (1_048_576) — see the report; the two do not agree exactly.
+  #
+  # max_output_tokens stays UNDECLARED on purpose. openclaw's manifest says
+  # 8192, but provider-models.ts:332 assigns OLLAMA_DEFAULT_MAX_TOKENS to
+  # every ollama model unconditionally, so 8192 records that nobody looked.
+  - kind: ollama-cloud
+    model: "glm-5.2"
+    context_window: 1000000
+    note: >-
+      Context window from openclaw's ollama-cloud-specific constant. Max output
+      undeclared: the only figure available there is a provider-wide default
+      applied to every ollama model, which is not evidence about this one.
+
+  # =========================================================================
+  # Z.AI coding plan — https://api.z.ai/api/coding/paas/v4  (kind: glm)
+  #
+  # The coding plan is a PLAN, and its limits are not the general Z.AI API's.
+  # Every source that names this base URL says 200000; every source that
+  # describes api.z.ai's general surface says ~1M for glm-5.2 and ~202800 for
+  # the rest. Both can be true. These entries take the plan's numbers because
+  # that is the endpoint this kind addresses.
+  # =========================================================================
+
+  # DIRECT — five files, all naming the coding-plan base URL.
+  #   context_window 200000 / max_output 96000:
+  #     <operator config: jikjicode.yaml>:65,66      (model at :61, url :62)
+  #     <operator config: jikji.yaml>:55,56          (model at :51, url :52)
+  #     <operator config: model-catalog.yaml>:11,12  (id at :8)
+  #     jikji/internal/foundry/configbuilder/provider_catalog.go:68
+  #                                                     (model+url at :67)
+  #     jikji/examples/config/stacked-loops.yaml:30
+  #   CONTRADICTED off-plan: 1000000/131072 at
+  #     openclaw/extensions/zai/openclaw.plugin.json:41,42
+  #   and 1048576 (context) at
+  #     hermes-agent/agent/model_metadata.py:299
+  #   — both describing Z.AI's general API. See the report.
+  - kind: glm
+    model: "glm-5.2"
+    context_window: 200000
+    max_output_tokens: 96000
+
+  # DIRECT on context window — this exact model against the coding-plan URL:
+  #   jikji/config.example.yaml:335 (model :331, url :333)
+  #
+  # max_output_tokens stays UNDECLARED. The only candidate is 128000, from a
+  # `glm-5` PREFIX rule at
+  #   jikji/internal/typebackbone/provider_defaults.yaml:31
+  # which is a family default, and it disagrees with the 96000 this same plan
+  # uses for glm-5.2. A family number that its own sibling contradicts is not
+  # a measurement of glm-5.1.
+  - kind: glm
+    model: "glm-5.1"
+    context_window: 200000
+    note: >-
+      Context window observed for this model on the coding-plan endpoint. Max
+      output undeclared: the only candidate is a glm-5 family default (128000)
+      that the plan's own glm-5.2 figure (96000) contradicts.
+
+  # =========================================================================
+  # Qwen token plan
+  # https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+  # =========================================================================
+
+  # INHERITED — from the token-plan roster anchor, i.e. from
+  # qwen3.8-max-preview, which model_catalog.yaml already carries at 983616.
+  #   <operator config: jikjicode.yaml>:53 `- <<: *qwen_token_plan_provider`
+  #     anchor's context_window 983616 at :44; this entry overrides `model`
+  #     (:55) and `max_output` (:56) and leaves context_window alone.
+  #   <operator config: jikji.yaml>:43, anchor value at :34, same pattern.
+  #   jikji/docs/providers.md:130 (anchor) and :138-139.
+  # The operator knew to override max output for this model and chose not to
+  # override the window — weak positive evidence, not an observation.
+  #
+  # CONTRADICTED: 1,000,000 for this exact model at
+  #   openclaw/extensions/qwen/models.ts:84
+  #   openclaw/extensions/qwen/openclaw.plugin.json:101
+  # and 131072 at
+  #   hermes-agent/agent/model_metadata.py:285
+  # — the last being a `"qwen"` substring catch-all that hermes' own code flags
+  # as unable to match this name properly. 983616 is the plan-specific number;
+  # 1,000,000 is the round one. They differ by 1.6%, in the safe direction.
+  #
+  # max_output_tokens is NOT restated: model_catalog.yaml already has 65536,
+  # and all three sources agree with it (<operator config: jikjicode.yaml>:56,
+  # openclaw extensions/qwen/models.ts:85, extensions/qwen/openclaw.plugin.json:102).
+  - kind: qwen
+    model: "qwen3.7-max"
+    context_window: 983616
+    note: >-
+      Inherited from the token-plan roster anchor (qwen3.8-max-preview), not
+      observed on this model. openclaw states 1,000,000 for the same model;
+      the difference is 1.6% and the smaller value is the safe one.
