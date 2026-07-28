@@ -519,6 +519,8 @@ wrong invoice (§10.7).
 documented as a runbook: set these, and the market-standard protocols work as written. Every
 flag entry names **what silently breaks without it**, because that is the failure mode that
 matters here — the engines accept requests and return `200` while ignoring what was asked.
+The profile also lists flags that must **not** be set: one SGLang option silently disables
+authentication entirely, which no amount of gateway-side care can compensate for.
 [VLLM.md](VLLM.md) §5 is the vLLM profile; [SGLANG.md](SGLANG.md) carries SGLang's, plus the
 row-by-row normalization table that makes the single-surface claim checkable rather than
 aspirational.
@@ -901,14 +903,33 @@ A miss lets the next strategy choose, and that choice is recorded at every check
 
 ```yaml
 priority_mapping:
-  classes: { realtime: 0, interactive: 2, batch: 10 }
+  classes: { realtime: 0, interactive: 2, batch: 10 }   # canonical: LOWER is more urgent
   emit:
-    vllm:   { field: priority }
+    vllm:   { field: priority, direction: ascending }    # lower first — native
+    sglang: { field: priority, direction: descending }   # HIGHER first — inverted, see below
     openai: { field: service_tier, map: { realtime: priority, interactive: default, batch: flex } }
     header: X-Request-Priority
 ```
 
 Unknown backends receive only the header, which is harmless if ignored.
+
+> ⚠️ **The two self-hosted engines order priority in opposite directions, using the same field
+> name and type, and both return `200` either way.** vLLM schedules the lowest value first;
+> SGLang schedules the **highest** first by default. A single shared constant is therefore
+> wrong on one of them — with the canonical map above, sending it unchanged to SGLang makes
+> **batch outrank realtime**, which is not a degradation but an inversion, and nothing in the
+> response reveals it.
+>
+> So `direction` is a required property of the emit rule, not a detail. The canonical scale
+> stays lower-is-more-urgent (matching the majority convention and §7.5's existing classes),
+> and the adapter negates for descending engines. A scenario test asserts that the same
+> canonical class produces opposite wire values on the two engines — because a test asserting
+> only "a number was sent" would pass while the behaviour is backwards.
+>
+> This is the clearest justification for §4.4's single-surface commitment. Two engines that
+> both "support priority" and both accept the same JSON disagree about what it means, and only
+> a normalizing layer that knows each engine's direction can present one coherent contract.
+> Details and citations: [VLLM.md](VLLM.md) §1.2, [SGLANG.md](SGLANG.md) §3.
 
 ### 7.6 Fail-back
 
