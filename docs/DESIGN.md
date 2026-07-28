@@ -1094,6 +1094,24 @@ The honest framing: this trades a small amount of routing predictability for a r
 in waste, and it only pays on subscription plans with resetting windows. On a pure
 pay-as-you-go deployment it is inert, which is the correct behaviour rather than a limitation.
 
+Four corrections from implementing it, each of which the formula above quietly required:
+
+1. **A rolling window has no reset instant, and that is the *common* case here.** A 5-hour
+   allowance is a rolling ring by construction; inventing an epoch-aligned boundary would
+   spike urgency at a moment unrelated to the real reset. So a rolling window scores **zero
+   until the provider reports a reset time** (§6.2), a calendar window uses dorang's own UTC
+   boundary, and a provider-reported reset always wins. The feature depends on the provider
+   probe rather than merely benefiting from it.
+2. **Jitter must be keyed on (node, subject), not node alone.** A per-node factor scales every
+   candidate that node ranks by the same amount, so it cannot change that node's ordering —
+   it is arithmetic with no effect on the stampede it was added to prevent.
+3. **The ratio diverges at the window edge**, and an infinity compares equal to itself across
+   every candidate, destroying the ordering the signal exists to provide. The denominator is
+   floored, giving a finite maximum.
+4. **With several rules that do not expire together, urgency is the maximum** — what is most
+   at stake. The minimum reading describes what may still be spent, which is admission's
+   question, not routing's.
+
 ### 7.6 Fail-back
 
 | Cause | Detection | Default chain |
@@ -1961,7 +1979,36 @@ credentials:
   account, and the reason is reported. What it must *not* do is retry in a tight loop against
   an auth server — that is how a recoverable expiry becomes a rate-limit ban.
 - **Refresh never happens on the request path.** A background loop per credential, off the hot
-  path, in keeping with §9.6.
+  path, in keeping with §9.6. The poll interval is clamped to a fraction of the margin —
+  a poll slower than the margin steps over the whole window and lands on an expired token,
+  which is the request-path refresh this bullet exists to avoid.
+
+Six things implementation showed the description above does not cover, each with a
+consequence:
+
+- **In-process single-flight does not prevent the lockout it was motivated by.** The store is
+  *shared with the vendor's CLI*, so the racing party is another process. The store is
+  therefore re-read immediately before every exchange, and a newer token found there is
+  adopted rather than a fresh one minted — turning a cross-process race into a file read.
+- **A revoked token yields a 401 per in-flight request**, so "refresh once and retry once"
+  without a gate is a refresh per request: exactly the ban this section warns about. The
+  401 path short-circuits when the credential has already moved past the token that failed,
+  and the backoff gate sits *inside* the single choke point so that path cannot walk around it.
+- **"Unhealthy" and "unusable" are not the same.** A failed refresh does not invalidate the
+  token it failed to replace. Unhealthy stops the credential being *chosen*; the existing
+  token keeps serving until it actually expires. Conflating them drops a working account on
+  one auth-server blip.
+- **A store write that fails after a successful exchange is its own failure mode**: the
+  refresh token is spent and its successor unrecorded, so every other reader of that store is
+  now broken. The credential is marked unhealthy with that specific reason while the
+  in-memory token keeps serving.
+- **A token with no expiry cannot be refreshed ahead of expiry.** Treating unknown as due is a
+  refresh loop, so it is never scheduled and relies on the 401 fallback alone.
+- **"Tokens are secrets" cannot bind the refresher** — that is provider code, and its errors
+  can carry tokens. Every token the credential has held is scrubbed from anything recorded,
+  and the provider's error is deliberately **not** wrapped, because wrapping would put its
+  unscrubbed text straight back into the message. The same reasoning excludes command output
+  from an exec-sourced credential's errors.
 
 Two constraints inherited from elsewhere in this design:
 
