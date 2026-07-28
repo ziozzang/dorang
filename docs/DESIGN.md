@@ -1032,6 +1032,68 @@ Unknown backends receive only the header, which is harmless if ignored.
 > a normalizing layer that knows each engine's direction can present one coherent contract.
 > Details and citations: [VLLM.md](VLLM.md) §1.2, [SGLANG.md](SGLANG.md) §3.
 
+### 7.5a Measured-signal routing: TTFT, health, and expiring quota
+
+Three ranking inputs come from measurement rather than configuration. All three are
+**comparators in the chain (§7.3)**, never overrides — they reorder healthy candidates and can
+never promote one that a pin, capability filter, quota, or budget has excluded.
+
+#### (a) Latency and throughput
+
+`internal/health` maintains a smoothed time-to-first-token and a smoothed generation rate per
+deployment, updated from every completed request. `lowest_latency` ranks on the first,
+`highest_tps` on the second, and they are deliberately separate signals: a backend can answer
+promptly and generate slowly, or the reverse, and choosing on the wrong one is how a "fastest"
+router loses to round-robin on long outputs. Generation rate excludes time-to-first-token, so a
+deep queue is not mistaken for a slow generator.
+
+A deployment with no samples has **no opinion** and is ranked by the next comparator (§7.1) —
+absent must never read as fastest or as slowest.
+
+#### (b) Circuit state feeds ordering, not just admission
+
+Health's binary admit/refuse is applied at try-acquire (§7.1). Its *continuous* part — recent
+failure rate and consecutive-failure count — is available to ordering, so a deployment that is
+technically still closed but visibly degrading sinks in the ranking before it trips. This is
+the cheap half of resilience: it costs nothing to prefer the healthier of two working
+backends, and it means the circuit breaker fires less often because traffic drained first.
+
+#### (c) Expiring quota — use it or lose it
+
+This one is not a performance signal at all, and it is the reason this section exists.
+
+A subscription window that **resets** is use-it-or-lose-it: an allowance at 20% consumed with
+one hour left on a weekly window is about to discard 80% of what was already paid for. Routing
+that ignores this systematically wastes the cheapest capacity available, and does so invisibly
+— nothing fails, the bill is simply higher than it needed to be.
+
+```
+urgency = unused_fraction ÷ remaining_fraction_of_window
+```
+
+where both are in [0,1]. An allowance 20% used with 10% of its window left scores 0.8 ÷ 0.1 =
+8.0; the same allowance at the start of the window scores ≈0.8. `quota_urgency` ranks
+candidates by that value, descending.
+
+Three constraints, because this is the kind of optimization that quietly does harm:
+
+1. **It applies only to quota that actually expires.** A prepaid balance that rolls over, or
+   pay-as-you-go where unused simply means unspent, has **zero** urgency — spending it early
+   buys nothing and forfeits optionality. The distinction is a property of the quota
+   (`resets: true`), not an inference from its shape.
+2. **It never overrides cost when the alternatives are not equivalent.** Preferring an
+   expiring allowance is right when the alternative is *also* already paid for; it is wrong
+   when the alternative is free. So `quota_urgency` composes as a tie-break *after*
+   `lowest_cost` by default, and an operator who wants it earlier must say so.
+3. **It must not create a stampede at the window edge.** Every node computing the same urgency
+   at the same moment converges on the same credential, and its concurrency limit then becomes
+   the bottleneck for the whole fleet. Urgency is therefore damped by current occupancy — the
+   same `least_busy` term already available — and the ranking is jittered per node.
+
+The honest framing: this trades a small amount of routing predictability for a real reduction
+in waste, and it only pays on subscription plans with resetting windows. On a pure
+pay-as-you-go deployment it is inert, which is the correct behaviour rather than a limitation.
+
 ### 7.6 Fail-back
 
 | Cause | Detection | Default chain |
@@ -1546,7 +1608,31 @@ upstream (modulo the alias rewrite of §7.2) and the numbers are available from 
 
 ### 10.5 Priority passthrough
 
-See §7.5. A client hint is clamped to the principal's permitted range.
+See §7.5. **A client-supplied priority is ignored by default.**
+
+Clamping to a permitted range was the earlier rule and it is not safe enough. Priority is a
+claim on shared capacity, so if callers may set it, every caller eventually sets the most
+urgent value — not maliciously, just because it is free and appears to help. At that point the
+scale carries no information, and the callers who left it alone are the ones penalised. A
+clamp only bounds how far the self-elevation goes; it does not remove the incentive.
+
+```yaml
+capacity:
+  principals:
+    default:            { client_priority: ignore }          # the default
+    batch-pipeline:     { client_priority: allow, range: [batch, interactive] }
+    latency-sensitive:  { client_priority: allow, range: [interactive, realtime] }
+```
+
+- `ignore` — the hint is dropped and the principal's configured class is used. Dropping is
+  reported in `x-dorang-dropped-params`, because silently discarding something a caller sent
+  is the behaviour §10.3 exists to prevent.
+- `allow` — the hint is honoured, clamped to the stated range. A principal granted a range has
+  been given a budget of urgency deliberately, by an operator who can see the whole fleet.
+
+The asymmetry is deliberate: **an operator can grant urgency, a caller cannot claim it.**
+Which class a request belongs to is a statement about its importance relative to other
+tenants' work, and the caller is the one party with no view of that.
 
 ### 10.5a dorang does not compact — a decided non-goal
 
@@ -1778,6 +1864,53 @@ model-axis contention specifically, which revision 1's test would not have caugh
 Bearer token → scheme-independent lookup (§2.4) → in-memory principal. Misses consult the
 store once, coalesced. Team, user, and key limits all apply; the most restrictive wins.
 External key management may be delegated over HTTP with a fixed principal schema.
+
+### 11.2b OAuth credentials refresh themselves
+
+Some providers authenticate by OAuth rather than a static key, and an access token that
+expires mid-flight is a `401` the caller did nothing to deserve. dorang refreshes them, and the
+mechanics matter more than the feature:
+
+```yaml
+credentials:
+  - id: plan-oauth-1
+    provider: some-plan
+    auth: oauth
+    oauth:
+      source: file                       # file | exec | env
+      path: ~/.some-vendor/auth.json     # the vendor CLI's own store
+      refresh_margin: 5m
+      account_id_field: account_id       # sent as a separate header where required
+```
+
+- **Refresh happens ahead of expiry, not on failure.** `refresh_margin` triggers renewal while
+  the current token is still valid, so a refresh never sits on a request's critical path. A
+  `401` is treated as a *second* signal — refresh once and retry once — because clock skew and
+  server-side revocation both exist, but it is the fallback, not the mechanism.
+- **One refresh per credential, coalesced.** Concurrent requests on an expiring token must not
+  each mint a refresh: some providers invalidate the previous refresh token on use, so a
+  stampede does not merely waste calls, it can **lock the account out**. Refresh is
+  single-flight per credential, and the losers wait for the winner's result.
+- **The token store is shared with the vendor's own CLI, so writes must not corrupt it.**
+  Refreshed tokens are written atomically (temp file, fsync, rename) with the original file
+  mode preserved. A half-written credential file breaks the CLI too, and the operator will not
+  suspect the gateway.
+- **A refresh failure marks the credential unhealthy; it does not fail the fleet.** The
+  credential steps aside exactly as an exhausted quota does (§6.1), traffic moves to another
+  account, and the reason is reported. What it must *not* do is retry in a tight loop against
+  an auth server — that is how a recoverable expiry becomes a rate-limit ban.
+- **Refresh never happens on the request path.** A background loop per credential, off the hot
+  path, in keeping with §9.6.
+
+Two constraints inherited from elsewhere in this design:
+
+**An OAuth credential is still a credential**, so §7.4a2's affinity rules apply unchanged — a
+conversation pinned to an account stays pinned across a token refresh, because the account is
+the same account. The token is an implementation detail of talking to it.
+
+**Tokens are secrets and follow §4.1** — never logged, never in an error message, never in a
+`Snapshot`. The only thing that leaves this subsystem is the credential's opaque id and its
+health.
 
 ### 11.3 Administration UI
 
