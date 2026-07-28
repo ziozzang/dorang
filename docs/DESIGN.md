@@ -860,6 +860,75 @@ share a pin. Entries expire on **creation** time, not last use, because the prem
 the upstream cache is gone after the TTL — refreshing on use would defeat the point. An
 unhealthy or exhausted target discards the pin immediately.
 
+#### (a2) Credential affinity — a correctness constraint, not a cache optimization
+
+Several accounts on the same provider is the normal case, not an edge case: two or more
+subscription plans on one vendor, several accounts on a cloud, a pool of keys behind one
+model. §5 already treats each credential as the unit that quotas and concurrency attach to.
+What §7.4a did not say is that **for stateful APIs the credential is also the unit that
+conversation state attaches to** — and that changes stickiness from an optimization into a
+constraint.
+
+Four things are scoped to the account, not to the model or the provider:
+
+| Account-scoped state | What happens if a later turn lands elsewhere |
+|---|---|
+| Server-side response handles (`previous_response_id` and equivalents) | The handle does not resolve. Hard error, or worse, silently answering from a truncated conversation |
+| Integrity-protected reasoning blocks (§10.2) | The receiving account cannot validate a block it did not issue |
+| Prompt cache residency | Silent cost and latency regression — the cache is cold, and nothing reports it |
+| Quota and spend windows (§6) | Not a failure, but the reason the pool exists |
+
+Only the third is recoverable. The first two are **correctness failures**, and the first can
+fail in the direction that produces a plausible answer to a different question.
+
+So the design distinguishes two strengths of affinity, and picking the wrong one is the bug:
+
+- **Preferred** — the default. Cache-driven. If the preferred credential is at capacity,
+  `on_capacity: spill` moves to another account, accepting a cold cache. Correct whenever the
+  conversation is stateless, which is most chat traffic.
+- **Pinned** — required. The conversation carries account-scoped state, so another account is
+  not a worse choice, it is a **wrong** one. `spill` must not apply. The request waits for
+  the pinned credential, or fails with a reason naming the pin. It never silently lands
+  elsewhere.
+
+**dorang infers the pin rather than trusting configuration for it.** A request that carries a
+server-side handle or an opaque reasoning block is pinned by that fact, whatever the
+stickiness setting says — because the setting expresses a preference about cost, and this is
+not a question about cost. Configuration can *widen* nothing here; it can only choose the
+policy for the unpinned case.
+
+```yaml
+key_rotation:
+  providers:
+    plan-vendor:
+      affinity_group: plan-vendor-accounts
+      stickiness:
+        scope: session            # none | run | session | conversation
+        on_capacity: spill        # applies ONLY to unpinned requests
+        pin_on_state: true        # default; a stateful request pins regardless of the above
+      keys:
+        - { id: plan-1, key_env: PLAN_KEY_1, max_concurrency: 7, capacity_group: plan-1 }
+        - { id: plan-2, key_env: PLAN_KEY_2, max_concurrency: 7, capacity_group: plan-2 }
+```
+
+Two consequences worth stating because they are easy to miss:
+
+1. **A pinned request that cannot be served is a terminal failure, not a fallback.** Falling
+   back re-runs the same impossibility on every hop and returns the same error more slowly —
+   the identical reasoning as the protocol-family pin in §7.6, one level finer. The pin is the
+   credential, not merely the family.
+
+2. **Pinning interacts with quota.** If the pinned account's quota is exhausted (§6), dorang
+   cannot move the conversation to a healthy account without breaking it. The honest outcome
+   is to fail and say *which* account is exhausted and when it resets, so the caller can
+   decide whether to wait or start a fresh conversation. Silently continuing on another
+   account would trade a visible limit for an invisible corruption.
+
+Scenario tests: two accounts on one provider, a stateful conversation, the preferred account
+saturated — assert the request **waits or fails** and never spills; the same conversation
+without state — assert it spills cleanly; and a pinned account with exhausted quota — assert a
+terminal error naming the account and its reset time.
+
 #### (b) Prefix matching, order-exact **[R1-4, R1-5, R1-6]**
 
 Routing to whichever backend still holds the conversation prefix requires knowing the prefix
