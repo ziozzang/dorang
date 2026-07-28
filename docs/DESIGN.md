@@ -1767,6 +1767,118 @@ Failing is the correct outcome in the third row. The caller learns the real limi
 information they did not have and cannot get elsewhere — and decides for themselves what to
 drop. That is a better outcome than a silently shortened conversation.
 
+### 10.5b Transform filters — reversible masking, and why it is hard
+
+A filter sits between the canonical request and the backend, may rewrite the request, and may
+rewrite the response on the way back. The motivating case is **PII masking**: replace a
+national identity number with a placeholder before the text leaves the operator's control,
+and restore it in the answer, so the upstream never sees it and the caller never notices.
+
+```yaml
+models:
+  - name: model-x
+    filters:
+      - { plugin: pii-mask, on: [request, response], config: { patterns: [krrn, email] } }
+```
+
+Filters are §11.5 plugins, which is the point: an operator's disclosure rules are theirs, and
+a gateway cannot ship the right pattern set for every jurisdiction.
+
+#### The reversible-mask contract
+
+A mask is not a redaction. It has to come back, which means holding a per-request
+**mask → original** table, and that table is the most dangerous object in the system.
+
+1. **The table lives for one request and is never persisted.** Not in the ledger, not in the
+   trace excerpt, not in a log, not in an audit row, not in a metric label. A redaction whose
+   key material is written next to the redacted text has redacted nothing.
+2. **Placeholders must be unforgeable and unambiguous.** A caller who sends text that looks
+   like a placeholder must not be able to make the unmasker substitute something. Placeholders
+   carry a per-request random component, and a placeholder-shaped string in the *input* is
+   escaped before masking runs.
+3. **Unmasking is not a blind string replace.** A model may echo a placeholder inside a longer
+   token, split it across a streaming frame boundary, translate it, or invent one that was
+   never issued. Only exact, whole placeholders issued in *this* request are substituted;
+   anything else is left alone and **counted**, because an invented placeholder is a signal
+   worth seeing.
+4. **Streaming makes this genuinely harder.** A placeholder can straddle two SSE frames, so
+   the unmasker holds a bounded tail across frames. That bound is a real limit: a placeholder
+   longer than it cannot be reassembled, which is why they are short and fixed-width.
+5. **Masking changes token counts and therefore cost.** Metering records what the *upstream*
+   was actually sent, since that is what was billed — not the pre-mask text.
+
+#### What a filter must not be allowed to do
+
+A filter runs inside the process holding provider credentials, so §11.5's plugin rules apply
+unchanged: no credential is reachable, ceilings are enforced by the host, and a breach is
+fail-open — **except** that a *failed mask* must fail **closed**. Those two rules point in
+opposite directions, deliberately: a filter that cannot enrich a request should be skipped,
+but a filter that was supposed to remove an identity number and did not must stop the
+request. The plugin declares which kind it is; `fail: closed` is the safe declaration and the
+default for anything named as a masking filter.
+
+> **Do not confuse this with §10.5a's compaction non-goal.** dorang refuses to rewrite a
+> caller's conversation *on its own initiative*. A filter is the operator's explicit,
+> configured instruction to do exactly that, on their own traffic, and it is reversible. The
+> distinction is consent, and it is why one is a non-goal and the other is a feature.
+
+### 11.6 Tiers, and the token guard
+
+#### Tiers
+
+A key belongs to a **tier**, and the tier — not the caller — decides what it may claim.
+
+| Tier | Priority | Typical limits |
+|---|---|---|
+| `unlimited` | highest | no budget ceiling; may be granted a priority range |
+| `commercial` | middle | budget, rate limits, full model set |
+| `free` | low | tight budget, small model set, low concurrency |
+| *(batch work)* | **below `free`** | any tier's batch traffic yields to any tier's interactive |
+
+Batch sitting below the free tier is deliberate. Batch has no waiting human, so latency costs
+it nothing, and §11.1's interactive reserve already encodes the same judgement one level down.
+A paying customer's batch job should not delay a free user's interactive request.
+
+Tiers are **configuration, not code** — the names above are defaults, and an operator defines
+their own set with their own ordering. What is fixed is that a tier is a property of the key,
+assigned by an operator, and §10.5's rule holds: a caller cannot claim one.
+
+#### The token guard
+
+A key whose usage suddenly departs from its own history is either compromised, looping, or
+newly popular, and the first two are expensive. The guard watches for a departure from the
+key's **own** baseline rather than a fixed threshold, because a fixed threshold is wrong for
+every key except the one it was set for.
+
+```yaml
+token_guard:
+  enabled: true
+  baseline_window: 7d
+  trigger: { factor: 10, min_absolute: 100000 }   # both must hold
+  action: pend                                    # pend | throttle | revoke | alert_only
+  cooldown: 1h
+```
+
+Four things this must get right, because an automated revocation is itself a denial of
+service:
+
+1. **`pend`, not `revoke`, is the default.** A pended key is refused with a distinct,
+   documented error and can be released by an operator in one action. Automatic *revocation*
+   of a key that turns out to be legitimately busy is an outage the operator did not choose,
+   and it is not reversible in the same sense — the caller has to be reissued a credential.
+2. **Both a relative and an absolute condition must hold.** A key that used 10 tokens
+   yesterday and 200 today has grown twentyfold and is not a problem. Without the absolute
+   floor, the guard fires hardest on the quietest keys.
+3. **A new key has no baseline**, and the guard must not treat that as anomalous or every key
+   trips on its first busy hour. Below a stated minimum of history it only alerts.
+4. **The action is always announced.** An event fires (§11.5) with the observed rate, the
+   baseline, and which condition tripped — so the first thing the operator learns is not a
+   support ticket from the affected user.
+
+The guard is not a budget. A budget is a *stated* ceiling the caller agreed to; the guard is a
+*statistical* judgement that might be wrong. They fail differently and are configured
+separately, and the guard's action is deliberately the reversible one.
+
 ### 10.6 Generic passthrough engine
 
 Provider-native routes are opened by configuration, not by writing an adapter each time.
