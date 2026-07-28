@@ -1696,9 +1696,42 @@ injecting a dorang-authored SSE frame into the upstream stream contradicts forwa
 upstream bytes untouched.
 
 Revision 2: post-hoc values for streaming responses are delivered **only** when the client
-opts in with `x-dorang-usage-events: 1`. Without it the stream stays byte-faithful to
-upstream (modulo the alias rewrite of §7.2) and the numbers are available from the ledger by
-`x-dorang-request-id`, which is a response header and always present.
+opts in with `x-dorang-usage-events: 1`. Without it the numbers remain available from the
+ledger by `x-dorang-request-id`, which is a response header and always present.
+
+#### The terminal frame is the right place, and it can carry everything
+
+Headers are gone before the first token; **TTFT and generation rate are not known until the
+stream ends.** So the only channel that can carry them is a frame emitted just before the
+terminator — `data: [DONE]` for the chat family, `message_stop` for messages.
+
+§10.5 removes the objection that used to make this awkward. Injecting a frame is not a
+violation of byte-fidelity, because the pass already rewrites `model` on every chunk and
+synthesizes a terminal chunk when the backend omits one. This is one more rule in the same
+single pass, and it costs one frame.
+
+So the opt-in event carries the whole per-request record rather than usage alone:
+
+```
+event: dorang.usage
+data: {"request_id":"…","model":"…","upstream_model":"…","deployment":"…",
+       "attempt":1,"tokens":{"input":…,"output":…,"cache_read":…,"reasoning":…},
+       "ttft_ms":…,"latency_ms":…,"tokens_per_second":…,
+       "cost_usd":"…","notional_usd":"…","route_reason":"prefix_hit:depth=3"}
+data: [DONE]
+```
+
+Three constraints keep it safe to add:
+
+1. **It is opt-in and emitted before the terminator.** A client that did not ask sees an
+   unchanged stream; a client that reads to `[DONE]` and stops still gets it, because it
+   arrives first. A frame *after* the terminator would be invisible — which is exactly why
+   trailers were removed.
+2. **A named event, not a `data:`-only frame.** Clients that dispatch on event name ignore an
+   unknown one; a bare `data:` frame would be handed to a JSON decoder expecting a chunk.
+3. **It never replaces the ledger.** A client can drop the connection before the terminator,
+   so the ledger is the record and the frame is a convenience — which also means the frame
+   failing to send is not a metering failure.
 
 ### 10.5 Priority passthrough
 
