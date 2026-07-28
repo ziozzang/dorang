@@ -86,7 +86,7 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 			"is saturated", resv.CredentialID())
 	}
 
-	d := newDispatcher(up.Client(), t.Logf, time.Now)
+	d := newDispatcher(up.Client(), nil, t.Logf, time.Now)
 	d.swap(&dispatchState{upstreams: table})
 	exec := &batchExecutor{d: d, owners: testOwners("key-1")}
 

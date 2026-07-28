@@ -21,7 +21,7 @@ import (
 // decodeRoute runs the decode half of the dispatcher for one route and body.
 func decodeRoute(t *testing.T, family server.Family, body string, form *canonical.Form) (*call, error) {
 	t.Helper()
-	d := newDispatcher(nil, func(string, ...any) {}, nil)
+	d := newDispatcher(nil, nil, func(string, ...any) {}, nil)
 	st := &dispatchState{}
 	d.swap(st)
 	rt := &server.Route{Family: family}

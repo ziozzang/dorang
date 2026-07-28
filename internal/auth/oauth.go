@@ -112,7 +112,14 @@ type OAuthConfig struct {
 	Command []string
 	// EnvVar is the variable to read, for SourceEnv.
 	EnvVar string
-	// Fields names the store's keys where they are not the defaults.
+	// StoreFormat names a vendor's store layout. Empty is [FormatGeneric].
+	//
+	// It is spelled StoreFormat rather than Format because this type carries a
+	// Format METHOD, which is what keeps a %v of a configuration from printing a
+	// path to a credential file.
+	StoreFormat StoreFormat
+	// Fields names the store's keys where they are not the format's. Each name
+	// set here overrides the format's own.
 	Fields TokenFields
 	// AccountHeader is the header the account id is sent in, where the provider
 	// requires one. Empty means the account id is not sent.
@@ -152,7 +159,12 @@ func (c *OAuthConfig) Validate() error {
 	default:
 		return fmt.Errorf("auth: oauth credential %s: unknown source", c.ID)
 	}
-	c.Fields = c.Fields.withDefaults()
+	if c.StoreFormat != "" {
+		if _, err := ParseStoreFormat(string(c.StoreFormat)); err != nil {
+			return fmt.Errorf("auth: oauth credential %s: %w", c.ID, err)
+		}
+	}
+	c.Fields = c.StoreFormat.Fields(c.Fields)
 	if c.RefreshMargin <= 0 {
 		c.RefreshMargin = DefaultRefreshMargin
 	}
