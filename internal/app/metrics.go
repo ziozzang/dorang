@@ -69,6 +69,15 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 		reg.Register(metrics.NewAuthCollector(a.Auth, cfg.Auth.RehashesOnUse(),
 			legacySunset(cfg), a.now))
 	}
+	// Registered only when a credential authenticates by OAuth. A refresh loop
+	// that has been failing for three days is invisible until the token it
+	// failed to replace expires, and these are the numbers that predict it — but
+	// a page of zeroed refresh counters on a deployment with no OAuth credential
+	// would say the refreshes are not happening rather than that there is
+	// nothing to refresh (DESIGN §12.3's rule 3).
+	if a.OAuth != nil {
+		reg.Register(metrics.NewOAuthCollector(a.OAuth, a.now, 0))
+	}
 	if a.Store != nil {
 		reg.Register(metrics.NewStoreCollector(a.Store, cfg.Storage.Driver))
 	}

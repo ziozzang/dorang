@@ -168,7 +168,7 @@ func TestReasoningBlobsAreCollected(t *testing.T) {
 // because the state does.
 func TestResponsesSubResourceHandlers(t *testing.T) {
 	rs := newTestResponses(t)
-	a := &App{dispatch: newDispatcher(nil, func(string, ...any) {}, rs.now)}
+	a := &App{dispatch: newDispatcher(nil, nil, func(string, ...any) {}, rs.now)}
 	a.dispatch.swap(&dispatchState{responses: rs})
 
 	body := `{"id":"resp_1","object":"response","created_at":1,"status":"completed","model":"m","output":[]}`

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,12 +72,40 @@ var (
 // TokenFields names the keys a vendor's store uses, because there is no
 // standard for them (DESIGN §11.2b's example configures account_id_field for
 // exactly this reason).
+//
+// A name may be a dotted path into a nested object — "tokens.access_token" —
+// because two of the three stores a real machine carries nest their tokens one
+// level down. A path names a leaf; every key it does not name survives a write
+// untouched, at whatever depth it sits.
 type TokenFields struct {
 	AccessToken  string // default "access_token"
 	RefreshToken string // default "refresh_token"
 	ExpiresAt    string // default "expires_at"
 	AccountID    string // default "account_id"
+
+	// ExpiresAtEncoding says how ExpiresAt is spelled where it is not a
+	// timestamp. A store that carries no expiry at all can still name the JWT
+	// it does carry, which is what makes refresh-ahead-of-expiry possible for
+	// one (see [ExpiryJWTClaim]).
+	ExpiresAtEncoding ExpiryEncoding
 }
+
+// ExpiryEncoding selects how the expiry field is read.
+type ExpiryEncoding uint8
+
+const (
+	// ExpiryTimestamp is the default: RFC 3339, unix seconds or unix
+	// milliseconds, told apart by shape.
+	ExpiryTimestamp ExpiryEncoding = iota
+	// ExpiryJWTClaim reads the `exp` claim of a JWT the store already carries.
+	//
+	// It exists because a store can hold a token and no expiry — and a token
+	// with no expiry is never refreshed ahead of time (see [Token.NeedsRefresh]),
+	// which leaves the whole of §11.2b resting on the 401 fallback. The claim is
+	// read, never verified: dorang is not the audience and holds no key. It is
+	// metadata about a token dorang already has.
+	ExpiryJWTClaim
+)
 
 func (f TokenFields) withDefaults() TokenFields {
 	if f.AccessToken == "" {
@@ -102,6 +131,10 @@ const (
 	expiryRFC3339 expiryStyle = iota // the default for a store dorang creates
 	expiryUnixSeconds
 	expiryUnixMillis
+	// expiryFromJWT records that the expiry was READ OUT OF the access token
+	// rather than out of a field of its own. Writing it back would add a key the
+	// vendor's CLI never wrote, to a file the vendor's CLI reads.
+	expiryFromJWT
 )
 
 // Token is one OAuth token set.
@@ -226,10 +259,17 @@ func decodeToken(b []byte, f TokenFields) (Token, error) {
 		return Token{}, fmt.Errorf("%w: not a JSON object", ErrTokenStoreMalformed)
 	}
 	t := Token{extra: map[string]json.RawMessage{}}
+	// Only a field named at the TOP level is consumed out of extra. A dotted
+	// path leaves its whole container behind, because the container holds keys
+	// dorang does not own and a write has to put them back.
+	consumed := map[string]bool{}
+	for _, name := range []string{f.AccessToken, f.RefreshToken, f.ExpiresAt, f.AccountID} {
+		if !strings.Contains(name, ".") {
+			consumed[name] = true
+		}
+	}
 	for k, v := range raw {
-		switch k {
-		case f.AccessToken, f.RefreshToken, f.ExpiresAt, f.AccountID:
-		default:
+		if !consumed[k] {
 			t.extra[k] = v
 		}
 	}
@@ -243,14 +283,37 @@ func decodeToken(b []byte, f TokenFields) (Token, error) {
 	if t.AccountID, err = decodeString(raw, f.AccountID); err != nil {
 		return Token{}, err
 	}
-	if t.ExpiresAt, t.style, err = decodeExpiry(raw, f.ExpiresAt); err != nil {
+	if t.ExpiresAt, t.style, err = decodeExpiry(raw, f.ExpiresAt, f.ExpiresAtEncoding); err != nil {
 		return Token{}, err
 	}
 	return t, nil
 }
 
+// lookupPath resolves a dotted field path to its leaf. A path that runs through
+// something that is not an object is a miss rather than an error: the store is
+// the vendor's, and a shape dorang did not expect is a field it does not have.
+func lookupPath(raw map[string]json.RawMessage, path string) (json.RawMessage, bool) {
+	segs := strings.Split(path, ".")
+	cur := raw
+	for i, s := range segs {
+		v, ok := cur[s]
+		if !ok {
+			return nil, false
+		}
+		if i == len(segs)-1 {
+			return v, true
+		}
+		var next map[string]json.RawMessage
+		if err := json.Unmarshal(v, &next); err != nil {
+			return nil, false
+		}
+		cur = next
+	}
+	return nil, false
+}
+
 func decodeString(raw map[string]json.RawMessage, key string) (string, error) {
-	v, ok := raw[key]
+	v, ok := lookupPath(raw, key)
 	if !ok {
 		return "", nil
 	}
@@ -264,10 +327,27 @@ func decodeString(raw map[string]json.RawMessage, key string) (string, error) {
 // decodeExpiry accepts the three spellings vendor stores actually use: RFC 3339,
 // unix seconds and unix milliseconds. The magnitude tells seconds from
 // milliseconds; the boundary is far outside any plausible token lifetime.
-func decodeExpiry(raw map[string]json.RawMessage, key string) (time.Time, expiryStyle, error) {
-	v, ok := raw[key]
+func decodeExpiry(raw map[string]json.RawMessage, key string, enc ExpiryEncoding) (time.Time, expiryStyle, error) {
+	v, ok := lookupPath(raw, key)
 	if !ok {
 		return time.Time{}, expiryRFC3339, nil
+	}
+	if enc == ExpiryJWTClaim {
+		var jwt string
+		if err := json.Unmarshal(v, &jwt); err != nil {
+			return time.Time{}, 0, fmt.Errorf(
+				"%w: field %q is not a string", ErrTokenStoreMalformed, key)
+		}
+		// A token that is not a JWT, or one whose payload has no usable `exp`,
+		// is not a malformed store: it is a store with no expiry, which
+		// [Token.NeedsRefresh] already has an answer for. Reporting it as an
+		// error would be reporting on the shape of a token, and the report
+		// would be the one place a token could end up.
+		ts, okJWT := jwtExpiry(jwt)
+		if !okJWT {
+			return time.Time{}, expiryFromJWT, nil
+		}
+		return ts, expiryFromJWT, nil
 	}
 	var s string
 	if err := json.Unmarshal(v, &s); err == nil {
@@ -313,21 +393,32 @@ func encodeToken(t Token, f TokenFields) ([]byte, error) {
 	for k, v := range t.extra {
 		out[k] = v
 	}
-	out[f.AccessToken] = t.Access
+	setPath(out, f.AccessToken, t.Access)
 	if t.Refresh != "" {
-		out[f.RefreshToken] = t.Refresh
+		setPath(out, f.RefreshToken, t.Refresh)
+	} else {
+		deletePath(out, f.RefreshToken)
 	}
 	if t.AccountID != "" {
-		out[f.AccountID] = t.AccountID
+		setPath(out, f.AccountID, t.AccountID)
+	} else {
+		deletePath(out, f.AccountID)
 	}
-	if !t.ExpiresAt.IsZero() {
+	switch {
+	case t.style == expiryFromJWT:
+		// The expiry came out of the access token, which has just been written.
+		// Adding a field of its own would add a key to a file the vendor's CLI
+		// also reads, and the next reader would have two answers.
+	case t.ExpiresAt.IsZero():
+		deletePath(out, f.ExpiresAt)
+	default:
 		switch t.style {
 		case expiryUnixSeconds:
-			out[f.ExpiresAt] = t.ExpiresAt.Unix()
+			setPath(out, f.ExpiresAt, t.ExpiresAt.Unix())
 		case expiryUnixMillis:
-			out[f.ExpiresAt] = t.ExpiresAt.UnixMilli()
+			setPath(out, f.ExpiresAt, t.ExpiresAt.UnixMilli())
 		default:
-			out[f.ExpiresAt] = t.ExpiresAt.UTC().Format(time.RFC3339)
+			setPath(out, f.ExpiresAt, t.ExpiresAt.UTC().Format(time.RFC3339))
 		}
 	}
 	b, err := json.MarshalIndent(out, "", "  ")
@@ -337,6 +428,98 @@ func encodeToken(t Token, f TokenFields) ([]byte, error) {
 		return nil, fmt.Errorf("%w: cannot be re-encoded", ErrTokenStoreMalformed)
 	}
 	return append(b, '\n'), nil
+}
+
+// setPath writes a leaf at a dotted path, creating objects along the way and
+// converting a container that arrived as raw JSON into something writable.
+//
+// Every sibling of the leaf survives, at every level. That is the requirement:
+// the file belongs to the vendor's CLI, and a write that dropped a key it wrote
+// would break it in a way the operator would not attribute to a gateway
+// (DESIGN §11.2b).
+func setPath(out map[string]any, path string, v any) {
+	segs := strings.Split(path, ".")
+	cur := out
+	for _, s := range segs[:len(segs)-1] {
+		cur = childMap(cur, s)
+	}
+	cur[segs[len(segs)-1]] = v
+}
+
+// deletePath removes a leaf. It creates nothing: a path that is not there is
+// already in the state the caller wants.
+func deletePath(out map[string]any, path string) {
+	segs := strings.Split(path, ".")
+	cur := out
+	for _, s := range segs[:len(segs)-1] {
+		next, ok := existingMap(cur, s)
+		if !ok {
+			return
+		}
+		cur = next
+	}
+	delete(cur, segs[len(segs)-1])
+}
+
+// childMap returns key's object, materialising it if it is raw or absent.
+func childMap(m map[string]any, key string) map[string]any {
+	if c, ok := existingMap(m, key); ok {
+		return c
+	}
+	n := map[string]any{}
+	m[key] = n
+	return n
+}
+
+// existingMap returns key's object when there is one, converting a raw JSON
+// object in place so that later writes to it are seen.
+func existingMap(m map[string]any, key string) (map[string]any, bool) {
+	switch c := m[key].(type) {
+	case map[string]any:
+		return c, true
+	case json.RawMessage:
+		var next map[string]json.RawMessage
+		if err := json.Unmarshal(c, &next); err != nil {
+			return nil, false
+		}
+		conv := make(map[string]any, len(next))
+		for k, v := range next {
+			conv[k] = v
+		}
+		m[key] = conv
+		return conv, true
+	}
+	return nil, false
+}
+
+// jwtExpiry reads the `exp` claim of a JWT.
+//
+// The signature is NOT verified, and the function says so where it is used:
+// dorang is not the audience, holds no key, and is reading metadata about a
+// token it already has rather than deciding whether to trust one. Everything
+// that can go wrong returns "no expiry" — nothing about the token, well-formed
+// or not, becomes an error message, because an error message is exactly where a
+// token must never appear (§4.1).
+func jwtExpiry(s string) (time.Time, bool) {
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp json.Number `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return time.Time{}, false
+	}
+	n, err := strconv.ParseInt(string(claims.Exp), 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(n, 0).UTC(), true
 }
 
 // DefaultTokenFileMode is the mode a token store dorang creates is given. A
