@@ -116,12 +116,12 @@ func TestMaxTokensSpelling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `"max_completion_tokens":256`) {
+	if !strings.Contains(string(b), `"max_completion_tokens":256`) { // pragma: allowlist secret — test fixture
 		t.Fatalf("override ignored: %s", b)
 	}
 
 	// Both spellings are accepted inbound; the newer one wins.
-	got, err := DecodeRequest([]byte(`{"model":"m","messages":[],"max_tokens":1,"max_completion_tokens":2}`))
+	got, err := DecodeRequest([]byte(`{"model":"m","messages":[],"max_tokens":1,"max_completion_tokens":2}`)) // pragma: allowlist secret — test fixture
 	if err != nil {
 		t.Fatal(err)
 	}

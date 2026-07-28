@@ -8,6 +8,8 @@
 >
 > Read alongside DESIGN §10.1 (two kinds of loss), §10.5a (dorang does not compact),
 > §10.6 (generic passthrough engine), §10.7 (metadata equivalence), and COMPATIBILITY.
+>
+> 한국어: [EXTENSIONS.ko.md](EXTENSIONS.ko.md)
 
 ---
 

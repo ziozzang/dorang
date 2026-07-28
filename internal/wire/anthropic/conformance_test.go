@@ -189,7 +189,7 @@ func TestDerivedReasoningIsMarkedOnTheWayOut(t *testing.T) {
 // neutral form used to reconstruct the block WITHOUT its data.
 func TestRedactedThinkingPayloadSurvives(t *testing.T) {
 	const body = `{"model":"m","messages":[{"role":"assistant","content":[` +
-		`{"type":"redacted_thinking","data":"EroBCkYIAxgCKkBopaque"}]}],"max_tokens":16}`
+		`{"type":"redacted_thinking","data":"EroBCkYIAxgCKkBopaque"}]}],"max_tokens":16}` // pragma: allowlist secret — test fixture
 	req, err := DecodeRequest([]byte(body))
 	if err != nil {
 		t.Fatalf("DecodeRequest: %v", err)

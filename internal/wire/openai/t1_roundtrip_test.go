@@ -150,8 +150,8 @@ func TestT1ResponseCanonicalRoundTrips(t *testing.T) {
 			`"encrypted_content":"blob"},{"type":"message","role":"assistant",` +
 			`"content":[{"type":"output_text","text":"hi","annotations":[]}]},` +
 			`{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}],` +
-			`"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},` +
-			`"output_tokens":6,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":16}}`)
+			`"usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":4},` + // pragma: allowlist secret — test fixture
+			`"output_tokens":6,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":16}}`) // pragma: allowlist secret — test fixture
 		first, err := DecodeResponsesResponse(body, nil)
 		if err != nil {
 			t.Fatal(err)

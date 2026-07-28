@@ -169,16 +169,22 @@ type ModerationResponse struct {
 // backend's ordering survives the crossing. encoding/json would sort a real map
 // alphabetically and quietly reorder every response.
 type ModerationResult struct {
-	Flagged           bool                `json:"flagged"`
-	Categories        moderationFlags     `json:"categories"`
-	CategoryScores    moderationScores    `json:"category_scores"`
-	CategoryApplied   moderationApplied   `json:"category_applied_input_types,omitempty"`
+	Flagged           bool              `json:"flagged"`
+	Categories        moderationFlags   `json:"categories"`
+	CategoryScores    moderationScores  `json:"category_scores"`
+	CategoryApplied   moderationApplied `json:"category_applied_input_types,omitempty"`
 	categoriesBacking []canonical.ModerationCategory
 }
 
-type moderationFlags struct{ cats []canonical.ModerationCategory }
-type moderationScores struct{ cats []canonical.ModerationCategory }
-type moderationApplied struct{ cats []canonical.ModerationCategory }
+type moderationFlags struct {
+	cats []canonical.ModerationCategory
+}
+type moderationScores struct {
+	cats []canonical.ModerationCategory
+}
+type moderationApplied struct {
+	cats []canonical.ModerationCategory
+}
 
 // MarshalJSON implements [encoding/json.Marshaler].
 func (f moderationFlags) MarshalJSON() ([]byte, error) {

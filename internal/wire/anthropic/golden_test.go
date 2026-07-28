@@ -95,7 +95,7 @@ func TestFullStreamGolden(t *testing.T) {
 		"event: content_block_stop\n" +
 		`data: {"type":"content_block_stop","index":2}` + "\n\n" +
 		"event: message_delta\n" +
-		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":40,"output_tokens":25}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":40,"output_tokens":25}}` + "\n\n" + // pragma: allowlist secret — test fixture
 		"event: message_stop\n" +
 		`data: {"type":"message_stop"}` + "\n\n"
 
@@ -128,7 +128,7 @@ func TestStreamNoCacheOmitsCacheFields(t *testing.T) {
 	}})
 	_ = w.Close()
 
-	for _, key := range []string{"cache_read_input_tokens", "cache_creation_input_tokens"} {
+	for _, key := range []string{"cache_read_input_tokens", "cache_creation_input_tokens"} { // pragma: allowlist secret — test fixture
 		if strings.Contains(buf.String(), key) {
 			t.Errorf("%s present with a zero count; 6.7 says cache fields appear only when > 0", key)
 		}
@@ -229,7 +229,7 @@ func TestResponseGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MarshalResponse: %v", err)
 	}
-	const want = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":40,"output_tokens":25,"total_tokens":125}}`
+	const want = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-x","content":[{"type":"text","text":"Hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":40,"output_tokens":25,"total_tokens":125}}` // pragma: allowlist secret — test fixture
 	if string(got) != want {
 		t.Errorf("response mismatch\ngot:  %s\nwant: %s", got, want)
 	}

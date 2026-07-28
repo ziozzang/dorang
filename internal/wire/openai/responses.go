@@ -465,8 +465,12 @@ func ResponsesRequestToCanonical(w *ResponsesRequest) (*canonical.Request, error
 		Extra:              w.Extra,
 	}
 	if w.Instructions != nil {
+		// instructions IS the system prompt on this wire (DESIGN §10.7), so it
+		// decodes to System and needs no flag: every encoder that has an
+		// instructions field emits System into it, and every encoder that does
+		// not emits a system message. Recording which spelling arrived would be
+		// a field nothing reads.
 		out.System = canonical.Content{canonical.TextBlock(*w.Instructions)}
-		out.InstructionsForm = true
 	}
 	if w.Text != nil && w.Text.Format != nil {
 		f := w.Text.Format

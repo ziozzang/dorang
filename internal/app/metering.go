@@ -20,11 +20,22 @@ import (
 type meterAdapter struct {
 	m   *meter.Meter
 	now func() time.Time
+	// record feeds the same event into the Prometheus surface of DESIGN §12.3.
+	//
+	// It hangs off the meter adapter rather than off a second hook in
+	// internal/server because this is already the observation point: one place
+	// where a finished request is described in full, reached exactly once per
+	// request, after the client's last byte. A second hook would be a second
+	// chance to disagree with this one.
+	record func(*server.Event)
 }
 
 // Record implements server.Meter. It never blocks and never fails the request:
 // internal/meter's Record is a bounded, non-blocking enqueue.
 func (a *meterAdapter) Record(ev server.Event) {
+	if a.record != nil {
+		a.record(&ev)
+	}
 	r := &ev.Result
 	a.m.Record(meter.Event{
 		Time:         a.now(),

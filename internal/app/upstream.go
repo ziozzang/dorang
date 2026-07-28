@@ -83,10 +83,26 @@ func (t *upstreamTable) secret(credentialID string) string {
 // Endpoint suffixes, per wire adapter.
 const (
 	pathChatCompletions = "/chat/completions"
+	pathCompletions     = "/completions"
 	pathEmbeddings      = "/embeddings"
 	pathMessages        = "/messages"
 	pathCountTokens     = "/messages/count_tokens"
+	pathModerations     = "/moderations"
+	pathRerank          = "/rerank"
+	pathSpeech          = "/audio/speech"
+	pathTranscriptions  = "/audio/transcriptions"
+	pathTranslations    = "/audio/translations"
+	pathImageGenerate   = "/images/generations"
+	pathImageEdit       = "/images/edits"
+	pathImageVariation  = "/images/variations"
 )
+
+// cohereRerankPath is the vendor's own rerank endpoint.
+//
+// It is joined RAW rather than through [upstream.endpoint], because that helper
+// supplies "/v1" for a bare host and this route lives under /v2. Running it
+// through the helper produces /v1/v2/rerank, which 404s.
+const cohereRerankPath = "/v2/rerank"
 
 // endpoint joins a provider's base URL with the path for one operation.
 //
@@ -103,6 +119,16 @@ func (u *upstream) endpoint(suffix string) string {
 	}
 	if p, err := url.Parse(base); err == nil && (p.Path == "" || p.Path == "/") {
 		base += "/v1"
+	}
+	return base + suffix
+}
+
+// endpointRaw joins a suffix that carries its own version segment, so a bare
+// host gets nothing inserted.
+func (u *upstream) endpointRaw(suffix string) string {
+	base := trimBase(u.baseURL)
+	if strings.HasSuffix(base, suffix) {
+		return base
 	}
 	return base + suffix
 }

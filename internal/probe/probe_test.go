@@ -501,7 +501,7 @@ func TestOAuthTokenIsResolvedPerRead(t *testing.T) {
 	if len(seen) != 2 || seen[0] == seen[1] {
 		t.Fatalf("authorization headers = %v; the second read reused the first token", seen)
 	}
-	if seen[1] != "Bearer rotating-token-2" {
+	if seen[1] != "Bearer rotating-token-2" { // pragma: allowlist secret — test fixture
 		t.Errorf("second header = %q", seen[1])
 	}
 }

@@ -30,7 +30,7 @@ func TestRoundTripOpenAIChat(t *testing.T) {
 		"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}`)
 
 	p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
-	res := testBackend("sk-test").Do(context.Background(), target(p), chatCall(catalog.APIOpenAIChat), nil)
+	res := testBackend("sk-test").Do(context.Background(), target(p), chatCall(catalog.APIOpenAIChat), nil) // pragma: allowlist secret — test fixture
 	if res.Err != nil {
 		t.Fatalf("Do: %v", res.Err)
 	}
@@ -39,7 +39,7 @@ func TestRoundTripOpenAIChat(t *testing.T) {
 	if req.path != "/v1/chat/completions" {
 		t.Errorf("path = %q, want /v1/chat/completions", req.path)
 	}
-	if got := req.header.Get("Authorization"); got != "Bearer sk-test" {
+	if got := req.header.Get("Authorization"); got != "Bearer sk-test" { // pragma: allowlist secret — test fixture
 		t.Errorf("Authorization = %q", got)
 	}
 	if got := req.header.Get("Accept-Encoding"); got != "identity" {
@@ -63,7 +63,7 @@ func TestRoundTripAnthropicMessages(t *testing.T) {
 	f := newFakeUpstream(t)
 	f.answer(http.StatusOK, `{"id":"msg-1","type":"message","role":"assistant","model":"upstream-model",
 		"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
-		"usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":3}}`)
+		"usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":3}}`) // pragma: allowlist secret — test fixture
 
 	p := testProvider(t, f, "anthropic", catalog.APIAnthropicMessages)
 	res := testBackend("sk-ant").Do(context.Background(), target(p),
@@ -142,7 +142,7 @@ func TestCountTokensOnlyOnMessages(t *testing.T) {
 	if res.Err == nil || res.Err.Status != http.StatusNotImplemented {
 		t.Fatalf("want a 501, got %+v", res.Err)
 	}
-	if res.Err.Code != "count_tokens_unsupported" {
+	if res.Err.Code != "count_tokens_unsupported" { // pragma: allowlist secret — test fixture
 		t.Errorf("code = %q, want count_tokens_unsupported", res.Err.Code)
 	}
 }
@@ -185,8 +185,8 @@ func TestGeminiRoundTrip(t *testing.T) {
 	f := newFakeUpstream(t)
 	f.answer(http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[{"text":"hi there"}]},
 		"finishReason":"STOP","index":0}],
-		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,
-		"cachedContentTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":17},
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4, // pragma: allowlist secret — test fixture
+		"cachedContentTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":17}, // pragma: allowlist secret — test fixture
 		"modelVersion":"gemini-2.5-pro","responseId":"resp-1"}`)
 
 	p := testProvider(t, f, "google", catalog.APIGemini)
@@ -262,7 +262,7 @@ func TestGeminiToolCallRoundTrip(t *testing.T) {
 	f.answer(http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[
 		{"functionCall":{"name":"get_weather","args":{"city":"Seoul"}}}]},
 		"finishReason":"STOP","index":0}],
-		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}`)
+		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}`) // pragma: allowlist secret — test fixture
 
 	p := testProvider(t, f, "google", catalog.APIGemini)
 	c := chatCall(catalog.APIOpenAIChat)

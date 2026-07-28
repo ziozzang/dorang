@@ -33,7 +33,10 @@ import (
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/health"
+	"github.com/ziozzang/dorang/internal/luaext"
 	"github.com/ziozzang/dorang/internal/meter"
+	"github.com/ziozzang/dorang/internal/metrics"
+	"github.com/ziozzang/dorang/internal/notify"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
@@ -66,6 +69,14 @@ type Options struct {
 	// SkipMigrate opens the store without applying migrations.
 	SkipMigrate bool
 
+	// Extensions are Go-implemented hooks (DESIGN §11.5). They are the
+	// documented extension point for anything the policy language cannot say,
+	// and registering one is a compile-time act — so they run whether or not
+	// extensions.lua.enabled is set, while the policy *directory* is only read
+	// when it is. They see the same secret-free views and run under the same
+	// wall-clock watchdog and panic guard as a policy program.
+	Extensions []luaext.Native
+
 	// BudgetBlockNanoUSD is the lease size of the durable budget (DESIGN §9.6).
 	// Zero uses [DefaultBudgetBlockNanoUSD]. It trades store traffic against
 	// the maximum overshoot §5.6 requires to be publishable as a number.
@@ -92,14 +103,30 @@ type App struct {
 	// Shadow compares a sampled fraction of traffic against a reference gateway
 	// (DESIGN §14.1). Nil when shadow.mode is off, which is the default.
 	Shadow *shadow.Shadower
+	// Hooks are the §11.5 extension points. Nil when extensions.lua.enabled is
+	// false, which is the default, and a nil engine costs one branch per hook
+	// point on the request path.
+	Hooks *luaext.Engine
+	// Notify is the §11.5 notification pipeline. Nil for `driver: none`, which
+	// is the default.
+	Notify *notify.Notifier
+	// Metrics is the DESIGN §12.3 Prometheus surface. It pulls from every
+	// subsystem above rather than being pushed to by any of them, so nothing
+	// here imports internal/metrics except this package.
+	Metrics *metrics.Registry
 
 	opts     Options
 	cfg      atomic.Pointer[config.Config]
+	requests *metrics.Requests
 	dispatch *dispatcher
 	targets  *batchResolver
 	models   *modelList
 	quota    *quotaSet
 	budget   *budgetGate
+	// responses is the Responses API's server-side state (DESIGN §9.2
+	// [R1-C7]). Nil when no store is configured, which makes `store: true`
+	// answer a named 501 rather than silently not storing.
+	responses *responsesStore
 
 	logf func(string, ...any)
 	now  func() time.Time
@@ -205,7 +232,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, fmt.Errorf("app: budget ledger: %w", err)
 	}
 	a.Ledger = ledger
-	a.budget = &budgetGate{ledger: ledger, now: a.now}
+
+	// 3b. Extensions and notifications (DESIGN §11.5). Both are built before
+	//     the dispatcher because the dispatcher holds the one and the budget
+	//     gate holds the other, and both are nil by default — the disabled
+	//     state is the absence of the object, not a flag inside it.
+	if a.Hooks, err = buildHooks(cfg, opts.Extensions, a.logf, a.now); err != nil {
+		return nil, err
+	}
+	if a.Notify, err = buildNotifier(cfg, a.Hooks, a.logf, a.now); err != nil {
+		return nil, err
+	}
+	a.budget = &budgetGate{ledger: ledger, now: a.now, notify: a.Notify}
+	a.responses = newResponsesStore(a.Store, a.now)
 
 	// 4. Gate.
 	master := os.Getenv(cfg.Server.MasterKeyEnv)
@@ -271,6 +310,8 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		upstreams: up,
 		quota:     qs,
 		budget:    a.budget,
+		responses: a.responses,
+		hooks:     a.Hooks,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -289,12 +330,19 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 
+	// 7c. Metrics (DESIGN §12.3). It is built before the HTTP surface because
+	//     the surface serves it, and the surface's own collector is registered
+	//     immediately afterwards — that one edge is a cycle in construction
+	//     order, not in the package graph.
+	a.Metrics = a.buildMetrics(cfg)
+
 	// 8. HTTP surface.
 	srv, err := server.New(a.serverOptions(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("app: http server: %w", err)
 	}
 	a.Server = srv
+	a.Metrics.Register(metrics.NewServerCollector(srv))
 
 	a.startBackground()
 	return a, nil
@@ -309,13 +357,14 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		Auth:              &authAdapter{a: a.Auth, now: a.now},
 		Dispatcher:        a.dispatch,
 		Models:            a.models,
-		Meter:             &meterAdapter{m: a.Meter, now: a.now},
+		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics},
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.Catalog),
-		Routes:            a.batchRoutes(),
+		Routes:            a.extraRoutes(),
 		Observer:          shadowObserver(a.Shadow),
+		Metrics:           a.Metrics,
 		CaptureHeadBytes:  int(cfg.Shadow.Capture.HeadBytes.Bytes()),
 		CaptureTailBytes:  int(cfg.Shadow.Capture.TailBytes.Bytes()),
 		Now:               a.now,
@@ -379,6 +428,21 @@ func (a *App) Reload(cfg *config.Config) error {
 	if err := checkShadowUnchanged(a.cfg.Load(), cfg); err != nil {
 		return err
 	}
+	// §4.1 says every section hot-reloads, and extensions.lua does: a reload
+	// recompiles the policy directory and swaps the engine by pointer, so an
+	// in-flight request keeps the engine it started with. A syntax error in a
+	// policy file fails the reload rather than half-applying it, which is the
+	// same rule the rest of this function follows.
+	//
+	// The notifier is NOT rebuilt, for the reason the shadow section is not:
+	// its deduplication table is what makes budget_80pct one alert rather than
+	// one per request, and rebuilding it on every reload would rearm every
+	// suppressed alert — turning "once an hour" into "once per SIGHUP".
+	hooks, err := buildHooks(cfg, a.opts.Extensions, a.logf, a.now)
+	if err != nil {
+		return err
+	}
+	a.Hooks = hooks
 
 	a.dispatch.swap(&dispatchState{
 		router:    rt,
@@ -387,6 +451,8 @@ func (a *App) Reload(cfg *config.Config) error {
 		upstreams: up,
 		quota:     qs,
 		budget:    a.budget,
+		responses: a.responses,
+		hooks:     hooks,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
 	})
@@ -488,6 +554,15 @@ func (a *App) Close(ctx context.Context) error {
 			// The meter's Close drains to disk and makes one last flush
 			// attempt, so it runs before the store it flushes into closes.
 			if err := a.Meter.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if a.Notify != nil {
+			// Closed before the store and the meter: it holds no handle on
+			// either, and a mail server that does not answer must not extend
+			// their shutdown. Queued notifications are delivered inside ctx's
+			// grace period and dropped — counted — past it.
+			if err := a.Notify.Close(ctx); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

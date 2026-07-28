@@ -245,7 +245,7 @@ func TestCredentialAbsentFromEveryErrorPath(t *testing.T) {
 				// A backend that echoes the credential it was given, which is
 				// exactly what §10.6's fourth rule exists for.
 				f.answer(http.StatusUnauthorized,
-					`{"error":{"message":"bad key: `+plantedSecret+`","type":"authentication_error"}}`)
+					`{"error":{"message":"bad key: `+plantedSecret+`","type":"authentication_error"}}`) // pragma: allowlist secret — test fixture
 				p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
 				return testBackend(plantedSecret), target(p), chatCall(catalog.APIOpenAIChat)
 			},

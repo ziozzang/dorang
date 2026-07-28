@@ -1781,6 +1781,55 @@ Failing is the correct outcome in the third row. The caller learns the real limi
 information they did not have and cannot get elsewhere — and decides for themselves what to
 drop. That is a better outcome than a silently shortened conversation.
 
+### 10.5 Stream reconstruction is the normal case
+
+Several sections of this design have treated rewriting a stream as a reluctant exception —
+zero-copy "withdrawn", a promise that "loses", masking described as hard. That framing was
+wrong, and it was distorting decisions.
+
+**dorang is a transforming proxy. Reconstructing the stream is part of its job**, and it
+already has to for reasons that have nothing to do with any optional feature:
+
+| Rewrite | Why it is unavoidable |
+|---|---|
+| `model` in every chunk | §7.2 — the caller asked for an alias and must get it back |
+| tool names | COMPATIBILITY 5.3 — names over 64 characters are shortened, and the model's call must be matched back to the real name |
+| tool-call ids | cross-protocol ids are normalized in both directions (5.4) |
+| `finish_reason` | 4.1–4.4 — a native value is mapped, and a terminal chunk is *synthesized* when the backend never sent one |
+| block boundaries | §10.7 — one family has implicit boundaries and the other explicit, so crossing means synthesizing them |
+| usage fields | §10.7 — cache counts normalize to inclusive, or every cached request bills wrong |
+
+A gateway that only forwarded bytes could do none of that, and would be a worse gateway. So
+the constraint was never "do not rewrite". It is:
+
+1. **One pass, bounded memory.** Rewrites compose into a single scanner over the stream, not a
+   pipeline of decoders. Nothing buffers the body.
+2. **Bounded lookahead.** A rewrite that needs to see across a frame boundary holds a bounded
+   tail — and that bound is stated, because it is what makes a token longer than it
+   unrewritable.
+3. **Frames stay valid at every boundary.** A client parsing incrementally must never see a
+   partial frame or a broken escape. This is what makes rewriting *safe*, and it is the real
+   discipline the "byte-faithful" language was standing in for.
+4. **No added latency.** A rewrite may not hold a frame waiting for one that has not arrived,
+   except where the protocol itself already requires it — §10.7's held terminal event is that
+   case, and it is protocol-mandated rather than a rewriting artifact.
+
+Everything that transforms a stream is therefore **one rewriter with composed rules**, not a
+set of special cases each apologizing for itself: alias substitution, tool-name restoration,
+reasoning-field normalization, credential blacklisting (§10.5c), and PII unmasking (§10.5b)
+all run in the same pass over the same bytes.
+
+> **This unlocks something previously deferred.** Normalizing `reasoning` against
+> `reasoning_content` across the two self-hosted engines was left undone on the grounds that
+> "normalizing means decoding every frame" — but the pass already exists and already touches
+> those frames. The objection was to a cost that had already been paid. Same for SGLang's
+> top-level reasoning token count.
+
+The remaining honest limit is different and narrower: **dorang rewrites fields it understands
+and relays everything else untouched.** An unmodelled block type passes through opaquely
+(§10.7), because rewriting what you cannot parse is how a proxy corrupts data — and that, not
+byte-fidelity, is the line worth holding.
+
 ### 10.5b Transform filters — reversible masking, and why it is hard
 
 A filter sits between the canonical request and the backend, may rewrite the request, and may
@@ -1892,6 +1941,62 @@ service:
 The guard is not a budget. A budget is a *stated* ceiling the caller agreed to; the guard is a
 *statistical* judgement that might be wrong. They fail differently and are configured
 separately, and the guard's action is deliberately the reversible one.
+
+### 10.5c Credential blacklisting on the downstream path
+
+An upstream can put dorang's own credential into anything it returns. It happens by accident
+— an error message quoting the request, a debug page rendering headers, a validation error
+echoing the field it rejected — and once it happens the operator's provider key is in a
+response body headed for a caller who should never see it.
+
+A first fix scrubbed **the credential applied to this request**. That is not enough, and the
+reason generalizes: dorang holds *many* credentials, and nothing guarantees a backend can only
+echo the one it was given. A shared gateway in front of it, a mis-routed retry, a provider
+that logs across tenants, a copy-pasted config — any of these puts key B in a response served
+on credential A. So the rule is:
+
+> **Every credential the process holds is blacklisted from everything that leaves it.**
+
+Not the one in use — all of them. And not only response bodies: the same set is scrubbed from
+error envelopes, native error fields, trace excerpts, log lines, metric label values, audit
+rows, and shadow diff records. A credential's only legitimate destination is the upstream
+request it authenticates.
+
+#### Where it costs something, and the trade
+
+Scanning every response for a set of secrets is a multi-pattern search over the whole stream,
+which is real work on a path §15 spends care keeping cheap. Two things make it affordable:
+
+- **The credential set is small and changes rarely**, so the matcher is built once at
+  configuration load, not per request. A multi-pattern automaton is O(stream length) with a
+  small constant regardless of set size — the cost does not grow as an operator adds accounts.
+- **It is a scan, not a parse.** It runs in the same single pass §15.2's relay already makes
+  over the bytes, alongside the model rewrite.
+
+Scrubbing rewrites the response, which is unremarkable — §10.5 establishes that rewriting is
+the normal case, and this rule simply joins the others in the same single pass. It carries no
+extra pass and no extra buffering.
+
+#### Three things that make this correct rather than approximate
+
+1. **Streaming means matching across frame boundaries.** A credential can straddle two SSE
+   frames, so the scanner holds a bounded tail — the same mechanism §10.5b needs for
+   placeholders, and the same bound applies: a secret longer than the tail cannot be
+   reassembled, which is a stated limit rather than a silent one.
+2. **A match is an incident, not a nuisance.** Redaction is the mitigation; the *finding* is
+   that an upstream echoed a credential, and that is worth an alert (§11.5), a counter, and a
+   named credential — because it means either that backend logs keys or something is
+   misconfigured, and both outrank the individual response.
+3. **The blacklist is derived, never configured.** It is the set of live credentials plus any
+   secret still inside a rotation grace period (§11.2c) — a rotated-away key is exactly the one
+   most likely to surface in a cached error page, and it is still a secret.
+
+#### What this is not
+
+It is not a general secret scanner, and it must not become one. Matching *shapes* — anything
+resembling a key — would rewrite legitimate model output, and a caller asking a model to
+explain an API key format would get mangled text with no explanation. dorang blacklists
+**exact values it holds**, which it can be certain about, and leaves everything else alone.
 
 ### 10.6 Generic passthrough engine
 
@@ -2376,7 +2481,25 @@ request completes
 ### 12.2 Tracing
 
 Per request: trace id, span ids, and a latency breakdown — queue, route, capacity wait,
-upstream connect, TTFT, total. OTLP export is optional; the breakdown is always recorded.
+upstream connect, TTFT, total.
+
+**Throughput is derived, not stored.** The ledger keeps `ttft_ms`, `latency_ms` and the output
+token count, and generation rate follows from them:
+
+```
+tokens_per_second = tokens_output ÷ (latency_ms − ttft_ms)
+```
+
+TTFT is subtracted deliberately: it is queueing and prefill, not generation, and including it
+makes a backend with a deep queue look like a slow generator (§7.5a). Storing the quotient as
+well would be a fourth number that can disagree with the three it comes from — the derivation
+is exact, so the columns are the record and the rate is a view over them.
+
+The same three numbers feed §7.5a's routing signals through a smoothed average, and are
+exposed per deployment as `dorang_deployment_tokens_per_second` and `dorang_ttft_seconds`.
+Routing wants the smoothed value because one slow request should not move a decision; an
+operator asking "what did this key actually get" wants the exact per-request figures. Both
+come from the same measurement taken once, at the first byte. OTLP export is optional; the breakdown is always recorded.
 
 Message content defaults to a truncated excerpt (512 characters) in `request_traces`,
 subject to sampling and a daily byte budget. `none` and `hash` are also available.
@@ -2616,7 +2739,8 @@ formatted string construction. Full-body buffering beyond the replay budget.
 ```
 cmd/dorang · cmd/dorangctl
 internal/{server,canonical,wire/<family>,router,capacity,prefix,health,quota,
-          pricing,meter,store,auth,admin,batch,cluster,config,luaext,passthrough}
+          pricing,meter,store,auth,admin,batch,cluster,config,luaext,notify,
+          passthrough}
 pkg/catalog          provider defaults, model catalog, base pricing
 ui/                  embedded admin SPA
 deploy/              compose for tests, Dockerfile, examples

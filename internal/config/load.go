@@ -98,4 +98,12 @@ func (c *Config) resolveSecrets(col *collector) {
 		}
 		c.KeyRotation.Providers[name] = kp // the map holds a copy of the struct
 	}
+	// The SMTP password is a secret like any other: it lives in the
+	// environment, a file or a vault reference, never in the file (§4.1).
+	if c.Notifications.Email.SMTP.Password.sources() == 1 {
+		c.Notifications.Email.SMTP.Password.resolve(env, "notifications.email.smtp", col)
+	}
+	if c.Notifications.Email.HTTP.Secret.sources() == 1 {
+		c.Notifications.Email.HTTP.Secret.resolve(env, "notifications.email.http", col)
+	}
 }

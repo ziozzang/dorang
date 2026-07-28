@@ -115,10 +115,11 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 		// asked for, rather than the backend's label: a self-hosted engine
 		// routinely answers application/octet-stream and a browser handed that
 		// plays nothing.
-		return &decoded{
-			raw:   body,
-			ctype: openai.SpeechMediaType(c.Speech.Format),
-		}, nil
+		format := ""
+		if c.Speech != nil {
+			format = c.Speech.Format
+		}
+		return &decoded{raw: body, ctype: openai.SpeechMediaType(format)}, nil
 
 	case OpTranscription, OpTranslation:
 		cresp, err := openai.DecodeTranscriptionResponse(body, x.respType)

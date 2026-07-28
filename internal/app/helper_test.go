@@ -12,7 +12,7 @@ import (
 // testPepper is the HMAC pepper every test in this package hashes under. The
 // adapters here join two packages that must agree on it, so it is one constant
 // rather than a literal repeated per test.
-const testPepper = "app-test-pepper-not-a-real-secret"
+const testPepper = "app-test-pepper-not-a-real-secret" // pragma: allowlist secret — test fixture
 
 // openTestStore opens a migrated SQLite store in a temporary directory.
 //

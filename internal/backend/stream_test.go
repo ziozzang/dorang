@@ -232,7 +232,7 @@ func TestGeminiStream(t *testing.T) {
 			`"parts":[{"text":"he"}]},"index":0}],"responseId":"r1"}`+"\n\n")
 		_, _ = io.WriteString(w, `data: {"candidates":[{"content":{"role":"model",`+
 			`"parts":[{"text":"llo"}]},"finishReason":"STOP","index":0}],`+
-			`"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6}}`+"\n\n")
+			`"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":6}}`+"\n\n") // pragma: allowlist secret — test fixture
 	})
 
 	p := testProvider(t, f, "google", catalog.APIGemini)

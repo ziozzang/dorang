@@ -100,7 +100,7 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", res.StatusCode)
 	}
-	if sawAuth != "Bearer secret-b" {
+	if sawAuth != "Bearer secret-b" { // pragma: allowlist secret — test fixture
 		t.Errorf("the row was dispatched with %q, want the reserved credential's "+
 			"secret %q — the reservation holds slots on cred-b's axes",
 			sawAuth, "Bearer secret-b")

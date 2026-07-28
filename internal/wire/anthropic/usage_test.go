@@ -56,7 +56,7 @@ func TestUsageInclusiveExclusiveAcrossFamilies(t *testing.T) {
 	const body = `{"id":"c1","object":"chat.completion","created":1,"model":"m",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],` +
 		`"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,` +
-		`"prompt_tokens_details":{"cached_tokens":800},"cache_creation_input_tokens":150}}`
+		`"prompt_tokens_details":{"cached_tokens":800},"cache_creation_input_tokens":150}}` // pragma: allowlist secret — test fixture
 
 	resp, err := openai.DecodeResponse([]byte(body), nil)
 	if err != nil {
@@ -123,7 +123,7 @@ func TestStreamingUsageAccounting(t *testing.T) {
 		frame(EventContentBlockStart, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`),
 		frame(EventContentBlockDelta, `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`),
 		frame(EventContentBlockStop, `{"type":"content_block_stop","index":0}`),
-		frame(EventMessageDelta, `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"cache_creation_input_tokens":150,"cache_read_input_tokens":800,"output_tokens":20}}`),
+		frame(EventMessageDelta, `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"cache_creation_input_tokens":150,"cache_read_input_tokens":800,"output_tokens":20}}`), // pragma: allowlist secret — test fixture
 		frame(EventMessageStop, `{"type":"message_stop"}`),
 	)
 	events, err := DecodeStream(stream, nil)

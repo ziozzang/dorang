@@ -92,7 +92,7 @@ func TestUnsafeRequestsAreNotSentAndAreCounted(t *testing.T) {
 	if !strings.Contains(string(s.Metrics(nil)), "dorang_shadow_skipped_unsafe_total 1") {
 		t.Error("the skipped count is not on the metrics endpoint")
 	}
-	if !strings.Contains(string(s.Health(nil)), `"skipped_unsafe":1`) {
+	if !strings.Contains(string(s.Health(nil)), `"skipped_unsafe":1`) { // pragma: allowlist secret — test fixture
 		t.Error("the skipped count is not in the health body, next to the verdict")
 	}
 }

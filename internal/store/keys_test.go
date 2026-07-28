@@ -200,14 +200,14 @@ func TestExpiredAndBlockedKeysDoNotAuthenticate(t *testing.T) {
 }
 
 func TestDorangV1NeedsAPepper(t *testing.T) {
-	if _, err := HashDorangV1(nil, "sk-x"); !errors.Is(err, ErrNoPepper) { // pragma: allowlist secret — test fixture
+	if _, err := HashDorangV1(nil, "sk-x"); !errors.Is(err, ErrNoPepper) {
 		t.Fatalf("got %v, want ErrNoPepper", err)
 	}
 	for _, b := range backends {
 		t.Run(b.name, func(t *testing.T) {
 			s := openStore(t, b, b.env(t), func(c *Config) { c.Pepper = nil })
 			k := &APIKey{ID: "k1"}
-			if err := s.NewAPIKeyFromToken("sk-x", k); !errors.Is(err, ErrNoPepper) { // pragma: allowlist secret — test fixture
+			if err := s.NewAPIKeyFromToken("sk-x", k); !errors.Is(err, ErrNoPepper) {
 				t.Fatalf("got %v, want ErrNoPepper", err)
 			}
 		})

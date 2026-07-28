@@ -118,8 +118,8 @@ func TestResponsesResponseGolden(t *testing.T) {
 		`"status":"completed","error":null,"incomplete_details":null,` +
 		`"model":"upstream-id","output":[{"type":"message","id":"msg_1","status":"completed",` +
 		`"role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}],` +
-		`"usage":{"input_tokens":36,"input_tokens_details":{"cached_tokens":30},` +
-		`"output_tokens":87,"output_tokens_details":{"reasoning_tokens":40},"total_tokens":123}}`)
+		`"usage":{"input_tokens":36,"input_tokens_details":{"cached_tokens":30},` + // pragma: allowlist secret — test fixture
+		`"output_tokens":87,"output_tokens_details":{"reasoning_tokens":40},"total_tokens":123}}`) // pragma: allowlist secret — test fixture
 	resp, err := DecodeResponsesResponse(upstream, &DecodeOptions{Model: "qwen3.5:397b"})
 	if err != nil {
 		t.Fatal(err)
@@ -154,8 +154,8 @@ func TestResponsesResponseGolden(t *testing.T) {
 		`"model":"qwen3.5:397b","output":[{"type":"message","status":"completed","role":"assistant",` +
 		`"content":[{"type":"output_text","text":"hi","annotations":[]}]}],` +
 		`"previous_response_id":null,"store":true,"temperature":null,"tools":[],"top_p":null,` +
-		`"usage":{"input_tokens":36,"input_tokens_details":{"cached_tokens":30},"output_tokens":87,` +
-		`"output_tokens_details":{"reasoning_tokens":40},"total_tokens":123}}`
+		`"usage":{"input_tokens":36,"input_tokens_details":{"cached_tokens":30},"output_tokens":87,` + // pragma: allowlist secret — test fixture
+		`"output_tokens_details":{"reasoning_tokens":40},"total_tokens":123}}` // pragma: allowlist secret — test fixture
 	if string(got) != want {
 		t.Fatalf("response bytes\n got: %s\nwant: %s", got, want)
 	}

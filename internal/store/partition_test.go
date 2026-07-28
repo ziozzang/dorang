@@ -244,7 +244,7 @@ func TestListPartitionsRejectsUnknownTables(t *testing.T) {
 }
 
 func TestValidIdent(t *testing.T) {
-	good := []string{"LiteLLM_VerificationToken", "a", "t1", "_x"}
+	good := []string{"LiteLLM_VerificationToken", "a", "t1", "_x"} // pragma: allowlist secret — test fixture
 	bad := []string{"", "1t", "a b", `a"b`, "a;drop", "a-b", strings.Repeat("x", 64)}
 	for _, s := range good {
 		if !validIdent(s) {

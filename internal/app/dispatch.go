@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/luaext"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
@@ -54,6 +55,15 @@ type dispatchState struct {
 	// budget is the durable spend gate (DESIGN §6.4, §9.6). Nil leaves budgets
 	// unenforced, which is only the case when no store is configured.
 	budget *budgetGate
+	// responses is the Responses API's server-side state (DESIGN §9.2
+	// [R1-C7]). Nil when no store is configured, which makes `store: true`
+	// answer a named 501 rather than silently not storing.
+	responses *responsesStore
+
+	// hooks are the §11.5 extension points. Nil is the disabled engine and
+	// every call through it is one branch, which is what makes "disabled by
+	// default on the hot path" true rather than aspirational.
+	hooks *luaext.Engine
 
 	prefixOn bool
 	chunk    int
@@ -67,6 +77,11 @@ func (d *dispatcher) swap(st *dispatchState) { d.st.Store(st) }
 func (d *dispatcher) state() *dispatchState  { return d.st.Load() }
 
 // call is one client request, decoded once and reused across fail-back hops.
+//
+// Exactly one of the typed request pointers is set, selected by kind. They are
+// separate fields rather than an `any` because every consumer switches on kind
+// already, and a type assertion would add a second, independent way for the two
+// to disagree.
 type call struct {
 	kind      callKind
 	clientAPI catalog.API
@@ -76,6 +91,22 @@ type call struct {
 	rreq      router.Request
 	stream    bool
 	allowUsg  bool
+
+	rerankReq *canonical.RerankRequest
+	modReq    *canonical.ModerationRequest
+	speechReq *canonical.SpeechRequest
+	transReq  *canonical.TranscriptionRequest
+	imageReq  *canonical.ImageRequest
+
+	// respEcho carries the Responses-API request fields that surface echoes
+	// back on its answer. They belong to the request, so regenerating them from
+	// dorang's defaults would tell the client dorang changed settings it never
+	// touched.
+	respEcho *openai.ResponsesOptions
+	// responseID is dorang's own id for a stored Responses exchange. dorang owns
+	// the state (DESIGN §9.2 [R1-C7]), so it owns the id: an upstream id would
+	// be meaningless to the store and would change on a fail-back hop.
+	responseID string
 }
 
 type callKind uint8
@@ -84,7 +115,53 @@ const (
 	callChat callKind = iota
 	callCountTokens
 	callEmbeddings
+
+	// The T1 surface of COMPATIBILITY §0.
+	callCompletions
+	callResponses
+	callModerations
+	callRerank
+	callSpeech
+	callTranscription
+	callImages
 )
+
+// callKindNames is the label set, a table rather than a switch so that a new
+// kind without a name is a compile-time hole rather than a silent "chat".
+var callKindNames = [...]string{
+	callChat:          "chat",
+	callCountTokens:   "count_tokens",
+	callEmbeddings:    "embeddings",
+	callCompletions:   "completions",
+	callResponses:     "responses",
+	callModerations:   "moderations",
+	callRerank:        "rerank",
+	callSpeech:        "audio.speech",
+	callTranscription: "audio.transcription",
+	callImages:        "images",
+}
+
+// String names the kind for a human-readable message.
+func (k callKind) String() string {
+	if int(k) < len(callKindNames) && callKindNames[k] != "" {
+		return callKindNames[k]
+	}
+	return "chat"
+}
+
+// code is the kind's stem in a machine-readable error code. It is the name with
+// the dot replaced, because a code is matched by application code and a '.' in
+// one reads as a namespace separator that dorang does not have.
+func (k callKind) code() string {
+	name := k.String()
+	out := []byte(name)
+	for i := range out {
+		if out[i] == '.' {
+			out[i] = '_'
+		}
+	}
+	return string(out)
+}
 
 // Dispatch implements server.Dispatcher.
 func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.ResponseWriter) error {
@@ -98,6 +175,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 		return err
 	}
 
+	// on_request (DESIGN §11.5). The Enabled test is the whole cost when hooks
+	// are off; the view is built only when one is registered. A hook that fails
+	// any of its ceilings returns the zero decision, which permits — fail-open
+	// — and only a hook that ran to completion can refuse.
+	if st.hooks.Enabled(luaext.HookRequest) {
+		v := requestView(rq, c)
+		if hd := st.hooks.OnRequest(ctx, &v); hd.Denied {
+			return hookDenied(&hd)
+		}
+	}
+
 	var lastErr error
 	for {
 		dec, rerr := st.router.Route(ctx, c.rreq)
@@ -109,6 +197,22 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 				return lastErr
 			}
 			return routeError(rerr)
+		}
+		// on_route (DESIGN §11.5). It sees the decision and may refuse it. It
+		// cannot ask for a different one — see luaext.RouteDecision — so a
+		// refusal is terminal.
+		//
+		// The reservation is released directly rather than through
+		// Router.Report, because nothing happened upstream: Report would either
+		// record a success the deployment never served, resetting its failure
+		// counter, or a failure it never caused, opening its circuit.
+		if st.hooks.Enabled(luaext.HookRoute) {
+			rv := routeView(rq, c, dec)
+			if rd := st.hooks.OnRoute(ctx, &rv); rd.Denied {
+				dec.Reservation.Release()
+				return server.NewError(http.StatusForbidden, server.TypePermission, rd.Reason).
+					WithCode(rd.Code)
+			}
 		}
 		// The budget is held before the request goes upstream and released the
 		// moment it is clear no money was spent (DESIGN §6.4, R1-20). It is
@@ -138,8 +242,23 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 			// The estimate was an upper bound, so settlement only ever releases
 			// budget — which is why settling after the answer is safe.
 			hold.settle(rq.Result.CostNanoUSD)
+			// on_response (DESIGN §11.5). It runs after pricing so the cost is
+			// in the view, and before the body is written so its wall-clock
+			// ceiling is a bound the caller can see rather than one nobody
+			// waits for. It observes; there is nothing left to refuse.
+			if st.hooks.Enabled(luaext.HookResponse) {
+				pv := responseView(rq, dec, &res, http.StatusOK)
+				st.hooks.OnResponse(ctx, &pv)
+			}
 			if res.body != nil {
-				return writeBody(w, res.body)
+				// The Responses API's server-side state is written here, after
+				// the answer is complete and before it goes out: a stored
+				// response the client never received is a reference it can
+				// resolve to a turn it never saw.
+				if err := d.storeResponse(ctx, st, c, rq, res.body); err != nil {
+					return err
+				}
+				return writeBody(w, res.body, res.contentType)
 			}
 			return nil
 		}
@@ -191,8 +310,16 @@ func (d *dispatcher) decode(st *dispatchState, rq *server.Request) (*call, error
 		// families — and it is refused explicitly below rather than mangled.
 		c.kind, c.clientAPI = callEmbeddings, catalog.APIOpenAIChat
 	default:
-		return nil, server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
-			"this route has no dispatcher in this build").WithCode("route_not_implemented")
+		if err := d.decodeT1(st, rq, c); err != nil {
+			return nil, err
+		}
+	}
+
+	// The model-in-the-path aliases resolved the model from the URL, and the
+	// gate authorized THAT name. The neutral request has to carry the same one,
+	// or the request is dispatched under a name the allow-list never saw.
+	if c.creq != nil && rq.Model != "" {
+		c.creq.Model = rq.Model
 	}
 
 	c.rreq = router.Request{
@@ -228,6 +355,11 @@ type result struct {
 	// body is the converted non-streaming answer, held rather than written so
 	// that pricing lands on the request before the headers are stamped.
 	body []byte
+	// contentType labels body. It is not always application/json: speech
+	// answers audio and a transcription asked for in srt or vtt answers text,
+	// and mislabelling either gives the client something it cannot play or
+	// parse.
+	contentType string
 }
 
 // attempt makes one upstream call and relays its answer.
@@ -244,29 +376,27 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		res.outcome = router.Outcome{Err: res.err, Cause: router.CauseUpstream5xx}
 		return res
 	}
-	if c.kind == callEmbeddings && up.api != catalog.APIOpenAIChat {
-		res.err = server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
-			"embeddings cannot cross protocol families and this deployment speaks "+string(up.api)).
-			WithCode("embeddings_family_mismatch")
-		res.outcome = router.Outcome{Err: res.err}
+	if err := checkFamily(c, up.api); err != nil {
+		res.err = err
+		res.outcome = router.Outcome{Err: err}
 		return res
 	}
 
-	payload, endpoint, err := d.encodeUpstream(c, dec, up)
+	call, err := d.encodeUpstream(c, dec, up)
 	if err != nil {
 		res.err = err
 		res.outcome = router.Outcome{Err: err}
 		return res
 	}
 
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, call.endpoint, bytes.NewReader(call.body))
 	if err != nil {
 		res.err = server.NewError(http.StatusBadGateway, server.TypeAPIError, err.Error()).
 			WithCode("upstream_request")
 		res.outcome = router.Outcome{Err: res.err, Cause: router.CauseUpstream5xx}
 		return res
 	}
-	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Content-Type", call.contentType)
 	// Identity encoding, always: a compressed stream cannot be relayed frame by
 	// frame and the terminal usage frame has to be readable (see openai.Scanner).
 	hreq.Header.Set("Accept-Encoding", "identity")
@@ -338,7 +468,7 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		res.retryable = true
 		return res
 	}
-	out, usage, err := d.convertResponse(c, dec, up, body)
+	out, ct, usage, err := d.convertResponse(c, dec, up, body, resp.Header)
 	res.total = d.now().Sub(start)
 	if err != nil {
 		res.err = err
@@ -347,6 +477,7 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 	}
 	res.usage = usage
 	res.body = out
+	res.contentType = ct
 	res.outcome = router.Outcome{
 		TTFT: res.ttft, Total: res.total,
 		InputTokens: int64(usage.InputTokens), OutputTokens: int64(usage.OutputTokens),
@@ -355,29 +486,44 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 }
 
 // writeBody sends a complete non-streaming answer.
-func writeBody(w http.ResponseWriter, body []byte) error {
+func writeBody(w http.ResponseWriter, body []byte, contentType string) error {
+	if contentType == "" {
+		contentType = "application/json"
+	}
 	h := w.Header()
-	h.Set("Content-Type", "application/json")
+	h.Set("Content-Type", contentType)
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	_, err := w.Write(body)
 	return err
 }
 
+// upstreamRequest is one rendered upstream call.
+type upstreamRequest struct {
+	body        []byte
+	endpoint    string
+	contentType string
+}
+
+func jsonUpstream(body []byte, endpoint string) upstreamRequest {
+	return upstreamRequest{body: body, endpoint: endpoint, contentType: "application/json"}
+}
+
 // encodeUpstream renders the request for the deployment that will serve it and
 // names the endpoint it goes to.
-func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream) ([]byte, string, error) {
+func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream) (upstreamRequest, error) {
 	switch c.kind {
 	case callEmbeddings:
 		body, err := replaceModel(c.body, dec.UpstreamModel)
 		if err != nil {
-			return nil, "", server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-				err.Error()).WithCode("invalid_request")
+			return upstreamRequest{}, server.NewError(http.StatusBadRequest,
+				server.TypeInvalidRequest, err.Error()).WithCode("invalid_request")
 		}
-		return body, up.endpoint(pathEmbeddings), nil
+		return jsonUpstream(body, up.endpoint(pathEmbeddings)), nil
 
 	case callCountTokens:
 		if up.api != catalog.APIAnthropicMessages {
-			return nil, "", server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
+			return upstreamRequest{}, server.NewError(http.StatusNotImplemented,
+				server.TypeNotImplemented,
 				"count_tokens has no equivalent on this deployment's protocol").
 				WithCode("count_tokens_unsupported")
 		}
@@ -386,9 +532,12 @@ func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream)
 			DefaultMaxTokens: 1,
 		})
 		if err != nil {
-			return nil, "", encodeError(err)
+			return upstreamRequest{}, encodeError(err)
 		}
-		return body, up.endpoint(pathCountTokens), nil
+		return jsonUpstream(body, up.endpoint(pathCountTokens)), nil
+
+	case callRerank, callModerations, callSpeech, callTranscription, callImages:
+		return d.encodeT1Upstream(c, dec, up)
 	}
 
 	req := *c.creq
@@ -409,15 +558,32 @@ func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream)
 			DefaultMaxTokens: d.defaultMaxTokens(dec),
 		})
 		if err != nil {
-			return nil, "", encodeError(err)
+			return upstreamRequest{}, encodeError(err)
 		}
-		return body, up.endpoint(pathMessages), nil
+		return jsonUpstream(body, up.endpoint(pathMessages)), nil
+
 	default:
+		// The openai-responses KIND is served on the chat route deliberately.
+		// internal/wire/openai has a Responses request/response encoder but no
+		// Responses STREAM decoder — that surface's events are a typed sequence
+		// with nothing in common with a chat chunk — so sending this kind to
+		// /v1/responses would trade a working streaming deployment for a
+		// non-streaming one. DESIGN §4.3 records that the hosts declaring the
+		// kind serve BOTH routes, so the chat route is a correct address for
+		// them. dorang's own /v1/responses FRONTEND is unaffected: it decodes to
+		// the neutral form and reaches whatever the deployment speaks.
+		if c.kind == callCompletions {
+			body, err := openai.MarshalCompletionRequest(&req, &openai.EncodeOptions{Model: dec.UpstreamModel})
+			if err != nil {
+				return upstreamRequest{}, encodeError(err)
+			}
+			return jsonUpstream(body, up.endpoint(pathCompletions)), nil
+		}
 		body, err := openai.MarshalRequest(&req, &openai.EncodeOptions{Model: dec.UpstreamModel})
 		if err != nil {
-			return nil, "", encodeError(err)
+			return upstreamRequest{}, encodeError(err)
 		}
-		return body, up.endpoint(pathChatCompletions), nil
+		return jsonUpstream(body, up.endpoint(pathChatCompletions)), nil
 	}
 }
 
@@ -427,22 +593,27 @@ func (d *dispatcher) encodeUpstream(c *call, dec *router.Decision, up *upstream)
 // copied: §7.2 requires the body to carry the name the client asked for, and the
 // name is not the only place the two differ once a deployment's upstream model
 // id is not the client's.
-func (d *dispatcher) convertResponse(c *call, dec *router.Decision, up *upstream, body []byte) ([]byte, canonical.Usage, error) {
+func (d *dispatcher) convertResponse(c *call, dec *router.Decision, up *upstream,
+	body []byte, header http.Header) ([]byte, string, canonical.Usage, error) {
+
 	switch c.kind {
 	case callEmbeddings:
 		out, err := replaceModel(body, c.model)
 		if err != nil {
-			return nil, canonical.Usage{}, server.NewError(http.StatusBadGateway,
+			return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway,
 				server.TypeAPIError, "the upstream answer was not a JSON object").
 				WithCode("upstream_shape")
 		}
 		u, _ := scanEmbeddingUsage(body)
-		return out, u, nil
+		return out, jsonContentType, u, nil
 
 	case callCountTokens:
 		// The count is the whole answer; there is nothing to convert and no
 		// usage to price beyond the request itself.
-		return body, canonical.Usage{}, nil
+		return body, jsonContentType, canonical.Usage{}, nil
+
+	case callRerank, callModerations, callSpeech, callTranscription, callImages:
+		return d.convertT1Response(c, up, body, header)
 	}
 
 	var (
@@ -453,10 +624,14 @@ func (d *dispatcher) convertResponse(c *call, dec *router.Decision, up *upstream
 	case catalog.APIAnthropicMessages:
 		cresp, err = anthropic.DecodeResponse(body, &anthropic.DecodeOptions{Model: c.model})
 	default:
-		cresp, err = openai.DecodeResponse(body, &openai.DecodeOptions{Model: c.model})
+		if c.kind == callCompletions {
+			cresp, err = openai.DecodeCompletionResponse(body, &openai.DecodeOptions{Model: c.model})
+		} else {
+			cresp, err = openai.DecodeResponse(body, &openai.DecodeOptions{Model: c.model})
+		}
 	}
 	if err != nil {
-		return nil, canonical.Usage{}, server.NewError(http.StatusBadGateway, server.TypeAPIError,
+		return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not read the upstream response: "+err.Error()).WithCode("upstream_decode")
 	}
 	var usage canonical.Usage
@@ -465,18 +640,29 @@ func (d *dispatcher) convertResponse(c *call, dec *router.Decision, up *upstream
 	}
 
 	var out []byte
-	switch c.clientAPI {
-	case catalog.APIAnthropicMessages:
+	switch {
+	case c.kind == callCompletions:
+		out, err = openai.MarshalCompletionResponse(cresp, &openai.ResponseOptions{Model: c.model})
+	case c.kind == callResponses:
+		if c.responseID != "" {
+			cresp.ID = c.responseID
+		}
+		out, err = openai.MarshalResponsesResponse(cresp, c.respEcho)
+	case c.clientAPI == catalog.APIAnthropicMessages:
 		out, err = anthropic.MarshalResponse(cresp, &anthropic.ResponseOptions{Model: c.model})
 	default:
 		out, err = openai.MarshalResponse(cresp, &openai.ResponseOptions{Model: c.model})
 	}
 	if err != nil {
-		return nil, usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
+		return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not render the response: "+err.Error()).WithCode("response_encode")
 	}
-	return out, usage, nil
+	return out, jsonContentType, usage, nil
 }
+
+// jsonContentType is the answer of every route whose body is JSON, which is all
+// of them but speech and a subtitle-formatted transcript.
+const jsonContentType = "application/json"
 
 // relayStream forwards an event stream to the client.
 //
@@ -586,6 +772,11 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	}
 	if !cost.NotionalMissing {
 		rq.Result.NotionalNanoUSD = cost.NotionalNano
+		// §8.5 rule 5: missing is reported, never zero. Without this flag the
+		// meter cannot tell a subscription with no notional_rate rule from one
+		// whose list-rate equivalent genuinely came to nothing, and the first
+		// of those makes the plan look infinitely efficient.
+		rq.Result.NotionalPriced = true
 	}
 
 	st.quota.record(dec.Credential, now, quota.Usage{
@@ -599,6 +790,9 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 // fillRouteResult stamps the routing decision onto the request before the first
 // byte goes out.
 func fillRouteResult(rq *server.Request, dec *router.Decision) {
+	// The deployment still on the Result is the one the previous attempt used,
+	// which is the only moment it is knowable — one line later it is gone.
+	prev := rq.Result.Deployment
 	rq.Result.Provider = dec.Provider
 	rq.Result.Credential = dec.Credential
 	rq.Result.Deployment = dec.Deployment
@@ -607,6 +801,7 @@ func fillRouteResult(rq *server.Request, dec *router.Decision) {
 	rq.Result.RouteReason = dec.Reason
 	if dec.Attempt > 1 {
 		rq.Result.FallbackFrom = dec.Reason
+		rq.Result.FallbackFromDeployment = prev
 	}
 	if names := dec.Dropped.Params(); len(names) > 0 {
 		rq.Result.DroppedParams = strings.Join(names, ",")

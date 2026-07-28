@@ -424,7 +424,7 @@ func TestResponseDecodeIsTheBackendDirection(t *testing.T) {
 		`{"type":"text","text":"here"},` +
 		`{"type":"tool_use","id":"toolu_1","name":"f","input":{"a":1}}],` +
 		`"stop_reason":"refusal","stop_sequence":null,` +
-		`"usage":{"input_tokens":50,"cache_creation_input_tokens":150,"cache_read_input_tokens":800,"output_tokens":20}}`
+		`"usage":{"input_tokens":50,"cache_creation_input_tokens":150,"cache_read_input_tokens":800,"output_tokens":20}}` // pragma: allowlist secret — test fixture
 
 	got, err := DecodeResponse([]byte(body), nil)
 	if err != nil {

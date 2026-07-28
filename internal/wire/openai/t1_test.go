@@ -332,7 +332,7 @@ func TestImageResponseGolden(t *testing.T) {
 	upstream := []byte(`{"created":1753660800,"data":[{"b64_json":"AAA","revised_prompt":"a cat, sitting"}],` +
 		`"size":"1024x1024","output_format":"png",` +
 		`"usage":{"input_tokens":9,"output_tokens":1500,"total_tokens":1509,` +
-		`"input_tokens_details":{"text_tokens":9,"image_tokens":0}}}`)
+		`"input_tokens_details":{"text_tokens":9,"image_tokens":0}}}`) // pragma: allowlist secret — test fixture
 	resp, err := DecodeImageResponse(upstream)
 	if err != nil {
 		t.Fatal(err)

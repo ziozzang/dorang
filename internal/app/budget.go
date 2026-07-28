@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/cluster"
+	"github.com/ziozzang/dorang/internal/notify"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
@@ -67,7 +69,21 @@ const budgetSubjectKind = "key"
 type budgetGate struct {
 	ledger *cluster.Ledger
 	now    func() time.Time
+	// notify raises DESIGN §11.5's budget_80pct and budget_exceeded. It is nil
+	// when notifications are off, and every method on a nil notifier is a
+	// constant — which is what keeps the check below off the allocator.
+	notify *notify.Notifier
 }
+
+// budget80Numerator and budget80Denominator are §11.5's 80% threshold as a
+// fraction. It is a fraction rather than a percentage multiplication because
+// limit is in nano-USD and limit*80 overflows an int64 somewhere above a
+// hundred-million-dollar ceiling — which is an absurd budget, and exactly the
+// kind of absurd input that should not silently invert a comparison.
+const (
+	budget80Numerator   = 4
+	budget80Denominator = 5
+)
 
 // budgetHold is one request's hold. A nil hold is the unbudgeted case and every
 // method on it is a no-op, so the caller has no branch to forget.
@@ -99,10 +115,13 @@ func (g *budgetGate) reserve(ctx context.Context, st *dispatchState, c *call,
 	}
 
 	amount := g.estimate(st, c, dec)
+	now := g.now()
+	subject := notify.Subject{Kind: budgetSubjectKind, ID: p.KeyID()}
 	hold, err := g.ledger.Reserve(ctx,
-		cluster.BudgetKey(budgetSubjectKind, p.KeyID(), window, g.now()), limit, amount)
+		cluster.BudgetKey(budgetSubjectKind, p.KeyID(), window, now), limit, amount)
 	if err != nil {
 		if errors.Is(err, cluster.ErrExhausted) {
+			g.raise(notify.EventBudgetExceeded, subject, now, limit, limit, window, rq)
 			return nil, server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
 				"the budget for this credential is exhausted for the current "+
 					window.String()+" period").WithCode("budget_exceeded")
@@ -111,7 +130,54 @@ func (g *budgetGate) reserve(ctx context.Context, st *dispatchState, c *call,
 			"the budget could not be reserved: "+err.Error()).WithCode("budget_unavailable")
 	}
 	rq.Result.BudgetNanoUSD = limit
+
+	// budget_80pct (§11.5). This is discovered on the request path and must not
+	// be *sent* from it: Admit is a sharded map lookup that allocates nothing
+	// and returns true at most once per subject per period, and everything
+	// after it — rendering, connecting, retrying — happens on a worker.
+	//
+	// Without the deduplication this fires on every request past the threshold,
+	// which is the difference between an alert and a filter rule.
+	if spent, seen := hold.Consumed(); seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
+		g.raise(notify.EventBudget80, subject, now, spent, seen, window, nil)
+	}
 	return &budgetHold{gate: g, hold: hold}, nil
+}
+
+// raise queues a budget notification, once per subject per period.
+//
+// The fields are built only after Admit says yes, which is the whole point of
+// the two-step API: a budget that sits at 81% for an hour costs one allocation,
+// not one per request.
+func (g *budgetGate) raise(ev notify.Event, subject notify.Subject, now time.Time,
+	spent, limit int64, window quota.Window, rq *server.Request) {
+
+	if !g.notify.Admit(ev, subject, now) {
+		return
+	}
+	fields := []notify.Field{
+		{Name: "subject", Value: subject.String()},
+		{Name: "period", Value: window.String()},
+		{Name: "limit_usd", Value: usdString(limit)},
+		{Name: "spent_usd", Value: usdString(spent)},
+	}
+	if ev == notify.EventBudget80 && limit > 0 {
+		fields = append(fields, notify.Field{Name: "percent",
+			Value: strconv.FormatInt(spent*100/limit, 10)})
+	}
+	if rq != nil {
+		fields = append(fields, notify.Field{Name: "request_id", Value: rq.ID})
+	}
+	g.notify.Send(notify.Notification{
+		Event: ev, Subject: subject, Fields: fields, At: now,
+	})
+}
+
+// usdString renders nano-USD as dollars. It is off the request path — it runs
+// once per subject per period, behind Admit — so §15.5's ban on formatted
+// string construction does not reach it.
+func usdString(nano int64) string {
+	return strconv.FormatFloat(quota.USD(nano), 'f', 6, 64)
 }
 
 // estimate is DESIGN §6.4's deliberately pessimistic upper bound: exact input

@@ -78,7 +78,7 @@ func newSourceDB(t *testing.T, rows []sourceRow) *sql.DB {
 		t.Fatal(err)
 	}
 	for _, r := range rows {
-		_, err := db.Exec(`INSERT INTO "LiteLLM_VerificationToken"
+		_, err := db.Exec(`INSERT INTO "LiteLLM_VerificationToken" // pragma: allowlist secret — test fixture
 			(token, key_name, key_alias, spend, expires, models, allowed_routes, user_id, team_id,
 			 max_parallel_requests, blocked, tpm_limit, rpm_limit, max_budget, budget_duration,
 			 object_permission_id, created_at, updated_at)
@@ -101,9 +101,9 @@ func TestImportHonoursExpiry(t *testing.T) {
 	live := "sk-live-token" // pragma: allowlist secret — test fixture
 	dead := "sk-dead-token" // pragma: allowlist secret — test fixture
 	src := newSourceDB(t, []sourceRow{
-		{token: HashLegacySHA256(live), keyName: "sk-...LIVE", teamID: "team-1", // pragma: allowlist secret — test fixture
+		{token: HashLegacySHA256(live), keyName: "sk-...LIVE", teamID: "team-1",
 			expires: "2027-01-01 00:00:00"},
-		{token: HashLegacySHA256(dead), keyName: "sk-...DEAD", teamID: "team-1", // pragma: allowlist secret — test fixture
+		{token: HashLegacySHA256(dead), keyName: "sk-...DEAD", teamID: "team-1",
 			expires: "2025-01-01 00:00:00"},
 	})
 
@@ -158,7 +158,7 @@ func TestImportNeverCopiesTheSecretRevealingColumn(t *testing.T) {
 	const token = "sk-super-secret-value-Zq7X" // pragma: allowlist secret — test fixture
 	const tail = "Zq7X"
 	src := newSourceDB(t, []sourceRow{
-		{token: HashLegacySHA256(token), keyName: "sk-..." + tail, keyAlias: "reporting-bot"}, // pragma: allowlist secret — test fixture
+		{token: HashLegacySHA256(token), keyName: "sk-..." + tail, keyAlias: "reporting-bot"},
 	})
 
 	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
@@ -212,7 +212,7 @@ func TestImportCarriesEveryAuthorizationField(t *testing.T) {
 	const token = "sk-fully-specified" // pragma: allowlist secret — test fixture
 	src := newSourceDB(t, []sourceRow{{
 		token:         HashLegacySHA256(token),
-		keyName:       "sk-...AAAA", // pragma: allowlist secret — test fixture
+		keyName:       "sk-...AAAA",
 		keyAlias:      "batch-runner",
 		spend:         1.25,
 		expires:       "2027-03-04 05:06:07",
@@ -284,7 +284,7 @@ func TestImportCarriesEveryAuthorizationField(t *testing.T) {
 func TestImportRefusesKeysWhoseTeamIsMissing(t *testing.T) {
 	const token = "sk-orphan" // pragma: allowlist secret — test fixture
 	src := newSourceDB(t, []sourceRow{
-		{token: HashLegacySHA256(token), keyName: "sk-...ORPH", teamID: "team-gone"}, // pragma: allowlist secret — test fixture
+		{token: HashLegacySHA256(token), keyName: "sk-...ORPH", teamID: "team-gone"},
 	})
 
 	t.Run("default skips and reports", func(t *testing.T) {
@@ -368,10 +368,10 @@ func TestImportWarnsAboutTheAdministrativeCredential(t *testing.T) {
 
 func TestImportAccountsForEveryRowAndColumn(t *testing.T) {
 	src := newSourceDB(t, []sourceRow{
-		{token: HashLegacySHA256("sk-a"), keyName: "sk-...A"},                         // pragma: allowlist secret — test fixture
-		{token: "not-a-digest", keyName: "sk-...B"},                                   // pragma: allowlist secret — test fixture
-		{token: "", keyName: "sk-...C"},                                               // pragma: allowlist secret — test fixture
-		{token: HashLegacySHA256("sk-d"), keyName: "sk-...D", teamID: "team-missing"}, // pragma: allowlist secret — test fixture
+		{token: HashLegacySHA256("sk-a"), keyName: "sk-...A"},
+		{token: "not-a-digest", keyName: "sk-...B"}, // pragma: allowlist secret — test fixture
+		{token: "", keyName: "sk-...C"},
+		{token: HashLegacySHA256("sk-d"), keyName: "sk-...D", teamID: "team-missing"},
 	})
 
 	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
@@ -419,8 +419,8 @@ func TestImportAccountsForEveryRowAndColumn(t *testing.T) {
 }
 
 func TestImportIsIdempotentAndNeverOverwrites(t *testing.T) {
-	const token = "sk-twice"                                                                  // pragma: allowlist secret — test fixture
-	src := newSourceDB(t, []sourceRow{{token: HashLegacySHA256(token), keyName: "sk-...TW"}}) // pragma: allowlist secret — test fixture
+	const token = "sk-twice" // pragma: allowlist secret — test fixture
+	src := newSourceDB(t, []sourceRow{{token: HashLegacySHA256(token), keyName: "sk-...TW"}})
 
 	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
 		func(t *testing.T, s *Store) {
@@ -449,8 +449,8 @@ func TestImportIsIdempotentAndNeverOverwrites(t *testing.T) {
 }
 
 func TestImportDryRunWritesNothing(t *testing.T) {
-	const token = "sk-dry"                                                                    // pragma: allowlist secret — test fixture
-	src := newSourceDB(t, []sourceRow{{token: HashLegacySHA256(token), keyName: "sk-...DR"}}) // pragma: allowlist secret — test fixture
+	const token = "sk-dry" // pragma: allowlist secret — test fixture
+	src := newSourceDB(t, []sourceRow{{token: HashLegacySHA256(token), keyName: "sk-...DR"}})
 
 	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
 		func(t *testing.T, s *Store) {

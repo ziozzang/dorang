@@ -629,7 +629,7 @@ func serverFuzzSeeds(tb testing.TB) map[string][]byte {
 // mirror following, because a differential test against a stale copy is a test
 // of nothing.
 func TestGateMirrorIsCurrent(t *testing.T) {
-	names := []string{"peekRequest", "hasPrefixAt", "skipSpace", "scanString", "skipValue"}
+	names := []string{"peekRequest", "hasPrefixAt", "skipSpace", "scanString", "skipValue"} // pragma: allowlist secret — test fixture
 	gate := funcSource(t, filepath.Join("..", "server", "peek.go"), names)
 	mirror := funcSource(t, "gatediff_test.go", names)
 	for _, n := range names {

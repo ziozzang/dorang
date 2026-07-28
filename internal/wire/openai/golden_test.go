@@ -149,7 +149,7 @@ func TestUsageChunkGolden(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		want := `data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1753660800,"model":"qwen3.5:397b","choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}`
+		want := `data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1753660800,"model":"qwen3.5:397b","choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}` // pragma: allowlist secret — test fixture
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("usage chunk missing or wrong\n got:\n%s\nwant frame:\n%s", buf.String(), want)
 		}
@@ -169,7 +169,7 @@ func TestUsageChunkGolden(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Fatal(err)
 		}
-		want := `data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1753660800,"model":"qwen3.5:397b","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}`
+		want := `data: {"id":"chatcmpl-0123456789abcdef","object":"chat.completion.chunk","created":1753660800,"model":"qwen3.5:397b","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}` // pragma: allowlist secret — test fixture
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("strict usage chunk wrong\n got:\n%s\nwant frame:\n%s", buf.String(), want)
 		}
@@ -217,7 +217,7 @@ func TestLateUsageAccepted(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	want := `"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":2}}`
+	want := `"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":2}}` // pragma: allowlist secret — test fixture
 	if !strings.Contains(buf.String(), want) {
 		t.Fatalf("late usage dropped or wrong\n got:\n%s\nwant substring:\n%s", buf.String(), want)
 	}

@@ -402,7 +402,7 @@ func TestSoftReservationNeverOvercommits(t *testing.T) {
 // deadline fires.
 func TestSoftReservationsDoNotDeadlockOnOverlappingNeeds(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipped in short mode")
+		t.Skip("skipped in short mode") // pragma: allowlist secret — test fixture
 	}
 	b := newBroker(t, Config{
 		Models: []ModelLimit{

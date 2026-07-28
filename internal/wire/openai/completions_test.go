@@ -82,7 +82,7 @@ func TestCompletionResponseGolden(t *testing.T) {
 	upstream := []byte(`{"id":"cmpl-1","object":"text_completion","created":1753660800,` +
 		`"model":"upstream-id","choices":[{"index":0,"text":" a time","finish_reason":"length"}],` +
 		`"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,` +
-		`"prompt_tokens_details":{"cached_tokens":2}}}`)
+		`"prompt_tokens_details":{"cached_tokens":2}}}`) // pragma: allowlist secret — test fixture
 	resp, err := DecodeCompletionResponse(upstream, &DecodeOptions{Model: "qwen3.5:397b"})
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestCompletionResponseGolden(t *testing.T) {
 	want := `{"id":"cmpl-1","object":"text_completion","created":1753660800,"model":"qwen3.5:397b",` +
 		`"choices":[{"index":0,"text":" a time","finish_reason":"length"}],` +
 		`"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5,` +
-		`"prompt_tokens_details":{"cached_tokens":2}}}`
+		`"prompt_tokens_details":{"cached_tokens":2}}}` // pragma: allowlist secret — test fixture
 	if string(got) != want {
 		t.Fatalf("response bytes\n got: %s\nwant: %s", got, want)
 	}

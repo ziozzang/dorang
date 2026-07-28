@@ -136,7 +136,7 @@ func TestScannerReadsOnlyTheTerminalUsageFrame(t *testing.T) {
 		chunkJSON("up", "a"),
 		`{"id":"x","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 		`{"id":"x","object":"chat.completion.chunk","created":1,"model":"up","choices":[{"index":0,"delta":{}}],`+
-			`"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8}}}`,
+			`"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8}}}`, // pragma: allowlist secret — test fixture
 	)
 	for _, split := range []int{0, 1, 13, 97} {
 		_, s := scanAll(t, body, ScannerOptions{From: "up", To: "gemma4:31b", CollectUsage: true}, split)

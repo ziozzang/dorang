@@ -613,14 +613,84 @@ const (
 )
 
 // Notifications configures outbound email (§11.5).
+//
+// Everything below `email` is delivery; everything beside it is the pipeline.
+// The pipeline exists because a notification is a deferred write and §9.6
+// requires a deferred write to be bounded, visible when it drops, and never on
+// the request path.
 type Notifications struct {
 	Email  EmailNotifications `yaml:"email,omitempty"`
 	Events []string           `yaml:"events,omitempty"`
+
+	// QueueSize bounds the queue between the request path and the sender.
+	// Reaching it drops, and the drop is counted.
+	QueueSize int `yaml:"queue_size,omitempty"`
+	// Workers deliver from the queue.
+	Workers int `yaml:"workers,omitempty"`
+	// DedupPeriod is how often one subject may raise the same event. Without
+	// it, budget_80pct fires on every request past the threshold.
+	DedupPeriod Duration `yaml:"dedup_period,omitempty"`
+	// DedupPeriods overrides the window per event name. Zero disables
+	// deduplication for that event.
+	DedupPeriods map[string]Duration `yaml:"dedup_periods,omitempty"`
+	// Retry bounds how hard a failing transport is retried.
+	Retry NotifyRetry `yaml:"retry,omitempty"`
 }
 
-// EmailNotifications selects the delivery driver.
+// EmailNotifications selects the delivery driver and configures it.
 type EmailNotifications struct {
 	Driver string `yaml:"driver,omitempty"`
+	// From is the envelope sender, required by the smtp driver.
+	From string `yaml:"from,omitempty"`
+	// To are the default recipients.
+	To []string `yaml:"to,omitempty"`
+
+	SMTP SMTPSettings    `yaml:"smtp,omitempty"`
+	HTTP WebhookSettings `yaml:"http,omitempty"`
+}
+
+// SMTPSettings configures the smtp driver. The password is a [SecretRef] like
+// every other secret: it is never written in the configuration file (§4.1).
+type SMTPSettings struct {
+	Addr     string    `yaml:"addr,omitempty"`
+	Username string    `yaml:"username,omitempty"`
+	Password SecretRef `yaml:",inline"`
+	// StartTLS upgrades the connection when the server offers it. Leaving it
+	// off while setting a username means the password crosses the wire in the
+	// clear, which net/smtp refuses for anything but a loopback server.
+	StartTLS bool `yaml:"starttls,omitempty"`
+	// TLSSkipVerify accepts an unverifiable certificate. It exists for a
+	// private relay and is a deliberate downgrade.
+	TLSSkipVerify bool     `yaml:"tls_skip_verify,omitempty"`
+	Timeout       Duration `yaml:"timeout,omitempty"`
+	// HELO is the name dorang announces itself as.
+	HELO string `yaml:"helo,omitempty"`
+}
+
+// WebhookSettings configures the http driver.
+//
+// Secret is required, not optional. A delivery carrying budget and quota state
+// is an information leak the moment the URL is reachable by anything else, and
+// an unsigned receiver has no way to tell a real delivery from a forged one
+// (§11.5 rule 1). It is a [SecretRef] like every other secret, so it is spelled
+// `key_env`, `key_file` or `key_ref`.
+type WebhookSettings struct {
+	URL     string            `yaml:"url,omitempty"`
+	Secret  SecretRef         `yaml:",inline"`
+	Timeout Duration          `yaml:"timeout,omitempty"`
+	Headers map[string]string `yaml:"headers,omitempty"`
+}
+
+// NotifyRetry bounds delivery retries. A failing mail server must not be
+// retried hard: past MaxAttempts the notification is dropped and counted, and
+// past BreakerThreshold consecutive failures delivery is not attempted at all
+// until BreakerCooldown elapses.
+type NotifyRetry struct {
+	MaxAttempts      int      `yaml:"max_attempts,omitempty"`
+	InitialBackoff   Duration `yaml:"initial_backoff,omitempty"`
+	MaxBackoff       Duration `yaml:"max_backoff,omitempty"`
+	BreakerThreshold int      `yaml:"breaker_threshold,omitempty"`
+	BreakerCooldown  Duration `yaml:"breaker_cooldown,omitempty"`
 }
 
 // notificationEvents are the events of §11.5.

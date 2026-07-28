@@ -92,6 +92,25 @@ func (rq *Request) Context() context.Context {
 	return rq.ctx
 }
 
+// WithParams sets captured path parameters and returns rq.
+//
+// It exists for the packages that SUPPLY routes to this one — internal/app
+// mounts the batch, files and Responses sub-resources — whose handler tests
+// otherwise have no way to build a request that has any parameters at all: the
+// capture array is filled by the matcher and is not exported. Nothing on the
+// request path calls it.
+func (rq *Request) WithParams(params ...Param) *Request {
+	rq.nparams = 0
+	for _, p := range params {
+		if rq.nparams >= maxParams {
+			break
+		}
+		rq.params[rq.nparams] = p
+		rq.nparams++
+	}
+	return rq
+}
+
 // Param returns a captured path parameter.
 func (rq *Request) Param(name string) string {
 	for i := 0; i < rq.nparams; i++ {

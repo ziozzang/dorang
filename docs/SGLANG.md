@@ -6,6 +6,8 @@
 >
 > Companion to [VLLM.md](VLLM.md), and structured to be read against it row for row.
 > Where SGLang behaves like vLLM this document says so and moves on. The value is in §7.
+>
+> 한국어: [SGLANG.ko.md](SGLANG.ko.md)
 
 SGLang is *closer* to dorang's target surface than vLLM in two ways that matter — it speaks
 Anthropic natively, and its load endpoint is real rather than a flag-gated zero — and

@@ -387,9 +387,9 @@ func TestUsageScanning(t *testing.T) {
 	}{
 		{`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 			Usage{Input: 10, Output: 5, Total: 15}, true},
-		{`{"id":"x","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":2}}`,
+		{`{"id":"x","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":2}}`, // pragma: allowlist secret — test fixture
 			Usage{Input: 3, Output: 4, CacheRead: 2}, true},
-		{`{"usage":{"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}`,
+		{`{"usage":{"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}`, // pragma: allowlist secret — test fixture
 			Usage{Input: 1, CacheRead: 7}, true},
 		{`{"choices":[{"usage":{"prompt_tokens":99}}]}`, Usage{}, false}, // nested, not top level
 		{`{"no":"usage"}`, Usage{}, false},

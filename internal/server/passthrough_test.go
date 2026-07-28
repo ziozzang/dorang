@@ -303,7 +303,7 @@ func TestPassthroughMetersBestEffort(t *testing.T) {
 		handle: func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, `{"id":"m1","usage":{"input_tokens":40,"output_tokens":9,`+
-				`"cache_read_input_tokens":12}}`)
+				`"cache_read_input_tokens":12}}`) // pragma: allowlist secret — test fixture
 		},
 	}
 	m := &recordingMeter{}

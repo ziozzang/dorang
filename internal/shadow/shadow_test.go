@@ -348,7 +348,7 @@ func TestCapDoesNotPreferentiallySampleCheapRequests(t *testing.T) {
 	}
 	if st := s.Stats(); st.Queued != 0 {
 		t.Fatalf("queued %d cheap requests after the ceiling stopped; "+
-			"skipping instead of stopping biases coverage toward cheap traffic", st.Queued)
+			"skipping instead of stopping biases coverage toward cheap traffic", st.Queued) // pragma: allowlist secret — test fixture
 	}
 }
 
@@ -404,7 +404,7 @@ func TestReferenceNeverReceivesTheClientCredential(t *testing.T) {
 	waitFor(t, 3*time.Second, "the reference call", func() bool { return s.Stats().Sent > 0 })
 	mu.Lock()
 	defer mu.Unlock()
-	if v := got.Get("Authorization"); v != "Bearer ref-secret" {
+	if v := got.Get("Authorization"); v != "Bearer ref-secret" { // pragma: allowlist secret — test fixture
 		t.Errorf("Authorization = %q, want the reference's own credential", v)
 	}
 	for _, name := range []string{"X-Dorang-Api-Key", "Api-Key", "X-Goog-Api-Key"} {

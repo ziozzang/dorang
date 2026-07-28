@@ -246,15 +246,15 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		Kind:          up.kind,
 	}
 
-	payload, endpoint, err := e.d.encodeUpstream(c, dec, up)
+	up_, err := e.d.encodeUpstream(c, dec, up)
 	if err != nil {
 		return nil, err
 	}
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, up_.endpoint, bytes.NewReader(up_.body))
 	if err != nil {
 		return nil, err
 	}
-	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Content-Type", up_.contentType)
 	hreq.Header.Set("Accept-Encoding", "identity")
 	applyCredential(up.api, st.upstreams.secret(dec.Credential), hreq.Header)
 
@@ -270,7 +270,7 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 	if resp.StatusCode >= 400 {
 		return &batch.ExecResult{StatusCode: resp.StatusCode, Body: body}, nil
 	}
-	out, _, err := e.d.convertResponse(c, dec, up, body)
+	out, _, _, err := e.d.convertResponse(c, dec, up, body, resp.Header)
 	if err != nil {
 		return nil, err
 	}

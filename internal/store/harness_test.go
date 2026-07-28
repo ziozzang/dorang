@@ -30,7 +30,7 @@ var backends = []backend{{
 	},
 }}
 
-var testPepper = []byte("test-pepper-not-a-real-secret")
+var testPepper = []byte("test-pepper-not-a-real-secret") // pragma: allowlist secret — test fixture
 
 // clock is an injectable, race-safe time source.
 type clock struct {
@@ -167,7 +167,7 @@ func assertIndexedAtScale(t *testing.T, s *Store, query string, args []any, want
 // "Filter: (status >= 400)", which the partial index makes unnecessary.
 var pgIndexSuffix = map[string]string{
 	"":                            "",
-	"request_logs_key_ts_idx":     "_api_key_id_ts_id_idx",
+	"request_logs_key_ts_idx":     "_api_key_id_ts_id_idx", // pragma: allowlist secret — test fixture
 	"request_logs_team_ts_idx":    "_team_id_ts_id_idx",
 	"request_logs_cred_ts_idx":    "_credential_id_ts_id_idx",
 	"request_logs_trace_ts_idx":   "_trace_id_ts_id_idx",

@@ -57,6 +57,21 @@ type Request struct {
 	ParallelToolCalls *bool
 	ServiceTier       string
 
+	// PreviousResponseID chains a Responses-API call onto a stored one. It has
+	// no equivalent in the other two families (DESIGN §10.7), which is why it
+	// needs server-side state rather than a wire field to cross.
+	PreviousResponseID string
+	// Store asks the server to retain this exchange. Nil is "the endpoint's
+	// default", which is not the same as false — the Responses API defaults it
+	// to true and a request that omitted it must not be recorded as having
+	// opted out.
+	Store *bool
+	// Prompt is the legacy text-completion prompt. It is nil for every
+	// chat-shaped request. When it is set, Messages still carries the prompt as
+	// a single user turn, so a legacy request can cross into a family that has
+	// no completions surface at all.
+	Prompt *Prompt
+
 	// Extra carries every field dorang does not model, keyed by its wire name,
 	// so a same-protocol crossing is a pass-through rather than a filter.
 	Extra map[string]json.RawMessage
@@ -65,6 +80,49 @@ type Request struct {
 // StreamOptions mirrors the OpenAI stream_options object.
 type StreamOptions struct {
 	IncludeUsage bool
+}
+
+// Prompt is the legacy text-completion prompt.
+//
+// The field is four different things on the wire — a string, an array of
+// strings, an array of token ids, and an array of arrays of token ids — and a
+// gateway that normalizes them to one form changes what the backend sees. All
+// four are preserved: Texts and Tokens are alternatives, and Array records
+// whether the outermost wire value was an array so a single-element prompt
+// re-emits as the caller sent it.
+type Prompt struct {
+	Texts  []string
+	Tokens [][]int
+	Array  bool
+}
+
+// Text is the prompt as one string, and whether that is lossless.
+//
+// It is lossless only for a single text prompt. A token prompt has no text form
+// at all — there is no tokenizer on this path (DESIGN §15.5) — so it flattens
+// to "" and the caller must record the loss.
+func (p *Prompt) Text() (string, bool) {
+	if p == nil || len(p.Tokens) > 0 {
+		return "", false
+	}
+	if len(p.Texts) == 1 {
+		return p.Texts[0], true
+	}
+	n := 0
+	for _, s := range p.Texts {
+		n += len(s) + 1
+	}
+	if n == 0 {
+		return "", false
+	}
+	out := make([]byte, 0, n)
+	for i, s := range p.Texts {
+		if i > 0 {
+			out = append(out, '\n')
+		}
+		out = append(out, s...)
+	}
+	return string(out), false
 }
 
 // Tool is a callable the caller declared.

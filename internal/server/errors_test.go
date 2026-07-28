@@ -110,8 +110,8 @@ func TestNormalizeEveryUpstreamShape(t *testing.T) {
 			// same deployment.
 			name:   "anthropic",
 			status: 400,
-			body:   `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}`,
-			want:   `{"error":{"message":"max_tokens is required","type":"invalid_request_error","param":null,"code":"400"}}`,
+			body:   `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}`,            // pragma: allowlist secret — test fixture
+			want:   `{"error":{"message":"max_tokens is required","type":"invalid_request_error","param":null,"code":"400"}}`, // pragma: allowlist secret — test fixture
 			shape:  ShapeAnthropic,
 		},
 		{

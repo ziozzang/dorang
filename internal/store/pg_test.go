@@ -87,7 +87,7 @@ func TestPostgresLedgerNeverSequentiallyScans(t *testing.T) {
 		spec  ledgerSpec
 		index string
 	}{
-		{"by key", ledgerSpec{where: "l.api_key_id = ?", args: []any{"key-3"}}, "request_logs_key_ts_idx"},
+		{"by key", ledgerSpec{where: "l.api_key_id = ?", args: []any{"key-3"}}, "request_logs_key_ts_idx"}, // pragma: allowlist secret — test fixture
 		{"by team", ledgerSpec{where: "l.team_id = ?", args: []any{"team-2"}}, "request_logs_team_ts_idx"},
 		{"by trace", ledgerSpec{where: "l.trace_id = ?", args: []any{"trace-99"}}, "request_logs_trace_ts_idx"},
 		{"errors", ledgerSpec{where: "l.status >= 400"}, "request_logs_errors_idx"},

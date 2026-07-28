@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strconv"
@@ -854,6 +855,27 @@ func (c *Config) validateShadow(col *collector) {
 	nonNegative(col, "shadow.report.max_bytes", int64(c.Shadow.Report.MaxBytes))
 }
 
+// checkWebhookURL rejects a notification endpoint dorang cannot POST to.
+//
+// Unlike a shadow reference (below) a query string is fine here: the URL is
+// used whole rather than joined with a request path, and every hosted webhook
+// carries its token in one.
+func checkWebhookURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", raw, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("invalid URL %q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid URL %q: no host", raw)
+	}
+	return nil
+}
+
 // checkShadowReferenceURL rejects a reference dorang cannot call, and one it
 // must not call.
 func checkShadowReferenceURL(raw string) error {
@@ -877,9 +899,106 @@ func checkShadowReferenceURL(raw string) error {
 }
 
 func (c *Config) validateNotifications(col *collector) {
-	mustBeOneOf(col, "notifications.email.driver", c.Notifications.Email.Driver, emailDrivers)
-	for i, e := range c.Notifications.Events {
+	n := &c.Notifications
+	mustBeOneOf(col, "notifications.email.driver", n.Email.Driver, emailDrivers)
+	for i, e := range n.Events {
 		mustBeOneOf(col, fmt.Sprintf("notifications.events[%d]", i), e, notificationEvents)
+	}
+	for _, name := range sortedKeys(n.DedupPeriods) {
+		mustBeOneOf(col, fmt.Sprintf("notifications.dedup_periods[%q]", name), name, notificationEvents)
+		nonNegative(col, fmt.Sprintf("notifications.dedup_periods[%q]", name),
+			int64(n.DedupPeriods[name]))
+	}
+	nonNegative(col, "notifications.queue_size", int64(n.QueueSize))
+	nonNegative(col, "notifications.workers", int64(n.Workers))
+	nonNegative(col, "notifications.dedup_period", int64(n.DedupPeriod))
+	nonNegative(col, "notifications.retry.max_attempts", int64(n.Retry.MaxAttempts))
+	nonNegative(col, "notifications.retry.initial_backoff", int64(n.Retry.InitialBackoff))
+	nonNegative(col, "notifications.retry.max_backoff", int64(n.Retry.MaxBackoff))
+	nonNegative(col, "notifications.retry.breaker_threshold", int64(n.Retry.BreakerThreshold))
+	nonNegative(col, "notifications.retry.breaker_cooldown", int64(n.Retry.BreakerCooldown))
+	if n.Retry.MaxBackoff > 0 && n.Retry.InitialBackoff > n.Retry.MaxBackoff {
+		col.add("notifications.retry.max_backoff",
+			"must not be shorter than initial_backoff (%s < %s)",
+			n.Retry.MaxBackoff, n.Retry.InitialBackoff)
+	}
+
+	// Recipients are checked for every driver that has one, because a `to:`
+	// that is not an address fails at delivery time — which is to say, during
+	// the incident the notification was meant to report.
+	for i, addr := range n.Email.To {
+		if !strings.Contains(addr, "@") {
+			col.add(fmt.Sprintf("notifications.email.to[%d]", i),
+				"%q is not an email address", addr)
+		}
+	}
+	if n.Email.From != "" && !strings.Contains(n.Email.From, "@") {
+		col.add("notifications.email.from", "%q is not an email address", n.Email.From)
+	}
+
+	switch n.Email.Driver {
+	case "smtp":
+		if n.Email.SMTP.Addr == "" {
+			col.add("notifications.email.smtp.addr",
+				"must be set as host:port when the driver is smtp")
+		} else if _, _, err := net.SplitHostPort(n.Email.SMTP.Addr); err != nil {
+			col.add("notifications.email.smtp.addr", "must be host:port (is %q)", n.Email.SMTP.Addr)
+		}
+		if n.Email.From == "" {
+			col.add("notifications.email.from", "must be set when the driver is smtp")
+		}
+		if len(n.Email.To) == 0 {
+			col.add("notifications.email.to", "must list at least one recipient when the driver is smtp")
+		}
+		if !n.Email.SMTP.Password.IsZero() {
+			n.Email.SMTP.Password.validate(c.Server.Env, "notifications.email.smtp", col)
+			if n.Email.SMTP.Username == "" {
+				col.add("notifications.email.smtp.username",
+					"must be set alongside an SMTP password")
+			}
+		}
+		if n.Email.SMTP.Username != "" && !n.Email.SMTP.StartTLS {
+			// net/smtp refuses PLAIN over an unencrypted connection to anything
+			// but a loopback server, so this would fail at delivery time rather
+			// than here. Saying so at load is the cheaper discovery.
+			col.add("notifications.email.smtp.starttls",
+				"must be true when a username is set: a password is not sent over an "+
+					"unencrypted connection")
+		}
+		nonNegative(col, "notifications.email.smtp.timeout", int64(n.Email.SMTP.Timeout))
+	case "http":
+		if n.Email.HTTP.URL == "" {
+			col.add("notifications.email.http.url", "must be set when the driver is http")
+		} else if err := checkWebhookURL(n.Email.HTTP.URL); err != nil {
+			col.add("notifications.email.http.url", "%s", err)
+		}
+		// §11.5 rule 1: a webhook delivery is signed. The secret is required
+		// rather than optional because an unsigned receiver cannot tell a real
+		// delivery from a forged one, and the payload carries budget and quota
+		// state.
+		if n.Email.HTTP.Secret.IsZero() {
+			col.add("notifications.email.http.key_env",
+				"must be set when the driver is http: a webhook delivery is signed "+
+					"(HMAC-SHA256 over the body), and a receiver with no secret cannot "+
+					"tell a real delivery from a forged one")
+		} else {
+			n.Email.HTTP.Secret.validate(c.Server.Env, "notifications.email.http", col)
+		}
+		nonNegative(col, "notifications.email.http.timeout", int64(n.Email.HTTP.Timeout))
+	case "lua":
+		// The lua driver delivers through the on_email hook. A configuration
+		// that selects it without enabling the hook is a mail system that
+		// silently sends nothing, which is exactly the failure this whole
+		// section is about.
+		if !c.Extensions.Lua.Enabled {
+			col.add("notifications.email.driver",
+				"the lua driver delivers through the on_email hook, "+
+					"but extensions.lua.enabled is false")
+		} else if len(c.Extensions.Lua.Hooks) > 0 && !oneOf("on_email", c.Extensions.Lua.Hooks) {
+			col.add("notifications.email.driver",
+				"the lua driver delivers through the on_email hook, "+
+					"but extensions.lua.hooks does not list it")
+		}
 	}
 }
 

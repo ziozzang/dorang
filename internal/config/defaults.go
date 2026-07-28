@@ -84,6 +84,29 @@ const (
 	// defaultShadowUnpricedEstimate is one cent. It is deliberately not zero:
 	// see Shadow.UnpricedEstimateUSD.
 	defaultShadowUnpricedEstimate = "0.01"
+
+	// §11.5 names the events and the drivers and leaves the pipeline open.
+	// These are the numbers internal/notify runs with, each chosen as a bound
+	// rather than as a preference:
+	//
+	//   - one worker, because mail is not a throughput problem and N workers
+	//     hammering a server that is already failing is the behaviour the
+	//     breaker exists to prevent;
+	//   - a queue of 256, which at a few hundred bytes a notification is
+	//     bounded memory and far more than a healthy deployment ever holds;
+	//   - an hour of deduplication, because that is the interval at which an
+	//     operator wants to be reminded that a budget is still at 80%, not the
+	//     interval at which requests arrive.
+	defaultNotifyQueueSize       = 256
+	defaultNotifyWorkers         = 1
+	defaultNotifyDedupPeriod     = time.Hour
+	defaultNotifyMaxAttempts     = 3
+	defaultNotifyInitialBackoff  = time.Second
+	defaultNotifyMaxBackoff      = 30 * time.Second
+	defaultNotifyBreakerFailures = 5
+	defaultNotifyBreakerCooldown = time.Minute
+	defaultNotifySMTPTimeout     = 10 * time.Second
+	defaultNotifyHTTPTimeout     = 10 * time.Second
 )
 
 // defaultStickyKey is the composite stickiness key of §4.2.
@@ -289,6 +312,16 @@ func (c *Config) ApplyDefaults() {
 
 	// notifications
 	setStr(&c.Notifications.Email.Driver, "none")
+	setInt(&c.Notifications.QueueSize, defaultNotifyQueueSize)
+	setInt(&c.Notifications.Workers, defaultNotifyWorkers)
+	setDur(&c.Notifications.DedupPeriod, defaultNotifyDedupPeriod)
+	setInt(&c.Notifications.Retry.MaxAttempts, defaultNotifyMaxAttempts)
+	setDur(&c.Notifications.Retry.InitialBackoff, defaultNotifyInitialBackoff)
+	setDur(&c.Notifications.Retry.MaxBackoff, defaultNotifyMaxBackoff)
+	setInt(&c.Notifications.Retry.BreakerThreshold, defaultNotifyBreakerFailures)
+	setDur(&c.Notifications.Retry.BreakerCooldown, defaultNotifyBreakerCooldown)
+	setDur(&c.Notifications.Email.SMTP.Timeout, defaultNotifySMTPTimeout)
+	setDur(&c.Notifications.Email.HTTP.Timeout, defaultNotifyHTTPTimeout)
 
 	// priority mapping
 	if len(c.PriorityMapping.Classes) == 0 {

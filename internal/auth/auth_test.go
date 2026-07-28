@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	testPepper = "test-pepper-not-a-real-one"
+	testPepper = "test-pepper-not-a-real-one"               // pragma: allowlist secret — test fixture
 	testMaster = "sk-master-0000000000000000000000000000"   // pragma: allowlist secret — test fixture
 	testToken  = "sk-live-abcdefghijklmnopqrstuvwxyz012345" // pragma: allowlist secret — test fixture
 )
@@ -208,7 +208,7 @@ func TestStripRemovesEveryAcceptedHeader(t *testing.T) {
 	}
 	// Non-canonical spellings, as a hand-built header map can hold.
 	hdr["x-api-key"] = []string{testToken}
-	hdr["OCP-APIM-SUBSCRIPTION-KEY"] = []string{testToken}
+	hdr["OCP-APIM-SUBSCRIPTION-KEY"] = []string{testToken} // pragma: allowlist secret — test fixture
 	hdr.Set("Content-Type", "application/json")
 	hdr.Set("X-Dorang-Request-Id", "req-1")
 
@@ -274,7 +274,7 @@ func TestOneLookupServesBothSchemes(t *testing.T) {
 func TestDigestsMatchReferenceImplementations(t *testing.T) {
 	h := testHasher(t, LegacyPolicy{})
 	for _, tok := range []string{
-		"sk-a", testToken, // pragma: allowlist secret — test fixture
+		"sk-a", testToken,
 		"sk-" + strings.Repeat("x", MaxTokenLen), // forces the allocating path
 	} {
 		sum, mac := h.digests(tok)

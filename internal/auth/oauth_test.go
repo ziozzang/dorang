@@ -612,7 +612,7 @@ func TestExecAndEnvErrorsCarryNoOutput(t *testing.T) {
 	if err != nil || tok.Access != storedAccess || tok.ExpiresAt.Unix() != 1800000000 {
 		t.Fatalf("env store JSON: %v, %v", tok, err)
 	}
-	e2 := &envStore{name: "DORANG_TEST_OAUTH_MISSING", fields: TokenFields{}.withDefaults()}
+	e2 := &envStore{name: "DORANG_TEST_OAUTH_MISSING", fields: TokenFields{}.withDefaults()} // pragma: allowlist secret — test fixture
 	if _, err := e2.Load(); !errors.Is(err, ErrTokenStoreUnreadable) {
 		t.Fatalf("a missing variable gave %v", err)
 	}
