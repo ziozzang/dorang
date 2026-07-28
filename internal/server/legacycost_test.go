@@ -75,6 +75,126 @@ func TestPricedRequestMirrorsTheCostHeaderExactly(t *testing.T) {
 	}
 }
 
+// deferredCostDispatcher answers with an event stream and leaves the cost unset,
+// which is what the real dispatcher does: a stream is settled after its last
+// frame, and these headers go out before its first.
+func deferredCostDispatcher() Dispatcher {
+	return DispatchFunc(func(_ context.Context, rq *Request, w http.ResponseWriter) error {
+		rq.Result.Provider = "prov-1"
+		rq.Result.Deployment = "dep-1"
+		rq.Result.UpstreamModel = "upstream-" + rq.Model
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, "data: {}\n\ndata: [DONE]\n\n"); err != nil {
+			return err
+		}
+		// Settlement happens here, after the client already has the headers.
+		rq.Result.Tokens = Usage{Input: 120, Output: 15, Total: 135}
+		rq.Result.CostNanoUSD = 126_600
+		rq.Result.Priced = true
+		return nil
+	})
+}
+
+// TestStreamedRequestDoesNotPublishACostOfZero is the regression the previous fix
+// introduced. Before it the legacy header was absent on a stream and claimed
+// nothing; after it the header was present and said 0 — and §7.7a reads
+// "legacy 0 + x-dorang-cost-usd absent" as NOT PRICED. Every streamed request
+// therefore told a cost exporter it had no price, while its ledger row carried
+// one, and in an agent deployment every turn streams.
+//
+// Absent and honest beats present and wrong. The number for a stream is on
+// §10.4's usage event and in the ledger, joined by x-dorang-request-id.
+func TestStreamedRequestDoesNotPublishACostOfZero(t *testing.T) {
+	s := newTestServer(t, func(o *Options) {
+		o.LegacyHeaders = true
+		o.Dispatcher = deferredCostDispatcher()
+	})
+	rec := do(s, post("/v1/chat/completions", `{"model":"model-x","stream":true}`))
+	h := rec.Header()
+
+	if got := h.Get(LegacyHeaderResponseCost); got != "" {
+		if isZeroUSD(got) {
+			t.Fatalf("%s = %q on a streamed request whose settled cost was %d nano: "+
+				"the header is written before the stream and the cost is known after it, "+
+				"so this is a zero nobody measured — and §7.7a reads it, beside an absent "+
+				"%s, as \"this model has no price rule\"",
+				LegacyHeaderResponseCost, got, 126_600, HeaderCostUSD)
+		}
+		t.Fatalf("%s = %q, want absent: nothing can know the cost at header time",
+			LegacyHeaderResponseCost, got)
+	}
+	// The other mirrors are unaffected: they carry values that ARE known before
+	// the first frame, and dropping them would lose a cutover its join key.
+	if h.Get(LegacyHeaderCallID) == "" || h.Get(LegacyHeaderModelID) == "" {
+		t.Errorf("the identifying mirrors went missing with the cost one: %v", h)
+	}
+}
+
+// TestTheDiscriminatorStillDistinguishesUnpricedFromPriced pins §7.7a's table as
+// a table: the three states a reader must be able to tell apart, asserted
+// together so that fixing one cannot quietly collapse another into it.
+func TestTheDiscriminatorStillDistinguishesUnpricedFromPriced(t *testing.T) {
+	cases := []struct {
+		name        string
+		dispatcher  Dispatcher
+		body        string
+		wantLegacy  string // "" means the header must be absent
+		wantNative  string
+		explanation string
+	}{
+		{
+			name: "no price rule matched", dispatcher: unpricedDispatcher(),
+			body: `{"model":"model-x"}`, wantLegacy: "zero", wantNative: "absent",
+			explanation: "the cost is unknown, not zero",
+		},
+		{
+			name: "priced", dispatcher: nil, // the fixture dispatcher prices
+			body: `{"model":"model-x"}`, wantLegacy: "value", wantNative: "value",
+			explanation: "both names carry one answer",
+		},
+		{
+			name: "streamed, not yet priced", dispatcher: deferredCostDispatcher(),
+			body: `{"model":"model-x","stream":true}`, wantLegacy: "absent", wantNative: "absent",
+			explanation: "the cost is not decidable at header time; read the usage event or the ledger",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newTestServer(t, func(o *Options) {
+				o.LegacyHeaders = true
+				if c.dispatcher != nil {
+					o.Dispatcher = c.dispatcher
+				}
+			})
+			h := do(s, post("/v1/chat/completions", c.body)).Header()
+			legacy, native := h.Get(LegacyHeaderResponseCost), h.Get(HeaderCostUSD)
+
+			check := func(name, want, got string) {
+				switch want {
+				case "absent":
+					if got != "" {
+						t.Errorf("%s = %q, want absent (%s)", name, got, c.explanation)
+					}
+				case "zero":
+					if got == "" || !isZeroUSD(got) {
+						t.Errorf("%s = %q, want an explicit zero (%s)", name, got, c.explanation)
+					}
+				case "value":
+					if got == "" || isZeroUSD(got) {
+						t.Errorf("%s = %q, want a real amount (%s)", name, got, c.explanation)
+					}
+				}
+			}
+			check(LegacyHeaderResponseCost, c.wantLegacy, legacy)
+			check(HeaderCostUSD, c.wantNative, native)
+			if c.wantLegacy == "value" && legacy != native {
+				t.Errorf("%s = %q but %s = %q: the mirror is not a mirror",
+					LegacyHeaderResponseCost, legacy, HeaderCostUSD, native)
+			}
+		})
+	}
+}
+
 // TestNotionalHeaderIsAbsentWhenThereIsNoListRate is DESIGN §8.5 rule 5 on the
 // header surface: a missing list-rate equivalent is REPORTED as missing, never
 // as zero, because "silently returning zero would make a subscription look

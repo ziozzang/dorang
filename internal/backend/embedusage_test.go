@@ -74,8 +74,9 @@ func TestEmbeddingUsageIsMeteredWhateverTheVendorCallsIt(t *testing.T) {
 				t.Error("the count is not marked as reported by the backend, so a downstream " +
 					"encoder cannot tell a measured zero from an unmeasured one")
 			}
-			// §11.6's guard is gated on this sum being positive.
-			if sum := res.Usage.InputTokens + res.Usage.OutputTokens + res.Usage.ReasoningTokens; sum == 0 {
+			// §11.6's guard is gated on the token total being positive, and the
+			// total is input plus output — reasoning is already inside output.
+			if sum := res.Usage.TotalTokens(); sum == 0 {
 				t.Error("the token guard of §11.6 cannot see this request at all")
 			}
 		})

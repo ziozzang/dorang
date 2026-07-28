@@ -88,13 +88,28 @@ func normalizeUsage(u Usage, shape usageShape) Usage {
 	if shape == shapeExclusive {
 		u.Input += u.CacheRead + u.CacheWrite
 	}
-	if u.Total == 0 {
-		// The upstream stated no total. Deriving it is what the encoders do
-		// (canonical.Usage.TotalTokens), and the breakdown fields are subsets:
-		// summing all five would charge the cached prefix and the reasoning
-		// tokens twice.
-		u.Total = u.Input + u.Output
+	if u.Input == 0 && u.Output == 0 && u.Total > 0 {
+		// A body that stated a total and neither half has stated its prompt
+		// count: an embedding and a rerank have no completion half, so the
+		// total IS the prompt count. internal/backend's scanRelayUsage and the
+		// audio decoder already read the field that way, and without the same
+		// reading here a passthrough embedding metered as zero tokens — which
+		// is also a request §11.6's token guard cannot see.
+		u.Input = u.Total
 	}
+	// ONE definition of "total tokens" in the binary: input plus output, with
+	// every breakdown field a subset of one of them. The same function as
+	// canonical.Usage.TotalTokens and meter.Tokens.Total, deliberately.
+	//
+	// A stated total is not preferred over the derived one any more. It was,
+	// and that was the second of the three answers to this question: a stated
+	// total travelled as far as the tokens-per-minute ceiling (app.totalTokens)
+	// and no further, because meter.Tokens carries the five breakdown fields
+	// and re-derives, so the ledger and the ceiling could count the same
+	// passthrough request differently. A total that contradicts its own parts
+	// is not a quantity this gateway can attribute, and the parts are what
+	// every other reader is built on.
+	u.Total = u.Input + u.Output
 	return u
 }
 

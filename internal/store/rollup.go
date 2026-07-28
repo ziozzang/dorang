@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -278,6 +279,183 @@ func (s *Store) ReadModelHour(ctx context.Context, k ModelHourKey) (UsageDelta, 
 // ReadTeamDay reads one usage_by_team_day row.
 func (s *Store) ReadTeamDay(ctx context.Context, k TeamDayKey) (UsageDelta, error) {
 	return s.readRollup(ctx, "usage_by_team_day", "team_id", Micros(k.Day), k.TeamID)
+}
+
+// RollupDim names one of the three materializations DESIGN §9.4 keeps.
+//
+// There is deliberately no fourth: the design refuses a full cube, so a report
+// can be grouped by the dimension its materialization is keyed on and by time,
+// and by nothing else. A query for a combination nobody materialized is refused
+// by name rather than answered with a table scan (§9.3).
+type RollupDim uint8
+
+const (
+	// RollupKey reads usage_by_key_hour.
+	RollupKey RollupDim = iota
+	// RollupModel reads usage_by_model_hour.
+	RollupModel
+	// RollupTeam reads usage_by_team_day.
+	RollupTeam
+)
+
+func (d RollupDim) table() (table, col string, bucketWidth int64) {
+	switch d {
+	case RollupKey:
+		return "usage_by_key_hour", "api_key_id", int64(time.Hour / time.Microsecond)
+	case RollupTeam:
+		return "usage_by_team_day", "team_id", int64(24 * time.Hour / time.Microsecond)
+	default:
+		return "usage_by_model_hour", "model_group", int64(time.Hour / time.Microsecond)
+	}
+}
+
+// RollupQuery asks for aggregated usage over a bounded window.
+//
+// ByDay and ByDim select the grouping. Neither means "one row for the whole
+// range"; both means one row per (day, dimension value).
+type RollupQuery struct {
+	Dim   RollupDim
+	Range TimeRange
+	ByDay bool
+	ByDim bool
+	// Limit caps the returned rows. The total is computed by its own query and
+	// is therefore the total over the RANGE, not over the page — a truncated
+	// sum presented as a total is a wrong number wearing an authoritative name.
+	Limit int
+}
+
+// RollupRow is one aggregated bucket.
+type RollupRow struct {
+	// Day is the UTC day the bucket falls in, zero when the query did not group
+	// by time.
+	Day time.Time
+	// Dim is the dimension's value, empty when the query did not group by it.
+	Dim   string
+	Usage UsageDelta
+}
+
+// ReadRollupRange aggregates one materialization over a bounded range.
+//
+// This is the query DESIGN §9.4's rollups were built to answer and that
+// /global/spend/report had no implementation for: the counters were correct and
+// unreadable through the administration surface, so an operator could see one
+// hour of one key and could not see a week of anything.
+//
+// It is an index range scan, not a table scan: every rollup table is keyed
+// (bucket_start, <dimension>), so a bounded window on bucket_start is a seek
+// plus a walk. That is the whole reason the grouping offered is exactly the
+// grouping the materializations are keyed on.
+func (s *Store) ReadRollupRange(ctx context.Context, q RollupQuery) ([]RollupRow, UsageDelta, error) {
+	if err := q.Range.validate(s.cfg.MaxTimeRange); err != nil {
+		return nil, UsageDelta{}, err
+	}
+	table, dimCol, width := q.Dim.table()
+	start, end := Micros(q.Range.Start), Micros(q.Range.End)
+
+	total, err := s.rollupTotal(ctx, table, start, end)
+	if err != nil {
+		return nil, UsageDelta{}, err
+	}
+
+	// Neither grouping asked for: the total is the whole answer, and running a
+	// second identical query to produce one row of it would be waste.
+	if !q.ByDay && !q.ByDim {
+		return nil, total, nil
+	}
+
+	var group, sel []string
+	if q.ByDay {
+		// The day floor is arithmetic on the bucket key rather than a date
+		// function, so one statement serves both dialects and stays an
+		// expression over an indexed integer. Unix micro-seconds put midnight
+		// UTC at an exact multiple of a day, which is what makes this exact.
+		day := "(bucket_start - (bucket_start % " + strconv.FormatInt(width*bucketsPerDay(width), 10) + "))"
+		sel = append(sel, day+" AS day_start")
+		group = append(group, day)
+	} else {
+		sel = append(sel, "0 AS day_start")
+	}
+	if q.ByDim {
+		sel = append(sel, dimCol)
+		group = append(group, dimCol)
+	} else {
+		sel = append(sel, "'' AS dim_value")
+	}
+	sel = append(sel, sumCols...)
+
+	qs := "SELECT " + strings.Join(sel, ", ") +
+		" FROM " + table +
+		" WHERE bucket_start >= ? AND bucket_start < ?" +
+		" GROUP BY " + strings.Join(group, ", ") +
+		// Oldest day first, and within a day the largest spender first: a
+		// report that is truncated by Limit should lose the rows an operator
+		// was least likely to be asking about.
+		" ORDER BY day_start ASC, SUM(cost_nano) DESC, 2 ASC"
+	args := []any{start, end}
+	if q.Limit > 0 {
+		qs += " LIMIT ?"
+		args = append(args, q.Limit)
+	}
+
+	rows, err := s.query(ctx, qs, args...)
+	if err != nil {
+		return nil, UsageDelta{}, err
+	}
+	defer rows.Close()
+
+	var out []RollupRow
+	for rows.Next() {
+		var (
+			day int64
+			dim string
+			r   RollupRow
+		)
+		if err := rows.Scan(&day, &dim, &r.Usage.Requests, &r.Usage.Errors,
+			&r.Usage.PromptTokens, &r.Usage.CompletionTokens, &r.Usage.CachedTokens,
+			&r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.CostNano,
+			&r.Usage.LatencyMSSum); err != nil {
+			return nil, UsageDelta{}, err
+		}
+		if q.ByDay {
+			r.Day = time.UnixMicro(day).UTC()
+		}
+		if q.ByDim {
+			r.Dim = dim
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, UsageDelta{}, err
+	}
+	return out, total, nil
+}
+
+// bucketsPerDay is how many buckets of the given width make a day, so the day
+// floor is exact for an hourly table and a no-op for a daily one.
+func bucketsPerDay(width int64) int64 {
+	return int64(24*time.Hour/time.Microsecond) / width
+}
+
+// sumCols are the counter aggregates, in the order readRollup scans them.
+var sumCols = []string{
+	"COALESCE(SUM(requests),0)", "COALESCE(SUM(errors),0)",
+	"COALESCE(SUM(prompt_tokens),0)", "COALESCE(SUM(completion_tokens),0)",
+	"COALESCE(SUM(cached_tokens),0)", "COALESCE(SUM(reasoning_tokens),0)",
+	"COALESCE(SUM(total_tokens),0)", "COALESCE(SUM(cost_nano),0)",
+	"COALESCE(SUM(latency_ms_sum),0)",
+}
+
+func (s *Store) rollupTotal(ctx context.Context, table string, start, end int64) (UsageDelta, error) {
+	var d UsageDelta
+	err := s.queryRow(ctx,
+		"SELECT "+strings.Join(sumCols, ", ")+" FROM "+table+
+			" WHERE bucket_start >= ? AND bucket_start < ?", start, end).
+		Scan(&d.Requests, &d.Errors, &d.PromptTokens, &d.CompletionTokens, &d.CachedTokens,
+			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano, &d.LatencyMSSum)
+	if err != nil && err != sql.ErrNoRows {
+		return UsageDelta{}, err
+	}
+	return d, nil
 }
 
 func (s *Store) readRollup(ctx context.Context, table, dimCol string, bucket int64, dim string) (UsageDelta, error) {

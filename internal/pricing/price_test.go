@@ -403,12 +403,20 @@ rules:
     cache_write: "0"
     reasoning: "0"
 `)
+	// The counts are inclusive (§10.7): 400k of the 1M prompt tokens came from cache and
+	// 100k more were written to it, and 250k of the 1M completion tokens were reasoning.
+	// The earlier fixture set every breakdown field to the whole count, which is a request
+	// that is 100% cache and 100% reasoning — the one shape under which the exclusive rate
+	// convention and the additive one that double-charged are hard to tell apart.
 	cost := mustPrice(t, c, Request{
 		Model: "m", InputTokens: 1_000_000, OutputTokens: 1_000_000,
-		CacheReadTokens: 1_000_000, CacheWriteTokens: 1_000_000, ReasoningTokens: 1_000_000,
+		CacheReadTokens: 400_000, CacheWriteTokens: 100_000, ReasoningTokens: 250_000,
 		At: at(t, "2026-07-15T12:00:00Z"),
 	})
-	if want := int64(4_440_000_000); cost.MarginalNano != want {
+	// input   0.85 x 0.5M = 425_000_000  (1M less the 400k read and the 100k written)
+	// output  3.40 x 0.75M = 2_550_000_000 (1M less the 250k reasoning)
+	// cache_read 0.19 x 0.4M = 76_000_000; cache_write and reasoning are priced at zero.
+	if want := int64(3_051_000_000); cost.MarginalNano != want {
 		t.Fatalf("marginal = %d, want %d", cost.MarginalNano, want)
 	}
 	if len(cost.Components) != 5 {

@@ -161,9 +161,33 @@ id, the retry count and the duration, and no cost header at all. **Read the pair
 | `0` | absent | no price rule matched this model — the number is unknown, not zero |
 | `0` | `0` | priced, and this request came to nothing |
 | *n* | *n* | priced at *n* |
+| absent | absent | **the answer streamed.** The cost is not decidable when the headers are written; read the §10.4 usage event, or the ledger by `x-dorang-request-id` |
 
-`TestUnpricedRequestStillMirrorsTheCostHeaderAsZero` and
-`TestPricedRequestMirrorsTheCostHeaderExactly` pin both halves.
+`TestUnpricedRequestStillMirrorsTheCostHeaderAsZero`,
+`TestPricedRequestMirrorsTheCostHeaderExactly`,
+`TestStreamedRequestDoesNotPublishACostOfZero` and
+`TestTheDiscriminatorStillDistinguishesUnpricedFromPriced` pin the four rows together, so
+that fixing one cannot quietly collapse another into it.
+
+**The fourth row is the correction to the first three.** Headers precede usage on a stream:
+the response headers go out before the first frame and the request is settled after the last
+one, so nothing has computed a cost when this header is written. Making the mirror
+unconditional therefore published `0` on every streamed request while the ledger row for the
+same request carried a real figure — and by the first row of the table above, a reader is
+entitled to interpret that pair as "this model has no price rule". A cost exporter read zero
+for every streamed request, and in an agent deployment every turn streams.
+
+The version before that emitted nothing at all, which was a different failure but a smaller
+one: **absent claims nothing, zero claims a measurement.** So the mirror is written whenever
+the cost is known and whenever it is knowably absent, and omitted only in the one case where
+it is not yet decidable. The number is still available for that case, on the channel §10.4
+already has for exactly this — the opt-in `event: dorang.usage` frame carries `cost_usd`, and
+it is emitted after settlement — and in the ledger, joined by `x-dorang-request-id`, which is
+a response header and always present.
+
+An exporter that must have a cost for every streamed turn should read the ledger, not the
+header. There is no arrangement of response headers that can carry a number the response does
+not yet know.
 
 **Names dorang does not mirror, and why.** A header emitted with an invented value is worse
 than an absent one: the reader cannot tell it apart from a measurement.

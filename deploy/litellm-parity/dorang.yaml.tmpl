@@ -273,3 +273,75 @@ fallbacks:
 observability:
   prometheus: true
 
+
+# ---------------------------------------------------------------------------
+# Prices.
+#
+# WHY THIS BLOCK EXISTS
+#   Neither verification harness priced anything, and a harness that exercises
+#   the accounting path with pricing switched off cannot see a pricing defect.
+#   It did not: dorang charged the `input` rate against the whole inclusive
+#   prompt and the `cache_read` rate against the cached part of it again — 27%
+#   over the vendor on a lightly cached request and 5.7x on a 90%-cached agent
+#   turn — through two clean parity runs and a clean cutover, because every run
+#   measured zero against zero. The numbers below are what make the cutover's
+#   cost column a measurement.
+#
+# THESE ARE NOT A VENDOR QUOTE
+#   They are plausible figures, not the upstream's real card, and nothing here
+#   is billed to anyone. What they have to be is DISTINGUISHABLE: an input rate,
+#   a different cache-read rate and a different output rate, so that a request
+#   with a cached prefix prices differently under a correct rule and a wrong
+#   one. Replace them with the real card before reading the column as money.
+#
+# WHICH CONVENTION THE RATES ARE IN
+#   dorang's usage counts are inclusive (DESIGN §10.7): the input count is the
+#   whole prompt, cache reads and writes included, and the output count is the
+#   whole completion, reasoning included. The RATE TABLE is exclusive: a rate
+#   for a part carves that part out of its parent's rate, so `input` is charged
+#   on (input - cache_read - cache_write) and `output` on (output - reasoning),
+#   and each token is charged exactly once. A sub-rate left undeclared leaves
+#   its tokens with the parent — which is what a vendor with no cache discount
+#   charges. See CONFIG §13.1a.
+# ---------------------------------------------------------------------------
+pricing:
+  currency: USD
+  rules:
+    # A catch-all, so no model in the surface is silently unpriced. An unpriced
+    # model is not free: it increments a counter and warns (§8.3), and on this
+    # harness it would also mean the cost column is empty for that route.
+    - id: parity-default
+      class: marginal_usage
+      match: {provider: litellm}
+      rates: {input: "0.20", output: "0.80"}
+
+    # The chat model the cutover drives, with the breakdown that makes the
+    # inclusive/exclusive question observable: an agent turn re-sends its whole
+    # conversation, so most of its prompt is a cache read.
+    - id: parity-cutover-model
+      class: marginal_usage
+      match: {provider: litellm, model: "gpt-oss:20b"}
+      rates:
+        input: "0.85"
+        output: "3.40"
+        cache_read: "0.19"
+        cache_write: "1.06"
+
+    # A second chat model priced with a separate reasoning rate, so the output
+    # half of the same rule is exercised too: reasoning tokens are already
+    # inside the output count and must not be charged by both rates.
+    - id: parity-reasoning-model
+      class: marginal_usage
+      match: {provider: litellm, model: "glm-5"}
+      rates:
+        input: "0.60"
+        output: "2.20"
+        cache_read: "0.12"
+        reasoning: "4.40"
+
+    # The embedding surface has no completion half; pricing it per prompt token
+    # keeps §11.6's token guard and the tpm ceiling able to see the traffic.
+    - id: parity-embeddings
+      class: marginal_usage
+      match: {provider: litellm, model_prefix: "jina-embeddings-"}
+      rates: {input: "0.02"}

@@ -404,10 +404,22 @@ func TestUsageScanning(t *testing.T) {
 		// the upstream's own arithmetic.
 		{`{"usage":{"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}`, // pragma: allowlist secret — test fixture
 			Usage{Input: 1, CacheRead: 7, Total: 1}, true},
-		// A stated total is never overwritten: it is the number the client was
-		// handed, even when it disagrees with the parts.
+		// A stated total that contradicts its own parts is NOT kept. It used to
+		// be — "the number the client was handed" — and that made it the second
+		// of three answers to "how many tokens was that": it reached the
+		// tokens-per-minute ceiling, which reads server.Usage.Total, and no
+		// further, because meter.Tokens carries the five breakdown fields and
+		// re-derives the total from them. The same passthrough request was
+		// counted 99 against the ceiling and 15 in the ledger. A total dorang
+		// cannot attribute to a prompt or a completion is not one it can carry.
 		{`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":99}}`,
-			Usage{Input: 10, Output: 5, Total: 99}, true},
+			Usage{Input: 10, Output: 5, Total: 15}, true},
+		// A total with NEITHER half stated is a different thing: an embedding
+		// and a rerank have no completion, so the total IS the prompt count.
+		// Reading it that way is what internal/backend's scanRelayUsage already
+		// does; without it a passthrough embedding metered as zero tokens, and a
+		// request of zero tokens is one §11.6's token guard cannot see.
+		{`{"usage":{"total_tokens":4}}`, Usage{Input: 4, Total: 4}, true},
 		{`{"choices":[{"usage":{"prompt_tokens":99}}]}`, Usage{}, false}, // nested, not top level
 		{`{"no":"usage"}`, Usage{}, false},
 		{`not json`, Usage{}, false},

@@ -395,6 +395,7 @@ Mounted and working:
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c rotation: a new secret with a grace window, an early cut, and the list an operator reads to answer "did the client roll?". Same durable key id, so budget, spend, allow-list and ledger history are untouched |
 | `/key/pend`, `/key/release` | §11.6's reversible refusal. Distinct from block, because a pend is a statistical judgement that might be wrong and an operator releases it in one action |
 | `/spend/logs` | Per-request ledger. Requires one of `key_id`, `team_id`, `trace_id`, `tag` or `errors_only`, plus a bounded date range — §9.3 refuses an unbounded scan rather than answering it slowly |
+| `/global/spend/report` | Aggregated spend over a bounded range, read off DESIGN §9.4's rollups. `group_by` takes `day` and **one** of `model`, `key` or `team` — those are the keys the three materializations actually have. §9.4 keeps purpose-built rollups rather than a cube, so any other grouping (`user`, `tag`, `provider`, or two subject dimensions at once) answers **501** naming what is missing instead of turning into a table scan; `/spend/logs` joins those per request. `notional_spend` is reported as `null`, never as `0`: the rollups carry no list-rate column, and §8.5 forbids the flattering answer |
 | `/admin/capacity` | Live broker occupancy per axis |
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | Where each catalogued model field came from |
 | `/health/history` | In-process ring; it starts empty on every restart |
@@ -402,14 +403,14 @@ Mounted and working:
 
 Answering **501 `dependency_not_configured`** in this build, because the storage behind them does
 not exist yet — `internal/store` has no Go code for `users`, `teams`, `team_members`,
-`deployments` or `model_aliases`, and no range-aggregating report query:
+`deployments` or `model_aliases`:
 
 | Path | Missing piece | Use instead |
 |---|---|---|
 | `/user/*`, `/team/*` | directory | `dorangctl`, or the database |
 | `/model/*`, `/model_group/info` | model registry | configuration + `SIGHUP` |
 | `/budget/*` | budget store | `dorangctl key create --budget-usd` |
-| `/global/spend/report`, `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | rollup query | `/spend/logs`, or query `request_logs` |
+| `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | a per-day per-subject per-**model** cube, which §9.4 deliberately does not materialize | `/global/spend/report` for the single-dimension question, `/spend/logs` for the per-request one |
 | `/admin/credentials/health`, `/admin/quota` | quota registry | `/metrics` |
 | `/spend/calculate`, `/admin/pricing/preview` | pricing engine | — |
 | `/admin/config/reload` | reloader | `SIGHUP` |

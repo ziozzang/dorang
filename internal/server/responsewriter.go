@@ -52,8 +52,15 @@ func (w *responseWriter) WriteHeader(code int) {
 	w.wrote = true
 	w.status = code
 	h := w.ResponseWriter.Header()
-	w.rq.srv.stampHeaders(h, w.rq, code)
+	// The stream flag is decided BEFORE the headers are stamped, not after.
+	// stampHeaders needs it: an event stream is priced once its last frame is
+	// written, so any cost the headers carry would be a number nobody has
+	// computed yet. It has to be read off the Content-Type the dispatcher set
+	// rather than off the request's `stream: true`, because a request that asked
+	// to stream and was answered with a complete body did not stream — and it
+	// was priced before this call, so its cost is real.
 	w.sse = strings.HasPrefix(h.Get("Content-Type"), "text/event-stream")
+	w.rq.srv.stampHeaders(h, w.rq, code, w.sse && !w.rq.Result.Priced)
 	w.ResponseWriter.WriteHeader(code)
 }
 

@@ -11,12 +11,29 @@ import (
 	_ "time/tzdata"
 )
 
+// farFuture is what "now" means to a catalog built by [mustCatalog].
+//
+// A settlement stamped ahead of the present is clamped to it, and every fixture in this
+// package settles at a hand-written instant. Left on the wall clock, whether a fixture is
+// "in the future" would depend on the day the suite runs — a fixture dated 2026-07-31 is
+// in the past today and was in the future when it was written, so the same test would pass
+// and fail on different dates. Pinning the clock past every fixture makes the clamp
+// something a test opts into with [mustCatalogAt] rather than something the calendar
+// decides.
+var farFuture = time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+
 func mustCatalog(t *testing.T, y string) *Catalog {
+	return mustCatalogAt(t, y, farFuture)
+}
+
+// mustCatalogAt builds a catalog whose present is now.
+func mustCatalogAt(t *testing.T, y string, now time.Time) *Catalog {
 	t.Helper()
 	c, err := ParseCatalog([]byte(y))
 	if err != nil {
 		t.Fatalf("ParseCatalog: %v", err)
 	}
+	c.SetClock(func() time.Time { return now })
 	return c
 }
 

@@ -214,6 +214,88 @@ type Catalog struct {
 	// carries is written only by Settle.
 	carryMu sync.Mutex
 	carries map[string]*carrySet
+
+	// clock is what "now" means to this catalog. It is only ever consulted to decide
+	// whether a settlement's instant is in the future; every other use of time comes from
+	// the request. Injected so that a deployment with a controlled clock — and every test
+	// in this package — settles against the same instant the rest of the process does,
+	// rather than against a wall clock a fixture cannot see.
+	clock func() time.Time
+}
+
+// SetClock replaces the catalog's notion of the present.
+//
+// It is called once, by whoever loads the catalog, before the catalog is published to
+// anything that prices. Nil restores the wall clock.
+func (c *Catalog) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	c.clock = now
+}
+
+func (c *Catalog) nowInstant() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
+}
+
+// AdoptState carries the running accounting state of a previous catalog into this one.
+//
+// This is what makes a configuration reload not a billing event. A subscription's
+// accumulator — how much of the open period's plan cost has already been attributed — lives
+// with the catalog, and a reload builds a fresh one; without this, an open period restarts
+// its attribution from the reload instant and attributes the remainder of the period a
+// second time. Measured: twenty reloads attributed 1,030 USD of a 100 USD plan, and one
+// reload nine tenths of the way through a period put 91.00 USD on a single request — which
+// internal/app then reserves against THAT request's budget.
+//
+// The bound was not "one plan cost per deliberate change" either. A SIGHUP re-reads and
+// re-applies whatever it finds, deliberately: an operator's SIGHUP is the only way to pick
+// up an edited external price catalog or a rotated key_file secret, so it cannot be
+// suppressed on "the main file did not change" without breaking the mechanism it is there
+// for. The fix therefore belongs here — a redundant reload has to be free — and not in a
+// watcher that guesses whether anything moved.
+//
+// State is carried per rule id. A rule that is new in this catalog starts empty, and a rule
+// whose amount or period changed keeps the total it has already attributed: accrue clamps
+// against the NEW plan cost, so a cheaper plan attributes nothing further for the rest of
+// the period and a dearer one attributes the difference. Both directions are bounded by one
+// plan cost, which is the property §8.1 exists to hold.
+func (c *Catalog) AdoptState(prev *Catalog) {
+	if prev == nil || prev == c {
+		return
+	}
+	for id, st := range c.subs {
+		p := prev.subs[id]
+		if p == nil {
+			continue
+		}
+		if snap := p.snap.Load(); snap != nil {
+			st.snap.Store(snap)
+		}
+	}
+	// The sub-nano rounding remainders go with it, for the same reason: §8.3 promises
+	// that repeated small requests do not drift, and a remainder dropped on every reload
+	// is drift with a schedule.
+	prev.carryMu.Lock()
+	carried := make(map[string]*carrySet, len(prev.carries))
+	for k, v := range prev.carries {
+		cp := *v
+		carried[k] = &cp
+	}
+	prev.carryMu.Unlock()
+
+	c.carryMu.Lock()
+	if c.carries == nil {
+		c.carries = carried
+	} else {
+		for k, v := range carried {
+			c.carries[k] = v
+		}
+	}
+	c.carryMu.Unlock()
 }
 
 // carrySet holds the sub-nano remainder of each rounded field for one settlement bucket.
@@ -249,12 +331,11 @@ type subState struct {
 // plan cost, and a request records the difference — so the rows sum to the total by
 // construction and no settled row is ever restated.
 // The accumulator lives for the life of this Catalog, which is the life of one loaded
-// configuration. A config reload builds a fresh Catalog, so an open period starts its
-// attribution over from the reload instant and can attribute the rest of the period a
-// second time — bounded by one plan cost per reload, where the summed formula was bounded
-// by nothing, but stated here rather than left to be discovered. Carrying this state (and
-// the rounding carries beside it) across a reload is the fix; it belongs with whatever
-// hands the new catalog its predecessor, not here.
+// configuration, and a config reload builds a fresh Catalog. [Catalog.AdoptState] is what
+// carries it across the swap, and it is not optional: without it an open period restarted
+// its attribution from the reload instant and attributed the rest of the period again —
+// twenty reloads put 1,030 USD on a 100 USD plan, and one reload late in a period put a
+// whole 91.00 USD on a single request.
 type subSnapshot struct {
 	periodStart time.Time
 	attributed  u128 // plan cost already attributed to this period, in atto-units

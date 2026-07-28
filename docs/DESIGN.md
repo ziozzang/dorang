@@ -1281,11 +1281,35 @@ grows**, and a request's recorded share is the increment that brings it up to da
 - **The cap is structural.** The elapsed fraction is clamped to the period inside the single
   function `Price`, `Settle` and `Explain` all reach the figure through — the same shape as
   the floor under `TotalNano`, which caught a third call site nobody had named. There is no
-  call site left that can attribute a plan twice. One gap remains and is stated rather than
-  left to be found: the accumulator lives with the loaded catalog, so a **config reload**
-  starts an open period's attribution over and can attribute the rest of that period a second
-  time — bounded by one plan cost per reload, where the summed formula was bounded by nothing.
-  Carrying the accumulator across a reload closes it.
+  call site left that can attribute a plan twice.
+- **A reload is not a billing event.** The accumulator lives with the loaded catalog and a
+  reload builds a fresh one, so an open period used to start its attribution over from the
+  reload instant and attribute the rest of that period again. This was recorded as a residual
+  "bounded by one plan cost per reload"; measured, it was **1,030 USD of a 100 USD plan over
+  twenty reloads**, with one reload nine tenths of the way through a period putting **91.00 USD
+  on a single request** — which the budget hold then reserves against *that request's* budget.
+  Nor was the bound one-per-deliberate-change: `SIGHUP` re-applies unconditionally, so a
+  config-management agent that HUPs on a timer billed on a timer.
+
+  The new catalog now **adopts the previous one's state** — the period's attributed total and
+  the sub-nano rounding carries — across the swap. It is closed there rather than by
+  suppressing redundant reloads, and the distinction is load-bearing: a `SIGHUP` is how an
+  operator picks up an edited external price catalog, an edited model-catalog overlay or a
+  rotated `key_file` secret, none of which the configuration file's own mtime says anything
+  about. *"Nothing in the file changed"* is not *"nothing changed"*, so the reload stays
+  unconditional and is made free instead.
+- **A settlement stamped in the future is clamped to the present.** The accumulator only moves
+  forward, so a row stamped ahead of now attributes everything the plan will have accrued by
+  that instant and leaves the real remainder of the period attributing nothing; a stamp that
+  lands in the *next* period moves the period marker forward as well, so every later row of
+  the real period takes the late-row branch below and the next period opens already depressed.
+  Measured: one such row left **10.00 USD attributed to a 100.00 USD July**. This is the mirror
+  of the late-row guard and it is reachable without anything malicious — one node in a cluster
+  with a clock that runs ahead is enough. It is clamped rather than refused, because a refusal
+  fails the whole pricing call and takes the request's real marginal cost with it; the plan
+  share is the only figure a bad clock can distort, so it is the only one adjusted. Only
+  settlement is clamped: `Price` and `Explain` mutate nothing, and pricing a future instant is
+  what a preview is for.
 - **A share is never negative**, and a row that arrives out of order inside the open period
   attributes zero rather than clawing back what a settled row already took.
 - **A period with no requests attributes nothing**, and a period whose traffic stopped early
@@ -1400,6 +1424,34 @@ accumulation can overflow a signed 64-bit nano value.
 
 Components: input, output, cached read, cache write, reasoning, request, characters,
 seconds. Cached counts are read from whichever usage field the backend reports.
+
+**The usage counts are inclusive and the rate table is exclusive, and something has to
+reconcile them.** §10.7 normalizes `InputTokens` to the whole prompt with the cached and
+cache-written prefix inside it, and `OutputTokens` to the whole completion with the reasoning
+tokens inside it. No vendor's rate card is quoted that way: `input` is the price of the
+prompt tokens the provider did *not* serve from cache, and reasoning is folded into `output`
+unless the vendor prices it apart. So **a declared rate for a part carves that part out of
+its parent's quantity** — `input` is charged on `input − cache_read − cache_write` and
+`output` on `output − reasoning`, each subtraction applying only where the rule declares the
+sub-rate — and every token is charged exactly once. An undeclared sub-rate leaves its tokens
+with the parent, which is what a vendor with no cache discount charges. CONFIG §13.1a states
+the rule where a catalog author reads it.
+
+> ⚠️ **The arithmetic did the opposite of this, under §10.7's own warning.** `input` was
+> charged against the whole inclusive prompt *and* `cache_read` against the cached part of it
+> again. On §8.5's example card a 120-token prompt with a 40-token cached prefix and a
+> 15-token completion billed **$0.0001606 against the vendor's $0.0001266 — 27% over**, and
+> **5.7×** on a 90%-cached agent turn. §10.7 says in words that "a mis-mapped cache field does
+> not produce a visible error, it produces a wrong invoice"; it was on the page while the
+> invoice was wrong, which is the second time a prose invariant about arithmetic has been
+> worth less than the arithmetic.
+>
+> It survived two clean parity runs and a clean cutover because **neither harness declared a
+> price** — every run compared zero against zero. A verification configuration that exercises
+> the accounting path with pricing switched off cannot see a pricing defect, and the harness
+> configurations now price. The regression test asserts the charged amount against a
+> hand-computed vendor figure, not against another function in the pricing package: both of
+> those agreed throughout.
 
 > An earlier draft also listed `images` as a component, but the request type carries no image
 > count, so the component was unreachable. Per-image pricing is expressible today as
@@ -1757,6 +1809,16 @@ Of dorang's own headers, only the identification and cost set is always attached
 `x-dorang-request-id`, `-model`, `-upstream-model`, `-deployment`, `-cost-usd`, and
 `-replayable` when false — the last because it changes retry semantics a caller may be relying
 on, which makes it an act-on header by the same rule.
+
+**No cost header can carry a streamed request's cost, and none pretends to.** The headers are
+written before the first frame and the request is settled after the last one, so on a stream
+`x-dorang-cost-usd` is absent — as it is for any unpriced request, because dorang's own
+vocabulary distinguishes "no price rule matched" from "this request was free" — and the
+legacy mirror `x-litellm-response-cost`, which is otherwise emitted unconditionally so that a
+missing price reads as `0` rather than as a missing header, is **omitted in this one case**
+rather than made to publish a zero nobody measured. COMPATIBILITY §7.7a carries the four-state
+table a reader discriminates on. The streamed cost travels on the terminal frame below, where
+the number exists, and in the ledger.
 The rest are emitted when `x-dorang-detail: full` is requested, or when
 `observability.always_full_headers` is set. Revision 1 attached roughly thirty headers to
 every response, which risks intermediary header-size limits and adds bytes ahead of the

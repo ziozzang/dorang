@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,6 +238,105 @@ func TestStreamedRequestIsRecordedAsStreamed(t *testing.T) {
 	if got := resp.header.Get("X-Dorang-Deployment"); got != row.DeploymentID {
 		t.Errorf("ledger deployment_id = %q, x-dorang-deployment = %q", row.DeploymentID, got)
 	}
+}
+
+// TestStreamedCostHeaderAgreesWithTheLedgerOrIsAbsent is the streamed half of
+// "dorang told the customer one number and billed against another", on the one
+// surface a cutover actually reads.
+//
+// The last fix made x-litellm-response-cost unconditional so that an unpriced
+// model could be told apart from a free one. On a stream that produced a header
+// asserting `0` while the ledger row for the same request recorded a real cost —
+// and COMPATIBILITY §7.7a reads "legacy 0 beside an absent x-dorang-cost-usd" as
+// "this model has no price rule". A cost exporter therefore read zero for every
+// streamed request, which in an agent deployment is every request. Before that
+// change the header was absent and claimed nothing, so the fix was a regression:
+// absent and honest beats present and wrong.
+//
+// The assertion is the pair, not the header: whatever the response publishes
+// must agree with what the ledger records, or publish nothing.
+func TestStreamedCostHeaderAgreesWithTheLedgerOrIsAbsent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("DORANG_KEY_PEPPER", "streamcost-pepper")
+
+	const frames = "data: {\"id\":\"chatcmpl-c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-x\",\"choices\":[]," +
+		"\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, frames)
+	}))
+	defer up.Close()
+
+	ctx := context.Background()
+	// The mirror only exists with legacy_headers on, which is what a cutover
+	// runs — and running the harness with it off is how this went unseen.
+	cfg := loadRoundTripConfig(t, dir, up.URL, "compat:\n  legacy_headers: true")
+	a, err := app.New(ctx, app.Options{Config: cfg, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(ctx)
+
+	token := issueKey(t, ctx, a.Store)
+	front := httptest.NewServer(a.Server)
+	defer front.Close()
+
+	body := `{"model":"model-x","stream":true,"stream_options":{"include_usage":true},` +
+		`"messages":[{"role":"user","content":"ping"}]}`
+	resp, err := postErr(front.URL+"/v1/chat/completions", token, body, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.status, resp.body)
+	}
+	if ct := resp.header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q: this turn did not stream, so it proves nothing", ct)
+	}
+
+	row := awaitLedgerRow(t, ctx, a, token)
+	if row.CostNano == 0 {
+		t.Fatal("the ledger recorded no cost, so there is nothing for the header to " +
+			"disagree with; the fixture no longer prices")
+	}
+
+	legacy := resp.header.Get("X-Litellm-Response-Cost")
+	native := resp.header.Get("X-Dorang-Cost-Usd")
+	switch {
+	case legacy == "" && native == "":
+		// The honest answer: the cost is not knowable when the headers are
+		// written, so neither name claims it. §10.4's usage event and the
+		// ledger carry it, joined by x-dorang-request-id.
+	case legacy != "" && nanoUSD(t, legacy) == row.CostNano:
+		// Also acceptable: something priced the turn before its first frame.
+	default:
+		t.Errorf("the response published x-litellm-response-cost = %q and "+
+			"x-dorang-cost-usd = %q while the ledger row for the same request "+
+			"(%s) recorded %d nano.\nheaders precede usage on a stream, so a "+
+			"published zero is a number nobody measured — and §7.7a reads it, "+
+			"beside an absent x-dorang-cost-usd, as \"not priced\"",
+			legacy, native, row.ID, row.CostNano)
+	}
+}
+
+// nanoUSD parses a rendered USD amount back into nano-units.
+func nanoUSD(t *testing.T, s string) int64 {
+	t.Helper()
+	whole, frac, _ := strings.Cut(s, ".")
+	n, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		t.Fatalf("cost header %q is not a number: %v", s, err)
+	}
+	frac = (frac + "000000000")[:9]
+	f, err := strconv.ParseInt(frac, 10, 64)
+	if err != nil {
+		t.Fatalf("cost header %q has an unparseable fraction: %v", s, err)
+	}
+	return n*1_000_000_000 + f
 }
 
 // totalFromUsageFrame reads total_tokens out of the last frame that carries a

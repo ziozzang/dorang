@@ -942,9 +942,63 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
-| `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images` | A `marginal_usage` rule with no rates is refused. ⚠️ **`images` passes validation and then refuses to assemble** — the request type carries no image count, so the component is unreachable and is reported rather than silently priced at zero. Use `request` on an image endpoint |
+| `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a** | A `marginal_usage` rule with no rates is refused. ⚠️ **`images` passes validation and then refuses to assemble** — the request type carries no image count, so the component is unreachable and is reported rather than silently priced at zero. Use `request` on an image endpoint |
 | `rules[].period` + `rules[].amount` | string + decimal | — | A `fixed_subscription` rule's period and cost | Both required for that class; a zero amount is refused |
 | `rules[].percent` | decimal | — | An `adjustment` rule's percentage | Required for that class; zero is refused |
+
+### 13.1a Which convention the rates are in
+
+**The rate table is exclusive. The usage counts are inclusive. A rate for a part carves that
+part out of its parent's rate.**
+
+This is the one thing a catalog author has to know, because vendors differ on it and the two
+halves of the arithmetic come from different places. dorang's token counts are **inclusive**
+(DESIGN §10.7): `input` is the whole prompt with the cached and cache-written prefix inside
+it, and `output` is the whole completion with the reasoning tokens inside it. A vendor's rate
+card is not: every provider dorang speaks to quotes `input` as the price of the prompt tokens
+it did *not* serve from cache, quotes a separate cached-input price for the ones it did, and
+folds reasoning into the output price unless it publishes a reasoning price of its own.
+
+So the rates you write are the vendor's, and dorang carves the quantities to match:
+
+| Rate | Charged against |
+|---|---|
+| `input` | `input_tokens − cache_read − cache_write` |
+| `cache_read` | `cache_read` |
+| `cache_write` | `cache_write` |
+| `output` | `output_tokens − reasoning` |
+| `reasoning` | `reasoning` |
+
+Each subtraction applies **only when the rule declares that sub-rate**. A rate table that says
+nothing about cache bills the cached prefix at the `input` rate — which is exactly what a
+vendor with no cache discount charges — so the common case needs no thought and the
+degenerate case degrades the right way. Transcribing a card is therefore mechanical: write
+each published price under its own name and write nothing for the components the vendor does
+not price separately.
+
+> ⚠️ **This paragraph exists because the arithmetic did the other thing.** `input` was charged
+> against the whole inclusive prompt *and* `cache_read` against the cached part of it again.
+> Against §8.5's own example card (`input: 0.85`, `output: 3.40`, `cache_read: 0.19`) a
+> 120-token prompt with a 40-token cached prefix and a 15-token completion billed
+> **$0.0001606 against the vendor's $0.0001266 — 27% over**; on a 90%-cached agent turn, where
+> a cached read costs a tenth of a fresh token, **5.7×**. §10.7 had warned in prose that "a
+> mis-mapped cache field does not produce a visible error, it produces a wrong invoice", and
+> the invoice was wrong while the warning was on the page.
+>
+> What let it survive two clean parity runs and a clean cutover is worth more than the fix:
+> **neither harness declared a price**, so every run compared zero against zero. The harness
+> configurations under `deploy/litellm-parity/` now price, and the assertion is against a
+> hand-computed vendor figure rather than against another dorang function — a test that
+> compares two internal functions cannot catch a convention error, because both of them agreed.
+
+Tier brackets are unaffected by the carve-out: a bracket is a statement about how large the
+request is, so `tiers[].up_to_input_tokens` is compared against the whole inclusive prompt.
+Under `tier_mode: graduated` the cached prefix comes off the *front* of the bracket walk,
+because a cache hit is literally a prefix of the prompt.
+
+If a usage report contradicts itself — more cached tokens than prompt tokens — the parent's
+charge falls to zero and never below it. A negative component would hand back budget and
+quota that nobody paid for.
 
 ### 13.2 Classes compose; they do not compete
 

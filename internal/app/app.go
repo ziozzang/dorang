@@ -313,6 +313,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The catalog settles against this node's clock, not the wall clock, so a
+	// settlement stamped ahead of the present is recognizable as such.
+	prices.SetClock(a.now)
 	qs, err := newQuotaSet(cfg, a.now)
 	if err != nil {
 		return nil, err
@@ -589,6 +592,25 @@ func (a *App) Reload(cfg *config.Config) error {
 	prices, err := buildPricing(cfg)
 	if err != nil {
 		return err
+	}
+	prices.SetClock(a.now)
+	// A reload must not be a billing event. The subscription accumulator and the
+	// sub-nano rounding carries live with the catalog, and this builds a fresh
+	// one; without carrying them across, an open period restarts its attribution
+	// from the reload instant and attributes the rest of the period AGAIN.
+	// Measured before this line existed: twenty reloads attributed 1,030 USD of
+	// a 100 USD plan, and a reload nine tenths of the way through a period put
+	// 91.00 USD on one request — which budget.reserve then holds against that
+	// request's own budget.
+	//
+	// It is done here rather than by suppressing redundant reloads, and the
+	// distinction matters: a SIGHUP is how an operator picks up an edited
+	// external price catalog (pricing.catalog), an edited model-catalog overlay
+	// or a rotated key_file secret, none of which the configuration file's own
+	// mtime says anything about. "Nothing in the file changed" is not "nothing
+	// changed", so the reload stays unconditional and is made free instead.
+	if prev := a.dispatch.state(); prev != nil && prev.pricing != nil {
+		prices.AdoptState(prev.pricing)
 	}
 	qs, err := newQuotaSet(cfg, a.now)
 	if err != nil {

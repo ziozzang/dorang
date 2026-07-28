@@ -32,7 +32,10 @@ func TestDesignExampleParsesAndPrices(t *testing.T) {
 	c := mustCatalog(t, designExample)
 	req := Request{
 		Provider: "plan-a", Model: "model-x", Credential: "plan-a-1",
-		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 1_000_000,
+		// 40% of the prompt was served from cache. A fixture whose prompt is
+		// ENTIRELY cache — which this was — cannot tell the exclusive rate
+		// convention from the additive one that double-charged the prefix.
+		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 400_000,
 		At: at(t, "2026-07-29T12:00:00Z"),
 	}
 	cost := mustPrice(t, c, req)
@@ -42,7 +45,10 @@ func TestDesignExampleParsesAndPrices(t *testing.T) {
 	if cost.MarginalNano != 0 || !cost.Missing {
 		t.Fatalf("a flat plan has no marginal rule: %+v", cost)
 	}
-	if want := int64(4_440_000_000); cost.NotionalNano != want { // 0.85 + 3.40 + 0.19
+	// 0.85 x 0.6M + 3.40 x 1M + 0.19 x 0.4M. The input rate is charged on the part of
+	// the prompt the cache did NOT serve; charging it on the whole inclusive count and
+	// cache_read on the prefix again gives 4_326_000_000, which is the defect.
+	if want := int64(3_986_000_000); cost.NotionalNano != want {
 		t.Fatalf("notional = %d, want %d", cost.NotionalNano, want)
 	}
 	if cost.NotionalMissing {
@@ -390,7 +396,7 @@ func TestExplainAuditsTheNotionalFigure(t *testing.T) {
 	c := mustCatalog(t, designExample)
 	req := Request{
 		Provider: "plan-a", Model: "model-x", Credential: "plan-a-1",
-		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 1_000_000,
+		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 400_000,
 		At: at(t, "2026-08-27T12:00:00Z"),
 	}
 	ex := c.Explain(req)
@@ -410,7 +416,7 @@ func TestExplainAuditsTheNotionalFigure(t *testing.T) {
 	if want := 30 * 24 * time.Hour; n.Age < want {
 		t.Fatalf("age = %s, want at least %s so staleness is visible", n.Age, want)
 	}
-	if n.Missing || n.Nano != 4_440_000_000 {
+	if n.Missing || n.Nano != 3_986_000_000 {
 		t.Fatalf("notional detail = %+v", n)
 	}
 	if len(n.Components) != 3 {

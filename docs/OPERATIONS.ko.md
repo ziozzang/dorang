@@ -349,6 +349,7 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c 로테이션: 유예 기간을 둔 새 시크릿, 조기 컷, "클라이언트가 갈아탔는가"를 답하기 위한 목록. 키 id는 그대로이므로 예산·지출·허용 목록·원장 이력은 건드리지 않는다 |
 | `/key/pend`, `/key/release` | §11.6의 되돌릴 수 있는 거부. block과 구분된다 — pend는 틀릴 수 있는 통계적 판단이고 운영자가 한 동작으로 해제한다 |
 | `/spend/logs` | 요청별 원장. `key_id`, `team_id`, `trace_id`, `tag`, `errors_only` 중 하나와 유계 날짜 범위가 필요하다 — §9.3은 무계 스캔을 느리게 답하지 않고 거부한다 |
+| `/global/spend/report` | 유계 범위의 집계 지출. DESIGN §9.4의 롤업에서 읽는다. `group_by`는 `day`와 `model`·`key`·`team` 중 **하나**를 받는다 — 세 물질화가 실제로 가진 키다. §9.4는 큐브가 아니라 목적별 롤업을 두므로, 그 밖의 조합(`user`, `tag`, `provider`, 또는 주체 차원 둘 동시)은 테이블 스캔이 되는 대신 없는 것을 명시하며 **501**로 답한다. `notional_spend`는 `0`이 아니라 `null`로 보고된다: 롤업에 리스트 요율 컬럼이 없고 §8.5가 유리한 답을 금지한다 |
 | `/admin/capacity` | 축별 브로커 점유 현황 |
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | 카탈로그 모델 필드의 출처 |
 | `/health/history` | 인프로세스 링. 재시작할 때마다 비어 있는 상태로 시작한다 |
@@ -356,14 +357,14 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 
 이 빌드에서 **501 `dependency_not_configured`**로 답하는 것. 뒤에 있어야 할 저장소가 아직 없기
 때문이다 — `internal/store`에는 `users`, `teams`, `team_members`, `deployments`, `model_aliases`에
-대한 Go 코드가 없고 범위 집계 리포트 쿼리도 없다:
+대한 Go 코드가 없다:
 
 | 경로 | 없는 것 | 대신 사용 |
 |---|---|---|
 | `/user/*`, `/team/*` | 디렉터리 | `dorangctl`, 또는 데이터베이스 |
 | `/model/*`, `/model_group/info` | 모델 레지스트리 | 설정 + `SIGHUP` |
 | `/budget/*` | 예산 저장소 | `dorangctl key create --budget-usd` |
-| `/global/spend/report`, `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | 롤업 쿼리 | `/spend/logs`, 또는 `request_logs` 직접 조회 |
+| `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | 일자별 × 주체별 × **모델별** 큐브. §9.4가 의도적으로 물질화하지 않는다 | 단일 차원 질문은 `/global/spend/report`, 요청별은 `/spend/logs` |
 | `/admin/credentials/health`, `/admin/quota` | 쿼터 레지스트리 | `/metrics` |
 | `/spend/calculate`, `/admin/pricing/preview` | 가격 엔진 | — |
 | `/admin/config/reload` | 리로더 | `SIGHUP` |

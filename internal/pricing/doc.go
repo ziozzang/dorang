@@ -36,6 +36,22 @@
 //     sub-nano remainder carried into the next settlement. Every value is range-checked
 //     before it is returned; overflow is [ErrOverflow], never a negative cost.
 //
+//  4. THE RATE TABLE IS EXCLUSIVE. dorang's usage counts are inclusive (§10.7): the input
+//     count contains the cached and cache-written prefix, and the output count contains the
+//     reasoning tokens. A rate table is not, because no vendor quotes one that way. So a
+//     rate that names a part of a larger count CARVES that part out of the larger count's
+//     rate, and each token is charged exactly once:
+//
+//     input     charged on InputTokens  - CacheReadTokens - CacheWriteTokens
+//     output    charged on OutputTokens - ReasoningTokens
+//
+//     with each subtraction applying only when the rule declares the sub-rate. A rate table
+//     that says nothing about cache therefore bills the cached prefix at the input rate,
+//     which is what a vendor with no cache discount charges. [chargedQuantity] is where the
+//     rule lives and [TestChargedAmountMatchesTheVendorInvoice] asserts it against a
+//     hand-computed invoice — not against another function in this package, because the
+//     defect this replaced was a convention error that every internal function agreed on.
+//
 // Two entry points, deliberately different:
 //
 //   - [Catalog.Price] is pure. It mutates nothing, takes no lock unless a subscription

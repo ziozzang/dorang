@@ -329,6 +329,82 @@ func settlementBucket(req *Request) string {
 	return req.Credential
 }
 
+// carvedInput is the part of the inclusive input count that a more specific rate in the
+// same rule already charges, and which the `input` rate must therefore not charge again.
+//
+// See [chargedQuantity] for the convention this implements.
+func carvedInput(rates *rateSet, req *Request) int64 {
+	var n int64
+	if rates.set[cCacheRead] {
+		n += req.CacheReadTokens
+	}
+	if rates.set[cCacheWrite] {
+		n += req.CacheWriteTokens
+	}
+	return n
+}
+
+// carvedOutput is the part of the inclusive output count that the `reasoning` rate already
+// charges.
+func carvedOutput(rates *rateSet, req *Request) int64 {
+	if rates.set[cReasoning] {
+		return req.ReasoningTokens
+	}
+	return 0
+}
+
+// chargedQuantity is the measured quantity a component is billed for: the quantity as
+// measured, less the parts that a more specific rate on the SAME rule already charges.
+//
+// # The convention, stated once
+//
+// dorang's usage counts are INCLUSIVE (§10.7): InputTokens is the whole prompt, cache reads
+// and cache writes included, and OutputTokens is the whole completion, reasoning included.
+// A vendor's rate card is not. Every provider dorang speaks to quotes `input` as the price
+// of the prompt tokens it did NOT serve from cache, quotes a separate cached-input price for
+// the ones it did, and folds reasoning into the output price unless it publishes a reasoning
+// price of its own. So the two halves are in different conventions and something has to
+// reconcile them.
+//
+// **The rate table is exclusive: a declared sub-rate carves its quantity out of its parent.**
+//
+//   - `cache_read` declared  → the `input` rate is charged on InputTokens - CacheReadTokens.
+//   - `cache_write` declared → likewise, less CacheWriteTokens.
+//   - `reasoning` declared   → the `output` rate is charged on OutputTokens - ReasoningTokens.
+//   - a sub-rate NOT declared → its tokens stay with the parent and are billed at the parent
+//     rate, which is exactly what a vendor with no cache discount charges.
+//
+// The alternative — charging `input` against the whole inclusive count and `cache_read`
+// against the cached part again — is what this function replaced. Against §8.5's own example
+// rates (input 0.85, output 3.40, cache_read 0.19 per 1M) and a 120/15-token request with a
+// 40-token cached prefix, it billed $0.0001606 where the vendor bills $0.0001266: 27% over,
+// and 5.7x over on a 90%-cached agentic workload. §10.7 warned about precisely this in prose
+// — "a mis-mapped cache field does not produce a visible error, it produces a wrong invoice"
+// — while the arithmetic did it anyway, which is why the rule now lives in the arithmetic
+// and is asserted against a hand-computed vendor figure rather than against another function.
+//
+// A clamp at zero rather than an error: a negative result means the backend reported more
+// cached tokens than prompt tokens, which contradicts the inclusive form every decoder
+// produces. Refusing to price the request would drop the whole bill over an upstream's
+// arithmetic; charging zero for the parent while its sub-rates still charge is the bounded
+// answer, and the ledger's own columns show the contradiction.
+func chargedQuantity(i int, req *Request, carvedIn, carvedOut int64) (int64, error) {
+	q, err := quantityOf(i, req)
+	if err != nil {
+		return 0, err
+	}
+	switch i {
+	case cInput:
+		q -= carvedIn
+	case cOutput:
+		q -= carvedOut
+	}
+	if q < 0 {
+		q = 0
+	}
+	return q, nil
+}
+
 // quantityOf reads the measured quantity a component is charged against.
 func quantityOf(i int, req *Request) (int64, error) {
 	var q int64
@@ -362,15 +438,21 @@ func quantityOf(i int, req *Request) (int64, error) {
 // evalUsage prices every component the winning rule declares a rate for. It serves
 // marginal_usage and notional_rate alike: the two classes price identically and differ only
 // in where the result is reported. comps may be nil, which skips the component breakdown.
+//
+// The quantities are the CHARGED ones, not the measured ones: a rule that declares
+// `cache_read` beside `input` charges each token once. [chargedQuantity] states the rule.
 func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 	rates := r.rates
 	if len(r.tiers) > 0 {
+		// The tier is selected on the whole inclusive prompt — a bracket is about how big
+		// the request is, not about how much of it is billable at the input rate.
 		rates = selectTier(r, req.InputTokens).rates
 	}
+	carvedIn, carvedOut := carvedInput(&rates, req), carvedOutput(&rates, req)
 	var total amt
 	for i := 0; i < numComponents; i++ {
 		if r.tierMode == TierGraduated && i == cInput && len(r.tiers) > 0 {
-			sub, err := gradedInput(r, req, comps)
+			sub, err := gradedInput(r, req, comps, carvedIn)
 			if err != nil {
 				return amt{}, err
 			}
@@ -383,7 +465,7 @@ func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 		if !rates.set[i] {
 			continue
 		}
-		qty, err := quantityOf(i, req)
+		qty, err := chargedQuantity(i, req, carvedIn, carvedOut)
 		if err != nil {
 			return amt{}, err
 		}
@@ -442,11 +524,19 @@ func selectTier(r *rule, input int64) tier {
 }
 
 // gradedInput splits input tokens across brackets, pricing each bracket at its own rate.
-func gradedInput(r *rule, req *Request, comps *[]Component) (amt, error) {
+//
+// carved is the cached and cache-written prefix that a `cache_read`/`cache_write` rate
+// already charges ([chargedQuantity]). The brackets are still walked over the WHOLE prompt,
+// because a bracket is a statement about request size; what changes is that the first
+// `carved` tokens of it are not charged here. Taking them off the front rather than off the
+// end is not arbitrary — a cache hit is a prefix of the prompt, so the tokens the cache
+// served are literally the ones in the earliest brackets.
+func gradedInput(r *rule, req *Request, comps *[]Component, carved int64) (amt, error) {
 	remaining := req.InputTokens
 	if remaining < 0 {
 		return amt{}, fmt.Errorf("pricing: input quantity is negative (%d)", remaining)
 	}
+	skip := min(carved, remaining)
 	var total amt
 	var prev int64
 	for i := range r.tiers {
@@ -466,7 +556,12 @@ func gradedInput(r *rule, req *Request, comps *[]Component) (amt, error) {
 			continue
 		}
 		remaining -= span
-		if !t.rates.set[cInput] {
+		if skip > 0 {
+			d := min(skip, span)
+			span -= d
+			skip -= d
+		}
+		if span <= 0 || !t.rates.set[cInput] {
 			continue
 		}
 		v, err := componentValue(t.rates.atto[cInput], span, componentInfo[cInput].divisor)
@@ -503,6 +598,27 @@ func (c *Catalog) subscriptionShare(r *rule, at time.Time, mutate bool) (amt, er
 	st := c.subs[r.id]
 	if st == nil { // not reachable for a compiled catalog; defensive.
 		return amt{}, errors.New("pricing: subscription state missing")
+	}
+	if mutate {
+		// A settlement stamped ahead of the present is clamped to it. The accumulator
+		// only ever moves forward, so a row stamped in the future attributes everything
+		// the plan will have accrued by that instant and leaves the real remainder of
+		// the period attributing nothing — and if the stamp lands in the NEXT period it
+		// moves periodStart forward too, so every subsequent row of the real period
+		// takes the backfill branch below and the next period opens already depressed.
+		// Measured: one such row attributed 10.00 USD of a 100.00 USD July.
+		//
+		// This is the mirror of the backfill guard and it is reachable without anything
+		// malicious: one node in a cluster with a clock that runs ahead is enough.
+		// Clamping rather than refusing, because a refusal fails the whole pricing call
+		// and takes the request's real marginal cost down with it — the plan share is the
+		// only figure a bad clock can distort, so it is the only one adjusted.
+		//
+		// Only settlement is clamped. Price and Explain mutate nothing, and pricing a
+		// future instant is exactly what a preview is for.
+		if now := c.nowInstant(); at.After(now) {
+			at = now
+		}
 	}
 	start, end := periodBounds(r.period, at, r.loc)
 

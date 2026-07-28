@@ -347,7 +347,7 @@ func marshalWithModel(obj map[string]json.RawMessage, model string) ([]byte, err
 //
 // Zero is not a harmless number here. [Result.Usage] is the single source for
 // the X-Dorang-Tokens-* headers, for internal/meter and for pricing, and
-// §11.6's token guard triggers on Input+Output+Reasoning > 0 — so an embedding
+// §11.6's token guard triggers on a positive token total — so an embedding
 // priced at zero is also an embedding the guard cannot see. Nothing fails, so
 // nothing alerts, and in a retrieval-heavy deployment the budgets, the per-key
 // spend and the rate guard silently exclude most of the traffic. The rerank

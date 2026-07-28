@@ -45,10 +45,19 @@ func (a *meterAdapter) Record(ev server.Event) {
 		a.record(&ev)
 	}
 	r := &ev.Result
-	if tokens := r.Tokens.Input + r.Tokens.Output + r.Tokens.Reasoning; tokens > 0 && ev.KeyID != "" {
+	if tokens := totalTokens(r.Tokens); tokens > 0 && ev.KeyID != "" {
 		// The guard watches TOKENS, not requests: §11.6's trigger is a token
 		// rate against a token baseline, and a key that doubles its request
 		// count while halving its context has not departed from anything.
+		//
+		// It counts them through totalTokens and not through a sum written out
+		// here. This line read Input+Output+Reasoning — a THIRD answer to "how
+		// many tokens was that", seventy lines above the one C1 corrected, and
+		// it reported 128 for the request whose own response body said 120.
+		// Reasoning is already inside Output (§10.7), so adding it again
+		// inflates both the observed rate and the baseline it is compared
+		// against, and a key whose reasoning share merely CHANGES drifts
+		// against a baseline built under a different mix.
 		_ = a.guard.Observe(context.Background(), ev.KeyID, tokens, a.now())
 	}
 	a.m.Record(meter.Event{

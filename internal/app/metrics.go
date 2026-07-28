@@ -331,19 +331,23 @@ func (a *App) recordMetrics(ev *server.Event) {
 	})
 }
 
-// totalTokens is what a tpm ceiling counts: everything the request consumed.
+// totalTokens is how many tokens a finished request consumed. It is THE
+// definition on this side of the process: the tokens-per-minute ceiling, the
+// token guard of §11.6 and the metric all read it, and nothing computes its own.
 //
-// Total is preferred when the dispatcher filled it, because a backend that
-// reports a total which is not the sum of its parts is reporting the number it
-// will bill for. Falling back to input plus output keeps the ceiling working
-// against a backend that reports only the parts.
+// Input plus output, and nothing else. CacheRead and CacheWrite are the parts of
+// Input that came from and went to cache, and Reasoning is the part of Output
+// that was reasoning; adding any of them again counts the cached prefix and the
+// reasoning tokens twice. Same rule as canonical.Usage.TotalTokens,
+// meter.Tokens.Total and server.normalizeUsage — that is the point, and a
+// second rule anywhere is how the ledger came to disagree with the wire.
 //
-// The fallback is NOT a sum of every field. CacheRead and CacheWrite are the
-// parts of Input that came from and went to cache, and Reasoning is the part of
-// Output that was reasoning; adding them again charges a cached, reasoning-heavy
-// request nearly twice its true consumption against the ceiling. Same rule as
-// meter.Tokens.Total and canonical.Usage.TotalTokens, which is the point — a
-// second rule here is how the ledger came to disagree with the wire.
+// Total is consulted first only because every producer now sets it to exactly
+// this sum (server.normalizeUsage on the passthrough path, the dispatcher on
+// every other), so the two branches cannot disagree; TestTokenTotalHasOneRule
+// pins that they do not. It used to be a genuinely different rule — a stated
+// upstream total was preferred here and re-derived in the ledger — which made
+// this the second of the three answers to "how many tokens was that".
 func totalTokens(u server.Usage) int64 {
 	if u.Total > 0 {
 		return u.Total

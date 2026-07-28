@@ -212,3 +212,49 @@ fallbacks:
 
 observability:
   prometheus: true
+
+# ---------------------------------------------------------------------------
+# Prices.
+#
+# The cutover shape talks to the real providers, so this is where a cost column
+# means something — and where it went unmeasured. Neither harness declared a
+# price, so both compared zero against zero and neither could see that dorang
+# was charging the input rate against the whole inclusive prompt AND the
+# cache_read rate against the cached part of it again (27% over on a lightly
+# cached request, 5.7x on a 90%-cached agent turn).
+#
+# These are illustrative figures, not the providers' real cards, and they are
+# per PROVIDER because that is the grain a cutover can check against an invoice.
+# Replace each block with the vendor's published rate before reading the column
+# as money; a rate with no provenance is a guess wearing a currency symbol, and
+# for a list-rate figure DESIGN §8.5 refuses to load one without `source` and
+# `as_of`.
+#
+# The rate table is EXCLUSIVE: a rate for a part carves that part out of its
+# parent's rate, so `input` is charged on (input - cache_read - cache_write) and
+# `output` on (output - reasoning). dorang's usage counts are inclusive; the
+# rates are not. CONFIG §13.1a states the rule.
+# ---------------------------------------------------------------------------
+pricing:
+  currency: USD
+  rules:
+    - id: direct-zai
+      class: marginal_usage
+      match: {provider: zai}
+      rates: {input: "0.60", output: "2.20", cache_read: "0.11"}
+    - id: direct-ollama-cloud
+      class: marginal_usage
+      match: {provider: ollama-cloud}
+      rates: {input: "0.85", output: "3.40", cache_read: "0.19", cache_write: "1.06"}
+    - id: direct-openrouter
+      class: marginal_usage
+      match: {provider: openrouter}
+      rates: {input: "0.50", output: "1.50"}
+    - id: direct-jina
+      class: marginal_usage
+      match: {provider: jina}
+      rates: {input: "0.02"}
+    - id: direct-qwen-plan
+      class: marginal_usage
+      match: {provider: qwen-plan}
+      rates: {input: "0.40", output: "1.60", cache_read: "0.08"}

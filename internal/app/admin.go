@@ -44,7 +44,12 @@ import (
 //   - Audit — every mutation, into the `audit_logs` table that has had a
 //     schema, two indexes and a retention sweep since the first migration and
 //     no writer.
-//   - Ledger reads — /spend/logs, over the five indexed queries the store has.
+//   - Ledger reads — /spend/logs, over the five indexed queries the store has,
+//     and /global/spend/report over the three rollup materializations of §9.4.
+//     The report groups by day and by one of model, key or team, because those
+//     are the keys the rollups actually have; §9.4 keeps purpose-built
+//     materializations rather than a cube, so any other grouping is refused by
+//     name instead of turned into a table scan.
 //   - Capacity and Catalog — read-only reporting off objects App already holds.
 //   - Health history — an in-process ring, which is what the package ships.
 //
@@ -52,8 +57,10 @@ import (
 //
 //   - Directory (users, teams, members), ModelRegistry (deployments, aliases),
 //     BudgetStore (ceilings): no store layer exists.
-//   - Ledger.Report: no range-aggregating query exists, so /global/spend/report
-//     and the three daily-activity endpoints answer 501.
+//   - The daily-activity endpoints. They ask for a second, per-day per-subject
+//     per-MODEL breakdown, and no materialization is keyed on two dimensions at
+//     once. /global/spend/report answers the single-dimension question and
+//     /spend/logs the per-request one; a cube would be the bloat §9.4 refuses.
 //   - CredentialReporter, Pricer, Reloader: the objects exist in this process
 //     but are not reachable from App as it stands.
 
@@ -605,15 +612,106 @@ func (l *adminLedger) ListRequests(ctx context.Context, q admin.LogQuery) (admin
 	return out, nil
 }
 
-// Report has no implementation because there is no query. internal/store has
-// three single-bucket rollup reads and one per-credential spend total; none of
-// them answers "top N over a range grouped by a dimension". A hand-rolled
-// aggregate over request_logs would be a scan with no index, which §9.3 refuses
-// on purpose.
-func (l *adminLedger) Report(context.Context, admin.ReportQuery) (admin.Report, error) {
-	return admin.Report{}, unsupportedLedger(
-		"aggregate spend reporting has no rollup query behind it in this build; " +
-			"/spend/logs serves the per-request ledger")
+// Report aggregates one of DESIGN §9.4's three materializations over a bounded
+// range.
+//
+// It answered 501 until now, and the reason it did was that no range query
+// existed: internal/store had three single-bucket reads and nothing that could
+// answer "a week, grouped by model". The counters were correct the whole time
+// and unreadable through the administration surface, which is the worse half of
+// the pair — an operator could see one hour of one key and could not see a week
+// of anything.
+//
+// What it can group by is exactly what the rollups are keyed on, because §9.4
+// keeps purpose-built materializations rather than a cube: day, and one of
+// model, key or team. Anything else is refused BY NAME rather than answered
+// with a table scan, which §9.3 refuses on purpose. Naming the gap is what lets
+// an operator reach for /spend/logs instead of retrying the same query.
+func (l *adminLedger) Report(ctx context.Context, q admin.ReportQuery) (admin.Report, error) {
+	dim, byDay, byDim, err := rollupPlan(q.GroupBy)
+	if err != nil {
+		return admin.Report{}, err
+	}
+	rows, total, err := l.st.ReadRollupRange(ctx, store.RollupQuery{
+		Dim:   dim,
+		Range: store.TimeRange{Start: q.Range.Start, End: q.Range.End},
+		ByDay: byDay, ByDim: byDim, Limit: q.Limit,
+	})
+	if err != nil {
+		return admin.Report{}, adminStoreError(err)
+	}
+	out := admin.Report{Range: q.Range, Total: rollupUsage(total)}
+	out.Rows = make([]admin.ReportRow, 0, len(rows))
+	for _, r := range rows {
+		row := admin.ReportRow{Day: r.Day, Usage: rollupUsage(r.Usage)}
+		switch dim {
+		case store.RollupKey:
+			row.KeyID = r.Dim
+		case store.RollupTeam:
+			row.TeamID = r.Dim
+		default:
+			row.ModelGroup = r.Dim
+		}
+		out.Rows = append(out.Rows, row)
+	}
+	return out, nil
+}
+
+// rollupPlan maps a requested grouping onto the materialization that carries it.
+func rollupPlan(groups []admin.GroupBy) (dim store.RollupDim, byDay, byDim bool, err error) {
+	// The default materialization for a time-only report is the per-model one:
+	// every inference request carries a model group, while a request on a public
+	// route carries no key and a key outside a team carries no team, so it is
+	// the one whose coverage is not conditional on how a deployment is organized.
+	dim = store.RollupModel
+	seen := ""
+	for _, g := range groups {
+		switch g {
+		case admin.GroupByDay:
+			byDay = true
+		case admin.GroupByModel, admin.GroupByKey, admin.GroupByTeam:
+			if byDim {
+				return 0, false, false, unsupportedLedger(
+					"a report can be grouped by day and by ONE of model, key or team: " +
+						seen + " and " + string(g) + " have separate rollups (§9.4 keeps " +
+						"purpose-built materializations, not a cube), so /spend/logs is the " +
+						"only place the two are joined")
+			}
+			byDim, seen = true, string(g)
+			switch g {
+			case admin.GroupByKey:
+				dim = store.RollupKey
+			case admin.GroupByTeam:
+				dim = store.RollupTeam
+			default:
+				dim = store.RollupModel
+			}
+		default:
+			return 0, false, false, unsupportedLedger(
+				"there is no rollup keyed by " + string(g) + " in this build; a report can " +
+					"group by day, model, key or team, and /spend/logs carries the rest per request")
+		}
+	}
+	return dim, byDay, byDim, nil
+}
+
+// rollupUsage converts a rollup counter set into the administration surface's.
+//
+// NotionalKnown stays false and NotionalNano stays zero: the rollup tables have
+// no notional column, and DESIGN §8.5 rule 5 requires a missing list rate to be
+// reported as missing rather than as a flattering zero. SubscriptionCostNano
+// stays zero for the same reason — the rollups carry one cost column. Marginal
+// mirrors it, exactly as adminLogRow does for a ledger row, because on this
+// build metering writes the same figure to both.
+func rollupUsage(d store.UsageDelta) admin.Usage {
+	return admin.Usage{
+		Requests: d.Requests, Errors: d.Errors,
+		PromptTokens: d.PromptTokens, CompletionTokens: d.CompletionTokens,
+		CachedTokens: d.CachedTokens, ReasoningTokens: d.ReasoningTokens,
+		TotalTokens: d.TotalTokens,
+		CostNano:    d.CostNano, MarginalCostNano: d.CostNano,
+		LatencyMSSum: d.LatencyMSSum,
+	}
 }
 
 // unsupportedLedger builds the refusal for a ledger query this build has no

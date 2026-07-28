@@ -15,6 +15,7 @@ import (
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/server"
+	"github.com/ziozzang/dorang/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -122,10 +123,115 @@ func TestLedgerRefusalsCarryTheUnsupportedSentinel(t *testing.T) {
 	if !errors.Is(err, admin.ErrUnsupported) {
 		t.Errorf("ListRequests error %v does not satisfy errors.Is(err, admin.ErrUnsupported)", err)
 	}
-	if _, err := l.Report(context.Background(), admin.ReportQuery{}); err == nil {
-		t.Fatal("Report was accepted")
-	} else if !errors.Is(err, admin.ErrUnsupported) {
+	// A grouping no rollup is keyed on is the refusal Report still gives, and it
+	// has to carry the sentinel for the same reason: internal/admin/ui.go tests
+	// for it by hand.
+	_, err = l.Report(context.Background(), admin.ReportQuery{
+		Range: rng, GroupBy: []admin.GroupBy{admin.GroupByTag},
+	})
+	if err == nil {
+		t.Fatal("a report grouped by a dimension with no rollup was accepted")
+	}
+	if !errors.Is(err, admin.ErrUnsupported) {
 		t.Errorf("Report error %v does not satisfy errors.Is(err, admin.ErrUnsupported)", err)
+	}
+	// An unbounded range is a different refusal and must not be flattened into
+	// the same one: §9.3 refuses it, and the caller fixes it by adding a bound.
+	if _, err := l.Report(context.Background(), admin.ReportQuery{}); err == nil {
+		t.Fatal("an unbounded report was accepted")
+	} else if !errors.Is(err, admin.ErrUnboundedRange) {
+		t.Errorf("Report error %v does not satisfy errors.Is(err, admin.ErrUnboundedRange)", err)
+	}
+}
+
+// TestGlobalSpendReportReadsTheRollups is D5: the rollups were correct and the
+// administration surface could not read them, so /global/spend/report answered
+// 501 over counters that were right the whole time.
+func TestGlobalSpendReportReadsTheRollups(t *testing.T) {
+	st, _ := openTestStore(t, nil)
+	ctx := context.Background()
+	hour := time.Date(2026, 7, 20, 13, 0, 0, 0, time.UTC)
+
+	b := store.NewRollupBatch()
+	for _, r := range []struct {
+		model string
+		at    time.Time
+		d     store.UsageDelta
+	}{
+		{"chat", hour, store.UsageDelta{Requests: 2, PromptTokens: 240, CompletionTokens: 30,
+			TotalTokens: 270, CostNano: 253_200}},
+		{"chat", hour.Add(2 * time.Hour), store.UsageDelta{Requests: 1, PromptTokens: 120,
+			CompletionTokens: 15, TotalTokens: 135, CostNano: 126_600}},
+		{"embed", hour.Add(26 * time.Hour), store.UsageDelta{Requests: 5, PromptTokens: 500,
+			TotalTokens: 500, CostNano: 1_000}},
+	} {
+		k := store.ModelHourKey{Hour: r.at, ModelGroup: r.model}
+		e := b.ModelHour[k]
+		e.Add(r.d)
+		b.ModelHour[k] = e
+	}
+	if _, err := st.MergeRollups(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+
+	l := &adminLedger{st: st}
+	rng := admin.Range{
+		Start: time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+	}
+
+	rep, err := l.Report(ctx, admin.ReportQuery{Range: rng, GroupBy: []admin.GroupBy{admin.GroupByModel}})
+	if err != nil {
+		t.Fatalf("group_by=model: %v", err)
+	}
+	if len(rep.Rows) != 2 {
+		t.Fatalf("group_by=model returned %d rows, want 2: %+v", len(rep.Rows), rep.Rows)
+	}
+	// Largest spender first, so a truncated report keeps what was asked about.
+	if rep.Rows[0].ModelGroup != "chat" || rep.Rows[0].Usage.CostNano != 379_800 {
+		t.Errorf("row 0 = %+v, want chat at 379_800 nano", rep.Rows[0])
+	}
+	if want := int64(380_800); rep.Total.CostNano != want {
+		t.Errorf("total cost = %d, want %d", rep.Total.CostNano, want)
+	}
+	if want := int64(905); rep.Total.TotalTokens != want {
+		t.Errorf("total tokens = %d, want %d", rep.Total.TotalTokens, want)
+	}
+	if rep.Total.NotionalKnown {
+		t.Error("the rollups carry no notional column, so a notional total must be " +
+			"reported as unavailable rather than as zero (§8.5 rule 5)")
+	}
+
+	// Grouping by day collapses the two chat buckets of the 20th into one row
+	// and keeps the 21st separate.
+	rep, err = l.Report(ctx, admin.ReportQuery{
+		Range: rng, GroupBy: []admin.GroupBy{admin.GroupByDay, admin.GroupByModel},
+	})
+	if err != nil {
+		t.Fatalf("group_by=day,model: %v", err)
+	}
+	if len(rep.Rows) != 2 {
+		t.Fatalf("group_by=day,model returned %d rows, want 2: %+v", len(rep.Rows), rep.Rows)
+	}
+	first := rep.Rows[0]
+	if !first.Day.Equal(time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("row 0 day = %s, want 2026-07-20 — the hourly buckets are not being "+
+			"floored to their day", first.Day)
+	}
+	if first.ModelGroup != "chat" || first.Usage.Requests != 3 {
+		t.Errorf("row 0 = %+v, want the 20th's three chat requests merged", first)
+	}
+	// A range that covers nothing is an empty report, not an error: "that team
+	// spent nothing last week" is an answer.
+	rep, err = l.Report(ctx, admin.ReportQuery{
+		Range:   admin.Range{Start: rng.End, End: rng.End.Add(24 * time.Hour)},
+		GroupBy: []admin.GroupBy{admin.GroupByModel},
+	})
+	if err != nil {
+		t.Fatalf("an empty range: %v", err)
+	}
+	if len(rep.Rows) != 0 || rep.Total.CostNano != 0 {
+		t.Errorf("an empty window reported %+v", rep)
 	}
 }
 

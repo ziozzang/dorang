@@ -661,9 +661,55 @@ head에 앉은 채 둘이 동시에 비는 순간을 영영 만나지 못할 수
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` | `marginal_usage` | 어떤 종류의 비용인가 | 그 외 거부 — 카탈로그 전용인 `notional_rate` 포함 (§13.3) |
 | `rules[].priority` | int | `0` | id보다 먼저 specificity 동률을 가른다 | 음수 거부 |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | specificity 사다리 | 선언되지 않은 `provider`나 `credential`은 거부. `model`과 `model_prefix`는 선언된 모델과 대조되지 **않는다** — 현재 어떤 배포도 서빙하지 않는 모델을 정당하게 가격 매길 수 있다 |
-| `rules[].rates.<component>` | decimal | — | 단위당 요율. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images` | 요율 없는 `marginal_usage` 규칙 거부. ⚠️ **`images`는 검증을 통과하고 조립에서 거부된다** — 요청 타입이 이미지 수를 싣지 않아 도달 불가능한 컴포넌트이며, 조용히 0으로 가격 매기는 대신 보고된다. 이미지 엔드포인트에는 `request`를 쓸 것 |
+| `rules[].rates.<component>` | decimal | — | 단위당 요율. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a** | 요율 없는 `marginal_usage` 규칙 거부. ⚠️ **`images`는 검증을 통과하고 조립에서 거부된다** — 요청 타입이 이미지 수를 싣지 않아 도달 불가능한 컴포넌트이며, 조용히 0으로 가격 매기는 대신 보고된다. 이미지 엔드포인트에는 `request`를 쓸 것 |
 | `rules[].period` + `rules[].amount` | string + decimal | — | `fixed_subscription`의 주기와 비용 | 그 클래스에 둘 다 필수; 금액 0 거부 |
 | `rules[].percent` | decimal | — | `adjustment`의 퍼센트 | 그 클래스에 필수; 0 거부 |
+
+### 13.1a 요율이 어떤 관례로 적혀 있는가
+
+**요율표는 배타(exclusive)이고 사용량 카운트는 포함(inclusive)이다. 부분에 대한 요율은 그 부분을
+부모의 요율에서 잘라낸다.**
+
+카탈로그 작성자가 알아야 할 것은 이 하나다. 벤더마다 관례가 다르고, 산술의 두 반쪽이 서로 다른
+곳에서 오기 때문이다. dorang의 토큰 카운트는 **포함**이다(DESIGN §10.7): `input`은 캐시 읽기·쓰기
+접두부를 안에 담은 프롬프트 전체이고, `output`은 추론 토큰을 안에 담은 응답 전체다. 벤더의 요율표는
+그렇지 않다: `input`은 캐시에서 제공되지 *않은* 프롬프트 토큰의 단가이고, 캐시된 것에는 별도 단가가
+있으며, 추론은 벤더가 따로 값을 매기지 않는 한 `output`에 접혀 있다.
+
+그래서 적는 요율은 벤더의 것이고, dorang이 수량을 거기에 맞춘다:
+
+| 요율 | 부과 대상 |
+|---|---|
+| `input` | `input_tokens − cache_read − cache_write` |
+| `cache_read` | `cache_read` |
+| `cache_write` | `cache_write` |
+| `output` | `output_tokens − reasoning` |
+| `reasoning` | `reasoning` |
+
+각 뺄셈은 **그 규칙이 해당 하위 요율을 선언한 경우에만** 적용된다. 캐시에 대해 아무 말도 하지 않는
+요율표는 캐시된 접두부를 `input` 요율로 청구한다 — 캐시 할인이 없는 벤더가 청구하는 방식 그대로다.
+따라서 요율표 옮겨 적기는 기계적이다: 공표된 단가를 각자의 이름 아래 적고, 벤더가 따로 값을 매기지
+않는 컴포넌트에는 아무것도 적지 않는다.
+
+> ⚠️ **이 문단은 산술이 반대로 하고 있었기 때문에 존재한다.** `input`이 포함 프롬프트 전체에,
+> `cache_read`가 그중 캐시된 부분에 *또* 부과되었다. §8.5의 예시 요율표(`input: 0.85`,
+> `output: 3.40`, `cache_read: 0.19`)에서 40토큰 캐시 접두부를 가진 120토큰 프롬프트와 15토큰 응답은
+> 벤더의 **$0.0001266 대비 $0.0001606 — 27% 초과**로 청구되었고, 캐시 읽기가 새 토큰의 1/10인
+> 90% 캐시 에이전트 턴에서는 **5.7배**였다. §10.7은 "잘못 매핑된 캐시 필드는 보이는 오류가 아니라
+> 잘못된 청구서를 만든다"고 이미 적고 있었다.
+>
+> 두 번의 깨끗한 패리티 실행과 한 번의 깨끗한 컷오버를 통과한 이유가 수정 자체보다 중요하다:
+> **어느 하니스도 가격을 선언하지 않았다.** 매 실행이 0과 0을 비교했다. `deploy/litellm-parity/`의
+> 하니스 설정은 이제 가격을 매기고, 회귀 테스트는 dorang의 다른 함수가 아니라 손으로 계산한 벤더
+> 금액에 대해 검사한다 — 내부 함수끼리의 비교는 관례 오류를 잡을 수 없다. 그것들은 서로 일치하고
+> 있었다.
+
+티어 구간은 잘라내기의 영향을 받지 않는다: 구간은 요청이 얼마나 큰가에 대한 진술이므로
+`tiers[].up_to_input_tokens`는 포함 프롬프트 전체와 비교된다. `tier_mode: graduated`에서 캐시된
+접두부는 구간 순회의 *앞쪽*에서 빠진다 — 캐시 히트는 문자 그대로 프롬프트의 접두부이기 때문이다.
+
+사용량 보고가 자기모순이면 — 프롬프트 토큰보다 캐시 토큰이 많으면 — 부모의 부과액은 0까지만
+내려가고 그 아래로는 가지 않는다. 음수 컴포넌트는 아무도 내지 않은 예산과 쿼터를 돌려주는 일이다.
 
 ### 13.2 클래스는 경쟁하지 않고 합성한다
 

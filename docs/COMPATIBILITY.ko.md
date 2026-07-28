@@ -112,7 +112,7 @@ Anthropic 형태 요청이 OpenAI 형태 백엔드로 가는 일이 매우 흔�
 | 7.4 | `GET /v1/models` 항목은 `{"id","object":"model","created":<상수>,"owned_by"}`. `created`는 현재 시각이 아니라 **고정 상수** — 클라이언트가 그것으로 캐싱한다. 목록은 호출 키의 모델 허용목록으로 필터링된다. |
 | 7.5 | ⚠️ **라우트 매칭은 구체성 순서다.** `/openai/deployments/{model}/chat/completions`가 `/openai/{endpoint...}`보다 먼저 매칭돼야 한다. 단순 프리픽스 라우터는 구체적 라우트를 catch-all에 조용히 삼킨다. |
 | 7.6 | 미지원 파라미터는 기본적으로 **조용히 드롭**되며 거부되지 않는다. 전부 그대로 전달하는 게이트웨이는 클라이언트가 본 적 없는 업스트림 400을 노출시킨다. dorang이 `drop_unsupported: true`를 기본값으로 두는 이유다. |
-| 7.7 | 응답 헤더를 읽는 도구가 있다 — 특히 call id와 모델/배포 id. dorang은 `x-dorang-request-id`와 `x-dorang-deployment`를 내보내고, `compat.legacy_headers`가 켜지면 널리 읽히는 레거시 헤더 이름을 미러링한다. |
+| 7.7 | 응답 헤더를 읽는 도구가 있다 — 특히 call id와 모델/배포 id. dorang은 `x-dorang-request-id`와 `x-dorang-deployment`를 내보내고, `compat.legacy_headers`가 켜지면 널리 읽히는 레거시 헤더 이름을 미러링한다. 이름별 목록과 판별표는 영문 §7.7a. `x-litellm-response-cost`는 가격 규칙이 없을 때 `0`으로 나가지만, **스트리밍 응답에서는 생략된다** — 헤더는 첫 프레임보다 먼저 쓰이고 비용은 마지막 프레임 뒤에 정산되므로 그 시점에 숫자가 존재하지 않는다. 부재는 아무것도 주장하지 않지만 0은 측정을 주장하고, §7.7a의 판별표에서 0은 "가격 미등록"으로 읽힌다. 스트리밍 비용은 §10.4의 `event: dorang.usage` 프레임과 원장에 있다. |
 | 7.8 | 클라이언트가 인바운드 call-id 헤더를 설정하면 그것을 요청 id로 존중한다. |
 
 ## 8. 라우팅 동작도 호환성의 일부다

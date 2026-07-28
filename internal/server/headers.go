@@ -175,8 +175,8 @@ const (
 	// what dorang calls a deployment. It is deliberately not HeaderUpstreamModel,
 	// which is the provider-side model name.
 	LegacyHeaderModelID = "X-Litellm-Model-Id"
-	// LegacyHeaderResponseCost mirrors HeaderCostUSD, and — unlike it — is
-	// ALWAYS emitted, carrying 0 when no price rule matched.
+	// LegacyHeaderResponseCost mirrors HeaderCostUSD, and — unlike it — carries
+	// 0 when no price rule matched instead of being omitted.
 	//
 	// This is the one mirror that is not a straight copy of its source, and the
 	// asymmetry is deliberate. x-dorang-cost-usd is absent on an unpriced
@@ -191,6 +191,18 @@ const (
 	// The pair is the discriminator, and COMPATIBILITY §7.7a says so: legacy
 	// header present with 0 AND x-dorang-cost-usd absent means "not priced";
 	// both present and 0 means "priced, and free".
+	//
+	// # The one case where it is omitted
+	//
+	// A streamed answer is priced AFTER its last frame, and the headers went out
+	// before its first. The number does not exist when this header is written,
+	// and a mirror that claims 0 there says "not priced" under the discriminator
+	// above — for every streamed request, which in an agent deployment is all of
+	// them. That was worse than the absence it replaced: the absence claimed
+	// nothing, the zero claims a measurement. So the mirror is written when the
+	// cost is known and when it is knowably absent, and omitted only when it is
+	// not yet decidable; the number for a stream travels on §10.4's usage event
+	// and in the ledger, joined by x-dorang-request-id.
 	LegacyHeaderResponseCost = "X-Litellm-Response-Cost"
 	// LegacyHeaderKeySpend mirrors HeaderSpendUSD.
 	LegacyHeaderKeySpend = "X-Litellm-Key-Spend"
@@ -210,7 +222,7 @@ const (
 // It is called only when compat.legacy_headers is on, which is off by default:
 // these are another vendor's names on dorang's responses, and emitting them
 // unasked would make dorang claim to be a proxy it is not.
-func stampLegacyHeaders(h http.Header, rq *Request, r *Result) {
+func stampLegacyHeaders(h http.Header, rq *Request, r *Result, costDeferred bool) {
 	h.Set(LegacyHeaderCallID, rq.ID)
 	if r.UpstreamModel != "" {
 		h.Set(HeaderRealModel, r.UpstreamModel)
@@ -218,15 +230,19 @@ func stampLegacyHeaders(h http.Header, rq *Request, r *Result) {
 	if r.Deployment != "" {
 		h.Set(LegacyHeaderModelID, r.Deployment)
 	}
-	// Unconditional: see LegacyHeaderResponseCost. An unpriced request reports
-	// 0 here and nothing on x-dorang-cost-usd, which is what tells the two
-	// apart.
-	var cb [32]byte
-	cost := int64(0)
-	if r.Priced {
-		cost = r.CostNanoUSD
+	// See LegacyHeaderResponseCost. An unpriced request reports 0 here and
+	// nothing on x-dorang-cost-usd, which is what tells the two apart — but only
+	// while the 0 is a measurement. On a stream the cost is settled after the
+	// last frame and these headers went out before the first, so the mirror is
+	// omitted rather than made to claim a number nobody has computed.
+	if !costDeferred {
+		var cb [32]byte
+		cost := int64(0)
+		if r.Priced {
+			cost = r.CostNanoUSD
+		}
+		h.Set(LegacyHeaderResponseCost, string(appendNanoUSD(cb[:0], cost)))
 	}
-	h.Set(LegacyHeaderResponseCost, string(appendNanoUSD(cb[:0], cost)))
 	if !rq.Detail {
 		return
 	}
@@ -275,7 +291,13 @@ var InboundRequestIDHeaders = []string{
 // Two headers are attached regardless of the detail flag because they are
 // standard HTTP a client acts on rather than dorang telemetry it merely reads:
 // Retry-After on a 429, and the rate-limit set when the dispatcher populated it.
-func (s *Server) stampHeaders(h http.Header, rq *Request, status int) {
+//
+// costDeferred says that this response will be priced after its headers are on
+// the wire, which is every streamed answer: the dispatcher settles once the last
+// frame is written (DESIGN §10.4). It is not a guess from the Content-Type — the
+// caller computes it from the response it is about to send — and the only thing
+// it changes is that a cost header is omitted rather than published as zero.
+func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferred bool) {
 	cfg := rq.srv.snap.Load()
 	r := &rq.Result
 
@@ -294,7 +316,7 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int) {
 		h.Set(HeaderCostUSD, string(appendNanoUSD(b[:0], r.CostNanoUSD)))
 	}
 	if cfg.legacyHeaders {
-		stampLegacyHeaders(h, rq, r)
+		stampLegacyHeaders(h, rq, r, costDeferred)
 	}
 
 	if status == http.StatusTooManyRequests && r.RetryAfterSeconds > 0 {
