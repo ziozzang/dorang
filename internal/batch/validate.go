@@ -26,6 +26,13 @@ type validateConfig struct {
 	maxErrors    int
 	groupSegment int
 	models       ModelResolver
+	// authorize refuses a row whose model the owning credential may not use.
+	//
+	// It sits beside models rather than inside it because the two answer
+	// different questions — "is this model served here" and "may THIS caller
+	// use it" — and folding them together is how the second one went missing:
+	// the resolver is a process-wide table with no idea who is asking.
+	authorize ModelAuthorizer
 }
 
 // validateInput scans a JSONL batch input file.
@@ -177,6 +184,17 @@ func validateRow(in *InputRow, ln *rawLine, vc validateConfig, seen map[string]i
 				Message: fmt.Sprintf("model %q is not served by any deployment", *probe.Model)}
 		}
 	}
+	// The allow-list, per row. A batch is the one surface where a single
+	// authenticated request names arbitrarily many models, so the check that
+	// the interactive gate does once has to happen here once per line — and
+	// the ROW's model is what gets dispatched, not the create body's, which
+	// names no model at all.
+	if vc.authorize != nil {
+		if err := vc.authorize(*probe.Model); err != nil {
+			return &ValidationError{Line: ln.num, Code: CodeModelNotAllowed, Param: "body.model",
+				Message: err.Error()}
+		}
+	}
 	return nil
 }
 
@@ -215,7 +233,11 @@ func modelOf(body json.RawMessage) string {
 // slightly worse ordering, so the shallowest digest is exactly the right
 // resolution.
 func groupHash(model string, line []byte, segment int) string {
-	d := prefix.Compute(model, line, segment)
+	// No tenant component: this digest never leaves the batch it was computed
+	// for and is used only to ORDER that batch's own rows. It is not consulted
+	// by the routing table, so it carries none of §7.4b's cross-tenant
+	// exposure — every row it compares belongs to one owner by construction.
+	d := prefix.Compute("", model, line, segment)
 	if len(d) == 0 {
 		return ""
 	}

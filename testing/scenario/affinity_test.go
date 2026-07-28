@@ -128,14 +128,14 @@ func TestScenario09_SamePrefixSameTargetReorderedIsFree(t *testing.T) {
 		// The structural claim behind the routing behaviour, stated directly
 		// against the chain rather than inferred from one routing decision.
 		// DESIGN §14's property row requires all three to diverge.
-		base := prefix.Compute("m", conversation("m", "alpha", "beta", "gamma"), 0)
+		base := prefix.Compute("t", "m", conversation("m", "alpha", "beta", "gamma"), 0)
 		cases := map[string][]byte{
 			"permutation": conversation("m", "beta", "alpha", "gamma"),
 			"insertion":   conversation("m", "alpha", "inserted", "beta", "gamma"),
 			"deletion":    conversation("m", "alpha", "gamma"),
 		}
 		for name, body := range cases {
-			got := prefix.Compute("m", body, 0)
+			got := prefix.Compute("t", "m", body, 0)
 			if sameDigests(base, got) {
 				t.Errorf("%s produced the same chain as the original: a match would send the "+
 					"request to a backend whose cache holds something else", name)
@@ -145,13 +145,13 @@ func TestScenario09_SamePrefixSameTargetReorderedIsFree(t *testing.T) {
 		// The inverse: identical bytes must produce an identical chain, or the
 		// three assertions above are satisfied by a chain that never matches
 		// anything.
-		again := prefix.Compute("m", conversation("m", "alpha", "beta", "gamma"), 0)
+		again := prefix.Compute("t", "m", conversation("m", "alpha", "beta", "gamma"), 0)
 		if !sameDigests(base, again) {
 			t.Fatal("identical bytes produced different digests; the table can never hit")
 		}
 
 		// And a different group must never share an entry with this one.
-		other := prefix.Compute("other", conversation("m", "alpha", "beta", "gamma"), 0)
+		other := prefix.Compute("t", "other", conversation("m", "alpha", "beta", "gamma"), 0)
 		if sameDigests(base, other) {
 			t.Fatal("two groups share a chain: a match no longer implies the same candidate set")
 		}
@@ -217,7 +217,7 @@ func TestScenario10_StickyTTLElapsedReRoutes(t *testing.T) {
 		r := newRig(t, affinityConfig(), rigOpts{
 			pricing: affinityPricing, prefix: true, prefixTL: time.Hour,
 		})
-		digests := prefix.Compute("m", conversation("m", "hello"), 0)
+		digests := prefix.Compute("t", "m", conversation("m", "hello"), 0)
 		req := router.Request{Model: "m", Digests: digests, InputTokens: 1_000_000}
 
 		r.health.MarkUnavailable("d-plan", 24*time.Hour)

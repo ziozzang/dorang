@@ -84,22 +84,44 @@ func (s SecretRef) String() string { return s.Source() }
 // GoString returns the redacted source, so %#v cannot print a secret either.
 func (s SecretRef) GoString() string { return "config.SecretRef{" + s.Source() + "}" }
 
-// MarshalYAML writes back only the reference, never a resolved value.
+// MarshalYAML writes back only the reference, never a resolved value and never
+// an inline literal.
 //
-// Note that a SecretRef embedded with `yaml:",inline"` is flattened by the
-// encoder rather than passed through this method, so the real guarantee is
-// that [SecretRef.resolve] moves an inline literal out of the exported field.
+// This method used to be unreachable. gopkg.in/yaml.v3 flattens a struct
+// embedded with `yaml:",inline"` field by field rather than calling its
+// MarshalYAML, and BOTH uses of SecretRef embed it that way — so the redaction
+// that looks like the guarantee never ran, and `dorangctl import config` wrote
+// every literal api_key from the source file straight to stdout as a plaintext
+// `key:` value. The comment here said as much and treated it as acceptable
+// because resolve() moves the literal out of the exported field first; the
+// import path is precisely the one that never calls resolve.
+//
+// The reachable guarantee is now [SecretRef.Reference], which the enclosing
+// types' own MarshalYAML methods use. This method is kept correct for a
+// non-inline use and is exercised by the same test.
 func (s SecretRef) MarshalYAML() (any, error) {
+	env, file, ref := s.Reference3()
 	m := map[string]string{}
 	switch {
-	case s.Env != "":
-		m["key_env"] = s.Env
-	case s.File != "":
-		m["key_file"] = s.File
-	case s.Ref != "":
-		m["key_ref"] = s.Ref
+	case env != "":
+		m["key_env"] = env
+	case file != "":
+		m["key_file"] = file
+	case ref != "":
+		m["key_ref"] = ref
 	}
 	return m, nil
+}
+
+// Reference3 returns the three reference spellings, and nothing else.
+//
+// It is the one accessor an enclosing type's MarshalYAML needs: whatever it
+// returns is safe to write to a file, because a literal secret is not among the
+// things it can return. Inline is deliberately absent from the result rather
+// than filtered by the caller — a caller that has to remember to filter is the
+// arrangement that failed.
+func (s SecretRef) Reference3() (env, file, ref string) {
+	return s.Env, s.File, s.Ref
 }
 
 // MarshalJSON writes back only the redacted source.

@@ -303,6 +303,36 @@ type Credential struct {
 	CapacityGroup string    `yaml:"capacity_group,omitempty"`
 }
 
+// credentialYAML is the marshalled shape of a Credential: every field, with the
+// secret reference spelled out and the inline literal structurally absent.
+type credentialYAML struct {
+	ID            string `yaml:"id"`
+	Provider      string `yaml:"provider"`
+	KeyEnv        string `yaml:"key_env,omitempty"`
+	KeyFile       string `yaml:"key_file,omitempty"`
+	KeyRef        string `yaml:"key_ref,omitempty"`
+	CapacityGroup string `yaml:"capacity_group,omitempty"`
+}
+
+// MarshalYAML writes a credential without its secret.
+//
+// It exists because `yaml:",inline"` bypasses [SecretRef.MarshalYAML]: the
+// encoder flattens the embedded struct's exported fields, Inline among them, so
+// the type's own redaction was never consulted and a literal key was written to
+// whatever file the caller was generating. DESIGN §4.1 — "secrets never appear
+// in configuration" — was true only of the code path that resolves them first.
+//
+// The shape here has no field a literal can land in, so the guarantee does not
+// depend on this function remembering to omit one.
+func (c Credential) MarshalYAML() (any, error) {
+	env, file, ref := c.Key.Reference3()
+	return credentialYAML{
+		ID: c.ID, Provider: c.Provider,
+		KeyEnv: env, KeyFile: file, KeyRef: ref,
+		CapacityGroup: c.CapacityGroup,
+	}, nil
+}
+
 // Capacity declares the ceilings of every axis (§5.1).
 type Capacity struct {
 	ProviderGroups     map[string]CapacityLimits  `yaml:"provider_groups,omitempty"`
@@ -443,6 +473,27 @@ type RotationKey struct {
 	Key            SecretRef `yaml:",inline"`
 	MaxConcurrency int       `yaml:"max_concurrency,omitempty"`
 	CapacityGroup  string    `yaml:"capacity_group,omitempty"`
+}
+
+// rotationKeyYAML is the marshalled shape of a RotationKey. See
+// [Credential.MarshalYAML] for why the inline literal cannot be represented.
+type rotationKeyYAML struct {
+	ID             string `yaml:"id"`
+	KeyEnv         string `yaml:"key_env,omitempty"`
+	KeyFile        string `yaml:"key_file,omitempty"`
+	KeyRef         string `yaml:"key_ref,omitempty"`
+	MaxConcurrency int    `yaml:"max_concurrency,omitempty"`
+	CapacityGroup  string `yaml:"capacity_group,omitempty"`
+}
+
+// MarshalYAML writes a rotation key without its secret. This is the second of
+// the two `yaml:",inline"` uses of SecretRef, and it had the same hole.
+func (r RotationKey) MarshalYAML() (any, error) {
+	env, file, ref := r.Key.Reference3()
+	return rotationKeyYAML{
+		ID: r.ID, KeyEnv: env, KeyFile: file, KeyRef: ref,
+		MaxConcurrency: r.MaxConcurrency, CapacityGroup: r.CapacityGroup,
+	}, nil
 }
 
 // Model is one client-facing name and the deployments behind it (§3).

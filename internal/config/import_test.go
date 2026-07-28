@@ -312,9 +312,24 @@ model_list:
 	if !warningsContain(warnings, "", "literal secret") {
 		t.Errorf("a literal api_key was not reported:\n%s", warningStrings(warnings))
 	}
-	// It is imported as an inline key, so loading in production refuses it.
-	if err := c.Validate(); !hasProblem(err, "credentials[0].key", "accepted only when server.env") {
-		t.Errorf("an inline literal must not validate in production: %v", err)
+	// The literal is not carried at all. What lands in the generated
+	// configuration is a key_env reference the operator has to fill in — the
+	// importer's output is a file, and DESIGN §4.1 says a file does not hold
+	// secrets.
+	if len(c.Credentials) != 1 {
+		t.Fatalf("credentials = %d, want 1", len(c.Credentials))
+	}
+	cred := c.Credentials[0]
+	if cred.Key.Inline != "" {
+		t.Errorf("the literal secret was carried into the imported config: %q", cred.Key.Inline)
+	}
+	if cred.Key.Env == "" {
+		t.Error("no key_env reference was substituted for the literal")
+	}
+	for _, w := range warnings {
+		if strings.Contains(w.Message, "sk-literal-secret") {
+			t.Errorf("the warning echoes the secret: %s", w.Message)
+		}
 	}
 }
 

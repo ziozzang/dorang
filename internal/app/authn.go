@@ -85,13 +85,29 @@ func (ad *authAdapter) AuthenticateHeader(ctx context.Context, h http.Header) (s
 }
 
 // principal is the server's view of an authenticated caller.
+//
+// One is built per request, which is what lets counted below be a plain field:
+// it records that THIS request has already been counted against the rate
+// meters, so a handler that authorizes fifty batch rows does not count fifty
+// requests.
 type principal struct {
 	p   *auth.Principal
 	now func() time.Time
-	// rates supplies the rolling-minute counts a key's rpm_limit and tpm_limit
-	// are compared against. Nil leaves both unenforced, which is what the whole
-	// gateway did before it existed.
+	// rates supplies the rolling-minute counts every subject's rpm_limit and
+	// tpm_limit are compared against. Nil leaves both unenforced, which is what
+	// the whole gateway did before it existed.
 	rates *keyRates
+	// obs is what each subject's window held when this request was admitted, and
+	// counted records that the admission happened. Together they are what makes
+	// one HTTP request cost one increment: a handler that authorizes fifty batch
+	// rows asks fifty times and must not count fifty requests.
+	obs     observed
+	counted bool
+}
+
+// ObservedRates implements [auth.RateSource] from this request's own snapshot.
+func (p *principal) ObservedRates(kind, id string) (rpm, tpm int64) {
+	return p.obs.ObservedRates(kind, id)
 }
 
 // maxParallel is the key's max_parallel_requests, or 0 when it has none.
@@ -105,22 +121,10 @@ func (p *principal) maxParallel() int {
 	if p == nil || p.p == nil || p.p.Master {
 		return 0
 	}
-	best := int64(0)
-	for _, l := range []*auth.Limits{&p.p.Key, p.p.User, p.p.Team} {
-		if l == nil || l.MaxParallel == nil {
-			continue
-		}
-		// Most restrictive wins across key, user and team (DESIGN §11.2), and a
-		// configured zero really is zero: it refuses everything, which is why
-		// the column is a pointer.
-		if v := *l.MaxParallel; best == 0 || v < best {
-			best = v
-		}
-	}
-	if best < 0 {
-		return 0
-	}
-	return int(best)
+	// Most restrictive wins across key, user and team (DESIGN §11.2). The rule
+	// lives in internal/auth beside the limits it combines rather than being
+	// spelled a second time here.
+	return auth.MostRestrictiveParallel(&p.p.Key, p.p.User, p.p.Team)
 }
 
 // priorityClass is the class an operator assigned this key (§7.5). It reaches
@@ -163,6 +167,14 @@ func (p *principal) UserID() string { return p.p.UserID }
 // TeamID implements server.Principal.
 func (p *principal) TeamID() string { return p.p.TeamID }
 
+// IsMaster reports the out-of-band administrative credential.
+//
+// It exists so that principalID can give a master-credential upload a real
+// owner. The master has no api_keys row, so its KeyID is "" — and an object
+// recorded with an empty owner used to be readable, usable and deletable by
+// every key in the deployment (batch.ownedBy).
+func (p *principal) IsMaster() bool { return p.p != nil && p.p.Master }
+
 // Authorize implements server.Principal.
 //
 // The observed rates are supplied HERE, at the one production construction of
@@ -170,34 +182,54 @@ func (p *principal) TeamID() string { return p.p.TeamID }
 // clock. Omitting them — which is what this function did — left every positive
 // rpm_limit and tpm_limit comparing a configured ceiling against a hard-coded
 // zero, so the check ran on every request and could never fire.
+//
+// They are supplied PER SUBJECT, through auth.RateSource, because one observed
+// pair cannot answer for three subjects: a team's ceiling read against a key's
+// count is a team ceiling multiplied by the number of keys under the team.
+//
+// The window is entered once per request, before the decision, and the snapshot
+// taken there is what every subject is judged against. Reading before the
+// increment lands is what makes a limit of 1 admit one request rather than none.
 func (p *principal) Authorize(a server.Access) error {
-	ac := auth.Access{Now: p.now(), Model: a.Model, Route: a.Route}
 	// The master credential is authorized unconditionally and has no stored row
 	// to carry limits, so it is not counted either: counting it would let an
 	// administrative probe consume a tenant's window under a shared id.
-	if !p.p.IsMaster() {
-		req, tok := p.rates.observe(p.p.KeyID)
-		ac.ObservedRPM, ac.ObservedTPM = clampInt(req), clampInt(tok)
+	if !p.counted && !p.p.IsMaster() {
+		p.counted = true
+		p.obs = p.rates.observe(p.p)
 	}
-	if err := p.p.Authorize(ac); err != nil {
+	if err := p.p.Authorize(auth.Access{
+		Now: p.now(), Model: a.Model, Route: a.Route, Rates: p,
+	}); err != nil {
 		return authError(err)
 	}
 	return nil
 }
 
-// clampInt narrows an int64 count to the int auth.Access carries, saturating
-// rather than wrapping. A wrapped count would read as a small number and turn an
-// exceeded ceiling into an allowed request, which is the one direction a limit
-// must never fail in.
-func clampInt(v int64) int {
-	const maxInt = int64(^uint(0) >> 1)
-	switch {
-	case v < 0:
-		return 0
-	case v > maxInt:
-		return int(maxInt)
+// ModelsRestricted implements server.ModelRestricted.
+//
+// It answers "is there a list at all", which is what a route that could not
+// determine the model has to know before it decides whether that is fine or
+// fatal. A key with no allow-list anywhere is unrestricted and a passthrough
+// body dorang cannot parse costs it nothing.
+func (p *principal) ModelsRestricted() bool {
+	if p == nil || p.p == nil || p.p.Master {
+		return false
 	}
-	return int(v)
+	for _, l := range []*auth.Limits{&p.p.Key, p.p.User, p.p.Team} {
+		if l == nil {
+			continue
+		}
+		for _, m := range l.Models {
+			if m == "*" {
+				continue
+			}
+			if m != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AllowsModel implements server.Principal.

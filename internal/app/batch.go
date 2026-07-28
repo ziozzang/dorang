@@ -17,8 +17,11 @@ import (
 
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
+	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/pricing"
+	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -42,9 +45,13 @@ func (a *App) startBatch(cfg *config.Config, up *upstreamTable) error {
 	a.targets.swap(buildTargets(cfg, a.Catalog))
 
 	svc, err := batch.New(batch.Config{
-		Store:    &batchStore{st: a.Store},
-		Blobs:    blobs,
-		Executor: &batchExecutor{d: a.dispatch},
+		Store: &batchStore{st: a.Store},
+		Blobs: blobs,
+		Executor: &batchExecutor{
+			d: a.dispatch,
+			owners: newOwnerResolver(
+				&storePrincipalLoader{st: a.Store}, a.now),
+		},
 		Capacity: &batchReserver{broker: a.Broker, table: up},
 		Models:   a.targets,
 		Logf:     a.logf,
@@ -206,7 +213,13 @@ func (t *upstreamTable) anyCredential(provider string) string {
 // The contract it must honour: a returned error means no HTTP answer was
 // produced at all, and a non-2xx answer is a result, not an error, because the
 // caller's error file has to carry the upstream's own envelope.
-type batchExecutor struct{ d *dispatcher }
+type batchExecutor struct {
+	d *dispatcher
+	// owners resolves the batch's owning credential so this path can ask the
+	// two questions the interactive gate asks and this one used to skip: may
+	// this caller use this model, and is there budget left.
+	owners *ownerResolver
+}
 
 // Execute implements batch.Executor.
 func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*batch.ExecResult, error) {
@@ -218,12 +231,34 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 	if !ok {
 		return nil, fmt.Errorf("app: no upstream configured for provider %q", req.Provider)
 	}
+	// Authorization before anything else, and before the value this function
+	// needs exists. identity refuses to produce an execIdentity for a model the
+	// owner's allow-list does not admit, so there is no ordering in which the
+	// upstream call happens and the check does not.
+	now := e.d.now()
+	id, err := e.owners.identity(ctx, req.OwnerKeyID, req.Model, now)
+	if err != nil {
+		return nil, err
+	}
 	creq, err := openai.DecodeRequest(req.Body)
 	if err != nil {
 		// A row body that does not decode produced no HTTP answer, so it is an
 		// error rather than a result. Validation already rejected the shape;
 		// reaching here means the row is worse than the validator can see.
 		return nil, err
+	}
+	// The model the ROW names, not the one the create body named — it named
+	// none. This is the value the allow-list was checked against above, and
+	// re-reading it from the decoded body here would be a second answer.
+	if creq != nil && creq.Model != "" && creq.Model != req.Model {
+		return nil, &terminalError{msg: "the row's body names a different model than the row"}
+	}
+	c := &call{
+		kind:      callChat,
+		clientAPI: catalog.APIOpenAIChat,
+		model:     req.Model,
+		body:      req.Body,
+		creq:      creq,
 	}
 	// The credential the scheduler reserved against, not one chosen here. The
 	// reservation holds slots on THAT account's axes (DESIGN §5.1), so sending
@@ -232,6 +267,32 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 	if cred == "" {
 		cred = st.upstreams.anyCredential(req.Provider)
 	}
+	// The row's target in the shape the budget gate and the pricer take. There is
+	// no routing decision to inherit — the scheduler already chose one — so it is
+	// assembled from what the scheduler chose rather than re-derived here.
+	dec := &router.Decision{
+		Provider:      req.Provider,
+		UpstreamModel: req.UpstreamModel,
+		Credential:    cred,
+		Kind:          up.Kind(),
+	}
+
+	// The budget, held before the row goes upstream and settled or released
+	// afterwards — the same pair dispatcher.Dispatch takes, through the same
+	// gate, against the same durable counters. A batch row costs the operator
+	// real money and used to reach no ceiling at all.
+	hold, berr := st.budget.reserveBatch(ctx, st, c, dec, id)
+	if berr != nil {
+		return nil, berr
+	}
+	settled := false
+	defer func() {
+		if !settled {
+			// Nothing was spent: no answer came back, or the answer was a
+			// refusal.
+			hold.release()
+		}
+	}()
 
 	res := e.d.backend.Do(ctx, backend.Target{
 		Provider:      up,
@@ -257,7 +318,36 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		// [batch.Executor] defines as an error rather than a result.
 		return nil, res.Err
 	}
+	settled = true
+	hold.settle(e.d.rowCost(st, dec, res.Usage, now))
 	return &batch.ExecResult{StatusCode: res.Status, Body: res.Body}, nil
+}
+
+// rowCost prices one completed batch row so the budget hold can be settled at
+// what it actually cost rather than at the estimate.
+func (d *dispatcher) rowCost(st *dispatchState, dec *router.Decision,
+	usage canonical.Usage, now time.Time) int64 {
+
+	if st == nil || st.pricing == nil {
+		return 0
+	}
+	cost, err := st.pricing.Settle(pricing.Request{
+		Provider:         dec.Provider,
+		Model:            dec.UpstreamModel,
+		Credential:       dec.Credential,
+		Deployment:       dec.Deployment,
+		InputTokens:      int64(usage.InputTokens),
+		OutputTokens:     int64(usage.OutputTokens),
+		CacheReadTokens:  int64(usage.CacheReadTokens),
+		CacheWriteTokens: int64(usage.CacheWriteTokens),
+		ReasoningTokens:  int64(usage.ReasoningTokens),
+		Requests:         1,
+		At:               now,
+	})
+	if err != nil || cost.Missing {
+		return 0
+	}
+	return cost.TotalNano
 }
 
 // batchRoutes mounts the batch and files surface on the HTTP server.
@@ -286,6 +376,14 @@ func (a *App) batchRoutes() []server.Route {
 		{
 			Pattern: "/v1/batches", Methods: server.MethodGET | server.MethodPOST,
 			Name: "batches", NeedsBody: true,
+			// NOT ModelAuthGate. The create body is
+			// {"input_file_id","endpoint","completion_window","metadata"} and
+			// names no model at all, so the gate would scan "", compare it
+			// against the allow-list, skip the check, and let a key restricted
+			// to one model submit a file naming any model in the catalog. The
+			// models a batch names are on the ROWS, and they are authorized
+			// where the rows are: at upload, and again per row at dispatch.
+			ModelAuth: server.ModelAuthHandler,
 			Handler: byMethod(map[string]server.Handler{
 				http.MethodPost: a.handleBatchCreate,
 				http.MethodGet:  a.handleBatchList,
@@ -293,17 +391,24 @@ func (a *App) batchRoutes() []server.Route {
 		},
 		{
 			Pattern: "/v1/batches/{id}", Methods: server.MethodGET,
-			Name: "batches_retrieve", Handler: a.handleBatchRetrieve,
+			Name: "batches_retrieve", ModelAuth: server.ModelAuthNone,
+			Handler: a.handleBatchRetrieve,
 		},
 		{
 			Pattern: "/v1/batches/{id}/cancel", Methods: server.MethodPOST,
-			Name: "batches_cancel", Handler: a.handleBatchCancel,
+			Name: "batches_cancel", ModelAuth: server.ModelAuthNone,
+			Handler: a.handleBatchCancel,
 		},
 		{
 			// The upload declares no body: an input file may be 200 MiB and the
 			// content is streamed into blob storage rather than buffered whole.
 			Pattern: "/v1/files", Methods: server.MethodGET | server.MethodPOST,
 			Name: "files",
+			// A batch input file is a list of model calls. Every row's model is
+			// checked against the uploading key's allow-list here, which is the
+			// last moment the uploader's identity is in hand — the rows are
+			// dispatched later, asynchronously, possibly by another process.
+			ModelAuth: server.ModelAuthHandler,
 			Handler: byMethod(map[string]server.Handler{
 				http.MethodPost: a.handleFileUpload,
 				http.MethodGet:  a.handleFileList,
@@ -311,7 +416,7 @@ func (a *App) batchRoutes() []server.Route {
 		},
 		{
 			Pattern: "/v1/files/{id}", Methods: server.MethodGET | server.MethodDELETE,
-			Name: "files_object",
+			Name: "files_object", ModelAuth: server.ModelAuthNone,
 			Handler: byMethod(map[string]server.Handler{
 				http.MethodGet:    a.handleFileRetrieve,
 				http.MethodDelete: a.handleFileDelete,
@@ -319,7 +424,8 @@ func (a *App) batchRoutes() []server.Route {
 		},
 		{
 			Pattern: "/v1/files/{id}/content", Methods: server.MethodGET,
-			Name: "files_content", Handler: a.handleFileContent,
+			Name: "files_content", ModelAuth: server.ModelAuthNone,
+			Handler: a.handleFileContent,
 		},
 	}
 }
@@ -335,6 +441,16 @@ func (a *App) handleBatchCreate(w http.ResponseWriter, rq *server.Request) error
 		return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
 			err.Error()).WithCode("invalid_body")
 	}
+	// The create body names no model, so there is nothing here to put through
+	// AuthorizeModel. What makes that safe is stated rather than assumed: the
+	// file's rows were checked against this same key's allow-list when it was
+	// uploaded (Create refuses a file this key does not own), and every row is
+	// checked again against a freshly loaded envelope before it is dispatched
+	// (batchExecutor.Execute). Neither of those is visible from here, which is
+	// why the claim is written down at the call site instead of being implied
+	// by the absence of a check.
+	rq.MarkModelAuthorized("batch rows are authorized at upload and again per row at dispatch")
+
 	out, err := a.Batch.Create(rq.Context(), batch.CreateRequest{
 		InputFileID:      body.InputFileID,
 		Endpoint:         body.Endpoint,
@@ -346,6 +462,18 @@ func (a *App) handleBatchCreate(w http.ResponseWriter, rq *server.Request) error
 		return batchError(err)
 	}
 	return writeJSON(w, http.StatusOK, out)
+}
+
+// modelAuthorizerFor builds the row authorizer for one upload.
+//
+// It closes over the REQUEST, not over the principal, so every row a caller
+// uploads goes through the same [server.Request.AuthorizeModel] the interactive
+// gate uses — one implementation of "may this caller use this model", reached
+// from both surfaces.
+func modelAuthorizerFor(rq *server.Request) batch.ModelAuthorizer {
+	return func(model string) error {
+		return rq.AuthorizeModel(model)
+	}
 }
 
 func (a *App) handleBatchList(w http.ResponseWriter, rq *server.Request) error {
@@ -404,11 +532,18 @@ func (a *App) handleFileUpload(w http.ResponseWriter, rq *server.Request) error 
 			b, _ := io.ReadAll(io.LimitReader(part, 128))
 			purpose = string(bytes.TrimSpace(b))
 		case "file":
+			if purpose != batch.PurposeBatch {
+				// Not a list of model calls; nothing here can reach a paid
+				// model. UploadFile refuses a batch-purpose upload with no
+				// authorizer, so this is the only branch that needs to say so.
+				rq.MarkModelAuthorized("upload purpose " + purpose + " carries no model calls")
+			}
 			out, err := a.Batch.UploadFile(rq.Context(), batch.UploadRequest{
 				Filename:   part.FileName(),
 				Purpose:    purpose,
 				OwnerKeyID: principalID(rq),
 				Content:    part,
+				Authorize:  modelAuthorizerFor(rq),
 			})
 			part.Close()
 			if err != nil {

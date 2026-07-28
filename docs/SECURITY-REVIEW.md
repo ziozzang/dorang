@@ -1022,10 +1022,18 @@ Written by the engineer who acted on the findings above. The findings themselves
 are unedited; this section records what was done, what was not, and what the
 review missed.
 
-Baseline: commit `207d622`. Every claim below was checked by reverting the fix
-in a scratch copy and observing the named test fail, then restoring it and
-observing it pass. A test that passes in both directions is recorded as such
-rather than counted.
+Baseline: commit `207d622`, on the branch the fixes were written on.
+
+> **This section was, for a time, false of `main`.** The document was copied to
+> `main` without the code — see "# Dispositions, third pass" at the end, which is
+> the authoritative statement. Every claim below has since been **re-verified
+> against the merged tree** by reverting the fix in place and watching the named
+> test fail; where the merge changed where a fix lives or what it does, the text
+> below has been corrected to match the binary rather than left as written. The
+> third pass carries the full revert-and-fail table and the list of what the
+> first two passes got wrong.
+
+A test that passes in both directions is recorded as such rather than counted.
 
 ## The unifying diagnosis, applied
 
@@ -1060,21 +1068,25 @@ The rest are honest patches, marked as such below.
 
 ## Finding-by-finding
 
+Status is as of the merge. "Closed" means a named test fails when the fix is
+reverted in the merged tree — the third pass lists the exact edit for each.
+
 | # | Finding | Status | Kind |
 |---|---|---|---|
-| 1 | [CRITICAL] batch bypasses the model allow-list and the budget gate | **Closed** | structural |
-| 2 | [HIGH] `rpm_limit`, `tpm_limit`, `max_parallel_requests` enforce nothing | **Closed** | patched + wired |
-| 3 | [HIGH] upstream error message copied into the client envelope | **Closed** | structural |
-| 4 | [HIGH] a team budget enforced per key | **Closed** | patched |
-| 5 | [HIGH] tenant isolation of cache affinity is false as shipped | **Closed** | patched |
-| 6 | [HIGH] unauthenticated key flood drives an O(keys) copy per request | **Closed** | patched |
-| 7 | [HIGH] non-streaming upstream read is an unbounded `io.ReadAll` | **Closed** | patched |
-| 8 | [HIGH] passthrough dispatches with no model check | **Closed** | structural |
-| 9 | [MEDIUM] `SecretRef.MarshalYAML` never runs | **Closed** | structural |
-| — | [MEDIUM] transport error text names internal hosts | **Closed** | patched (bundled) |
-| — | [MEDIUM] `x-dorang-native-error-type` unvalidated and unbounded | **Closed** | patched (bundled) |
-| — | [MEDIUM] passthrough relays upstream `Set-Cookie` | **Closed** | patched (bundled) |
-| — | The administrative control plane is not mounted | **Not fixed, recorded** | see below |
+| 1 | [CRITICAL] batch bypasses the model allow-list and the budget gate | **Closed**, verified | structural |
+| 2 | [HIGH] `rpm_limit`, `tpm_limit`, `max_parallel_requests` enforce nothing | **Closed**, verified — and it was NOT closed on `main` until the merge; the per-team half was a live defect, see the third pass | patched + wired |
+| 3 | [HIGH] upstream error message copied into the client envelope | **Closed**, verified | structural |
+| 4 | [HIGH] a team budget enforced per key | **Closed**, verified | patched |
+| 5 | [HIGH] tenant isolation of cache affinity is false as shipped | **Closed**, verified | patched |
+| 6 | [HIGH] unauthenticated key flood drives an O(keys) copy per request | **Closed**, verified — first half only; the store-lookup half is open | patched |
+| 7 | [HIGH] non-streaming upstream read is an unbounded `io.ReadAll` | **Closed**, verified — in `internal/backend`, and the test was strengthened to bound the READ | patched |
+| 8 | [HIGH] passthrough dispatches with no model check | **Closed**, verified | structural |
+| 9 | [MEDIUM] `SecretRef.MarshalYAML` never runs | **Closed**, verified — by `Credential`/`RotationKey`, not by the method the finding names | structural |
+| — | [MEDIUM] transport error text names internal hosts | **Closed**, verified | patched (bundled) |
+| — | [MEDIUM] `x-dorang-native-error-type` unvalidated and unbounded | **Closed**, verified | patched (bundled) |
+| — | [MEDIUM] passthrough relays upstream `Set-Cookie` | **Closed**, verified | patched (bundled) |
+| — | The administrative control plane is not mounted | **Fixed** — mounted, with its three latent defects closed first | see the third pass |
+| — | [MEDIUM] `batch.ownedBy` treats an unowned record as public (found while fixing) | **Closed**, verified | patched |
 
 ### 1 — CRITICAL, batch
 
@@ -1117,9 +1129,16 @@ and is what the pre-existing unit test still exercises — that test passes befo
 and after and closes nothing, which is precisely the topology the review named.
 The tests that close it are end-to-end through `app.principal.Authorize`.
 
-`internal/app/rates.go` is the counter: a tumbling minute, all three subjects
-incremented per request, tokens added at settlement, and the map dropped whole
-on rollover so a flood of distinct subject ids cannot accumulate.
+`internal/app/rates.go` is the counter. As merged it is a **rolling** minute —
+sixty stamped one-second buckets per subject, sharded sixteen ways, capped at
+100 000 subjects with cold-entry eviction — keyed `kind:id`, so all three
+subjects are counted per request and a flood of distinct subject ids is bounded
+rather than merely reset. (The branch's version was a tumbling minute with the
+map dropped whole on rollover; `main` had independently written the rolling one
+for the per-key sweep, and the merge kept the rolling window and re-derived it
+per subject. The third pass records why.) Tokens are added at settlement, from
+`App.recordMetrics`, which is the one production site every finished request
+passes.
 
 `max_parallel_requests` reaches the broker through
 `capacity.Request.PrincipalMax`, combined with the static
@@ -1128,7 +1147,11 @@ can tighten a deployment default and never raise it.
 
 Tests: `TestRPMLimitIsEnforced`, `TestTPMLimitIsEnforced`,
 `TestTeamRPMCountsEveryKeyUnderTheTeam`, `TestRateWindowRolls`,
-`internal/capacity/principalmax_test.go`.
+`TestSettledTokensReachEverySubjectOfTheRequest`,
+`TestRPMLimitRefusesThroughTheWholeStack` and `TestTPMLimitCountsFinishedTokens`
+(both through the assembled stack, against a real upstream),
+`TestMaxParallelReachesThePrincipal`, and `TestPrincipalMaxTightensTheAxis` /
+`TestPrincipalMaxNeverWidens` in `internal/capacity/queue_limits_test.go`.
 
 **Mitigated, not closed:** `tpm_limit` bounds the *next* request, because the
 token count does not exist until settlement. A single enormous request can
@@ -1144,20 +1167,34 @@ and the body gets `canonicalMessage(status)`, a function whose only input is the
 status. A new branch cannot leak by forgetting a rule; it would have to write
 the leak.
 
-`internal/redact` is the scrubber the review asked to be moved somewhere both
-paths can reach. `internal/app` applies it to the recorded native text with the
-exact secret that attempt sent, so the ledger copy is scrubbed too.
-`internal/probe`'s own `scrubber` is untracked work in progress and was left
-alone; it should be switched to `internal/redact` when that work lands.
+The scrubber runs in `internal/backend`, which is the layer that makes the HTTP
+call after the L5 extraction. `upstreamError` collects what was actually put on
+the outbound credential headers — `collectSecrets`, which reads the headers
+rather than the credential table, so an OAuth token applied by code it does not
+own is caught too — and scrubs it out of `NativeMessage`, the native type and the
+code before anything renders or records them, so the ledger copy is scrubbed too.
+`internal/redact` exists as the shared implementation; `internal/app` no longer
+applies it, because `internal/app` no longer touches an upstream response.
+`internal/probe`'s own `scrubber` is a third copy and was left alone; it should
+be switched to `internal/redact` when that work lands.
 
-The bundled MEDIUMs went with it: `WriteError` now applies `safeHeaderValue` and
-a 128-byte clamp to the upstream-controlled `NativeType`, and
-`internal/app/dispatch.go` no longer relays transport error text.
+The bundled MEDIUMs went with it: `WriteError` applies `safeHeaderValue` and a
+128-byte clamp to the upstream-controlled `NativeType`, and `transportError` logs
+the transport failure instead of relaying `err.Error()` — which for a dial
+failure names the operator's internal host, port and resolved address.
 
 Tests: `internal/server/errorleak_test.go` (all seven envelope shapes),
 `TestAHostileUpstreamCannotEchoTheCredentialBack` (end to end, a backend
 answering with the `Authorization` header it was handed),
-`TestUnreachableUpstreamDoesNotNameInternalHosts`.
+`TestUnreachableUpstreamDoesNotNameInternalHosts`,
+`TestNativeErrorTypeHeaderIsCheckedAndClamped`.
+
+**A consequence, found by the merge:** `Error.Message` is now
+`canonicalMessage(status)` on every branch, so anything that *classified* on the
+upstream's words had to move to `NativeMessage` with it.
+`internal/app/estimate.go`'s `upstreamCause` did not, and §10.5a's "route to a
+larger window" had silently stopped being reachable from an upstream signal.
+`TestAnUpstreamOverflowIsRecognisedFromTheBody` pins it.
 
 **Deliberately not done:** the review suggested an operator flag to relay an
 excerpt for debuggability. Not added — it is a flag whose only effect is to
@@ -1211,16 +1248,20 @@ pass.**
 
 ### 7 — HIGH, unbounded read
 
-`readUpstreamBody` reads one byte past `dispatchState.maxResponseBytes`
-(default `DefaultMaxResponseBytes`, 32 MiB, matching the request cap) and
+`backend.readUpstreamBody` reads one byte past `Options.MaxResponseBytes`
+(default `backend.DefaultMaxResponseBytes`, 32 MiB, matching the request cap) and
 answers `502 upstream_response_too_large`, not retryable — a fail-back hop would
-buffer another one. The batch executor uses the same function; it had the same
-unbounded read and the review did not mention it.
+buffer another one. It is in `internal/backend` because that is the package that
+makes the call; the batch executor reaches it through the same `backend.Do`, so
+the second unbounded read the review did not mention is closed by the same code
+rather than by a second copy of it.
 
-`maxResponseBytes` is a field on the dispatch state but is **not yet surfaced in
+`MaxResponseBytes` is an option on the backend but is **not yet surfaced in
 YAML**. Same gap the review notes for `server.max_body_bytes`.
 
-Tests: `TestOversizedUpstreamResponseIsRefused`.
+Tests: `TestOversizedUpstreamResponseIsRefused` — which now counts what the
+reader was ASKED FOR, because the first version of it passed against an
+implementation that read the whole body and measured it afterwards.
 
 ### 8 — HIGH, passthrough
 
@@ -1242,6 +1283,13 @@ list". A `Principal` that does not implement it is treated as restricted:
 fail-closed, so a future implementation that merely forgets a method costs
 availability rather than enforcement.
 
+Both refusals are **403 `permission_error`**, per COMPATIBILITY §11.2 — the
+credential authenticated and is simply not permitted this model, and a 401 tells
+a client to re-authenticate over a body it should instead re-encode. The branch
+answered 401 citing §7.2, which is about tag-routing misses; the shared
+authorization gate has always answered 403 for the same refusal, so one rule had
+two answers and only the unreachable one was wrong.
+
 Tests: `internal/server/passthrough_security_test.go`.
 
 **Mitigated, not closed:** a restricted key with a legitimate non-JSON
@@ -1251,9 +1299,12 @@ the fail-closed direction, but an operator will notice it.
 
 ### 9 — MEDIUM, `dorangctl import config`
 
-Two changes. `Credential` and `RotationKey` have explicit `MarshalYAML` methods
-whose target shape has no field an inline literal can occupy, so the `,inline`
-flattening cannot reach it. And `internal/config/import.go` no longer *creates*
+Two changes, and the finding's own title names the wrong method.
+`SecretRef.MarshalYAML` **never runs** — that is the finding — and it still never
+runs: it can be renamed out of existence and every marshalling test passes. The
+fix is one layer out. `Credential` and `RotationKey` have explicit `MarshalYAML`
+methods whose target shape has no field an inline literal can occupy, so the
+`,inline` flattening cannot reach it. And `internal/config/import.go` no longer *creates*
 inline literals: a literal `api_key` in the source becomes
 `key_env: DORANG_<PROVIDER>_API_KEY` plus a warning naming the variable. The
 secret is not echoed into the warning either — the fix for "a secret ended up
@@ -1266,56 +1317,53 @@ Tests: `internal/config/secretmarshal_test.go`,
 starts a server without the operator setting the named environment variables
 first. That is intended.
 
-## `internal/admin` — the decision
+## `internal/admin` — mounted
 
-**Left unwired.** The three latent defects were not fixed and the package is
-still imported by nothing.
+**This section said "Left unwired", and that is no longer true.** It is mounted,
+with its three latent defects closed first — read-before-auth, a team-scoped
+administrator derived from `api_keys.team_id`, and request-supplied id filters
+checked rather than trusted. The reasoning for deferring it stands as written:
+wiring it without those three would have converted three latent findings into
+live ones on one commit. They were fixed, then it was wired. The third pass has
+the detail and the tests.
 
-The reasoning: wiring it correctly means fixing read-before-auth, adding a
-team-scoped admin concept, and replacing request-supplied id filters with the
-authenticated principal — of which the second is a design change (there is no
-`admin_team` role, no schema for one, and `admin_viewer` currently means "read
-everything"). Doing that alongside nine security fixes in one pass would mean
-shipping a new authorization model with no operational review. The review's own
-instruction — *wiring it up without them converts three latent findings into
-live ones on the same commit* — was followed by not wiring it.
+### Revoking a leaked key
 
-### Revoking a leaked key today
+`POST /key/block` serves. `TestALeakedKeyCanBeRevokedThroughTheAPI`
+(`cmd/dorang/revoke_test.go`) runs the incident end to end over HTTP: a working
+key, one administrative call, and the next request from that key refused, with
+the audit row read back from the database. The refusal is observed within
+`DefaultEntryTTL` (60 s), because `internal/auth` caches a loaded credential —
+the test waits for it rather than asserting instantly, since the operator's
+question is "how long until it stops working" and the answer has to be a bounded
+number rather than "never".
 
-There is **no API path to revoke a key**. `POST /key/block` answers
-`501 route_not_implemented`. An operator with a leaked `sk-` key has three
-options, in order of preference:
+`POST /key/regenerate` replaces the secret outright, and `POST /key/rotate`
+replaces it with a grace window (§11.2c). Both go through `store.RotateKey`;
+regenerate follows it with `EndGrace`. There is no second write path, because the
+one that existed wrote `api_keys`' denormalized verifier columns while
+authentication resolves through `api_key_secrets` — a regeneration that
+regenerated nothing, behind a 200.
 
-1. **Block the row, then wait out the cache.**
-   ```sql
-   UPDATE api_keys SET blocked = 1 WHERE id = '<key id>';
-   ```
-   `internal/auth` caches a loaded credential for `DefaultEntryTTL` (60 s), so
-   the key stops working within a minute of the write. `Authenticator.use`
-   enforces `Blocked` on every request independently of `Authorize`, so no
-   second check has to be reached. This is the fastest safe option and needs no
-   restart.
+The SQL break-glass path still works and is still the right answer in one case:
+when the administrative credential itself is what leaked.
 
-2. **Delete the row** if the key should not exist at all:
-   ```sql
-   DELETE FROM api_keys WHERE id = '<key id>';
-   ```
-   Same 60-second window. Prefer (1): a blocked row keeps the audit trail and
-   keeps the ledger's foreign keys resolvable.
+```sql
+UPDATE api_keys SET blocked = 1 WHERE id = '<key id>';
+```
 
-3. **Restart the process** if the window matters more than the disruption. A
-   restart drops the snapshot and the overlay, so the next request re-reads the
-   row.
-
-Find the key id without the secret: the label is derived from the first 8 hex
-characters of the lookup digest (`store.LabelFor`), so
+`internal/auth` caches a loaded credential for `DefaultEntryTTL` (60 s), so the
+key stops working within a minute of the write, and `Authenticator.use` enforces
+`Blocked` on every request independently of `Authorize`. Find the key id without
+the secret: the label is derived from the first 8 hex characters of the lookup
+digest (`store.LabelFor`), so
 `SELECT id, key_label, user_id, team_id FROM api_keys WHERE key_label = ?`
 identifies it from what a leak report usually contains.
 
-**In-flight batches:** blocking the row now also stops batches that key
-submitted, within the owner-resolution TTL (30 s) — `batchExecutor` calls
-`Authorize` per row. Before this change, a batch submitted before a block kept
-spending until it finished.
+**In-flight batches:** blocking the row also stops batches that key submitted,
+within the owner-resolution TTL (30 s) — `batchExecutor` reaches `Authorize` per
+row. Before this change, a batch submitted before a block kept spending until it
+finished.
 
 ## What the review missed
 
@@ -1333,13 +1381,20 @@ Found while fixing, not in the findings above.
    (`internal/app/batch.go`, pre-fix line 266). The review found the interactive
    one only. Both now use `readUpstreamBody`.
 
-3. **`batch.ownedBy` treats an unowned record as public.**
-   `ownedBy(recordOwner, owner)` returns true when `recordOwner == ""`, so a
-   file or batch created with an empty `OwnerKeyID` is readable, usable and
-   deletable by *every* key. A master-credential upload produces exactly such a
-   record. **Not fixed in this pass** — tightening it changes behaviour for
-   deployments running unowned imported keys, and it needs its own decision.
-   Recorded here as a live cross-tenant access issue, severity MEDIUM.
+3. **`batch.ownedBy` treated an unowned record as public.**
+   `ownedBy(recordOwner, owner)` returned true when `recordOwner == ""`, so a
+   file or batch created with an empty `OwnerKeyID` was readable, usable and
+   deletable by *every* key. A master-credential upload produced exactly such a
+   record. **Fixed**, in both halves, because either alone is incomplete:
+   `principalID` gives the master credential a reserved, non-empty owner
+   (`app.MasterOwnerID`), and `ownedBy` no longer reads an empty `recordOwner` as
+   everyone's. The alternative — "an unowned record is the master credential's" —
+   was rejected because it leaves the WRITE path producing ownerless rows and
+   relabels every legacy row as something the master credential did, which is a
+   lie in an audit sense. The residue is the fail-closed direction: rows that
+   already have an empty owner are now visible only to an administrative caller.
+   Tests: `TestAnUnownedRecordIsNotVisibleToEveryKey`,
+   `TestTheMasterCredentialOwnsWhatItCreates`.
 
 4. **A batch row's body could name a different model than the row.** The
    scheduler carries `row.Model` (extracted at validation) and the executor
@@ -1362,8 +1417,6 @@ pass:
 
 - **Store lookups for unknown keys are unbounded** (finding 6, second half).
   The largest remaining item.
-- `internal/admin` and its three defects (above).
-- `batch.ownedBy` treating unowned records as public (new, above).
 - [MEDIUM] request bodies buffered before the concurrency gate;
   `server.max_body_bytes` and the new `max_response_bytes` not exposed in YAML.
 - [MEDIUM] no `ReadTimeout`/`IdleTimeout`, no body-read deadline — slow POST.
@@ -1408,7 +1461,7 @@ coincidence.
 
 | # | Control | What it does now |
 |---|---|---|
-| 1 | per-key `rpm_limit` / `tpm_limit` | `internal/app/rates.go` keeps a rolling minute per api key: sixty stamped one-second buckets, sharded sixteen ways, capped at 100 000 subjects with cold-entry eviction. `app.principal.Authorize` fills `auth.Access.ObservedRPM`/`ObservedTPM` — the one production construction site, which omitted both, so every positive ceiling compared against a hard-coded zero. The request is counted at the gate (a ceiling enforced only on finished requests cannot refuse a burst) and the tokens at settlement |
+| 1 | per-key `rpm_limit` / `tpm_limit` | `internal/app/rates.go` keeps a rolling minute: sixty stamped one-second buckets, sharded sixteen ways, capped at 100 000 subjects with cold-entry eviction. `app.principal.Authorize` supplies the observed counters at the one production construction site of `auth.Access`, which omitted them, so every positive ceiling compared against a hard-coded zero. The request is counted at the gate (a ceiling enforced only on finished requests cannot refuse a burst) and the tokens at settlement. **Corrected by the merge:** as written here the window was keyed by api key ALONE and `auth.Access` carried one observed pair for three subjects, so a TEAM's ceiling was compared against one KEY's counter — a team limit multiplied by the number of keys under it. It is now keyed `kind:id` and read per subject through `auth.RateSource`; see the third pass |
 | 1 | per-key `max_parallel_requests` | `capacity.Request.PrincipalMax`, combined with the static `capacity.principals` table by taking the **more restrictive**: a key's own ceiling can tighten a configured one and never widen it. It travels with the request because it is not in the file and changes when the key is edited |
 | 2 | `capacity.*.max_queue` | A per-axis queue-depth ceiling in `internal/capacity`. Past it `Acquire` returns `ErrQueueFull` and leaves nothing enqueued. Before this the wait queue was an unbounded heap |
 | 2 | `capacity.principals.<id>.max_queue_wait` | A wait budget on `Acquire`, returning `ErrQueueTimeout`. The router uses it for a **pinned** request, which is the request that genuinely has to wait — an unpinned one spills or falls back (§7.4a2, §7.6), and queueing it instead would trade a fast hop onto a healthy backend for a slow wait on a saturated one. It does **not** apply to batch: batch is the work that is supposed to wait (§11.1), and the thirty-second default every principal carries would have turned ordinary contention into failed rows |
@@ -1420,7 +1473,7 @@ coincidence.
 | 7 | `client_priority` / `range` | `capacity.principals.<id>.client_priority: allow` with a `range` of two class names, compiled into `router.PriorityConfig.Grants` and applied by `CanonicalFor(principal, …)`. The inbound hint is read from `X-Request-Priority`; an ungranted hint is reported in `x-dorang-dropped-params`, which §10.5 requires and which was silent before. The key's `priority_class` now reaches the router too — it was loaded, carried on the principal, and read by nothing but the Lua hook view |
 | 8 | `DORANG_STATE_DIR` | `config.ExpandPath` resolves a leading `~` to it. Every shipped state path is `~/.dorang/…`, so under the image's `nonroot` user the database, the spool and the **generated key pepper** were written to `/home/nonroot` — outside the declared volume, lost on restart. Losing the pepper makes every issued api key unverifiable |
 | 8 | the image's `HEALTHCHECK` | `dorangctl health` now exists. The image invoked it and the CLI answered `unknown command "health"` and exited 2, so every container reported unhealthy after `start-period + 3 × interval`, forever — and being distroless, nothing else in it could have probed either |
-| 10 | model allow-list status | 403 `permission_error`, per COMPATIBILITY §11.2. The branch cited §7.2, which is about **tag routing**; the shared authorization gate has always answered 403 for the same refusal, so one rule had two answers and only the unreachable one was wrong |
+| 10 | model allow-list status | 403 `permission_error`, per COMPATIBILITY §11.2. The branch cited §7.2, which is about **tag routing**; the shared authorization gate has always answered 403 for the same refusal, so one rule had two answers and only the unreachable one was wrong. Since the merge the check runs at the GATE for every `ModelAuthGate` route rather than inside `handleInference`, which was reachable by six patterns and by nothing else — so the 403 now covers the routes the check could not previously reach, passthrough included |
 | 12 | inline `notional_rate` | Accepted in `pricing.rules[]` with mandatory `source` and `as_of`, and carried across the bridge into the catalog's spelling. Adding the class name alone would not have been a fix: `internal/pricing` refuses a notional rule without provenance, so the translation had to carry it |
 | 12 | `cached_read` / `cache_read` | Both spellings are accepted in both files and resolved to one component. The same component under both names in one rule is refused as pricing one thing twice |
 | — | `routing.prefix.ttl` per backend | Not on the list; see below |
@@ -1556,3 +1609,272 @@ Two are structural rather than behavioural, and deliberately so.
 "the CLI has a health command" was never the thing that was wrong — the two
 halves disagreeing was. `TestStateDirIsDeclaredAndRead` requires the image's
 `ENV DORANG_STATE_DIR` to name the directory its `VOLUME` declares.
+
+---
+
+# Dispositions, third pass — the merge, and what was verified
+
+The nine fixes were written on a branch, together with the "# Dispositions"
+section above. **Only the document reached `main`**, inside a commit whose
+subject is *"gitignore: cmd/ was never in version control"*; the 5,221 lines of
+fix code stayed on the branch, which is not an ancestor of `main`. So for the
+life of that commit `main` shipped a security document asserting protections
+that were not in the binary — nine findings marked **Closed**, naming files that
+did not exist and tests that appeared only inside this document.
+
+An audit checked all twelve disposition claims and found **ten false on `main`**.
+This section is written after merging the branch, and it is the authoritative
+statement: **every claim below was checked by reverting the fix in place, running
+the named test, and observing it fail** — then restoring it and observing it
+pass. Nothing is recorded as closed on the strength of the code reading
+correctly. A fix that passes with and without it has not landed.
+
+Read the two sections above as history. Where they disagree with this one, this
+one is what the binary does; the specific corrections are listed at the end.
+
+## The merge: which implementation was kept, and why
+
+`main` had moved a long way — the L5 extraction into `internal/backend`
+completed, `internal/app` no longer makes an HTTP call, the "configured but never
+applied" sweep landed, key rotation grew a second table. Twelve files conflicted
+and several of them held **two implementations of one thing**. This codebase has
+been bitten three times by exactly that, so in every case one was kept and the
+other deleted. None is behind a flag.
+
+| Duplicate | Kept | Deleted | Why |
+|---|---|---|---|
+| **The rate window** — `internal/app/rates.go` existed on both sides: the branch's `rateMeter` (tumbling minute, map dropped whole on rollover, per subject) and the sweep's `keyRates` (sixteen shards, sixty stamped one-second buckets, 100 000-subject cap with cold eviction, per **key**) | `keyRates` | `rateMeter` | A rolling minute is the number an operator can reconcile against a provider's own 429s; a tumbling one refuses a burst that straddles the boundary and admits one that does not. But `keyRates` was keyed by api key alone, which is the live defect below — so it was **re-derived per subject**, keyed `kind:id`, and made to serve `auth.RateSource`. One data structure, three subjects |
+| **`MostRestrictiveParallel` / `strictest` / `mostRestrictive`** — the same "smaller of two ceilings, zero means none" written three times | `auth.MostRestrictiveParallel` (the shared rule) and `capacity.strictest` (the broker's own, which also carries the queue ceiling the sweep added) | `capacity.mostRestrictive`, and the inline loop in `app.principal.maxParallel` | The branch's `mostRestrictive` was byte-for-byte `strictest` without queue support. `principal.maxParallel` now calls `auth.MostRestrictiveParallel` rather than spelling §11.2's rule a fourth time |
+| **The concurrency ceiling's path to the broker** — the branch set `capacity.Request.PrincipalMax` in the routing-request literal via `principalMaxParallel(rq.Principal)`; the sweep set it in `applyPrincipalPolicy` alongside the priority class and the client hint | `applyPrincipalPolicy` | `principalMaxParallel`, and the literal's field | Two writers of one field, and the later one silently won. One place now reads the caller's policy into the routing request |
+| **`internal/capacity/principalmax_test.go`** (branch) vs `queue_limits_test.go`'s `TestPrincipalMaxTightensTheAxis` / `TestPrincipalMaxNeverWidens` (sweep) | the sweep's | the branch's file | Same three properties, and the sweep's exercise the broker end to end rather than the helper |
+| **The bounded upstream read** — `readUpstreamBody` + `DefaultMaxResponseBytes` + `errUpstreamTooLarge` in `internal/app/dispatch.go` (branch) and in `internal/backend/backend.go` (branch, re-derived) | `internal/backend`'s | `internal/app`'s, and the `internal/app` copy of `TestOversizedUpstreamResponseIsRefused` | `internal/app` no longer makes the HTTP call. Its copy had no production caller — it was already the version nothing runs, which is the defect this review is named after |
+| **The §11.3 scrubber's application site** — `internal/app/dispatch.go` scrubbing with `internal/redact` (branch) and `internal/backend/errors.go` scrubbing with `collectSecrets` (branch, re-derived) | `internal/backend`'s | the `internal/app` site and its `redact` import | Same reason. `collectSecrets` is also stronger: it reads what was actually put on the outbound headers, so an OAuth token applied by code it does not own is caught too |
+| **The batch row's allow-list check** — `ownerResolver.identity` asked `principalAllowsModel(p, model)` **and** `p.Authorize(auth.Access{Model: model})`, and `auth.Limits.authorize` already consults the allow-list when `Access.Model` is non-empty | `p.Authorize` (the shared gate) | `principalAllowsModel` | Removing either alone changed nothing observable, so "revert the fix and watch a test fail" passed against a defect the other copy silently covered. That is the exact failure mode this pass exists to remove — recorded in the first pass as "one control with two implementations", and now it is one control with one |
+| **Replacing a key's secret** — `store.ReplaceKeyVerifier` (branch) and `store.RotateKey` + `EndGrace` (`secrets.go`, current `main`) | `RotateKey` + `EndGrace` | `ReplaceKeyVerifier` | Not a stylistic choice. `ReplaceKeyVerifier` wrote `api_keys.lookup`, `.token_hash` and `.hash_scheme` — the **denormalized** copy. Authentication resolves through `api_key_secrets` (`resolveKeyQuery`), so on current `main`'s schema the leaked secret would have gone on authenticating and the freshly minted one would have been unknown to the gateway, behind a `200 OK` telling the operator the credential had been replaced. `/key/regenerate` is now `RotateKey` with a zero grace followed by `EndGrace`: the difference between a planned rotation and an incident is a parameter, not a second write path |
+| **The model-allow-list refusal status** — the branch's `Request.AuthorizeModel` answered **401** citing §7.2; the sweep had just corrected the same refusal from 401 to **403 `permission_error`** citing §11.2 | 403 | 401 | §7.2 is about **tag routing** misses, a different condition. The shared authorization gate has always answered 403 for this refusal, so one rule had two answers. Both passthrough refusals moved with it (`model_not_allowed` and `model_not_authorizable`), because a caller cannot be told to re-authenticate over a body it should re-encode |
+| **The upstream context-overflow classifier** — `internal/app/estimate.go` and a second copy in `testing/scenario/harness.go`, both reading `server.Error.Message` | both, corrected to read `NativeMessage` | — | The two copies remain (the harness is another agent's file and is mid-flight), but both were silently broken by finding 3: `Message` is now `canonicalMessage(status)`, a function of the status line alone, so scanning it for a vendor's overflow phrase finds nothing. §10.5a's "route to a larger window" had stopped being reachable from an upstream signal. **This is the one duplicate this pass did not collapse**, and it is named here so the next pass does |
+
+### Re-derived, because the code the fix guarded had moved
+
+`main` completed the L5 extraction while the branch sat unmerged: `internal/app`
+now delegates every upstream call to `internal/backend`. Four fixes therefore
+land one package down, and one lands in a place neither side anticipated.
+
+- **The §11.3 leak → `internal/backend/errors.go`.** `upstreamError` scrubs the
+  provider credential out of `Error.NativeMessage`, which is where the upstream's
+  text lives now — `Normalize` writes nothing from a decoded body into
+  `Error.Message` on any branch.
+- **The unbounded read → `internal/backend/backend.go`.** The L5 layer shipped
+  the same asymmetry the interactive dispatcher had: 1 MiB on the error branch,
+  `io.ReadAll` on the success branch. `Options.MaxResponseBytes`,
+  `DefaultMaxResponseBytes` and a non-retryable `upstream_response_too_large`.
+- **Transport error text → `internal/backend/errors.go`.** `transportError`
+  relayed `err.Error()` under a comment arguing it was safe because it cannot
+  carry a credential. True, and not the finding: it carries the operator's
+  internal hostname, port and IP.
+- **The batch executor → `backend.Do`.** The branch's version made its own HTTP
+  call. The budget hold, the row/body model-mismatch check and the settlement
+  now wrap `backend.Do` instead, so the batch path and the interactive path share
+  one client, one scrubber and one bounded read.
+- **The batch owner's envelope → `cluster.AuthPrincipal`.** The branch had its
+  own `recordFromAPIKey`; `main` had moved that conversion to
+  `cluster.AuthRecord`, which also resolves the key's **tier** and applies it to
+  the limits. `AuthRecord` was split so both callers derive from one conversion —
+  otherwise a batch row would have been authorized against an untiered envelope,
+  which is a second view of one credential's limits and the shape R1-A named.
+
+### The live defect the document claimed was closed
+
+**A team's `rpm_limit` was multiplied by the number of keys under the team.**
+`auth.Access` carried ONE observed pair for three subjects, and `internal/app`'s
+window was keyed by api key alone, so `internal/auth/principal.go` compared the
+**team's** ceiling against one **key's** counter. Demonstrated before the fix:
+team `rpm_limit: 4`, ten keys × four requests → **zero refused**; ten requests on
+one key → six refused. It is the same N-multiplication as finding 4, in the rate
+dimension, and it was live on `main` while this document said finding 2 was
+closed.
+
+Closed by `auth.RateSource`: `Limits.authorize` takes the subject's **id** and
+reads that subject's counter, `keyRates` is keyed `kind:id`, and the window is
+entered once per request — read and increment together under the subject's shard
+lock, so two concurrent requests cannot both observe the same pre-count. Tokens
+land on all three subjects at settlement, from `App.recordMetrics`, which is the
+one production settlement site and the only point every finished request passes.
+
+## Verification: revert the fix, watch the named test fail
+
+Every row was produced mechanically: apply the edit in the "Reverted" column, run
+only the named test, record the outcome, restore. A row is present only if the
+test **failed** with the fix reverted and passes with it.
+
+| # | Control | Reverted | Named test |
+|---|---|---|---|
+| 1 | batch: dispatch-time allow-list and kill switches | `ownerResolver.identity` no longer calls `p.Authorize` | `TestBatchExecutorRefusesAModelTheOwnerMayNotUse`, `TestBatchExecutorRefusesABlockedOwner` |
+| 1 | batch: a budget hold on every row | `reserveBatch` replaced by a nil hold | `TestBatchExecutionIsBudgeted` |
+| 1 | batch: upload-time allow-list, per row | `validateRow` skips `vc.authorize` | `TestUploadRefusesARowNamingADisallowedModel` |
+| 2 | the observed window reaches the check at all | `principal.Authorize` no longer calls `rates.observe` | `TestRPMLimitIsEnforced`, `TestTPMLimitIsEnforced`, `TestRateWindowRolls`, `TestRPMLimitRefusesThroughTheWholeStack`, `TestTPMLimitCountsFinishedTokens` |
+| 2 | the window counts every SUBJECT, not only the key | `subjectsOf` returns the key alone | `TestTeamRPMCountsEveryKeyUnderTheTeam` |
+| 2 | `auth` compares each subject against its own counter | `Limits.authorize` reads `Access.ObservedRPM/TPM` again | `TestRPMLimitIsEnforced`, `TestTeamRPMCountsEveryKeyUnderTheTeam` |
+| 2 | the token half is settled from a real finished request | `App.recordMetrics` drops `recordTokens` | `TestTPMLimitCountsFinishedTokens` |
+| 2 | settled tokens land on every subject | `recordTokens` given the key id only | `TestSettledTokensReachEverySubjectOfTheRequest` |
+| 2 | `max_parallel_requests` reaches the routing request | `applyPrincipalPolicy` sets `PrincipalMax = 0` | `TestMaxParallelReachesThePrincipal` |
+| 2 | the broker applies the carried ceiling | `Broker.needs` drops `strictest(…, req.PrincipalMax)` | `TestPrincipalMaxTightensTheAxis`, `TestPrincipalMaxNeverWidens` |
+| 3 | the envelope carries dorang's words, not the upstream's | `Normalize` sets `e.Message = e.NativeMessage` | `TestNormalizeEveryUpstreamShape` (and `internal/server/errorleak_test.go`) |
+| 3 | the RECORDED native text is scrubbed of the sent secret | `upstreamError` drops `scrub(e.NativeMessage, secrets)` | `TestAHostileUpstreamCannotEchoTheCredentialBack` |
+| 3 | transport error text does not name internal hosts | `transportError` relays `err.Error()` | `TestUnreachableUpstreamDoesNotNameInternalHosts` |
+| 3 | `x-dorang-native-error-type` is clamped and header-safe | `WriteError` emits the raw `NativeType` | `TestNativeErrorTypeHeaderIsCheckedAndClamped` |
+| 4 | one budget hold per declaring subject | `budgetSubjectsOf` returns the key alone | `TestTeamBudgetIsNotMultipliedByTheNumberOfKeys`, `TestEachBudgetSubjectKeepsItsOwnPeriod` |
+| 5 | the prefix chain is seeded with the tenant | `NewChain` seeds `H(group)` again | `TestChainIsTenantScoped`, `TestTenantAndGroupCannotBeConfused` |
+| 5 | `router.Request.Tenant` is assigned in production | `decode` sets `Tenant: ""` | `TestRouterRequestCarriesTheTenant` |
+| 6 | an unknown-key flood cannot drive a snapshot merge | `insert` merges on `positives+negatives` | `TestUnknownKeyFloodDoesNotMergeOnEveryMiss` |
+| 7 | the non-streaming upstream body is BOUNDED | `readUpstreamBody` returns `io.ReadAll(r)` | `TestOversizedUpstreamResponseIsRefused` |
+| 8 | passthrough consults the allow-list | `authorizePassthroughModel` marks the request authorized instead | `TestPassthroughEnforcesTheModelAllowList` |
+| 8 | passthrough fails CLOSED when it cannot determine the model | `principalRestrictsModels` returns false | `TestPassthroughRefusesWhenTheModelCannotBeDetermined` |
+| 8 | a route cannot reach the mux without a `ModelAuth` answer | `newRouteTable` stops refusing `ModelAuthUnset` | `TestRouteTableRefusesAnUndeclaredModelAuth`, `TestEveryRouteDeclaresAModelAuthMode` |
+| 8 | a `ModelAuthHandler` route that never asked fails the request | `Server.serve` drops the post-condition | `TestModelAuthHandlerRouteThatSkipsTheCheckFails` |
+| 9 | `Credential.MarshalYAML` leaves the inline literal nowhere to land | method renamed out of the interface | `TestMarshalingNeverEmitsAPlaintextSecret` |
+| 9 | `RotationKey.MarshalYAML`, the same for the rotation pool | method renamed out of the interface | `TestMarshalingNeverEmitsAPlaintextSecret` |
+| 9 | `import config` writes `key_env`, never an inline literal | `internal/config/import.go` emits `SecretRef{Inline: raw}` for a literal again | `TestImportWarnsAboutALiteralKey` |
+| — | passthrough does not relay upstream `Set-Cookie` | the two `dst.Del` calls removed | `TestPassthroughDoesNotRelaySetCookie` |
+| — | an unowned batch record is not everyone's | `ownedBy` admits an empty `recordOwner` again | `TestAnUnownedRecordIsNotVisibleToEveryKey` |
+| — | the master credential owns what it creates | `principalID` returns `""` for the master again | `TestTheMasterCredentialOwnsWhatItCreates` |
+| — | `/key/regenerate` actually retires the leaked secret | `ReplaceVerifier` made a no-op | `TestRegeneratingAKeyRetiresTheOldSecret` |
+| — | an upstream overflow is classified from the NATIVE text | `upstreamCause` reads `e.Message` | `TestAnUpstreamOverflowIsRecognisedFromTheBody` |
+| — | an ungranted priority hint is REPORTED as dropped (§10.5) | `droppedParams` stops naming the header | `TestGrantedClientPriorityIsHonouredAndADropIsReported` |
+
+### Four tests that did not survive the check as written, and were fixed
+
+- **`TestOversizedUpstreamResponseIsRefused` proved the refusal, not the bound.**
+  With `readUpstreamBody` reverted to `io.ReadAll(r)` it still returned the
+  too-large error, because the length check followed the read — so the test
+  passed against an implementation with none of the safety. The finding is a
+  remote OOM: the bytes must not be READ. The surviving copy counts what the
+  reader was asked for.
+- **`TestTPMLimitCountsFinishedTokens` fed the counter itself.** It called
+  `rates.record(keyID, 500)` directly and then asserted a 429, which proves the
+  comparison works and says nothing about whether anything in production feeds
+  it — the exact topology that let `rpm_limit` and `tpm_limit` ship enforcing
+  nothing, unit-tested, for the life of the project. It now drives a real chat
+  completion against a real upstream that reports usage, and the second request
+  is refused.
+- **`TestGrantedClientPriorityIsHonouredAndADropIsReported` named itself end to
+  end and called `CanonicalFor` directly.** §10.5's requirement is that a dropped
+  hint be *reported* in `x-dorang-dropped-params`, and nothing asserted the
+  header. It now sends `X-Request-Priority` from an ungranted key through the
+  assembled stack and reads the response header.
+- **Finding 9's fix is not where the first pass said it was.**
+  `SecretRef.MarshalYAML` can be renamed out of existence and every marshalling
+  test still passes: both uses embed `SecretRef` with `yaml:",inline"`, and
+  gopkg.in/yaml.v3 flattens an inline-embedded struct's exported fields rather
+  than calling its `MarshalYAML`. That method is **dead code**, correctly
+  written and never called. The load-bearing halves are `Credential.MarshalYAML`,
+  `RotationKey.MarshalYAML` and the importer's refusal to create an inline
+  literal, and those are the three rows in the table above.
+
+## `internal/admin` — mounted
+
+The first pass left it unwired on the grounds that mounting it would convert
+three latent findings into live ones. All three are closed and it is mounted, so
+**there is an API path to revoke a leaked key** — which the review's plainest
+sentence said there was not.
+
+- **Read-before-auth.** `API.ServeHTTP` authenticates FIRST: before the route
+  lookup, before `OPTIONS`, before the 405 and before the 501. Everything above
+  it was an oracle. Test: `TestTheRouteTableIsNotReadableBeforeAuthentication`.
+- **Team-scoped administration.** `admin.Scope`, derived from the key's
+  `team_id` rather than from a role nobody can forget to set; the zero `Scope`
+  admits nothing. Tests: `TestATeamAdminCannotReachAnotherTeam`,
+  `TestATeamAdminCannotMintOrMoveKeysAcrossTeams`,
+  `TestDeploymentWideEndpointsRefuseAScopedAdmin`, `TestTheZeroScopeAdmitsNothing`.
+- **Request-supplied id filters.** A parameter naming another team is
+  `403 out_of_scope`; an OBJECT outside the scope is `404`, identical to an id
+  that does not exist, so no id becomes an existence oracle. Listings are
+  filtered after the store returns, not only before. Tests:
+  `TestListingFiltersCannotWidenTheScope`, `TestSpendLogsCannotReachAnotherTeam`,
+  `TestBudgetSubjectsAreScoped`.
+
+`cmd/dorang/revoke_test.go` runs the incident end to end over HTTP —
+`TestALeakedKeyCanBeRevokedThroughTheAPI` blocks a working key with one call and
+watches the next request from it be refused, reading the audit row back;
+`TestAnOrdinaryKeyCannotAdminister` pins 403 for a tenant key and 401 for none.
+
+`internal/store/admin.go` supplies what the mounted surface calls: list, update,
+delete, `users.role`, and the first `INSERT INTO audit_logs` in the repository —
+against a table that had had a schema, two indexes and a retention sweep that
+DELETES from it since the first migration. Rotation and pend are wired to
+`store.RotateKey`, `EndGrace`, `ListKeySecrets`, `PendKey` and `ReleaseKey`, so
+`/key/rotate`, `/key/rotate/cut`, `/key/secrets`, `/key/pend` and `/key/release`
+serve rather than answering 501. Seven dependencies are still absent and answer
+`501 dependency_not_configured` naming the missing piece; the list is in
+`docs/OPERATIONS.md` §3.2.
+
+## What the first two passes got wrong
+
+The two sections above have been **corrected in place** so that no false claim
+stands anywhere in this document. What they said before is recorded here, because
+each error is an instance of the defect class the review is about and deleting it
+silently would repeat the mistake that made a second audit necessary.
+
+1. **"Closed" was asserted for code that was not on `main` at all.** Nine
+   findings, twelve disposition claims, ten of them false — not fabricated, but
+   copied ahead of the code they described. A disposition that names a file or a
+   test is only closed once that file or test exists **on the branch it is
+   claimed for**, and the check that would have caught this is `git merge-base
+   --is-ancestor`, not a reading of the diff.
+2. **Finding 2 was closed twice and was wrong both times.** The first pass
+   described a `rates.go` that did not exist. The sweep then wrote a real one and
+   recorded finding 2 closed — with the window keyed by api key alone, so a team
+   ceiling was still multiplied by the number of keys under the team. Two
+   independent "closed"s and the defect survived both.
+3. **Finding 3's fix was described in the wrong package.** `internal/redact`
+   applied in `internal/app`; the L5 extraction moved the upstream call and the
+   scrubber had to move with it. The same relocation broke
+   `internal/app/estimate.go`'s overflow classifier, which nothing noticed
+   because it read a field that still existed and had merely stopped carrying the
+   text.
+4. **Finding 7's fix was described on `dispatchState`**, which no longer makes an
+   HTTP call, and its test proved a refusal rather than a bound.
+5. **Finding 9's fix was described as `SecretRef.MarshalYAML`**, which is dead
+   code — `yaml:",inline"` flattens the embedded struct's exported fields and
+   never calls its marshaller. The method the finding names still never runs.
+6. **`internal/admin` was recorded as deliberately unwired** with "there is no
+   API path to revoke a key" as the operational consequence. That was true when
+   written and is not now.
+7. **`batch.ownedBy` was recorded as "not fixed in this pass"** and had in fact
+   been fixed on the branch the pass was written from.
+
+## Still open
+
+Named, because a control that exists and is not called is this codebase's
+dominant defect and it has now been counted three times.
+
+1. **Store lookups for unknown keys are still unbounded** (finding 6's second
+   half). One `LoadByLookup` per unauthenticated request; the negative TTL bounds
+   repeats of the same key and nothing bounds distinct ones. The first pass
+   called this the largest thing left open and it still is.
+2. **`internal/store` has no directory, no model registry and no budget-ceiling
+   storage.** `users`, `teams`, `team_members`, `deployments` and `model_aliases`
+   are tables with no Go code, so `/user/*`, `/team/*`, `/model/*` and
+   `/budget/*` answer `501 dependency_not_configured` — and a **team-level**
+   `rpm_limit`/`tpm_limit` cannot be put on a stored row at all, which is why the
+   per-subject rate ceiling is proved at the gate
+   (`TestTeamRPMCountsEveryKeyUnderTheTeam`,
+   `TestSettledTokensReachEverySubjectOfTheRequest`) and not over HTTP.
+3. **No range-aggregating ledger query**, so `/global/spend/report` and the three
+   daily-activity endpoints have nothing to call. **`/audit/list`**: rows are
+   written now and still cannot be read over the API.
+4. **`quota.Registry`, `internal/probe`, `pricing.Catalog` and `App.Reload`** are
+   not reachable from the administrative surface, so `/admin/credentials/health`,
+   `/admin/quota`, `/spend/calculate`, `/admin/pricing/preview` and
+   `/admin/config/reload` have no adapter. `SIGHUP` works.
+5. **Two copies of the upstream-overflow classifier** remain, in
+   `internal/app/estimate.go` and `testing/scenario/harness.go`. Both are correct
+   today; nothing keeps them that way.
+6. **Rate ceilings are per process.** An N-node deployment enforces N times every
+   `rpm_limit` and `tpm_limit`, and `tpm_limit` bounds the NEXT request because
+   the token count does not exist until settlement.
+7. **`auth.Strip`, the OAuth subsystem, `internal/luaext`, `store.ImportKeys`,
+   `quota.Ranker`** — unchanged from the first pass.
+8. Everything under "## Not addressed" above that is not corrected in the list
+   before this one.
+

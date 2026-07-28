@@ -75,11 +75,85 @@ type Request struct {
 	idbuf   [32]byte
 	bytesIn int64
 
+	// modelAuthorized records that the allow-list has actually been consulted
+	// for this request, by the gate or by the handler. It is the evidence
+	// [Server.serve] checks before it lets a ModelAuthHandler route write a
+	// response, so a handler that forgets to call [Request.AuthorizeModel]
+	// fails the request instead of dispatching it unchecked.
+	modelAuthorized bool
+
 	// cap is the shadow capture buffer, non-nil only when this request was
 	// sampled (DESIGN §14.1). It comes from its own pool rather than living
 	// inline, so the 95% of requests that are never sampled do not each retain
 	// a quarter of a megabyte for the life of the request pool.
 	cap *capture
+}
+
+// AuthorizeModel enforces the calling key's model allow-list for one named
+// model, and records that the check happened.
+//
+// This is the only place the allow-list is consulted. It is a method on the
+// request rather than a free function over the principal because the *fact of
+// having asked* is the half that kept going missing: three separate routes held
+// a principal, never asked it anything, and dispatched. Routing the question
+// through the request lets [Server.serve] refuse a ModelAuthHandler route that
+// never asked — a check that is skipped now fails the request instead of
+// passing it.
+//
+// A route may call it many times; a batch input file names a model per row and
+// every one of them has to clear the same list.
+//
+// The status is 403 permission_error, per COMPATIBILITY §11.2: the credential
+// authenticated fine, it is simply not permitted this model, and a 401 tells the
+// client to re-authenticate, which cannot help. An earlier draft answered 401
+// citing §7.2 — but §7.2 is about TAG ROUTING misses, a different condition, and
+// the shared authorization gate below has always answered 403 for the same
+// refusal. One rule had two answers; this is the one that agrees with the rest of
+// the surface.
+func (rq *Request) AuthorizeModel(model string) error {
+	if model == "" {
+		return NewError(http.StatusBadRequest, TypeInvalidRequest,
+			"the request did not name a model").
+			WithCode("missing_model").WithParam("model")
+	}
+	if rq.Principal == nil {
+		// A public route has no subject to restrict. Recording the check as
+		// done is correct rather than lenient: there is no allow-list.
+		rq.modelAuthorized = true
+		return nil
+	}
+	if !rq.Principal.AllowsModel(model) {
+		return NewError(http.StatusForbidden, TypePermission,
+			"this key is not allowed to use the requested model").
+			WithCode("model_not_allowed").WithParam("model")
+	}
+	// The full envelope too, not only the allow-list: a model named by a
+	// handler rather than scanned by the gate has never been through
+	// Authorize, so its blocked/expired/budget/rate limits are unchecked at
+	// this point.
+	if err := rq.Principal.Authorize(Access{Model: model, Route: rq.Path}); err != nil {
+		return asError(err, http.StatusForbidden, TypePermission)
+	}
+	rq.modelAuthorized = true
+	return nil
+}
+
+// ModelAuthorized reports whether the allow-list has been consulted for this
+// request. It exists for [Server.serve]'s post-condition and for tests that
+// assert a handler reached the check.
+func (rq *Request) ModelAuthorized() bool { return rq.modelAuthorized }
+
+// MarkModelAuthorized records that a handler established, by a route-specific
+// argument, that this request cannot reach a model call the allow-list would
+// have refused.
+//
+// It is deliberately clumsy to say. The only legitimate users are handlers
+// whose request names no model at all and whose downstream work is authorized
+// elsewhere against a durable owner — batch retrieval, file listing — and every
+// call site has to write down which of those it is.
+func (rq *Request) MarkModelAuthorized(because string) {
+	_ = because
+	rq.modelAuthorized = true
 }
 
 // Context is the request's context, already bounded by the configured request
@@ -144,6 +218,7 @@ func (rq *Request) reset() {
 	rq.AuthHeader = ""
 	rq.Model = ""
 	rq.Stream = false
+	rq.modelAuthorized = false
 	rq.Detail = false
 	rq.UsageEvents = false
 	rq.Start = time.Time{}

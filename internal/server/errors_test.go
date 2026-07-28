@@ -58,119 +58,137 @@ func TestErrorEnvelopeGolden(t *testing.T) {
 // TestNormalizeEveryUpstreamShape runs the five envelope shapes SGLANG.md §6.2
 // found on one server, vLLM's integer code (VLLM.md §2.2), FastAPI's validation
 // detail, and bodies that are not error envelopes at all. Every one produces the
-// same four-key object with a string code.
+// same four-key object with a string code — and none of them puts the
+// upstream's own words in it.
+//
+// The `want` column is therefore dorang's canonical text for the status, and
+// `nativeMsg` is where the upstream's text went. COMPATIBILITY §11.3: recorded
+// out of band, not in the body.
 func TestNormalizeEveryUpstreamShape(t *testing.T) {
 	cases := []struct {
-		name   string
-		status int
-		body   string
-		want   string
-		shape  Shape
-		native string
+		name      string
+		status    int
+		body      string
+		want      string
+		shape     Shape
+		native    string
+		nativeMsg string
 	}{
 		{
-			name:   "openai nested",
-			status: 400,
-			body:   `{"error":{"message":"bad model","type":"invalid_request_error","param":"model","code":"model_not_found"}}`,
-			want:   `{"error":{"message":"bad model","type":"invalid_request_error","param":"model","code":"model_not_found"}}`,
-			shape:  ShapeNested,
+			name:      "openai nested",
+			status:    400,
+			body:      `{"error":{"message":"bad model","type":"invalid_request_error","param":"model","code":"model_not_found"}}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":"model","code":"model_not_found"}}`,
+			shape:     ShapeNested,
+			nativeMsg: "bad model",
 		},
 		{
 			// vLLM: integer code, Python exception name as the type. An OpenAI
 			// SDK branching on a string code raises before the message is ever
 			// surfaced.
-			name:   "nested with an integer code and a python type",
-			status: 400,
-			body:   `{"error":{"message":"bad request","type":"BadRequestError","param":null,"code":400}}`,
-			want:   `{"error":{"message":"bad request","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:  ShapeNested,
-			native: "BadRequestError",
+			name:      "nested with an integer code and a python type",
+			status:    400,
+			body:      `{"error":{"message":"bad request","type":"BadRequestError","param":null,"code":400}}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:     ShapeNested,
+			native:    "BadRequestError",
+			nativeMsg: "bad request",
 		},
 		{
 			// SGLang shape (a): flat. An OpenAI SDK reads
 			// body["error"]["message"]; against this, that key does not exist.
-			name:   "flat with object=error",
-			status: 400,
-			body:   `{"object":"error","message":"flat message","type":"BadRequest","param":null,"code":400}`,
-			want:   `{"error":{"message":"flat message","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:  ShapeFlat,
-			native: "BadRequest",
+			name:      "flat with object=error",
+			status:    400,
+			body:      `{"object":"error","message":"flat message","type":"BadRequest","param":null,"code":400}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:     ShapeFlat,
+			native:    "BadRequest",
+			nativeMsg: "flat message",
 		},
 		{
 			// The same server, streaming: nested. Two shapes, one process.
-			name:   "flat and nested agree after normalization",
-			status: 400,
-			body:   `{"error":{"message":"flat message","type":"Bad Request","param":null,"code":400}}`,
-			want:   `{"error":{"message":"flat message","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:  ShapeNested,
-			native: "Bad Request",
+			name:      "flat and nested agree after normalization",
+			status:    400,
+			body:      `{"error":{"message":"flat message","type":"Bad Request","param":null,"code":400}}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:     ShapeNested,
+			native:    "Bad Request",
+			nativeMsg: "flat message",
 		},
 		{
 			// SGLang shape (d): Anthropic-shaped, from /v1/messages on the
 			// same deployment.
-			name:   "anthropic",
-			status: 400,
-			body:   `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}`,            // pragma: allowlist secret — test fixture
-			want:   `{"error":{"message":"max_tokens is required","type":"invalid_request_error","param":null,"code":"400"}}`, // pragma: allowlist secret — test fixture
-			shape:  ShapeAnthropic,
+			name:      "anthropic",
+			status:    400,
+			body:      `{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens is required"}}`, // pragma: allowlist secret — test fixture
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:     ShapeAnthropic,
+			nativeMsg: "max_tokens is required",
 		},
 		{
 			// SGLang shape (e): a bare string from the auth middleware.
-			name:   "bare string",
-			status: 401,
-			body:   `{"error": "Unauthorized"}`,
-			want:   `{"error":{"message":"Unauthorized","type":"authentication_error","param":null,"code":"401"}}`,
-			shape:  ShapeBareString,
+			name:      "bare string",
+			status:    401,
+			body:      `{"error": "Unauthorized"}`,
+			want:      `{"error":{"message":"the upstream provider rejected this gateway's credential","type":"authentication_error","param":null,"code":"401"}}`,
+			shape:     ShapeBareString,
+			nativeMsg: "Unauthorized",
 		},
 		{
-			name:   "fastapi detail string",
-			status: 422,
-			body:   `{"detail":"field required"}`,
-			want:   `{"error":{"message":"field required","type":"invalid_request_error","param":null,"code":"422"}}`,
-			shape:  ShapeDetail,
+			name:      "fastapi detail string",
+			status:    422,
+			body:      `{"detail":"field required"}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"422"}}`,
+			shape:     ShapeDetail,
+			nativeMsg: "field required",
 		},
 		{
-			name:   "fastapi detail array",
-			status: 422,
-			body:   `{"detail":[{"loc":["body","model"],"msg":"field required","type":"value_error.missing"}]}`,
-			want:   `{"error":{"message":"[{\"loc\":[\"body\",\"model\"],\"msg\":\"field required\",\"type\":\"value_error.missing\"}]","type":"invalid_request_error","param":null,"code":"422"}}`,
-			shape:  ShapeDetail,
+			name:      "fastapi detail array",
+			status:    422,
+			body:      `{"detail":[{"loc":["body","model"],"msg":"field required","type":"value_error.missing"}]}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"422"}}`,
+			shape:     ShapeDetail,
+			nativeMsg: `[{"loc":["body","model"],"msg":"field required","type":"value_error.missing"}]`,
 		},
 		{
-			name:   "type is stringified status",
-			status: 400,
-			body:   `{"object":"error","message":"m","type":"400","param":null,"code":"400"}`,
-			want:   `{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"400"}}`,
-			shape:  ShapeFlat,
-			native: "400",
+			name:      "type is stringified status",
+			status:    400,
+			body:      `{"object":"error","message":"m","type":"400","param":null,"code":"400"}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`,
+			shape:     ShapeFlat,
+			native:    "400",
+			nativeMsg: "m",
 		},
 		{
-			name:   "html from a load balancer",
-			status: 502,
-			body:   "<html><head><title>502 Bad Gateway</title></head></html>",
-			want:   `{"error":{"message":"Bad Gateway: <html><head><title>502 Bad Gateway</title></head></html>","type":"api_error","param":null,"code":"502"}}`,
-			shape:  ShapeOpaque,
+			name:      "html from a load balancer",
+			status:    502,
+			body:      "<html><head><title>502 Bad Gateway</title></head></html>",
+			want:      `{"error":{"message":"the upstream provider failed to serve the request","type":"api_error","param":null,"code":"502"}}`,
+			shape:     ShapeOpaque,
+			nativeMsg: "<html><head><title>502 Bad Gateway</title></head></html>",
 		},
 		{
 			name:   "empty body",
 			status: 504,
 			body:   "",
-			want:   `{"error":{"message":"Gateway Timeout","type":"timeout_error","param":null,"code":"504"}}`,
+			want:   `{"error":{"message":"the upstream provider did not answer in time","type":"timeout_error","param":null,"code":"504"}}`,
 			shape:  ShapeOpaque,
 		},
 		{
-			name:   "json that is not an error",
-			status: 500,
-			body:   `{"result":"surprise"}`,
-			want:   `{"error":{"message":"Internal Server Error: {\"result\":\"surprise\"}","type":"api_error","param":null,"code":"500"}}`,
-			shape:  ShapeOpaque,
+			name:      "json that is not an error",
+			status:    500,
+			body:      `{"result":"surprise"}`,
+			want:      `{"error":{"message":"the upstream provider failed to serve the request","type":"api_error","param":null,"code":"500"}}`,
+			shape:     ShapeOpaque,
+			nativeMsg: `{"result":"surprise"}`,
 		},
 		{
-			name:   "code as an object is carried rather than dropped",
-			status: 400,
-			body:   `{"error":{"message":"m","type":"invalid_request_error","code":{"inner":"x"}}}`,
-			want:   `{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"{\"inner\":\"x\"}"}}`,
-			shape:  ShapeNested,
+			name:      "code as an object is carried rather than dropped",
+			status:    400,
+			body:      `{"error":{"message":"m","type":"invalid_request_error","code":{"inner":"x"}}}`,
+			want:      `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"{\"inner\":\"x\"}"}}`,
+			shape:     ShapeNested,
+			nativeMsg: "m",
 		},
 	}
 	for _, c := range cases {
@@ -184,6 +202,9 @@ func TestNormalizeEveryUpstreamShape(t *testing.T) {
 			}
 			if e.NativeType != c.native {
 				t.Errorf("native type %q, want %q", e.NativeType, c.native)
+			}
+			if e.NativeMessage != c.nativeMsg {
+				t.Errorf("native message %q, want %q", e.NativeMessage, c.nativeMsg)
 			}
 			if e.Status != c.status {
 				t.Errorf("status %d, want %d", e.Status, c.status)
@@ -250,9 +271,14 @@ func TestWriteErrorSetsRetryAfterAndNativeType(t *testing.T) {
 	if got := w.Header().Get(HeaderNativeErrorType); got != "RateLimitError" {
 		t.Errorf("native error type %q, want RateLimitError", got)
 	}
-	want := `{"error":{"message":"slow down","type":"rate_limit_error","param":null,"code":"429"}}`
+	// The upstream said "slow down"; the client is told dorang's own words for
+	// a 429, and the backend's text is kept out of band (COMPATIBILITY §11.3).
+	want := `{"error":{"message":"the upstream provider is rate limiting this gateway","type":"rate_limit_error","param":null,"code":"429"}}`
 	if got := w.Body.String(); got != want {
 		t.Errorf("body\n got %s\nwant %s", got, want)
+	}
+	if e.NativeMessage != "slow down" {
+		t.Errorf("native message %q, want the upstream text recorded", e.NativeMessage)
 	}
 }
 

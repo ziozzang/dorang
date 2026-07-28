@@ -48,7 +48,13 @@ type uiServer struct {
 type uiSession struct {
 	// actor is the label shown in the page header. An operator with several
 	// credentials open in several tabs needs to know which one this tab is.
-	actor   string
+	actor string
+	// scope is the administrative scope resolved when the session was created.
+	// It is stored rather than re-derived because the cookie is deliberately
+	// not the credential, so there is nothing left to re-derive it from — which
+	// also means a scope CHANGE is not observed until the session ends, on the
+	// same one-hour bound as a revocation.
+	scope   Scope
 	expires time.Time
 }
 
@@ -258,11 +264,18 @@ func (s *uiServer) newPage(screen, title string, v viewer) page {
 	}
 }
 
-// viewer is who is looking at a screen: the label to show, and whether a cookie
-// session is what authorized them.
+// viewer is who is looking at a screen: the label to show, whether a cookie
+// session is what authorized them, and — the part that is not decoration — the
+// scope their answers are bounded by.
+//
+// The scope travels on the viewer rather than being looked up per screen
+// because a screen that had to remember to ask would be a screen that could
+// forget to, and the keys screen forgetting means one tenant's operator reading
+// every tenant's credentials.
 type viewer struct {
 	actor    string
 	signedIn bool
+	scope    Scope
 }
 
 // actorLabel renders a principal for the page header. It is an identity, never
@@ -374,14 +387,18 @@ func (s *uiServer) authorize(w http.ResponseWriter, r *http.Request) (viewer, bo
 	if !s.api.cfg.DisableUISessions {
 		if c, err := r.Cookie(s.api.cfg.SessionCookie); err == nil {
 			if sess, live := s.lookupSession(c.Value); live {
-				return viewer{actor: sess.actor, signedIn: true}, true
+				// The session carries the scope that was resolved when it was
+				// created, alongside the authorization decision it already
+				// held. Re-deriving it per request would need the credential,
+				// which the cookie deliberately is not.
+				return viewer{actor: sess.actor, signedIn: true, scope: sess.scope}, true
 			}
 		}
 	}
 	// Fall back to the API's own credential, so that a deployment fronted by an
 	// authenticating proxy — or an operator with curl — reaches the same pages.
 	if p, err := s.api.authenticate(r); err == nil {
-		return viewer{actor: actorLabel(p)}, true
+		return viewer{actor: actorLabel(p), scope: p.AdminScope()}, true
 	}
 	if s.api.cfg.DisableUISessions {
 		http.Error(w, "an administrative credential is required", http.StatusUnauthorized)
@@ -451,6 +468,7 @@ func (s *uiServer) newSession(p Principal) string {
 	}
 	s.sessions[id] = uiSession{
 		actor:   actorLabel(p),
+		scope:   p.AdminScope(),
 		expires: now.Add(s.api.cfg.SessionTTL),
 	}
 	return id
@@ -557,7 +575,11 @@ func (s *uiServer) screenKeys(w http.ResponseWriter, r *http.Request, v viewer) 
 			"A key store is not configured in this process.", CodeDependencyOff)
 		return
 	}
-	keys, err := ks.ListKeys(r.Context(), KeyFilter{Limit: s.api.cfg.MaxListLimit})
+	f := KeyFilter{Limit: s.api.cfg.MaxListLimit}
+	if !v.scope.Global && len(v.scope.Teams) == 1 {
+		f.TeamID = v.scope.Teams[0]
+	}
+	keys, err := ks.ListKeys(r.Context(), f)
 	if err != nil {
 		s.renderError(w, r, v, "Keys", err)
 		return
@@ -565,6 +587,12 @@ func (s *uiServer) screenKeys(w http.ResponseWriter, r *http.Request, v viewer) 
 	now := s.api.now()
 	rows := make([]keyRow, 0, len(keys))
 	for _, k := range keys {
+		// The filter above is an optimization; this is the enforcement. A
+		// screen must not be the one place the scope is not applied, and the
+		// UI reads the SAME store the API reads.
+		if !v.scope.AllowsTeam(k.TeamID) {
+			continue
+		}
 		rows = append(rows, keyRow{Key: k, Expired: k.Expired(now)})
 	}
 	s.render(w, r, http.StatusOK, "keys", keysPage{
@@ -574,6 +602,15 @@ func (s *uiServer) screenKeys(w http.ResponseWriter, r *http.Request, v viewer) 
 }
 
 func (s *uiServer) screenModels(w http.ResponseWriter, r *http.Request, v viewer) {
+	// Deployment configuration, credential health and capacity occupancy are
+	// the operator's, and there is no per-team view of them.
+	if !v.scope.Global {
+		s.renderMessage(w, r, http.StatusForbidden, v, "Models & deployments",
+			"This credential administers "+v.scope.String()+
+				". Models and deployments are administered for the whole deployment.",
+			CodeOutOfScope)
+		return
+	}
 	reg := s.api.cfg.Models
 	if reg == nil {
 		s.renderMessage(w, r, http.StatusNotImplemented, v, "Models & deployments",
@@ -622,6 +659,15 @@ func (s *uiServer) screenModels(w http.ResponseWriter, r *http.Request, v viewer
 }
 
 func (s *uiServer) screenUsage(w http.ResponseWriter, r *http.Request, v viewer) {
+	// The usage screen is a deployment-wide aggregate over the ledger, which
+	// carries no subject filter. Same rule as /global/spend/report.
+	if !v.scope.Global {
+		s.renderMessage(w, r, http.StatusForbidden, v, "Usage & cost",
+			"This credential administers "+v.scope.String()+
+				". The usage screen aggregates the whole deployment.",
+			CodeOutOfScope)
+		return
+	}
 	led := s.api.cfg.Ledger
 	if led == nil {
 		s.renderMessage(w, r, http.StatusNotImplemented, v, "Usage & cost",

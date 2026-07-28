@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,9 +13,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/pricing"
+	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
 )
 
@@ -143,20 +147,106 @@ func TestNoRPMLimitIsUnlimited(t *testing.T) {
 
 // TestTPMLimitCountsFinishedTokens closes the other half: the request count is
 // taken at the gate, the token count when the request settles.
+//
+// The tokens come from a REAL finished request through a real upstream, not
+// from a direct call into the counter. A test that feeds the counter itself
+// proves the comparison works and says nothing about whether anything in
+// production feeds it — which is precisely the topology that let rpm_limit and
+// tpm_limit ship enforcing nothing, unit-tested, for the life of the project.
 func TestTPMLimitCountsFinishedTokens(t *testing.T) {
-	a := newWiringApp(t, wiringYAML, nil)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"x","object":"chat.completion","model":"m1-upstream",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},`+
+			`"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":400,"completion_tokens":400,"total_tokens":800}}`)
+	}))
+	defer up.Close()
+
+	yaml := fmt.Sprintf(`
+version: 1
+observability: {always_full_headers: true}
+providers:
+  - {name: p1, kind: openai, base_url: %q}
+credentials:
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: p1, upstream_model: m1-upstream, credentials: [c1]}
+`, up.URL)
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
 	secret := issueKey(t, a, func(k *store.APIKey) { k.TPMLimit = int64Ptr(100) })
 
-	// Nothing has been spent, so the key is admitted.
-	if w := callWith(a, secret, http.MethodGet, "/v1/models", ""); w.Code != http.StatusOK {
-		t.Fatalf("first request: %d", w.Code)
-	}
-	// Settle a request that consumed more than the whole minute's allowance.
-	keyID := lookupKeyID(t, a, secret)
-	a.rates.record(keyID, 500)
+	const chat = `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
 
-	if w := callWith(a, secret, http.MethodGet, "/v1/models", ""); w.Code != http.StatusTooManyRequests {
-		t.Fatalf("a key past tpm_limit answered %d, want 429\n%s", w.Code, w.Body.String())
+	// Nothing has been spent, so the first request is admitted and served.
+	if w := callWith(a, secret, http.MethodPost, "/v1/chat/completions", chat); w.Code != http.StatusOK {
+		t.Fatalf("first request: %d %s", w.Code, w.Body.String())
+	}
+
+	// 800 tokens against a ceiling of 100. The count exists only at settlement,
+	// so the ceiling bounds the NEXT request — which is the whole of what a
+	// post-hoc counter can do and is what tpm means everywhere it is published.
+	w := callWith(a, secret, http.MethodPost, "/v1/chat/completions", chat)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("a key past tpm_limit answered %d, want 429: the settled token count "+
+			"reaches no counter\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "rate") {
+		t.Errorf("the refusal does not say it is a rate limit: %s", w.Body.String())
+	}
+}
+
+// The settled token count lands on EVERY subject of the request, not only on
+// the api key.
+//
+// auth.Access carried ONE observed pair for three subjects and the window was
+// keyed by api key alone, so a team's tpm_limit was compared against one key's
+// count — a team ceiling multiplied by the number of keys under the team, the
+// same N-multiplication as the budget defect in the rate dimension. This drives
+// App.recordMetrics, which is the one production settlement site, and then asks
+// the gate about a DIFFERENT key on the same team.
+//
+// It is a separate test from the one above because `teams` has no Go code in
+// internal/store yet (docs/OPERATIONS.md §12), so a team ceiling cannot be put
+// on a stored row and reached over HTTP. The half that can be joined is joined:
+// the real settlement site feeds the real gate.
+func TestSettledTokensReachEverySubjectOfTheRequest(t *testing.T) {
+	a := newWiringApp(t, wiringYAML, nil)
+
+	a.recordMetrics(&server.Event{
+		KeyID: "key-1", UserID: "user-1", TeamID: "team-a",
+		Result: server.Result{Tokens: server.Usage{Input: 400, Output: 400, Total: 800}},
+	})
+
+	// A different key, same team, and the ceiling is the TEAM's.
+	other := &principal{
+		p: &auth.Principal{
+			KeyID: "key-2", TeamID: "team-a",
+			Team: &auth.Limits{TPMLimit: auth.Limit(100)},
+		},
+		now:   a.now,
+		rates: a.rates,
+	}
+	if err := other.Authorize(server.Access{}); err == nil {
+		t.Fatal("a second key under a team that has already spent 800 tokens against a " +
+			"tpm_limit of 100 was admitted: the settled tokens reached only the api key, " +
+			"so the team ceiling is enforced per key")
+	}
+
+	// And a key on a different team is unaffected, so the counter separates
+	// rather than simply refusing everything.
+	elsewhere := &principal{
+		p: &auth.Principal{
+			KeyID: "key-3", TeamID: "team-b",
+			Team: &auth.Limits{TPMLimit: auth.Limit(100)},
+		},
+		now:   a.now,
+		rates: a.rates,
+	}
+	if err := elsewhere.Authorize(server.Access{}); err != nil {
+		t.Fatalf("another team's key was refused by team-a's spend: %v", err)
 	}
 }
 
@@ -268,21 +358,49 @@ func TestMeteringDegradedReachesHealth(t *testing.T) {
 }
 
 // TestGrantedClientPriorityIsHonouredAndADropIsReported is §10.5 end to end: the
-// grant comes from the file, the hint from the request, and a hint that was not
-// granted says so on the way out.
+// hint is honoured for a key an operator granted it to, and REPORTED as dropped
+// for one that was not.
+//
+// The name used to promise more than the body delivered: it asserted the joint
+// (the configured grant reaching router.PriorityConfig) and then called
+// CanonicalFor directly, which is the priority clamp's own unit test wearing an
+// end-to-end name. §10.5's requirement is that a dropped hint be reported in
+// x-dorang-dropped-params, and that header is stamped by the dispatcher — so
+// asserting it needs a request that reaches an upstream, which is what this now
+// does.
 func TestGrantedClientPriorityIsHonouredAndADropIsReported(t *testing.T) {
-	a := newWiringApp(t, wiringYAML, nil)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"x","object":"chat.completion","model":"m1-upstream",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},`+
+			`"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer up.Close()
+
+	yaml := strings.Replace(wiringYAML,
+		`base_url: "https://example.invalid"`, fmt.Sprintf("base_url: %q", up.URL), 1)
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
 	ungranted := issueKey(t, a, nil)
 
-	w := callWith(a, ungranted, http.MethodGet, "/v1/models", "")
+	const chat = `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chat))
+	r.Header.Set("Authorization", "Bearer "+ungranted)
+	r.Header.Set(HeaderClientPriority, "0")
+	w := httptest.NewRecorder()
+	a.Server.ServeHTTP(w, r)
+
 	if w.Code != http.StatusOK {
-		t.Fatalf("status %d", w.Code)
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	dropped := w.Header().Get(server.HeaderDroppedParams)
+	if !strings.Contains(dropped, HeaderClientPriority) {
+		t.Fatalf("an ungranted priority hint was dropped silently; "+
+			"%s = %q, want it to name %s (§10.5)",
+			server.HeaderDroppedParams, dropped, HeaderClientPriority)
 	}
 
-	// The header path is exercised through the router directly, because the
-	// dropped-params header is stamped by the dispatcher and an inference
-	// request needs an upstream. What must hold here is the joint: the config
-	// grant reached router.PriorityConfig.
+	// And the joint underneath it: the configured grant reaches the router's
+	// priority config, and a principal with no grant does not acquire one.
 	cfg := a.Config()
 	if !cfg.Capacity.Principals["granted"].GrantsClientPriority() {
 		t.Fatal("the fixture lost its grant")

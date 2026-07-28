@@ -213,7 +213,7 @@ func (h *harness) serve(ctx context.Context, body []byte, key string, prefixOn b
 	}
 	if prefixOn {
 		group, _ := h.router.Resolve(req.Model)
-		rr.Digests = prefix.Compute(group, body, 0)
+		rr.Digests = prefix.Compute("t", group, body, 0)
 	}
 	d, err := h.router.Route(ctx, rr)
 	if err != nil {
@@ -526,7 +526,7 @@ func BenchmarkPrefixChain(b *testing.B) {
 			b.SetBytes(int64(len(body)))
 			b.ReportAllocs()
 			for b.Loop() {
-				if d := prefix.Compute(Model, body, 0); len(d) == 0 {
+				if d := prefix.Compute("t", Model, body, 0); len(d) == 0 {
 					b.Fatal("no digests")
 				}
 			}

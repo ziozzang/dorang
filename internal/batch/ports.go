@@ -67,6 +67,15 @@ type ExecRequest struct {
 	PriorityClass string
 	// PrincipalID is the owning api key, user or team.
 	PrincipalID string
+	// OwnerKeyID is the api key the batch was created under.
+	//
+	// It is distinct from PrincipalID, which the deployment may have pointed at
+	// a user or a team for capacity accounting. This one names the credential
+	// row, which is what an executor needs in order to re-derive the owner's
+	// authorization envelope — the model allow-list and the budget ceilings —
+	// for a row dispatched hours after the request that created it, possibly in
+	// a different process.
+	OwnerKeyID string
 	// Attempt is 0 on the first try and increments per retry.
 	Attempt int
 }
@@ -119,6 +128,20 @@ type CapacityRequest struct {
 	// (DESIGN §11.1). Always true for work this package dispatches.
 	Batch bool
 }
+
+// ModelAuthorizer answers whether the credential that owns a batch may use a
+// model, returning nil when it may.
+//
+// It is a per-request function rather than a [Config] dependency because the
+// answer belongs to the caller, not to the deployment: the same file uploaded
+// by two keys has two answers. Passing it in the request is also what makes the
+// omission visible — [Service.UploadFile] refuses a batch-purpose upload that
+// carries no authorizer, so "nobody checked" is a 400 rather than a bypass.
+//
+// The returned error is surfaced to the caller as the row's validation error,
+// so it should read as a refusal and must not name anything the caller is not
+// entitled to know.
+type ModelAuthorizer func(model string) error
 
 // ModelResolver maps a client-facing model name onto the provider and upstream
 // model it will be served by.

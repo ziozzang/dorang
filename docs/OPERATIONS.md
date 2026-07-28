@@ -74,17 +74,22 @@ Two registration details that are deliberate rather than accidental:
 
 | Code | Meaning |
 |---|---|
-| `route_not_implemented` | A route dorang declares and this build has not mounted: `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`, and the whole administrative shape (`/key/*`, `/user/*`, `/team/*`, `/model/*`, `/model_group/*`, `/budget/*`, `/spend/*`, `/global/spend/*`, `/health/history`). `/v1/responses`, `/v1/files` and `/v1/batches` are also on this list, because their subsystems are mounted conditionally — a build without them must answer "declared, not built" rather than "no such path" |
+| `route_not_implemented` | A route dorang declares and this build has not mounted: `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`. `/v1/responses`, `/v1/files` and `/v1/batches` are also on this list, because their subsystems are mounted conditionally — a build without them must answer "declared, not built" rather than "no such path" |
 | `route_unknown` | Anything else |
 
 A 501 carries `X-Dorang-Unimplemented: <path>`. A known path with the wrong method answers
 **405** with an `Allow` header and code `method_not_allowed`.
 
-⚠️ **There is no HTTP administrative surface in this build.** The `internal/admin` package
-exists, is tested, has a read-only embedded UI, and **is not mounted by `cmd/dorang`**. Every
-`/key/*`, `/user/*`, `/team/*`, `/budget/*`, `/spend/*` and `/admin/*` path answers 501 today.
-Administration is `dorangctl` and the database. Plan accordingly: this is the single largest gap
-between the design and the binary.
+**The HTTP administrative surface is mounted.** `/key/*`, `/user/*`, `/team/*`, `/model/*`,
+`/budget/*`, `/spend/*`, `/admin/*` and the embedded read-only UI at `/ui` are served by
+`cmd/dorang`, behind `DORANG_MASTER_KEY` or a key whose owning user holds an administrative role.
+Every mutation writes an `audit_logs` row.
+
+Not every endpoint has storage behind it. The ones that do not answer **501
+`dependency_not_configured`** naming the missing piece rather than a generic refusal — see §3.2
+for the list and §12 for why. The distinction matters when you are reading a 501: a
+`dependency_not_configured` says *this build cannot serve it*; a `route_not_implemented` says
+*dorang has not built it*.
 
 ### 0.3 One behaviour worth knowing before you read a log
 
@@ -324,7 +329,119 @@ refused *as such*, never disappear and be refused as unknown.
 TTL or on the next reload, not instantly. `dorangctl key revoke` says so on stderr. If you need
 it now, `SIGHUP` the process after revoking.
 
-### 3.1 The administrative credential
+### 3.1 Revoking a leaked key
+
+This is the incident-response procedure. It needs an HTTP client and the administrative
+credential, and nothing else — no shell on the box, no database client, no restart.
+
+```
+curl -s -X POST http://gateway:4000/key/block \
+  -H "Authorization: Bearer $DORANG_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"key_id":"<key id>"}'
+```
+
+The response is the key's new state. An `audit_logs` row is written before the call returns; a
+mutation that could not be audited is refused rather than applied silently, and if the write
+fails *after* the change was applied you get `500 audit_write_failed` telling you to reconcile
+rather than retry.
+
+**How fast it takes effect.** `internal/auth` caches a loaded credential for `DefaultEntryTTL`
+(60 s), so the key stops working within a minute of the block. `Authenticator.use` enforces
+`Blocked` on every request independently of the authorization checks, so no second gate has to be
+reached. `SIGHUP` clears the cache immediately if the minute matters.
+
+**In-flight batches stop too.** `batchExecutor` re-resolves the owning credential per row within
+its 30 s owner-resolution TTL and calls `Authorize`, so a blocked key's running batch stops
+spending. Before that check existed, a batch submitted before a block kept spending until it
+finished.
+
+**Finding the key id from a leak report.** The label is derived from the first 8 hex characters
+of the lookup digest (`store.LabelFor`) and never from the secret's own characters, so a leaked
+token's label identifies the row without the token going anywhere:
+
+```
+curl -s "http://gateway:4000/key/list?limit=200" \
+  -H "Authorization: Bearer $DORANG_MASTER_KEY"
+```
+
+⚠️ **Never send the plaintext key as a parameter.** `/key/info` and `/key/block` take `key_id`
+and refuse a `key` parameter with code `secret_in_request`. A live credential in a URL is a live
+credential in your access logs, your proxy traces and your shell history — which is how the leak
+you are responding to often happened.
+
+**Rotating instead of blocking.** `POST /key/regenerate` mints a new secret behind the same key
+id, keeping every authorization field, and returns the new token exactly once. The cutover is
+immediate: there is no grace window in which the old secret still verifies, because a grace
+window on an incident path keeps the compromised secret working for its duration.
+
+**Before this surface was mounted** the only lever was a hand-written
+`UPDATE api_keys SET blocked = 1 WHERE id = '<key id>'` against the database, which needs shell
+access to the node, cannot be done from a runbook over HTTP, and leaves no audit row. That is no
+longer the procedure. It still works as a break-glass path if the administrative credential
+itself is what leaked.
+
+### 3.2 What the administrative surface serves, and what it does not
+
+Mounted and working:
+
+| Path | Notes |
+|---|---|
+| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | The whole credential lifecycle. `/key/regenerate` cuts the old secret outright — it is the incident path |
+| `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c rotation: a new secret with a grace window, an early cut, and the list an operator reads to answer "did the client roll?". Same durable key id, so budget, spend, allow-list and ledger history are untouched |
+| `/key/pend`, `/key/release` | §11.6's reversible refusal. Distinct from block, because a pend is a statistical judgement that might be wrong and an operator releases it in one action |
+| `/spend/logs` | Per-request ledger. Requires one of `key_id`, `team_id`, `trace_id`, `tag` or `errors_only`, plus a bounded date range — §9.3 refuses an unbounded scan rather than answering it slowly |
+| `/admin/capacity` | Live broker occupancy per axis |
+| `/admin/catalog/explain`, `/admin/catalog/unverified` | Where each catalogued model field came from |
+| `/health/history` | In-process ring; it starts empty on every restart |
+| `/ui` | Read-only operator UI. Sign in with an administrative credential; the session is one hour, which is also the lag before a revoked credential loses the UI |
+
+Answering **501 `dependency_not_configured`** in this build, because the storage behind them does
+not exist yet — `internal/store` has no Go code for `users`, `teams`, `team_members`,
+`deployments` or `model_aliases`, and no range-aggregating report query:
+
+| Path | Missing piece | Use instead |
+|---|---|---|
+| `/user/*`, `/team/*` | directory | `dorangctl`, or the database |
+| `/model/*`, `/model_group/info` | model registry | configuration + `SIGHUP` |
+| `/budget/*` | budget store | `dorangctl key create --budget-usd` |
+| `/global/spend/report`, `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | rollup query | `/spend/logs`, or query `request_logs` |
+| `/admin/credentials/health`, `/admin/quota` | quota registry | `/metrics` |
+| `/spend/calculate`, `/admin/pricing/preview` | pricing engine | — |
+| `/admin/config/reload` | reloader | `SIGHUP` |
+
+### 3.3 Administrative scope
+
+There are two kinds of administrator and the difference is a fact the schema already holds.
+
+- **Global.** `DORANG_MASTER_KEY`, and an administrative key that belongs to **no team**. This is
+  the operator: every subject, every endpoint.
+- **Team-scoped.** An administrative key that **does** belong to a team (`api_keys.team_id`). It
+  administers that team's keys, members, budgets and spend, and nothing else.
+
+The scope is derived from the key rather than stored, so it cannot be forgotten: a key that is on
+a team is scoped by being on a team. There is no `admin_team` role to set and no migration to
+skip.
+
+What a team-scoped administrator gets:
+
+| Attempt | Answer |
+|---|---|
+| Its own team's key, by id | Served |
+| Another team's key, by id | **404**, identical to an id that does not exist — a 403 would turn every key id into an existence oracle |
+| `?team_id=` naming another team | **403 `out_of_scope`** — a parameter refusal discloses nothing and tells you which parameter to fix |
+| `/key/list` with no filter | Its own team only, never the deployment |
+| `/spend/logs` reaching another team's rows via `key_id` or `trace_id` | Rows dropped; the store filter is an optimization, the row check is the enforcement |
+| Minting a key on another team, or on no team | **403** — a key on no team would be a *global* administrator |
+| Changing a user's `user_role` | **403** — the role is what decides who administers, so writing it is escalation |
+| `/model/*`, `/admin/*`, `/global/spend/report`, `/user/new`, `/team/new`, `/health/history` | **403** — deployment-wide, and there is no honest per-team view of "reload the configuration" |
+
+A credential that authenticates but may not administer gets **403**, not 401: a working key being
+told its key does not work sends the operator to the wrong problem. **401** means no usable
+credential, and it is now the answer to every administrative path for an unauthenticated caller —
+including the unknown ones. The route table is not readable before authentication.
+
+### 3.4 The administrative credential
 
 `DORANG_MASTER_KEY` is compared out of band in constant time and is **never a row**. It is not
 issued, not listed, not revocable through `dorangctl`. Rotating it is an environment change plus
@@ -918,7 +1035,7 @@ Two things that are **not** causes any more, and were:
 | Symptom | Explanation |
 |---|---|
 | Every key fails authentication after a move or a restore | Pepper mismatch (§2.3, §8.4). Key rows exist; the digests were computed under a different pepper |
-| A revoked key still works | Credentials are cached. It clears within the entry TTL or on `SIGHUP` |
+| A revoked key still works | Credentials are cached. It clears within the entry TTL (60 s) or on `SIGHUP` — see §3.1 |
 | A reload "did nothing" | It probably succeeded and rebuilt only what is rebuildable. Storage, the authenticator, the meter and the capacity broker are **not** replaced on reload — that needs a restart |
 | A shadow configuration change is ignored | Correct. `shadow:` is the one section that refuses to hot-reload, because rebuilding it re-arms the daily cost ceiling |
 | A passthrough prefix 501s | Its provider has no `base_url`, so the route was dropped at build time rather than pointed at nothing |
@@ -933,9 +1050,9 @@ Operationally relevant gaps, so you do not plan around something that is not the
 
 | Area | Status |
 |---|---|
-| **HTTP administration** | `internal/admin` is complete, tested and **not mounted**. All of `/key/*`, `/user/*`, `/team/*`, `/model/*`, `/budget/*`, `/spend/*`, `/admin/*` and the embedded `/ui` answer 501. Use `dorangctl` |
+| **HTTP administration** | Mounted (§3.1–3.3). The credential lifecycle including rotation and pend, `/spend/logs`, capacity, catalog, health history and `/ui` are served; users, teams, deployments, budgets and the aggregate spend reports answer `501 dependency_not_configured` because `internal/store` has no code for those tables. Use `dorangctl` for those |
+| **Audit trail readback** | `audit_logs` is written by every administrative mutation and `/audit/list` is a named 501. Query the table directly |
 | `observability.otlp_endpoint` | No exporter is wired. The latency breakdown is recorded and not exported |
-| Per-key `rpm_limit` / `tpm_limit` on a USER or a TEAM | The rolling minute is counted per **api key**, so a user or team ceiling is enforced per key rather than across the keys under it. A single key cannot exceed it; ten keys under one team can, ten times over |
 | `capacity.*.rpm`, `.tpm` | **Refused at load**, naming the working home: `deployments[].limits[]` for a per-deployment rate, the api key's own `rpm_limit`/`tpm_limit` for a per-caller one |
 | **Lua** | There is **no Lua interpreter**, and that is a decision rather than an omission — see [CONFIG.md](CONFIG.md) §16. The four hook points, their ceilings and their secret-free views are built; what runs in them is a total policy language (`*.policy`) or a compiled-in Go `Native`. A `.lua` file under `extensions.lua.dir` is a **load error**, never a file that is silently ignored |
 | `on_route` re-routing | The hook sees the chosen deployment and may refuse it; it cannot ask for a different one |
@@ -943,6 +1060,7 @@ Operationally relevant gaps, so you do not plan around something that is not the
 | Credential import from an incumbent database | Implemented in the store and **has no CLI entry point** — see [MIGRATION.md](MIGRATION.md) §3 |
 | Rate limiting across nodes | The rolling minute is per process. An N-node deployment enforces N times every `rpm_limit` and `tpm_limit`. The durable ledger would close it, at a store write per request — not taken |
 | `tpm_limit` bounds the NEXT request | A token count does not exist until settlement, so one enormous request can cross the ceiling once before anything refuses |
+| Prefix / cluster metrics | State exists; nothing exports it. Capacity and health are readable at `/admin/capacity` and `/health/history` |
 | `providers[].usage_probe`, `providers[].metrics.interval`, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. The list is held as executable state in `internal/config/consumed_test.go`, so it cannot drift; see [CONFIG.md](CONFIG.md) §23.1 |
 
 ---

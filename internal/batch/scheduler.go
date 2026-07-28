@@ -501,6 +501,7 @@ func (s *Service) attempt(ctx context.Context, rec *BatchRecord, row *RowRecord,
 		Body:          in.Body,
 		PriorityClass: s.cfg.PriorityClass,
 		PrincipalID:   rec.PrincipalID,
+		OwnerKeyID:    rec.OwnerKeyID,
 		Attempt:       attempt,
 	}
 	res, execErr := s.execOnce(ctx, resv, req)

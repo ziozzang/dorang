@@ -52,6 +52,14 @@ func (c *call) estimate() tokenest.Estimate {
 // speaks, across all five upstream shapes. This consults it. An unrecognised
 // 400 classifies as before — CauseNone, terminal — so the only behaviour that
 // changes is the one that was missing.
+//
+// It reads NativeMessage and not Message. COMPATIBILITY §11.3's fix moved the
+// upstream's own text out of the client-facing Message — which is now
+// canonicalMessage(status), a function of the status line alone — and into
+// NativeMessage. Classifying on Message after that change would scan dorang's
+// own words for a vendor's phrase and find none, so the overflow chain would
+// silently stop being reachable from an upstream signal: the fix and this
+// classifier read the same field, or one of them does nothing.
 func upstreamCause(status int, e *server.Error) router.Cause {
 	if cause := router.Classify(status, nil); cause != router.CauseNone {
 		return cause
@@ -59,5 +67,5 @@ func upstreamCause(status int, e *server.Error) router.Cause {
 	if e == nil {
 		return router.CauseNone
 	}
-	return router.ClassifyBody(status, e.Code, e.Message)
+	return router.ClassifyBody(status, e.Code, e.NativeMessage)
 }

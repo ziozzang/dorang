@@ -42,11 +42,16 @@ var (
 // Machine-readable error codes. Scripts switch on these, so they are part of
 // the contract and change only with a deliberate break.
 const (
-	CodeInvalidRequest   = "invalid_request"
-	CodeUnboundedRange   = "unbounded_range"
-	CodeRangeTooWide     = "range_too_wide"
-	CodeUnauthorized     = "unauthorized"
-	CodeForbidden        = "forbidden"
+	CodeInvalidRequest = "invalid_request"
+	CodeUnboundedRange = "unbounded_range"
+	CodeRangeTooWide   = "range_too_wide"
+	CodeUnauthorized   = "unauthorized"
+	CodeForbidden      = "forbidden"
+	// CodeOutOfScope is a valid administrative credential asking about a
+	// subject outside its own scope. It is distinct from CodeForbidden — which
+	// means "not an administrator at all" — because the operator's follow-up
+	// differs: one is a missing role, the other is the wrong tenant.
+	CodeOutOfScope       = "out_of_scope"
 	CodeNotFound         = "not_found"
 	CodeConflict         = "conflict"
 	CodeMethodNotAllowed = "method_not_allowed"

@@ -247,12 +247,14 @@ func legacySunset(cfg *config.Config) time.Time {
 // twice.
 func (a *App) recordMetrics(ev *server.Event) {
 	r := &ev.Result
-	// The token half of the key's rolling minute. The request half was counted
-	// at the gate, because a ceiling enforced only on FINISHED requests cannot
-	// refuse a burst; tokens are not known until here, so they land here.
-	if a.rates != nil && ev.KeyID != "" {
+	// The token half of the rolling minute, for every subject the request
+	// belonged to. The request half was counted at the gate, because a ceiling
+	// enforced only on FINISHED requests cannot refuse a burst; tokens are not
+	// known until here, so they land here. All three subjects, because a team's
+	// tpm_limit is a statement about the team.
+	if a.rates != nil {
 		if n := totalTokens(r.Tokens); n > 0 {
-			a.rates.record(ev.KeyID, n)
+			a.rates.recordTokens(ev.KeyID, ev.UserID, ev.TeamID, n)
 		}
 	}
 	if a.requests == nil {

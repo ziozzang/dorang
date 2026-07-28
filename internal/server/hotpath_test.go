@@ -101,7 +101,7 @@ func TestNoAllocsPatternedRouteLookup(t *testing.T) {
 		}
 		o.Routes = []Route{{
 			Pattern: "/openai/deployments/{model}/chat/completions",
-			Methods: MethodPOST, Name: "azure",
+			Methods: MethodPOST, Name: "azure", ModelAuth: ModelAuthNone,
 			Handler: func(http.ResponseWriter, *Request) error { return nil },
 		}}
 	})

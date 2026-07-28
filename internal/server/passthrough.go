@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -131,6 +132,11 @@ func compilePassthrough(routes []PassthroughRoute) ([]*Route, error) {
 			Family:    FamilyPassthrough,
 			Public:    auth != PassthroughAuthDorang,
 			NeedsBody: false, // step 3: relay without parsing, streaming
+			// The gate cannot do it: NeedsBody is false, so there is no body
+			// for it to scan a model out of, and the allow-list check it would
+			// run compares "" and passes everything. servePassthrough peeks a
+			// bounded prefix instead and names what it finds.
+			ModelAuth: ModelAuthHandler,
 			Handler:   passthroughHandler(pt),
 		})
 	}
@@ -219,6 +225,17 @@ func (s *Server) servePassthrough(w http.ResponseWriter, rq *Request, pt *passth
 	rq.Result.Deployment = pt.provider
 
 	if pt.allowWS && isWebSocketUpgrade(r.Header) {
+		// A relayed socket carries model calls in frames this engine never
+		// decodes, so there is no model to name and no bounded peek that would
+		// find one. A key that restricts models therefore cannot be allowed to
+		// open one: the alternative is an upgrade that spends the operator's
+		// credential on whatever the frames ask for.
+		if rq.Principal != nil && principalRestrictsModels(rq.Principal) {
+			return passthroughUnauthorizable(
+				"this key restricts the models it may use, and a relayed WebSocket " +
+					"carries model calls that cannot be checked against that list")
+		}
+		rq.MarkModelAuthorized("websocket relay, key restricts no models")
 		return s.relayWebSocket(w, rq, pt, target)
 	}
 
@@ -234,6 +251,15 @@ func (s *Server) servePassthrough(w http.ResponseWriter, rq *Request, pt *passth
 	if r.Body != nil && r.Body != http.NoBody {
 		body = http.MaxBytesReader(nil, r.Body, cfg.maxBody)
 	}
+
+	// The allow-list, before anything is sent. peeked is put back in front of
+	// the reader so the relay is still a relay: the bytes examined here are
+	// forwarded, not consumed.
+	body, e = authorizePassthroughModel(rq, body, r.Header.Get("Content-Type"))
+	if e != nil {
+		return e
+	}
+
 	out, err := http.NewRequestWithContext(ctx, r.Method, target.String(), body)
 	if err != nil {
 		return NewError(http.StatusBadGateway, TypeAPIError,
@@ -263,6 +289,125 @@ func (s *Server) servePassthrough(w http.ResponseWriter, rq *Request, pt *passth
 		rq.Result.Tokens = usage
 	}
 	return nil
+}
+
+// passthroughPeekLimit bounds how much of a relayed body is examined to find
+// the model name.
+//
+// It is generous on purpose. A chat body carrying a long conversation is
+// legitimately hundreds of kilobytes, and refusing one because the model field
+// happened to sort after the messages array would break real traffic for no
+// safety gain. It is still a bound: DESIGN §15.5's rule against full-body
+// buffering applies to this path as much as to the relay below it, and past
+// this many bytes the answer comes from the principal's own restriction rather
+// than from more parsing.
+const passthroughPeekLimit = 1 << 20
+
+// authorizePassthroughModel enforces the model allow-list on a relayed body and
+// returns the reader the relay should use.
+//
+// The engine's contract is that it does not parse what it forwards (§10.6 step
+// 3), and that contract is why the allow-list was bypassed here: a body nobody
+// parses names a model nobody checks. The reconciliation is the same one step 5
+// already makes for usage — a BOUNDED peek, whose bytes are handed straight
+// back to the relay, so the forwarded request is byte-identical to the one that
+// arrived.
+//
+// What it does when it cannot find an answer is the part that matters. A body
+// it cannot parse, or one larger than the peek window, is refused for a key
+// whose allow-list restricts anything at all, and allowed for a key with no
+// restriction to enforce. That is the direction that cannot fail open: an
+// unrestricted key is unaffected, and a restricted key cannot reach an
+// unexamined model by making its body awkward.
+func authorizePassthroughModel(rq *Request, body io.Reader, contentType string) (io.Reader, *Error) {
+	if rq.Principal == nil {
+		// auth: client or auth: none. There is no dorang subject on this
+		// request and therefore no allow-list; the caller is authenticating to
+		// the provider itself.
+		rq.MarkModelAuthorized("passthrough route authenticates no dorang principal")
+		return body, nil
+	}
+	restricted := principalRestrictsModels(rq.Principal)
+	if body == nil {
+		// No body, no model. A GET or DELETE under a passthrough prefix cannot
+		// name a model to spend on.
+		rq.MarkModelAuthorized("passthrough request carries no body")
+		return body, nil
+	}
+	if !jsonish(contentType) {
+		if restricted {
+			return nil, passthroughUnauthorizable(
+				"this key restricts the models it may use, and a passthrough body " +
+					"that is not JSON cannot be checked against that list")
+		}
+		rq.MarkModelAuthorized("unrestricted key, non-JSON passthrough body")
+		return body, nil
+	}
+
+	peeked, err := io.ReadAll(io.LimitReader(body, passthroughPeekLimit+1))
+	if err != nil {
+		return nil, NewError(http.StatusBadRequest, TypeInvalidRequest,
+			"could not read the request body").WithCode("invalid_body")
+	}
+	rest := io.Reader(bytes.NewReader(peeked))
+	if len(peeked) > passthroughPeekLimit {
+		// Truncated: peekRequest would be reading half an object.
+		if restricted {
+			return nil, passthroughUnauthorizable(
+				"this key restricts the models it may use, and the passthrough body " +
+					"is too large to check against that list")
+		}
+		rq.MarkModelAuthorized("unrestricted key, oversized passthrough body")
+		return io.MultiReader(rest, body), nil
+	}
+
+	model, _, ok := peekRequest(peeked)
+	switch {
+	case !ok:
+		// Not a JSON object at all, despite the content type.
+		if restricted {
+			return nil, passthroughUnauthorizable(
+				"this key restricts the models it may use, and the passthrough body " +
+					"is not a JSON object")
+		}
+		rq.MarkModelAuthorized("unrestricted key, unparseable passthrough body")
+	case model == "":
+		// A JSON object that names no model reaches no model call the
+		// allow-list has an opinion about.
+		rq.MarkModelAuthorized("passthrough body names no model")
+	default:
+		if err := rq.AuthorizeModel(model); err != nil {
+			return nil, asError(err, http.StatusForbidden, TypePermission)
+		}
+		rq.Model = model
+	}
+	return rest, nil
+}
+
+// passthroughUnauthorizable is the refusal for a body whose model cannot be
+// established for a key that restricts models.
+// The status is 403 permission_error, the same answer the allow-list gives
+// everywhere else (COMPATIBILITY §11.2): the credential authenticated, and what
+// it cannot do is use a model that could not be named. A 401 here would tell a
+// client to re-authenticate over a body it should instead re-encode.
+func passthroughUnauthorizable(msg string) *Error {
+	return NewError(http.StatusForbidden, TypePermission, msg).
+		WithCode("model_not_authorizable")
+}
+
+// principalRestrictsModels reports whether a principal's allow-list refuses
+// anything.
+//
+// A Principal that does not implement [ModelRestricted] is treated as
+// restricted. That is the fail-closed direction and it is deliberate: this
+// question is asked only when the model could not be determined, and answering
+// "unrestricted" for an implementation that never said so is how a bypass gets
+// reintroduced by a type that merely forgot a method.
+func principalRestrictsModels(p Principal) bool {
+	if r, ok := p.(ModelRestricted); ok {
+		return r.ModelsRestricted()
+	}
+	return true
 }
 
 // target computes the upstream URL for a relayed request.
@@ -420,6 +565,12 @@ func copyResponseHeaders(dst, src http.Header) {
 	}
 	stripHopByHop(dst)
 	StripAuthHeaders(dst)
+	// Set-Cookie is stripped on the same reasoning as the authentication
+	// headers: relayed, it lets a backend set cookies on DORANG's origin, not
+	// its own — including overwriting or clearing an operator UI session. The
+	// upstream's cookie jar is not a thing a gateway forwards.
+	dst.Del("Set-Cookie")
+	dst.Del("Set-Cookie2")
 }
 
 // relayBody streams the response through a bounded buffer.
