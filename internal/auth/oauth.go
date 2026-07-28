@@ -241,6 +241,14 @@ type CredentialHealth struct {
 	ExpiresAt time.Time
 	// Refreshes counts successful renewals.
 	Refreshes uint64
+	// StoreLoads counts tokens adopted from the store rather than exchanged.
+	//
+	// It is here because a credential with no Refresher — the safe default, where
+	// the vendor's CLI keeps its own token current and dorang only reads it —
+	// leaves Refreshes at zero forever. Without this number that deployment has
+	// no signal at all that the credential is being kept current, and a store
+	// that silently stopped being updated looks exactly like one that is fine.
+	StoreLoads uint64
 }
 
 // String renders the health without any token material, which is why it is
@@ -254,8 +262,9 @@ func (h CredentialHealth) String() string {
 	if !h.ExpiresAt.IsZero() {
 		exp = h.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	return fmt.Sprintf("auth.CredentialHealth{id:%s provider:%s %s failures:%d expires:%s refreshes:%d}",
-		h.ID, h.Provider, state, h.Failures, exp, h.Refreshes)
+	return fmt.Sprintf(
+		"auth.CredentialHealth{id:%s provider:%s %s failures:%d expires:%s refreshes:%d loads:%d}",
+		h.ID, h.Provider, state, h.Failures, exp, h.Refreshes, h.StoreLoads)
 }
 
 // OAuthCredential is one credential that refreshes itself.
@@ -405,6 +414,7 @@ func (c *OAuthCredential) Health() CredentialHealth {
 		LastRefresh: c.lastRefresh,
 		ExpiresAt:   t.ExpiresAt,
 		Refreshes:   c.refreshes.Load(),
+		StoreLoads:  c.loads.Load(),
 	}
 }
 

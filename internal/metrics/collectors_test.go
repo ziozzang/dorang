@@ -55,6 +55,7 @@ func TestWholeSurfaceValidates(t *testing.T) {
 		"dorang_coordination_max_overshoot",
 		"dorang_capacity_overshoot_measured",
 		"dorang_oauth_refreshes_total",
+		"dorang_oauth_store_loads_total",
 		"dorang_shadow_skipped_total",
 		"dorang_batch_queue_depth",
 		"dorang_batch_rows_in_flight",
@@ -415,7 +416,7 @@ type fakeOAuth struct{ now time.Time }
 func (f fakeOAuth) Snapshot() []auth.CredentialHealth {
 	return []auth.CredentialHealth{
 		{
-			ID: "oauth-1", Provider: "plan-a", Healthy: true, Refreshes: 12,
+			ID: "oauth-1", Provider: "plan-a", Healthy: true, Refreshes: 12, StoreLoads: 41,
 			LastRefresh: f.now.Add(-30 * time.Minute),
 			ExpiresAt:   f.now.Add(30 * time.Minute),
 		},

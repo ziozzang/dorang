@@ -208,6 +208,19 @@ func (c *OAuthCollector) Collect(w *Writer) {
 		w.Uint(cr.Refreshes)
 	}
 
+	w.Metric("dorang_oauth_store_loads_total", Counter,
+		"Tokens adopted from the credential's store rather than exchanged for (DESIGN "+
+			"§11.2b). A deployment with no refresh endpoint configured — the safe default, "+
+			"where the vendor's own CLI keeps the token current and dorang only reads it — "+
+			"shows loads and no refreshes, and this is the ONLY number that moves for it. "+
+			"A store that silently stopped being updated otherwise looks exactly like one "+
+			"that is fine.")
+	for _, cr := range creds {
+		w.Label("credential", cr.ID)
+		w.Label("provider", cr.Provider)
+		w.Uint(cr.StoreLoads)
+	}
+
 	w.Metric("dorang_oauth_consecutive_failures", Gauge,
 		"Consecutive failed refreshes per credential. This is the number that rises "+
 			"silently while the current token still works.")
