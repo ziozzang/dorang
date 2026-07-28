@@ -415,8 +415,20 @@ kinds:
   echo:             { api: echo }              # deterministic, tests only
 ```
 
-Model-name prefix rules supply context window, max output, and reasoning shape when a name
-matches a known family, so a new model of a known family works without configuration.
+Model-name prefix rules supply context window and max output when a name matches a known
+family, so a new model of a known family works without configuration.
+
+> **Prefix rules may NOT supply reasoning capability.** An earlier draft of this section said
+> they could, which directly contradicts §10.2 and review finding C5: generalizing a
+> reasoning capability observed on one model version to a whole family is the exact defect
+> that made revision 1 silently drop the control on the family's other members. Reasoning
+> capability comes only from an explicit, dated model entry. A configuration that tries to
+> attach reasoning to a prefix rule is **rejected at load**, not ignored.
+
+**Undeclared is not zero-shaped.** A numeric capability that has not been observed is
+recorded as undeclared rather than filled with a plausible guess, because a wrong context
+window feeds context-window fallback routing (§7.6) and would silently misroute. Operators
+supply real values per deployment; `UnverifiedModels()` lists what still needs a probe.
 
 ---
 

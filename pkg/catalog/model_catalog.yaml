@@ -1,0 +1,159 @@
+# dorang — model catalog (DESIGN §10.2)
+#
+# One entry per (kind, model). Model names are opaque: a `:` in a name is a
+# literal character, and nothing in dorang splits on it (DESIGN §2.1,
+# REVIEW C3). Names appear here exactly as the provider returns them.
+#
+# `verified: YYYY-MM-DD` on an entry records when the model's EXISTENCE was
+# confirmed against the provider. It says nothing about reasoning capability,
+# which carries its own date.
+#
+# Reasoning
+# ---------
+# An absent `reasoning:` block means `unknown`, and unknown is the default for
+# every model here. Unknown is not a gap to be filled with a plausible guess:
+# dorang omits the reasoning control and reports it in x-dorang-dropped-params
+# rather than send a form the model may silently ignore or reject (§10.2).
+#
+# A block may claim a concrete capability only together with `verified:`, the
+# date the form was accepted by the live endpoint. Loading refuses any entry
+# that claims a capability without one, and refuses `unknown` carrying a date.
+# Catalog.UnverifiedModels lists everything still unprobed.
+#
+# The model lists below were fetched from the live endpoints on 2026-07-28.
+# Reasoning capability was NOT probed in that pass, so exactly one entry claims
+# a concrete capability: qwen3.8-max-preview, whose effort scale is in use in an
+# operator configuration today.
+#
+# `context_window` and `max_output_tokens` are in tokens; 0 or absent means
+# undeclared, and callers must treat that like unknown rather than as a bound.
+#
+# Pricing
+# -------
+# `pricing:` is a hint for cost-aware routing before any pricing rule matches.
+# Authoritative cost lives in the pricing rule set (DESIGN §8), which can
+# express subscriptions and adjustments a per-token pair cannot. No prices were
+# verified in the 2026-07-28 pass, so no entry carries one; a fabricated price
+# would flow straight into routing decisions and invoices. Shape, for operators
+# adding their own:
+#
+#   pricing:
+#     currency: USD
+#     input_per_mtok: "0.60"          # exact decimal, kept as written
+#     output_per_mtok: "2.20"
+#     cached_input_per_mtok: "0.06"
+#     verified: 2026-07-28
+
+version: 1
+
+models:
+
+  # =========================================================================
+  # Ollama Cloud — https://ollama.com/v1
+  # Model list fetched from the live endpoint on 2026-07-28: 19 models.
+  #
+  # `deepseek-v3.2` appears in some older deployments and is deliberately
+  # absent: the provider no longer offers it. It is not an oversight, and it
+  # should not be re-added without a fresh fetch showing it back on the list.
+  # =========================================================================
+
+  - { kind: ollama-cloud, model: "deepseek-v4-pro",       verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "deepseek-v4-flash",     verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "glm-5.1",               verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "glm-5.2",               verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "kimi-k3",               verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "kimi-k2.7-code",        verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "kimi-k2.6",             verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "kimi-k2.5",             verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "minimax-m3",            verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "minimax-m2.7",          verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "minimax-m2.5",          verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "qwen3.5:397b",          verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "gpt-oss:120b",          verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "gpt-oss:20b",           verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "gemma4:31b",            verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "mistral-large-3:675b",  verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "nemotron-3-ultra",      verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "nemotron-3-super",      verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "nemotron-3-nano:30b",   verified: 2026-07-28 }
+
+  # =========================================================================
+  # Z.AI coding plan — https://api.z.ai/api/coding/paas/v4  (kind: glm)
+  # Model list fetched from the live endpoint on 2026-07-28: 8 models.
+  #
+  # Note the collision with Ollama Cloud: `glm-5.1` and `glm-5.2` exist on
+  # both providers. They are different entries because the key is (kind,
+  # model). Nothing about the name identifies its provider — provider identity
+  # comes only from configuration (DESIGN §2.1 rule 2).
+  # =========================================================================
+
+  - { kind: glm, model: "glm-4.5",       verified: 2026-07-28 }
+  - { kind: glm, model: "glm-4.5-air",   verified: 2026-07-28 }
+  - { kind: glm, model: "glm-4.6",       verified: 2026-07-28 }
+  - { kind: glm, model: "glm-4.7",       verified: 2026-07-28 }
+  - { kind: glm, model: "glm-5",         verified: 2026-07-28 }
+  - { kind: glm, model: "glm-5-turbo",   verified: 2026-07-28 }
+  - { kind: glm, model: "glm-5.1",       verified: 2026-07-28 }
+  - { kind: glm, model: "glm-5.2",       verified: 2026-07-28 }
+
+  # =========================================================================
+  # Qwen token plan
+  # https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+  # =========================================================================
+
+  - kind: qwen
+    model: "qwen3.8-max-preview"
+    verified: 2026-07-28
+    context_window: 983616
+    max_output_tokens: 131072
+    reasoning:
+      capability: effort_scale
+      levels: [low, high, xhigh]
+      default_level: xhigh
+      verified: 2026-07-28
+      note: >-
+        The only concretely claimed reasoning capability in this catalog. Basis
+        is an operator configuration in production use against this endpoint
+        and this model, not a shape inferred from the kind. Note that it
+        contradicts the qwen kind's `enable_thinking` shape hint — which is why
+        capability is keyed by model (REVIEW C5).
+
+  - kind: qwen
+    model: "qwen3.7-max"
+    verified: 2026-07-28
+    max_output_tokens: 65536
+    # Reasoning deliberately left unknown. The verified effort scale above was
+    # established for qwen3.8-max-preview specifically; carrying it across to a
+    # different model on the same plan is precisely the generalization REVIEW
+    # C5 rejects — an effort scale observed on one model version, assumed for
+    # the rest of the family. One probe of this endpoint closes it, and an
+    # operator who has already confirmed the form can set it in an overlay.
+
+  # =========================================================================
+  # xAI — https://api.x.ai/v1
+  # =========================================================================
+
+  - { kind: xai, model: "grok-4.3", verified: 2026-07-28, context_window: 256000, max_output_tokens: 64000 }
+  - { kind: xai, model: "grok-4.5", verified: 2026-07-28, context_window: 256000, max_output_tokens: 64000 }
+
+  # =========================================================================
+  # OpenAI through a Codex OAuth credential
+  # =========================================================================
+
+  - { kind: codex-responses, model: "gpt-5.5",       verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-sol",   verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-terra", verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-luna",  verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
+
+  # =========================================================================
+  # Jina — embeddings and rerank
+  #
+  # Reasoning is left unknown here too. It is structurally implausible that an
+  # embeddings endpoint accepts a reasoning control, but "implausible" is not
+  # "checked", and this catalog's whole contract is that a date means somebody
+  # looked. These are the cheapest entries on the unverified list to close.
+  # =========================================================================
+
+  - { kind: jina, model: "jina-embeddings-v5-text-nano",  verified: 2026-07-28, category: embedding }
+  - { kind: jina, model: "jina-embeddings-v5-text-small", verified: 2026-07-28, category: embedding }
+  - { kind: jina, model: "jina-reranker-v3",              verified: 2026-07-28, category: rerank }

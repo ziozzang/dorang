@@ -1,0 +1,297 @@
+# dorang — provider kind defaults (DESIGN §4.3)
+#
+# A kind selects, in one word: the wire adapter, capability defaults, the
+# prompt-cache scheme, and the reasoning-control shape.
+#
+# Reading this file
+# ----------------
+# `reasoning:` here is a SHAPE HINT — the reasoning form the adapter for this
+# kind implements. It is NOT a capability claim about any model on this kind.
+# Keying reasoning folding on the provider kind is the defect REVIEW C5
+# records: within one provider the control changes across model generations, so
+# a kind-level value applied to a model would be silently ignored or rejected
+# on some members. Per-model capability lives in model_catalog.yaml and is
+# returned by Catalog.Reasoning; it defaults to `unknown` and is never guessed.
+# The values here use the §10.2 capability vocabulary. §4.3 names some shapes
+# differently; the mapping is: reasoning_effort -> effort_scale,
+# glm_thinking -> thinking_flag, thinking_budget and enable_thinking unchanged.
+#
+# `context_window` and `max_output_tokens` are in tokens, and 0 means
+# UNDECLARED — not unlimited, not zero. Same principle as `unknown` reasoning:
+# a plausible-looking number that was never checked is worse than no number,
+# because context-window fallback routing (§7.6) would act on it. Most kinds
+# therefore declare no window; the numbers live on models and prefix rules
+# where they were actually observed.
+#
+# `supports_tools` / `supports_streaming` are defaults for the wire adapter,
+# freely overridden per model or by deployment configuration.
+
+version: 1
+
+# Alias -> kind. Aliases are matched against the provider's configured `kind`
+# field only. They are never inferred from a model name (DESIGN §2.1 rule 2).
+kind_aliases:
+  dashscope: qwen
+  minimax-cn: minimax
+  ollama_cloud: ollama-cloud
+  ollama-turbo: ollama-cloud
+  zai: glm
+  z-ai: glm
+  "z.ai": zai            # chained: z.ai -> zai -> glm
+  x-ai: xai
+  codex: codex-responses
+  gemini: google
+  vertex-ai: vertex
+  azure-openai: azure
+
+kinds:
+
+  # ---- OpenAI-shaped -------------------------------------------------------
+
+  openai:
+    api: openai-chat
+    cache: openai_cache_key
+    reasoning: effort_scale
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  openai-responses:
+    api: openai-responses
+    cache: openai_cache_key
+    # §4.3 writes `reasoning_effort` here; on the Responses surface the wire
+    # form is the `reasoning: {effort, summary}` object of §10.2.
+    reasoning: responses_reasoning
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  # OpenAI models reached through a Codex OAuth credential rather than a
+  # platform API key. Same wire surface, different credential and model set.
+  codex-responses:
+    api: openai-responses
+    cache: openai_cache_key
+    reasoning: responses_reasoning
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+
+  azure:
+    api: openai-chat
+    cache: openai_cache_key
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Deployment-name indirection is configuration, not name parsing: the
+      upstream deployment is an explicit field, never derived from the model.
+
+  # ---- Anthropic-shaped ----------------------------------------------------
+
+  anthropic:
+    api: anthropic-messages
+    cache: anthropic_cache_control
+    reasoning: thinking_budget
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  minimax:
+    api: anthropic-messages
+    cache: anthropic_cache_control
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  bedrock:
+    api: anthropic-messages
+    cache: anthropic_cache_control
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      §4.3 elides bedrock's defaults. It fronts several model families, so this
+      is a starting point a deployment is expected to override.
+
+  # ---- Google-shaped -------------------------------------------------------
+
+  google:
+    api: gemini
+    cache: google_cached_contents
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  vertex:
+    api: gemini
+    cache: google_cached_contents
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      §4.3 elides vertex's defaults; it also fronts non-Gemini families that a
+      deployment must configure explicitly.
+
+  # ---- Chat providers on the OpenAI wire -----------------------------------
+
+  glm:
+    api: openai-chat
+    cache: openai_cache_key
+    # §4.3 calls this shape `glm_thinking`; §10.2 classifies it as the boolean
+    # {thinking: {type: enabled|disabled}} form.
+    reasoning: thinking_flag
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+
+  qwen:
+    # §4.3 lists `openai-chat`. The token-plan endpoint in use speaks the
+    # Responses surface, which is what this default reflects; a deployment on
+    # the plain compatible-mode endpoint overrides `api` back to openai-chat.
+    api: openai-responses
+    cache: openai_cache_key
+    # §4.3's shape hint for this kind is enable_thinking. The one qwen model
+    # whose capability has actually been verified accepts an effort scale
+    # instead — see model_catalog.yaml. That divergence is the point of C5:
+    # the hint describes the adapter, the model entry describes the model, and
+    # the model entry wins.
+    reasoning: enable_thinking
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+
+  deepseek:
+    api: openai-chat
+    cache: openai_cache_key
+    reasoning: effort_scale
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  moonshot:
+    api: openai-chat
+    cache: openai_cache_key
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  mistral:
+    api: openai-chat
+    cache: openai_cache_key
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  xai:
+    api: openai-chat
+    cache: openai_cache_key
+    reasoning: effort_scale
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+
+  openrouter:
+    api: openai-chat
+    cache: openrouter_cache
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  # ---- Self-hosted / local -------------------------------------------------
+
+  ollama:
+    api: openai-chat
+    cache: ollama_keep_alive
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  # The hosted endpoint at https://ollama.com/v1. Distinct from `ollama`: it
+  # takes a credential, hosts a fixed model set, and has no keep-alive knob to
+  # hold a model resident, so no prompt-cache scheme applies.
+  ollama-cloud:
+    api: openai-chat
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+
+  vllm:
+    api: openai-chat
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    metrics: prometheus
+    priority: native
+
+  # ---- Non-chat surfaces ---------------------------------------------------
+
+  cohere:
+    api: cohere
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  jina:
+    api: jina
+    cache: none
+    category: embedding
+    supports_tools: false
+    supports_streaming: false
+    verified: 2026-07-28
+
+  # ---- Test adapter --------------------------------------------------------
+
+  echo:
+    api: echo
+    cache: none
+    reasoning: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: Deterministic in-process adapter, tests only (DESIGN §4.3).
+
+# Model-name prefix rules — the middle lookup layer.
+#
+# A rule is a LITERAL string-prefix test on the configured model name. It
+# supplies capability DEFAULTS ONLY and never touches identity, routing or
+# hashing (DESIGN §2.1 rule 3, REVIEW C3): matching `grok-4.` does not make
+# `grok-4.9` a catalogued model, and the name is returned unchanged.
+#
+# The schema has no reasoning field here, deliberately. A prefix rule
+# generalizes over every present and future member of a name family, which is
+# exactly the generalization REVIEW C5 rejects. Reasoning capability is
+# per-(kind, model) or it is unknown.
+#
+# The longest matching prefix wins; a kind-scoped rule beats a kind-agnostic
+# one of equal length.
+prefix_rules:
+
+  - kind: xai
+    prefix: "grok-4."
+    context_window: 256000
+    max_output_tokens: 64000
+    note: >-
+      Observed on grok-4.3 and grok-4.5 on 2026-07-28. Applies to later 4.x
+      members as a default until one is listed explicitly.
+
+  - kind: codex-responses
+    prefix: "gpt-5."
+    context_window: 400000
+    max_output_tokens: 100000
+    note: Observed across the gpt-5.5 and gpt-5.6 models on 2026-07-28.
+
+  - kind: jina
+    prefix: "jina-embeddings-"
+    category: embedding
+
+  - kind: jina
+    prefix: "jina-reranker-"
+    category: rerank
