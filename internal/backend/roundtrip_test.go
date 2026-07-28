@@ -63,7 +63,7 @@ func TestRoundTripAnthropicMessages(t *testing.T) {
 	f := newFakeUpstream(t)
 	f.answer(http.StatusOK, `{"id":"msg-1","type":"message","role":"assistant","model":"upstream-model",
 		"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
-		"usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":3}}`) // pragma: allowlist secret — test fixture
+		"usage":{"input_tokens":7,"output_tokens":2,"cache_read_input_tokens":3}}`)
 
 	p := testProvider(t, f, "anthropic", catalog.APIAnthropicMessages)
 	res := testBackend("sk-ant").Do(context.Background(), target(p),
@@ -185,8 +185,8 @@ func TestGeminiRoundTrip(t *testing.T) {
 	f := newFakeUpstream(t)
 	f.answer(http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[{"text":"hi there"}]},
 		"finishReason":"STOP","index":0}],
-		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4, // pragma: allowlist secret — test fixture
-		"cachedContentTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":17}, // pragma: allowlist secret — test fixture
+		"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4,
+		"cachedContentTokenCount":6,"thoughtsTokenCount":3,"totalTokenCount":17},
 		"modelVersion":"gemini-2.5-pro","responseId":"resp-1"}`)
 
 	p := testProvider(t, f, "google", catalog.APIGemini)
@@ -262,7 +262,7 @@ func TestGeminiToolCallRoundTrip(t *testing.T) {
 	f.answer(http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[
 		{"functionCall":{"name":"get_weather","args":{"city":"Seoul"}}}]},
 		"finishReason":"STOP","index":0}],
-		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}`) // pragma: allowlist secret — test fixture
+		"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"totalTokenCount":8}}`)
 
 	p := testProvider(t, f, "google", catalog.APIGemini)
 	c := chatCall(catalog.APIOpenAIChat)

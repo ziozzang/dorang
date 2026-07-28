@@ -78,7 +78,7 @@ func newSourceDB(t *testing.T, rows []sourceRow) *sql.DB {
 		t.Fatal(err)
 	}
 	for _, r := range rows {
-		_, err := db.Exec(`INSERT INTO "LiteLLM_VerificationToken" // pragma: allowlist secret — test fixture
+		_, err := db.Exec(`INSERT INTO "LiteLLM_VerificationToken"
 			(token, key_name, key_alias, spend, expires, models, allowed_routes, user_id, team_id,
 			 max_parallel_requests, blocked, tpm_limit, rpm_limit, max_budget, budget_duration,
 			 object_permission_id, created_at, updated_at)
