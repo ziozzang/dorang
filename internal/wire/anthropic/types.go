@@ -127,11 +127,21 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 	var probe struct {
 		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(data, &probe); err != nil {
+	// The discriminator decides everything below it, so it is resolved
+	// case-sensitively first: {"Type":"text"} declares no type here, exactly as
+	// it declares none to the backend. Filtering against the probe rather than
+	// against the whole block is deliberate — at this point the block may still
+	// turn out to be an opaque one, whose members are nobody's business.
+	typed := strictBytes(data, &probe)
+	if err := json.Unmarshal(typed, &probe); err != nil {
 		return err
 	}
 	if !modelledBlockType(probe.Type) {
-		extra, err := splitExtra(data, blockTypeOnly)
+		// Only the discriminator is reserved on an opaque block, so only a
+		// collision with "type" was removed: a member spelled like a modelled
+		// field is relayed exactly as it arrived, which is the whole point of
+		// the opaque path.
+		extra, err := splitExtra(typed, blockTypeOnly)
 		if err != nil {
 			return err
 		}
@@ -140,6 +150,7 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 	}
 	type alias ContentBlock
 	var a alias
+	data = strictBytes(data, &a)
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
@@ -281,6 +292,10 @@ func (m Message) MarshalJSON() ([]byte, error) {
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type alias Message
 	var a alias
+	// Filter once, then decode the SAME bytes twice: a key dropped from the
+	// struct decode must be dropped from Extra too, or it is relayed to the
+	// next hop and re-creates the bypass there (COMPATIBILITY 2.0).
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -323,6 +338,7 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 func (t *Tool) UnmarshalJSON(b []byte) error {
 	type alias Tool
 	var a alias
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -390,6 +406,7 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 func (m *Metadata) UnmarshalJSON(b []byte) error {
 	type alias Metadata
 	var a alias
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -449,6 +466,9 @@ func (r Request) MarshalJSON() ([]byte, error) {
 func (r *Request) UnmarshalJSON(b []byte) error {
 	type alias Request
 	var a alias
+	// The gate scanned these same bytes for "model" and "stream" with exact
+	// key comparison. This is the line that makes the adapter agree with it.
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -502,6 +522,8 @@ func (r Response) MarshalJSON() ([]byte, error) {
 func (r *Response) UnmarshalJSON(b []byte) error {
 	type alias Response
 	var a alias
+	// Response-only type: json.Unmarshal, not strictBytes. See [strictUnmarshal]
+	// for why the line is drawn here and not around every decode.
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}

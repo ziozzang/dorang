@@ -91,9 +91,12 @@ func peekRequest(b []byte) (model string, stream, ok bool) {
 			// about stream_options.include_usage: truthy is not enough, and a
 			// gateway that accepts "1" or "yes" here streams a response the
 			// client's parser is not expecting.
-			if hasPrefixAt(b, i, "true") {
-				stream = true
-			}
+			// Assign, never OR. A later `"stream": false` must clear an earlier
+			// true, because every adapter and backend takes the last duplicate.
+			// A gate that disagrees prepares an SSE response — including
+			// COMPATIBILITY 1.3's in-band error path — for a call that comes
+			// back whole. The fuzzer found this; reading the code did not.
+			stream = hasPrefixAt(b, i, "true")
 			i = skipValue(b, i)
 		default:
 			i = skipValue(b, i)
@@ -102,17 +105,39 @@ func peekRequest(b []byte) (model string, stream, ok bool) {
 			return model, stream, false
 		}
 	}
-	if model == "" && sawEscapedKey {
-		// An escaped key can spell "model" ("model" is the same key to a
-		// conforming parser). The fast path deliberately does not decode keys,
-		// so on the rare body that used one and named no model, fall back to a
-		// real parse rather than route the request as anonymous.
-		var slow struct {
-			Model  string `json:"model"`
-			Stream bool   `json:"stream"`
-		}
+	if sawEscapedKey {
+		// An escaped key can spell "model" — it is the same key to every
+		// conforming parser, and the fast path deliberately does not decode keys.
+		// Two things this must get right, both of which an earlier version did not:
+		//
+		// The fallback runs whenever an escaped key was seen, NOT only when no
+		// model was found. Given a body naming the model twice, once plainly and
+		// once with an escaped key, the fast path stops at the first while every
+		// adapter unescapes and takes the last — so the gate authorized one model
+		// and the backend served another. That failed OPEN: the key's allow-list
+		// was checked against a name that was never dispatched.
+		//
+		// And it decodes into a map, not a tagged struct. encoding/json matches
+		// tags case-insensitively, with Unicode folding, which is the very defect
+		// W10 exists to close — using a struct here would put it back inside the
+		// gate. A map yields unescaped keys and exact matching, and takes the last
+		// duplicate, which is what the adapters do.
+		var slow map[string]json.RawMessage
 		if err := json.Unmarshal(b, &slow); err == nil {
-			return slow.Model, slow.Stream, true
+			m, st := model, stream
+			if raw, found := slow["model"]; found {
+				var v string
+				if json.Unmarshal(raw, &v) == nil {
+					m = v
+				}
+			}
+			if raw, found := slow["stream"]; found {
+				var v bool
+				if json.Unmarshal(raw, &v) == nil {
+					st = v
+				}
+			}
+			return m, st, true
 		}
 	}
 	return model, stream, true

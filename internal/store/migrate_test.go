@@ -250,6 +250,28 @@ func TestMigrationsDeclareSameTables(t *testing.T) {
 				}
 				set[name] = true
 			}
+			// A rebuild table is a migration artifact, not part of the schema.
+			// SQLite cannot drop a CHECK constraint, so widening one means
+			// create-copy-drop-rename; comparing the raw CREATE statements
+			// would report the scratch table as a dialect difference. Honour
+			// DROP and RENAME so the comparison is over the FINAL table set,
+			// which is the thing that has to match.
+			for _, stmt := range splitStatements(m.Body) {
+				fields := strings.Fields(stmt)
+				upper := strings.ToUpper(stmt)
+				switch {
+				case strings.HasPrefix(upper, "DROP TABLE"):
+					name := fields[len(fields)-1]
+					name = strings.TrimSuffix(name, ";")
+					delete(set, name)
+				case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "RENAME TO"):
+					// ALTER TABLE <from> RENAME TO <to>
+					to := strings.TrimSuffix(fields[len(fields)-1], ";")
+					from := fields[2]
+					delete(set, from)
+					set[to] = true
+				}
+			}
 		}
 		names[dir] = set
 	}

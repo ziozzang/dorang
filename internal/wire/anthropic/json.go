@@ -6,6 +6,8 @@ import (
 	"errors"
 	"sort"
 	"sync"
+
+	"github.com/ziozzang/dorang/internal/canonical"
 )
 
 // Marshal encodes v the way the reference serializer does.
@@ -39,6 +41,32 @@ func marshalTo(dst *bytes.Buffer, v any) error {
 	dst.Truncate(dst.Len() - 1)
 	return nil
 }
+
+// strictUnmarshal decodes a REQUEST with case-sensitive field matching.
+//
+// COMPATIBILITY 2.0: encoding/json fills a `json:"model"` field from a member
+// spelled "Model". The authorization gate (internal/server/peek.go) compares
+// key bytes exactly and so does every backend downstream, so a struct decode
+// here would resolve a model the gate never authorized — an allow-list bypass,
+// not a cosmetic difference. Every decode on the request path goes through
+// this; see [canonical.StrictBytes] for the rule and for what happens to a
+// colliding key.
+//
+// RESPONSES ARE DELIBERATELY NOT STRICT. A response body comes from a backend
+// dorang chose, not from a caller: a case variation there is a vendor quirk
+// that cannot bypass anything, because nothing is authorized against a
+// response, and refusing it would turn an upstream cosmetic bug into a failed
+// request and lost usage counts. Types that appear on BOTH paths —
+// [ContentBlock] is a request block and a response block — follow the request
+// rule, because that is the rule with a security property attached.
+func strictUnmarshal(b []byte, v any) error { return canonical.StrictUnmarshal(b, v) }
+
+// strictBytes is [strictUnmarshal]'s filter on its own, for the UnmarshalJSON
+// methods that decode the SAME bytes twice — once into the struct and once into
+// the raw member map that feeds Extra. Filtering once and using the result for
+// both is what keeps a dropped key from reappearing in Extra and being relayed
+// to the next hop, where a Go parser would match it again.
+func strictBytes(b []byte, v any) []byte { return canonical.StrictBytes(b, v) }
 
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 

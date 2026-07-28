@@ -271,8 +271,13 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 // it apart again. The id keys health, prefix affinity and circuit state, so it
 // must be stable across a hot reload — which it is, because it is derived only
 // from configuration.
+// The separator is printable on purpose. The id is stamped into
+// x-dorang-deployment, logged and used as a metric label, and internal/server
+// does not sanitize the values a dispatcher puts on Result — a control
+// character here becomes a malformed response header, which is how the first
+// version of this function was found.
 func deploymentID(group, provider, upstream string) string {
-	return group + "\x1f" + provider + "\x1f" + upstream
+	return group + "|" + provider + "|" + upstream
 }
 
 // capabilitiesFor is what a deployment of this kind can express (DESIGN §10.1).
@@ -448,9 +453,21 @@ func strictest(a, b int64) int64 {
 
 // meterConfig renders metering.* onto the meter, with the store as the sink.
 func meterConfig(cfg *config.Config, st *store.Store, now func() time.Time) (meter.Config, error) {
-	mode, err := meter.ParseExcerptMode(cfg.Metering.Trace.StoreMessages)
-	if err != nil {
-		return meter.Config{}, fmt.Errorf("app: metering.trace.store_messages: %w", err)
+	// The two packages spell the same three policies differently: the
+	// configuration file says none | hash | truncated (DESIGN §12.2) and
+	// internal/meter says none | hash | excerpt. Translating here keeps both
+	// spellings correct in their own file.
+	var mode meter.ExcerptMode
+	switch cfg.Metering.Trace.StoreMessages {
+	case config.StoreMessagesNone:
+		mode = meter.ExcerptNone
+	case config.StoreMessagesHash:
+		mode = meter.ExcerptHash
+	case config.StoreMessagesTruncated, "":
+		mode = meter.ExcerptText
+	default:
+		return meter.Config{}, fmt.Errorf(
+			"app: metering.trace.store_messages: unknown mode %q", cfg.Metering.Trace.StoreMessages)
 	}
 	dir := config.ExpandPath(cfg.Metering.Spool.Dir)
 	if dir != "" {

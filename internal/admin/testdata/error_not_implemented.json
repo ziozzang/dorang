@@ -1,0 +1,9 @@
+{
+  "error": {
+    "message": "dorang's domain model has users and teams (DESIGN §11.4); an organization is a column on teams, not an object with its own lifecycle. Use /team/* and set organization_id",
+    "type": "not_implemented_error",
+    "param": null,
+    "code": "organizations_unsupported"
+  }
+}
+

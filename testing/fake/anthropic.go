@@ -254,11 +254,11 @@ func (u *Upstream) antStream(f *flusher, s Script, bh Behaviour) {
 	}
 
 	content := 0
-	failed := false
-	// step emits one content frame. It returns false when the stream must end,
-	// and sets failed when it ended by delivering an in-band error — after
-	// which there is NO message_stop, because the message did not stop, it
-	// failed (COMPATIBILITY 6.2).
+	// step emits one content frame. It returns false when the stream must end.
+	// When it ends by delivering an in-band error the caller returns without
+	// reaching the terminal frames below, which is the contract: there is NO
+	// message_stop after an error, because the message did not stop, it failed
+	// (COMPATIBILITY 6.2).
 	step := func(name string, v any) bool {
 		if bh.InterFrame > 0 {
 			time.Sleep(bh.InterFrame)
@@ -286,7 +286,6 @@ func (u *Upstream) antStream(f *flusher, s Script, bh Behaviour) {
 			_ = f.write(antFrame("error", antEnvelope{
 				Type: "error", Error: antError{Type: typ, Message: msg, Param: nil, Code: code},
 			}))
-			failed = true
 			return false
 		}
 		return true
@@ -348,8 +347,6 @@ func (u *Upstream) antStream(f *flusher, s Script, bh Behaviour) {
 			return
 		}
 	}
-	_ = failed
-
 	// COMPATIBILITY 6.6: a content_block_stop always precedes the terminal
 	// message_delta, which is why every block above closed itself before this
 	// point rather than leaving the close to the terminal frame.

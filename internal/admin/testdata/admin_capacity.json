@@ -1,0 +1,26 @@
+{
+  "axes": [
+    {
+      "axis": "model",
+      "key": "prov-a|a/model",
+      "in_use": 3,
+      "limit": 10,
+      "waiting": 1,
+      "used_pct": 30
+    },
+    {
+      "axis": "global",
+      "key": "global",
+      "in_use": 3,
+      "limit": 0,
+      "waiting": 0,
+      "used_pct": null
+    }
+  ],
+  "expired": 1,
+  "grants": 97,
+  "reservations": 3,
+  "waiting": 1,
+  "wakeups": 12
+}
+

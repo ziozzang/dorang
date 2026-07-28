@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
@@ -112,6 +113,36 @@ func BenchmarkAuthenticateLegacyRehashOnUse(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		if _, err := a.Authenticate(ctx, testToken); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkOAuthAccessToken is the provider-side hot path: one atomic load and
+// an expiry comparison. It takes no lock, so a refresh in flight cannot appear
+// here as latency (DESIGN §11.2b).
+func BenchmarkOAuthAccessToken(b *testing.B) {
+	dir := b.TempDir()
+	path := dir + "/auth.json"
+	body := `{"access_token":"at-bench","refresh_token":"rt-bench",` +
+		`"expires_at":"2030-01-01T00:00:00Z","account_id":"acct-bench"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	c, err := NewOAuthCredential(OAuthConfig{
+		ID: "bench", Source: SourceFile, Path: path,
+		Now: func() time.Time { return testNow },
+	}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := c.Reload(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := c.AccessToken(); err != nil {
 			b.Fatal(err)
 		}
 	}

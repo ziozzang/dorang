@@ -1,0 +1,65 @@
+package admin
+
+import "sync/atomic"
+
+// Metrics is the administration surface's counter set (§12.3).
+//
+// Fixed cardinality, deliberately: nothing here is labelled by a route, an
+// object id, or anything else a caller supplies. The per-object numbers an
+// operator wants — spend by key, health by credential, occupancy by axis — are
+// served by the endpoints themselves, from the ledger and from the live
+// reporters, which is where §9 says they belong.
+type Metrics struct {
+	requests      atomic.Uint64
+	uiRequests    atomic.Uint64
+	authFailures  atomic.Uint64
+	unimplemented atomic.Uint64
+	serverErrors  atomic.Uint64
+
+	mutations atomic.Uint64
+	// auditFailures counts mutations that were applied but could not be
+	// audited. It is separate from serverErrors because it is the one 500 that
+	// means the trail is incomplete, which is an operational fact rather than a
+	// transient failure.
+	auditFailures atomic.Uint64
+	// keysIssued counts credentials minted. The secret is returned once; this
+	// counter is the only lasting trace of the count.
+	keysIssued atomic.Uint64
+	// rangeRefusals counts ledger queries refused for an absent or too-wide
+	// time range. A deployment where this is large has a client that expects
+	// unbounded search, which is worth knowing before it becomes a support
+	// ticket about slowness.
+	rangeRefusals atomic.Uint64
+	// notionalMissing counts answers where the notional figure was reported
+	// unavailable (§8.5 rule 5: missing is reported, never zero).
+	notionalMissing atomic.Uint64
+}
+
+// MetricsSnapshot is a consistent-enough read of [Metrics] for export.
+type MetricsSnapshot struct {
+	Requests        uint64
+	UIRequests      uint64
+	AuthFailures    uint64
+	Unimplemented   uint64
+	ServerErrors    uint64
+	Mutations       uint64
+	AuditFailures   uint64
+	KeysIssued      uint64
+	RangeRefusals   uint64
+	NotionalMissing uint64
+}
+
+func (m *Metrics) snapshot() MetricsSnapshot {
+	return MetricsSnapshot{
+		Requests:        m.requests.Load(),
+		UIRequests:      m.uiRequests.Load(),
+		AuthFailures:    m.authFailures.Load(),
+		Unimplemented:   m.unimplemented.Load(),
+		ServerErrors:    m.serverErrors.Load(),
+		Mutations:       m.mutations.Load(),
+		AuditFailures:   m.auditFailures.Load(),
+		KeysIssued:      m.keysIssued.Load(),
+		RangeRefusals:   m.rangeRefusals.Load(),
+		NotionalMissing: m.notionalMissing.Load(),
+	}
+}

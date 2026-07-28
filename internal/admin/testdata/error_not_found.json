@@ -1,0 +1,9 @@
+{
+  "error": {
+    "message": "no key with id \"absent\"",
+    "type": "not_found_error",
+    "param": null,
+    "code": "not_found"
+  }
+}
+

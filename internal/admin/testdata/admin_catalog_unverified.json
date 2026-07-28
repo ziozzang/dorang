@@ -1,0 +1,9 @@
+{
+  "count": 2,
+  "models": [
+    "vendor/unlisted-a",
+    "vendor/unlisted-b"
+  ],
+  "note": "a model listed here has no confirmed verification date; §4.3 treats an unverified capability claim as a defect rather than a warning"
+}
+

@@ -195,6 +195,10 @@ func (m Message) MarshalJSON() ([]byte, error) {
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type alias Message
 	var a alias
+	// Filter once, then decode the SAME bytes twice: a key dropped from the
+	// struct decode must be dropped from Extra too, or it is relayed to the
+	// next hop and re-creates the bypass there (COMPATIBILITY 2.0).
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -334,6 +338,7 @@ func (p Part) MarshalJSON() ([]byte, error) {
 func (p *Part) UnmarshalJSON(b []byte) error {
 	type alias Part
 	var a alias
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -407,6 +412,7 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 func (t *Tool) UnmarshalJSON(b []byte) error {
 	type alias Tool
 	var a alias
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
@@ -493,6 +499,9 @@ func (r Request) MarshalJSON() ([]byte, error) {
 func (r *Request) UnmarshalJSON(b []byte) error {
 	type alias Request
 	var a alias
+	// The gate scanned these same bytes for "model" and "stream" with exact
+	// key comparison. This is the line that makes the adapter agree with it.
+	b = strictBytes(b, &a)
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}

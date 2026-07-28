@@ -1,0 +1,72 @@
+{
+  "metadata": {
+    "count": 1,
+    "dimension": "team",
+    "end_date": "2026-07-29T00:00:00Z",
+    "has_more": false,
+    "limit": 100,
+    "start_date": "2026-07-25T00:00:00Z",
+    "total": {
+      "api_requests": 2,
+      "successful_requests": 1,
+      "failed_requests": 1,
+      "prompt_tokens": 1020,
+      "completion_tokens": 200,
+      "cached_tokens": 100,
+      "reasoning_tokens": 0,
+      "total_tokens": 1220,
+      "spend": 0.66,
+      "marginal_spend": 0,
+      "subscription_spend": 0.66,
+      "notional_spend": 1.19,
+      "notional_available": true,
+      "latency_ms_sum": 250
+    }
+  },
+  "results": [
+    {
+      "breakdown": {
+        "models": [
+          {
+            "model_group": "chat",
+            "metrics": {
+              "api_requests": 2,
+              "successful_requests": 1,
+              "failed_requests": 1,
+              "prompt_tokens": 1020,
+              "completion_tokens": 200,
+              "cached_tokens": 100,
+              "reasoning_tokens": 0,
+              "total_tokens": 1220,
+              "spend": 0.66,
+              "marginal_spend": 0,
+              "subscription_spend": 0.66,
+              "notional_spend": 1.19,
+              "notional_available": true,
+              "latency_ms_sum": 250
+            }
+          }
+        ]
+      },
+      "date": "2026-07-26",
+      "metrics": {
+        "api_requests": 2,
+        "successful_requests": 1,
+        "failed_requests": 1,
+        "prompt_tokens": 1020,
+        "completion_tokens": 200,
+        "cached_tokens": 100,
+        "reasoning_tokens": 0,
+        "total_tokens": 1220,
+        "spend": 0.66,
+        "marginal_spend": 0,
+        "subscription_spend": 0.66,
+        "notional_spend": 1.19,
+        "notional_available": true,
+        "latency_ms_sum": 250
+      },
+      "team_id": "team-1"
+    }
+  ]
+}
+

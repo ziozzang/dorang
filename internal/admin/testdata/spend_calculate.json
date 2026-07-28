@@ -1,0 +1,57 @@
+{
+  "currency": "USD",
+  "marginal": 0,
+  "subscription": 0.66,
+  "adjustment": 0,
+  "total": 0.66,
+  "missing": true,
+  "components": [],
+  "applied_rules": [
+    {
+      "class": "fixed_subscription",
+      "level": "credential",
+      "order": 0,
+      "priority": 0,
+      "rule_id": "plan-a-subscription",
+      "why": "most specific"
+    }
+  ],
+  "class_traces": [
+    {
+      "class": "marginal_usage",
+      "considered": [
+        {
+          "eligible": false,
+          "level": "default",
+          "order": 0,
+          "priority": 0,
+          "reason": "no rule matched the provider",
+          "rule_id": "none",
+          "selected": false
+        }
+      ]
+    }
+  ],
+  "notional": {
+    "amount": 4.25,
+    "available": true,
+    "rule_id": "plan-a-list-rate",
+    "source": "vendor public price page",
+    "as_of": "2026-07-28",
+    "age_seconds": 3600,
+    "components": [
+      {
+        "name": "input",
+        "rule_id": "plan-a-list-rate",
+        "rate": "0.85",
+        "unit": "per_1m_tokens",
+        "quantity": 5000000,
+        "scale": 0,
+        "subtotal": 4.25
+      }
+    ],
+    "note": "an estimate of what this traffic would have cost at the provider's list price; never billed, never budgeted, never routed on, and never discounted"
+  },
+  "notes": []
+}
+

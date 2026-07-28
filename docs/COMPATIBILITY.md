@@ -152,3 +152,94 @@ Contracts above were read from source and schema, not inferred. Two items remain
 - `n > 1` streaming semantics — no explicit handling was found in the reference
   implementation; treat multi-choice streaming as unspecified and do not over-invest.
 - Per-backend `logprobs` fidelity.
+
+---
+
+## 11. Error taxonomy — vendor vocabulary, not ours
+
+An error is an API surface. Clients branch on it: SDKs decide whether to retry from the
+status and the `type`, and application code often matches `code`. A gateway that invents its
+own vocabulary is as incompatible as one that changes a field name — it just fails later, in
+someone's retry loop, rather than at the first request.
+
+So dorang emits **the vendor's own error vocabulary**, chosen by which family the caller is
+speaking, and normalizes every upstream shape into it. Backends are inconsistent enough that
+this is unavoidable work: one engine sends an integer `code` and a Python exception name as
+`type`, and a single server has been observed producing four different `type` spellings for
+one condition across four call paths.
+
+### 11.1 Envelopes
+
+**OpenAI family** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/responses`, and the rest:
+
+```json
+{"error":{"message":"…","type":"invalid_request_error","param":"model","code":"model_not_found"}}
+```
+
+`code` is a **string or null**, never a number. `param` is the offending field or null.
+
+**Anthropic family** — `/v1/messages`:
+
+```json
+{"type":"error","error":{"type":"invalid_request_error","message":"…"}}
+```
+
+The outer `"type":"error"` is load-bearing: the Anthropic SDK dispatches on it. There is no
+`code` and no `param` in this family, so a condition dorang would express through `code` is
+folded into the message.
+
+### 11.2 Canonical conditions
+
+One internal condition per row. dorang never emits a `type` outside this table.
+
+| Condition | HTTP | OpenAI `type` | OpenAI `code` | Anthropic `type` |
+|---|---:|---|---|---|
+| Malformed request body | 400 | `invalid_request_error` | `invalid_request` | `invalid_request_error` |
+| Unknown or disallowed parameter | 400 | `invalid_request_error` | `invalid_parameter` | `invalid_request_error` |
+| Structural downgrade refused (§10.1) | 400 | `invalid_request_error` | `unsupported_construct` | `invalid_request_error` |
+| Context window exceeded | 400 | `invalid_request_error` | `context_length_exceeded` | `invalid_request_error` |
+| Budget exhausted (terminal, §6.4) | 400 | `invalid_request_error` | `budget_exceeded` | `invalid_request_error` |
+| Missing or malformed credential | 401 | `authentication_error` | `invalid_api_key` | `authentication_error` |
+| Expired or revoked credential | 401 | `authentication_error` | `invalid_api_key` | `authentication_error` |
+| Model not in the key's allow-list | 403 | `permission_error` | `model_not_allowed` | `permission_error` |
+| Route not permitted for this key | 403 | `permission_error` | `route_not_allowed` | `permission_error` |
+| Key blocked | 403 | `permission_error` | `key_blocked` | `permission_error` |
+| Unknown model | 404 | `invalid_request_error` | `model_not_found` | `not_found_error` |
+| Unknown resource (file, batch, response) | 404 | `invalid_request_error` | `not_found` | `not_found_error` |
+| Body over the size cap | 413 | `invalid_request_error` | `request_too_large` | `request_too_large` |
+| Rate limit (RPM/TPM) | 429 | `rate_limit_error` | `rate_limit_exceeded` | `rate_limit_error` |
+| Provider quota exhausted (§6) | 429 | `rate_limit_error` | `insufficient_quota` | `rate_limit_error` |
+| No healthy deployment | 429 | `rate_limit_error` | `no_healthy_deployment` | `overloaded_error` |
+| Capacity wait timed out (§5.4) | 429 | `rate_limit_error` | `capacity_unavailable` | `overloaded_error` |
+| Gateway fault | 500 | `api_error` | `internal_error` | `api_error` |
+| Upstream 5xx after fallback | 502 | `api_error` | `upstream_error` | `api_error` |
+| Route declared but unimplemented (§0.2) | 501 | `api_error` | `route_not_implemented` | `api_error` |
+| Upstream timeout | 504 | `api_error` | `timeout` | `api_error` |
+
+Three of these deserve their reasoning stated, because a plausible alternative is wrong:
+
+- **Budget exhausted is 400, not 429.** A `429` invites a retry and marks the condition as a
+  fallback trigger (§7.6), which would spend a *different* subject's budget on a model the
+  caller never asked for. Budget is terminal; the status has to say so.
+- **Model not in the allow-list is 403, not 401.** The credential authenticated fine; it is
+  not permitted this model. A `401` tells the client to re-authenticate, which cannot help.
+  A reference proxy answers `401` here — dorang does not follow it, because the guidance it
+  gives the client is actively misleading.
+- **No healthy deployment is 429 and not 503.** It is a capacity condition with a
+  `Retry-After`, and clients already back off correctly on `429`.
+
+### 11.3 The native error is preserved, never forwarded
+
+The upstream's own `type`, `code`, and message are recorded in the ledger and surfaced in
+`x-dorang-native-error-type` / `x-dorang-native-error-code`. They are **not** put in the
+response body. Forwarding them reproduces the exact defect this section exists to fix — a
+client branching on `type` mis-branches on a vendor-specific string — and it is the same
+out-of-band pattern §4.2a uses for stop reasons.
+
+### 11.4 `Retry-After` is mandatory on every 429 and 503
+
+Not gated behind a detail header (§10.4). A client acts on it; without it every SDK's backoff
+degrades to a fixed guess. When the upstream supplies one, it is honoured; when it does not
+and the condition is a dorang-side wait, dorang supplies its own estimate from the quota
+reset time or the capacity queue.

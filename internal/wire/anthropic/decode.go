@@ -26,10 +26,13 @@ func (o *DecodeOptions) warn() WarnFunc {
 // max_tokens is required here and its absence is a 400, not a default. That is
 // the frontend half of DESIGN §10.7's first trap: this family demands the
 // field, so a client that omitted it gets the same answer from dorang as from
-// the vendor rather than a surprise further down.
+// the vendor rather than a surprise further down. "Max_Tokens" is an absence
+// too: the decode is case-SENSITIVE (COMPATIBILITY 2.0, [strictUnmarshal]),
+// which is also what makes {"Model":"x"} carry no model here and no model
+// through the authorization gate.
 func DecodeRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := json.Unmarshal(b, &w); err != nil {
+	if err := strictUnmarshal(b, &w); err != nil {
 		return nil, err
 	}
 	if w.MaxTokens == nil {
@@ -46,7 +49,7 @@ func DecodeRequest(b []byte) (*canonical.Request, error) {
 // (COMPATIBILITY 6.9).
 func DecodeCountTokensRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := json.Unmarshal(b, &w); err != nil {
+	if err := strictUnmarshal(b, &w); err != nil {
 		return nil, err
 	}
 	return RequestToCanonical(&w, nil)
@@ -324,6 +327,9 @@ func metadataToCanonical(extra map[string]json.RawMessage, warn WarnFunc) map[st
 // ---------------------------------------------------------------------------
 
 // DecodeResponse parses a non-streaming response into the neutral form.
+//
+// This is json.Unmarshal and not [strictUnmarshal] on purpose: the bytes are a
+// backend's, not a caller's, and the reasoning is in [strictUnmarshal].
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {

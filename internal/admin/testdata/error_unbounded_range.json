@@ -1,0 +1,16 @@
+{
+  "error": {
+    "message": "a ledger query requires a bounded time range: supply start_date and end_date (YYYY-MM-DD or RFC 3339). DESIGN §9.3 refuses an unbounded search rather than answering it slowly",
+    "type": "invalid_request_error",
+    "param": "start_date",
+    "code": "unbounded_range",
+    "detail": {
+      "max_range_hours": 2208,
+      "missing": [
+        "start_date",
+        "end_date"
+      ]
+    }
+  }
+}
+

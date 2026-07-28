@@ -1,0 +1,23 @@
+{
+  "budgets": [
+    {
+      "budget_id": "team:team-1",
+      "subject_kind": "team",
+      "subject_id": "team-1",
+      "max_budget": 500,
+      "soft_budget": null,
+      "budget_duration": "monthly",
+      "spend": 0,
+      "reserved": 0,
+      "remaining": 500,
+      "period_start": null,
+      "period_end": null,
+      "reserved_until": null,
+      "updated_at": "2026-07-28T12:00:00Z"
+    }
+  ],
+  "count": 1,
+  "limit": 100,
+  "offset": 0
+}
+

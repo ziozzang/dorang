@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "model_group": "chat",
+      "providers": [
+        "prov-a"
+      ],
+      "upstream_models": [
+        "vendor/model-x:2026-07"
+      ],
+      "aliases": [
+        "chat-latest"
+      ],
+      "deployments": 1,
+      "enabled_deployments": 1
+    }
+  ]
+}
+

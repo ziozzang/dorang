@@ -33,9 +33,13 @@ func (o *DecodeOptions) warn() WarnFunc {
 }
 
 // DecodeRequest parses OpenAI request bytes into the neutral representation.
+//
+// The decode is case-SENSITIVE (COMPATIBILITY 2.0): {"Model":"x"} carries no
+// model here, exactly as it carries none through the authorization gate and
+// none into the backend. See [strictUnmarshal].
 func DecodeRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := json.Unmarshal(b, &w); err != nil {
+	if err := strictUnmarshal(b, &w); err != nil {
 		return nil, err
 	}
 	return RequestToCanonical(&w)
@@ -287,7 +291,9 @@ func decodeToolChoice(raw json.RawMessage) (*canonical.ToolChoice, error) {
 		} `json:"function"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(b, &obj); err != nil {
+	// Request path: tool_choice is carried raw on the wire type and decoded
+	// here, so this is where its members get the case-sensitive treatment.
+	if err := strictUnmarshal(b, &obj); err != nil {
 		return nil, err
 	}
 	name := obj.Function.Name
@@ -321,6 +327,12 @@ func splitDataURL(s string) (mediaType, data string, ok bool) {
 // ---------------------------------------------------------------------------
 
 // DecodeResponse parses a non-streaming completion into the neutral form.
+//
+// This is json.Unmarshal and not [strictUnmarshal] on purpose. The bytes are a
+// backend's, not a caller's: a differently-cased key here is a vendor quirk
+// that can lose usage counts if refused and cannot bypass authorization if
+// accepted, because nothing is authorized against a response. [Message] is
+// still strict, since the same type decodes request messages.
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {

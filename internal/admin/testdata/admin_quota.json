@@ -1,0 +1,30 @@
+{
+  "count": 2,
+  "windows": [
+    {
+      "credential_id": "cred-a",
+      "provider_id": "prov-a",
+      "window": "day",
+      "metric": "tokens",
+      "used": 900,
+      "limit": 1000,
+      "used_pct": 90,
+      "reset_at": null,
+      "source": "provider",
+      "stale": true
+    },
+    {
+      "credential_id": "cred-a",
+      "provider_id": "prov-a",
+      "window": "minute",
+      "metric": "requests",
+      "used": 30,
+      "limit": 60,
+      "used_pct": 50,
+      "reset_at": null,
+      "source": "combined",
+      "stale": false
+    }
+  ]
+}
+

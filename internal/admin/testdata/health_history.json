@@ -1,0 +1,25 @@
+{
+  "count": 2,
+  "end_date": "2026-07-29T00:00:00Z",
+  "has_more": false,
+  "history": [
+    {
+      "timestamp": "2026-07-26T09:35:00Z",
+      "subject_kind": "credential",
+      "subject": "cred-b",
+      "state": "healthy",
+      "reason": "probe succeeded",
+      "latency_ms": 120
+    },
+    {
+      "timestamp": "2026-07-26T09:30:00Z",
+      "subject_kind": "credential",
+      "subject": "cred-b",
+      "state": "unavailable",
+      "reason": "consecutive failures",
+      "status": 503
+    }
+  ],
+  "start_date": "2026-07-25T00:00:00Z"
+}
+

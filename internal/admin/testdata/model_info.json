@@ -1,0 +1,43 @@
+{
+  "data": [
+    {
+      "id": "dep-1",
+      "model_name": "chat",
+      "dorang_params": {
+        "provider": "prov-a",
+        "model": "vendor/model-x:2026-07",
+        "credential_ids": [
+          "cred-a"
+        ],
+        "weight": 3,
+        "priority": 0,
+        "rpm": 600,
+        "tpm": null,
+        "max_parallel_requests": null,
+        "timeout_ms": null,
+        "stream_timeout_ms": null
+      },
+      "litellm_params": {
+        "provider": "prov-a",
+        "model": "vendor/model-x:2026-07",
+        "credential_ids": [
+          "cred-a"
+        ],
+        "weight": 3,
+        "priority": 0,
+        "rpm": 600,
+        "tpm": null,
+        "max_parallel_requests": null,
+        "timeout_ms": null,
+        "stream_timeout_ms": null
+      },
+      "model_info": {
+        "id": "dep-1",
+        "enabled": true,
+        "created_at": "2026-07-28T12:00:00Z",
+        "updated_at": "2026-07-28T12:00:00Z"
+      }
+    }
+  ]
+}
+

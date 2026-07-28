@@ -1,0 +1,9 @@
+{
+  "error": {
+    "message": "/no/such/route is not an implemented administration route; see DESIGN §2.3 for the shape-compatible set",
+    "type": "not_implemented_error",
+    "param": null,
+    "code": "not_implemented"
+  }
+}
+

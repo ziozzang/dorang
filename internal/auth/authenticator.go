@@ -175,7 +175,7 @@ type Authenticator struct {
 	mu      sync.RWMutex
 	overlay map[Lookup]*entry
 
-	fl flight
+	fl flight[Lookup, *entry]
 
 	rehashCh   chan rehashJob
 	rehashDone chan struct{}
@@ -540,6 +540,9 @@ func (a *Authenticator) fetch(ctx context.Context, l Lookup) (*entry, error) {
 	})
 	if shared {
 		a.coalesced.Add(1)
+	}
+	if errors.Is(err, errFlightAborted) {
+		return nil, refuse(ReasonUnavailable, "", "lookup did not complete")
 	}
 	return e, err
 }

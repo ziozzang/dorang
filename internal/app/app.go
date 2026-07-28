@@ -80,8 +80,10 @@ type App struct {
 	Server   *server.Server
 	Batch    *batch.Service
 
+	opts     Options
 	cfg      atomic.Pointer[config.Config]
 	dispatch *dispatcher
+	targets  *batchResolver
 	models   *modelList
 	quota    *quotaSet
 
@@ -107,6 +109,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	cfg := opts.Config
 
 	a := &App{
+		opts: opts,
 		logf: opts.Logf,
 		now:  opts.Now,
 	}
@@ -235,13 +238,12 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		quota:     qs,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
-		maxHops:   cfg.Fallbacks.MaxHops,
 	})
 	a.models = newModelList(cfg)
 
 	// 7. Batch. Its Store, Blobs, Executor, Reserver and ModelResolver are all
 	//    interfaces internal/batch declares; the adapters are in batch.go.
-	if err := a.startBatch(cfg, rt, up); err != nil {
+	if err := a.startBatch(cfg, up); err != nil {
 		return nil, err
 	}
 
@@ -269,7 +271,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
-		Passthrough:       passthroughRoutes(cfg),
+		Passthrough:       passthroughRoutes(cfg, a.Catalog),
 		Routes:            a.batchRoutes(),
 		Now:               a.now,
 		Logf:              a.logf,
@@ -285,7 +287,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 // reservations, and a store swap would drop the connection pool under an
 // in-flight ledger write.
 func (a *App) Reload(cfg *config.Config) error {
-	cat, err := catalog.Load()
+	cat, err := catalog.Load(a.opts.CatalogPaths...)
 	if err != nil {
 		return fmt.Errorf("app: model catalog: %w", err)
 	}
@@ -323,9 +325,9 @@ func (a *App) Reload(cfg *config.Config) error {
 		quota:     qs,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
-		maxHops:   cfg.Fallbacks.MaxHops,
 	})
 	a.models.swap(cfg)
+	a.targets.swap(buildTargets(cfg, cat))
 	a.quota = qs
 	a.Catalog = cat
 	a.cfg.Store(cfg)

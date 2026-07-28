@@ -24,6 +24,7 @@
   </nav>
   {{end}}
   <span class="spacer"></span>
+  {{if .Actor}}<span class="tag">{{.Actor}}</span>{{end}}
   <button type="button" id="theme-toggle">theme</button>
   {{if .Session}}
   <form method="POST" action="{{.Base}}/logout"><button type="submit">sign out</button></form>

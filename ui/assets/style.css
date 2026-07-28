@@ -1,8 +1,8 @@
 /* dorang admin UI.
  *
- * One stylesheet, no imports, no web fonts: DESIGN §11.3 requires the UI to
- * work offline, and an @import or a font URL is an external asset wearing a
- * stylesheet's clothes.
+ * One stylesheet, no imported sheets, no web fonts: DESIGN §11.3 requires the
+ * UI to work offline, and a remote sheet or a font URL is an external asset
+ * wearing a stylesheet's clothes.
  *
  * Both themes are defined. The default follows the operating system through
  * prefers-color-scheme; an explicit choice is stamped on <html data-theme>

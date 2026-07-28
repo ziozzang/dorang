@@ -78,22 +78,48 @@ func TestPriorityBandsAreSpacedForResponsesToolLoops(t *testing.T) {
 // TestPriorityHintIsClampedNotHonoured checks §10.5: a client hint is clamped
 // to the principal's permitted range. An unclamped hint is how one caller
 // outranks every other one on a shared engine.
-func TestPriorityHintIsClampedNotHonoured(t *testing.T) {
-	p := DefaultPriority() // Min 0, Max 10
-	over := -50
-	under := 500
-	if got := p.Canonical("batch", &over); got != 0 {
-		t.Fatalf("a hint below the permitted range must clamp to Min: got %d", got)
+// TestClientPriorityHintIsIgnoredByDefault pins DESIGN §10.5. The default used
+// to be the widest possible clamp, 0..10, under which a caller in the batch
+// class could send a hint of 0 and be served as realtime — free self-elevation,
+// which is exactly the incentive the rule exists to remove.
+func TestClientPriorityHintIsIgnoredByDefault(t *testing.T) {
+	p := DefaultPriority()
+	mostUrgent := 0
+	if got := p.Canonical("batch", &mostUrgent); got != 10 {
+		t.Fatalf("a batch caller claiming the most urgent value must stay at its class (10): got %d", got)
 	}
-	if got := p.Canonical("batch", &under); got != 10 {
-		t.Fatalf("a hint above the permitted range must clamp to Max: got %d", got)
+	lessUrgent := 500
+	if got := p.Canonical("batch", &lessUrgent); got != 10 {
+		t.Fatalf("a hint is ignored in both directions, not merely clamped upward: got %d", got)
 	}
+	if got := p.Canonical("realtime", &lessUrgent); got != 0 {
+		t.Fatalf("a caller cannot de-escalate itself either; the class decides: got %d", got)
+	}
+}
 
-	// A configuration that states no range ignores hints entirely rather than
-	// accepting them unbounded.
-	noRange := PriorityConfig{Classes: map[string]int{"batch": 10}, Default: "batch"}
-	if got := noRange.Canonical("batch", &over); got != 10 {
-		t.Fatalf("with no permitted range the class alone decides: got %d", got)
+// TestPriorityHintIsHonouredWithinAGrantedRange covers the other half: an
+// operator who has seen the whole fleet may grant a principal a band, and
+// within it the hint is honoured and clamped. Granting is an operator act; the
+// asymmetry is the point.
+func TestPriorityHintIsHonouredWithinAGrantedRange(t *testing.T) {
+	p := DefaultPriority()
+	p.Min, p.Max = 2, 10 // interactive..batch, granted to this principal
+
+	tooUrgent := -50
+	if got := p.Canonical("batch", &tooUrgent); got != 2 {
+		t.Fatalf("a hint below the granted range clamps to its most urgent end: got %d", got)
+	}
+	tooSlack := 500
+	if got := p.Canonical("batch", &tooSlack); got != 10 {
+		t.Fatalf("a hint above the granted range clamps to its least urgent end: got %d", got)
+	}
+	within := 4
+	if got := p.Canonical("batch", &within); got != 4 {
+		t.Fatalf("a hint inside the granted range is honoured: got %d", got)
+	}
+	// The grant cannot reach past realtime, because the range says so.
+	if got := p.Canonical("realtime", &tooUrgent); got != 2 {
+		t.Fatalf("the granted range bounds every class, not just the default: got %d", got)
 	}
 }
 

@@ -224,11 +224,11 @@ func unitHash(node, subject string) float64 {
 		fnvPrime  = 1099511628211
 	)
 	h := uint64(fnvOffset)
-	for i := 0; i < len(node); i++ {
+	for i := range len(node) {
 		h = (h ^ uint64(node[i])) * fnvPrime
 	}
 	h = (h ^ 0xff) * fnvPrime // separator: ("ab","c") must not equal ("a","bc")
-	for i := 0; i < len(subject); i++ {
+	for i := range len(subject) {
 		h = (h ^ uint64(subject[i])) * fnvPrime
 	}
 	h ^= h >> 33

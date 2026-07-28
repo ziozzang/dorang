@@ -49,3 +49,19 @@ jobs:
       - run: staticcheck ./...
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A citation pointing at someone's home directory leaks a username and a
+      # directory layout, and is useless to any reader. This has happened once;
+      # the guard is cheaper than noticing again.
+      - name: no local filesystem paths
+        run: |
+          if git grep -nE '/(home|Users)/[A-Za-z0-9_.-]+/' -- . ':!*.md'; then
+            echo "::error::absolute home paths found in tracked files"; exit 1
+          fi
+          if git grep -nE '/(home|Users)/[A-Za-z0-9_.-]+/' -- '*.md'; then
+            echo "::error::absolute home paths found in docs"; exit 1
+          fi

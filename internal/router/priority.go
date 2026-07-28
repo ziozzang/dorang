@@ -111,8 +111,25 @@ func DefaultPriority() PriorityConfig {
 			}},
 		},
 		Header: "X-Request-Priority",
-		Min:    0,
-		Max:    10,
+
+		// A client-supplied hint is IGNORED by default (DESIGN §10.5).
+		// Min == Max disables the clamp path entirely.
+		//
+		// This was 0..10 — the widest possible range — which meant a caller in
+		// the batch class could send a hint of 0 and be served as realtime, for
+		// free. Clamping bounds how far a caller can self-elevate but leaves
+		// the incentive intact, and priority is a claim on shared capacity: if
+		// callers may set it, every caller eventually sets the most urgent
+		// value, not maliciously but because it costs nothing and appears to
+		// help. The scale then carries no information and the callers who left
+		// it alone are the ones penalised.
+		//
+		// An operator grants a range per principal, having seen the whole
+		// fleet. A caller cannot claim one — which class a request belongs to
+		// is a statement about its importance relative to other tenants' work,
+		// and the caller is the one party with no view of that.
+		Min: 0,
+		Max: 0,
 	}
 }
 
