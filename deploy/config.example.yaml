@@ -1,0 +1,281 @@
+# dorang — example configuration
+#
+# A file alone is enough to run the gateway: the database only ever overlays
+# what is here (design §4.1). Every section hot-reloads on SIGHUP, on a change
+# to this file, and through the admin reload endpoint; in-flight requests keep
+# the snapshot they started with.
+#
+# Secrets never appear in this file. Every key is a reference:
+#
+#   key_env:  NAME          read from the process environment
+#   key_file: /path/to/key  read from a file, trailing newline trimmed
+#   key_ref:  vault:…       handed to an external resolver
+#   key:      literal       accepted ONLY when server.env is "development"
+#
+# Sizes accept B / KB / MB / GB and KiB / MiB / GiB. Durations accept
+# "250ms", "30s", "1h"; a bare number is seconds.
+#
+# Every value below is the default unless the comment says otherwise, so the
+# shortest working file is `version: 1` plus providers, credentials and models.
+
+version: 1
+
+server:
+  listen: ":4100"
+  env: production                 # production | development
+  master_key_env: DORANG_MASTER_KEY   # the admin credential, compared out of band (§2.4)
+  key_pepper_env: DORANG_KEY_PEPPER   # HMAC pepper for dorang_v1 key hashing (§2.4)
+  request_timeout: 600s
+  shutdown_grace: 30s
+
+storage:
+  driver: sqlite                  # sqlite | postgres
+  sqlite:
+    path: ~/.dorang/dorang.db
+  postgres:
+    url_env: DORANG_DATABASE_URL
+    max_conns: 32
+
+cluster:
+  enabled: false
+  node_id: ""                     # empty derives one at start-up
+  redis_url_env: DORANG_REDIS_URL
+  # local is exact on one node and overshoots N-fold on N nodes, so
+  # `enabled: true` with `capacity_mode: local` refuses to start (§5.6).
+  capacity_mode: local            # local | shared-redis | shared-pg | leased
+  min_leasable: 16                # leased mode will not divide a smaller ceiling
+
+auth:
+  legacy:
+    enabled: false                # accepts the unsalted incumbent digest…
+    until: ""                     # …only until this date, which is then required (§2.4)
+  rehash_on_use: true             # upgrade a legacy hash on successful use
+
+providers:
+  - name: plan-a
+    kind: glm                     # selects wire adapter, cache scheme, reasoning shape (§4.3)
+    base_url: https://api.example-plan-a.invalid
+    timeout: 180s
+    max_concurrency: 20           # the `route` axis (§5.1)
+    capacity_group: shared-pool   # membership in the `provider_group` axis
+    params:
+      drop_unsupported: true      # filter parameters the kind cannot express (§10.3)
+      drop: []                    # …and always remove these
+      set: {}                     # inject unconditionally
+      default: {}                 # inject when the caller did not send them
+    retry:
+      max_attempts: 2
+      backoff: exponential        # exponential | linear | constant
+      base: 500ms
+    usage_probe:
+      enabled: false              # poll the provider's own view of quota (§6.2)
+      fetcher: glm
+      interval: 60s
+
+  - name: cloud-a
+    kind: openai
+    base_url: https://api.example-cloud-a.invalid/v1
+    timeout: 120s
+    max_concurrency: 12
+    capacity_group: shared-pool
+    metrics:
+      enabled: false              # scrape backend metrics for least_busy / highest_tps (§12.4)
+      endpoint: http://127.0.0.1:8000/metrics
+      interval: 15s
+
+credentials:
+  # A credential is the unit quotas and concurrency actually attach to (§3).
+  - id: plan-a-1
+    provider: plan-a
+    key_env: DORANG_EXAMPLE_PLAN_A_KEY
+    capacity_group: plan-a-account
+
+  - id: acct-1
+    provider: cloud-a
+    key_env: DORANG_EXAMPLE_CLOUD_A_KEY_1
+    capacity_group: acct-1
+
+  - id: acct-2
+    provider: cloud-a
+    key_file: /etc/dorang/secrets/cloud-a-2.key
+    capacity_group: acct-2
+
+capacity:
+  # Several providers sharing one upstream pool.
+  provider_groups:
+    shared-pool: {max_concurrency: 24}
+  # Per account, across every model that account can serve.
+  credential_groups:
+    plan-a-account: {max_concurrency: 7}
+    acct-1: {max_concurrency: 3}
+    acct-2: {max_concurrency: 3}
+  # Per (key, model): a coding plan may allow 7 in flight *per model*, so
+  # serving two models means 14 concurrent requests on one key (§5).
+  models:
+    - {provider: plan-a, model: model-x, max_concurrency: 7}
+    - {provider: plan-a, model: model-y, max_concurrency: 7}
+  principals:
+    default: {max_concurrent: 32, max_queue_wait: 30s}
+  global: {max_concurrency: 256}
+  # The share of every axis batch work may not occupy, so batch cannot starve
+  # interactive traffic on any single axis (§11.1).
+  interactive_reserve: 0.3
+
+key_rotation:
+  strategy: least_used            # round_robin | least_used | failover | random
+  providers:
+    cloud-a:
+      affinity_group: cloud-a-accounts
+      stickiness:
+        scope: session            # session | api_key | user | team | tenant | none
+        on_capacity: spill        # spill to the next key, or wait for this one
+      keys:
+        - {id: acct-1, key_env: DORANG_EXAMPLE_CLOUD_A_KEY_1, max_concurrency: 3, capacity_group: acct-1}
+        - {id: acct-2, key_file: /etc/dorang/secrets/cloud-a-2.key, max_concurrency: 3, capacity_group: acct-2}
+
+models:
+  # A model name is an opaque string: nothing splits it on ':' or '/' (§2.1).
+  - name: model-x
+    class: chat-large
+    strategy: [prefix_sticky, lowest_cost, least_busy]   # a tie-break chain (§7.3)
+    deployments:
+      - provider: plan-a
+        upstream_model: model-x
+        credentials: [plan-a-1]
+        weight: 10
+        priority: 0
+      - provider: cloud-a
+        upstream_model: model-x:cloud
+        credentials: [acct-1, acct-2]
+        weight: 5
+        priority: 1
+        timeout: 90s
+        stream_timeout: 60s
+        limits:
+          - {metric: rpm, value: 600}
+          - {metric: tpm, value: 400000}
+
+  - name: model-y
+    class: chat-small
+    strategy: [least_busy]
+    deployments:
+      - {provider: plan-a, upstream_model: model-y, credentials: [plan-a-1], weight: 1}
+
+aliases:
+  # Upstream receives the real model id; the response body carries back the
+  # name the client asked for (§7.2).
+  model-large: model-x
+  model-small: model-y
+
+classes:
+  # Interchangeable groups — the scope fail-back may delegate within (§7.6).
+  chat-large: [model-x]
+  chat-small: [model-y]
+
+routing:
+  sticky:
+    enabled: true
+    ttl: 1h                       # entries expire on creation, not on last use (§7.4a)
+    purge_interval: 5m
+    key: [api_key, session_id]
+  prefix:
+    enabled: true
+    chunk_bytes: 4096             # BYTE boundaries — no tokenizer on the hot path (§7.4b)
+    checkpoints: logarithmic      # logarithmic | fixed
+    max_bytes: 64MiB              # budget by retained memory, not by entry count
+    ttl: 1h
+
+fallbacks:
+  on:
+    rate_limit:      [same_group, same_class]
+    quota_exhausted: [same_group, same_class]
+    context_window:  [same_class_larger]
+    content_policy:  [same_class]
+    upstream_5xx:    [same_group, same_class]
+    timeout:         [same_group]
+    budget_exceeded: []           # never — failing is correct
+    auth:            []           # never — the credential is marked exhausted
+  max_hops: 3
+  budget_ms: 120000
+
+pricing:
+  catalog: /etc/dorang/pricing.yaml
+  currency: USD
+  # Rules kept in this file, in addition to the catalog. Prices are exact
+  # decimals, never floating point (§8.3); classes compose instead of
+  # competing (§8.1).
+  rules:
+    - id: plan-a-tokens
+      class: marginal_usage
+      match: {provider: plan-a, model: model-x}
+      rates: {input: "0.0000025", output: "0.00001", cached_read: "0.00000025"}
+    - id: plan-a-subscription
+      class: fixed_subscription
+      match: {credential: plan-a-1}
+      period: monthly
+      amount: "20.00"
+    - id: house-margin
+      class: adjustment
+      percent: "5"
+
+metering:
+  numeric:
+    enabled: true                 # always on: fixed cardinality, never dropped (§12.1)
+  trace:
+    store_messages: truncated     # none | hash | truncated
+    truncate_chars: 512
+    sample_rate: 1.0
+    daily_byte_budget: 8GiB
+  spool:
+    dir: ~/.dorang/spool          # trace payloads land on disk before the store
+    max_bytes: 2GiB
+  flush_interval: 250ms
+
+observability:
+  prometheus: true
+  otlp_endpoint: ""
+  log_level: info                 # debug | info | warn | error
+  log_format: json                # json | text
+  always_full_headers: false      # otherwise the full header set is opt-in per request (§10.4)
+
+extensions:
+  lua:
+    enabled: false
+    dir: /etc/dorang/lua
+    hooks: [on_request, on_route, on_response, on_email]
+    limits: {instructions: 5000000, memory_mb: 32, timeout: 200ms}
+
+passthrough:
+  # Provider-native routes, opened by configuration rather than by an adapter.
+  # An unmapped prefix is not served: this is not an open proxy (§10.6).
+  enabled: false
+  routes:
+    - {prefix: /anthropic, provider: cloud-a}
+    - {prefix: /plan-a, provider: plan-a, auth: dorang, meter: true}
+  default:
+    auth: dorang                  # dorang | client | none
+    meter: true
+    timeout: 600s
+
+shadow:
+  # Compare live traffic against a reference gateway during a migration (§14.1).
+  mode: "off"                     # off | mirror | compare
+  reference:
+    url: ""
+    api_key_env: DORANG_SHADOW_REFERENCE_KEY
+  sample_rate: 0.05
+  compare: {structural: true, semantic: false}
+  max_cost_usd_per_day: "5"
+
+notifications:
+  email:
+    driver: none                  # smtp | http | lua | none
+  events: [key_created, budget_80pct, budget_exceeded, quota_exhausted,
+           credential_unhealthy, batch_completed, invite]
+
+priority_mapping:
+  classes: {realtime: 0, interactive: 2, batch: 10}
+  emit:
+    vllm: {field: priority}
+    openai: {field: service_tier, map: {realtime: priority, interactive: default, batch: flex}}
+    header: X-Request-Priority

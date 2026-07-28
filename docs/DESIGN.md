@@ -291,35 +291,41 @@ auth:
   legacy:  { enabled: false, until: "" }
   rehash_on_use: true
 
+# This example is kept internally consistent — every cross-reference below
+# resolves — and a test loads it verbatim. An earlier draft did not, and the
+# config validator caught nine dangling references in it.
 providers:
-  - name: plan-a
+  - name: plan-a                 # a per-model-limit coding plan
     kind: glm
-    base_url: https://…
+    base_url: https://plan-a.example/v1
     timeout: 180s
     max_concurrency: 20          # route axis
     capacity_group: plan-a-pool  # provider-group axis membership
     params: { drop_unsupported: true, drop: [] }
     retry:  { max_attempts: 2, backoff: exponential, base: 500ms }
     usage_probe: { enabled: true, fetcher: glm, interval: 60s }
+  - name: cloud-a                # a per-account-limit cloud, two accounts
+    kind: ollama-cloud
+    base_url: https://cloud-a.example/v1
+    timeout: 180s
+    capacity_group: cloud-a-pool
 
 credentials:
-  - id: acct-1
-    provider: cloud-a
-    key_env: CLOUD_A_KEY_1
-    capacity_group: acct-1        # ← per-account axis
-  - id: acct-2
-    provider: cloud-a
-    key_env: CLOUD_A_KEY_2
-    capacity_group: acct-2
+  - { id: plan-a-1, provider: plan-a,  key_env: PLAN_A_KEY_1 }
+  - { id: plan-a-2, provider: plan-a,  key_env: PLAN_A_KEY_2 }
+  - { id: acct-1,   provider: cloud-a, key_env: CLOUD_A_KEY_1, capacity_group: acct-1 }
+  - { id: acct-2,   provider: cloud-a, key_env: CLOUD_A_KEY_2, capacity_group: acct-2 }
 
 capacity:
-  provider_groups:  { cloud-a-pool: { max_concurrency: 6 } }
+  provider_groups:
+    cloud-a-pool: { max_concurrency: 6 }   # both accounts together
+    plan-a-pool:  { max_concurrency: 20 }
   credential_groups:
-    acct-1: { max_concurrency: 3 }        # per account, all models
+    acct-1: { max_concurrency: 3 }         # per account, ALL models
     acct-2: { max_concurrency: 3 }
   models:
-    - { provider: plan-a, model: model-x, max_concurrency: 7 }   # per (key, model)
-    - { provider: plan-a, model: model-y, max_concurrency: 7 }
+    - { provider: plan-a, model: model-x, max_concurrency: 7 }   # per (key, MODEL)
+    - { provider: plan-a, model: model-y, max_concurrency: 7 }   # so both together = 14
   principals: { default: { max_concurrent: 32, max_queue_wait: 30s } }
   interactive_reserve: 0.3       # §11.1 — fraction of every axis batch may not take
 
@@ -338,8 +344,16 @@ models:
     class: chat-large
     strategy: [prefix_sticky, lowest_cost, least_busy]
     deployments:
-      - { provider: plan-a,  upstream_model: model-x,       credentials: [plan-a-1], weight: 10, priority: 0 }
-      - { provider: cloud-a, upstream_model: model-x:cloud, credentials: [acct-1, acct-2], weight: 5, priority: 1 }
+      - { provider: plan-a,  upstream_model: model-x,       credentials: [plan-a-1, plan-a-2], weight: 10, priority: 0 }
+      - { provider: cloud-a, upstream_model: model-x:cloud, credentials: [acct-1, acct-2],     weight: 5,  priority: 1 }
+  - name: model-y
+    class: chat-small
+    deployments:
+      - { provider: plan-a, upstream_model: model-y, credentials: [plan-a-1, plan-a-2] }
+  - name: model-z
+    class: chat-large
+    deployments:
+      - { provider: cloud-a, upstream_model: model-z:cloud, credentials: [acct-1, acct-2] }
 
 aliases: { model-small: model-y, model-large: model-x }
 classes: { chat-large: [model-x, model-z], chat-small: [model-y] }

@@ -1,0 +1,117 @@
+version: 1
+
+server:
+  listen: ":4100"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  request_timeout: 600s
+  shutdown_grace: 30s
+
+storage:
+  driver: sqlite                 # sqlite | postgres
+  sqlite: { path: ~/.dorang/dorang.db }
+  postgres: { url_env: DORANG_DATABASE_URL, max_conns: 32 }
+
+cluster:
+  enabled: false
+  node_id: ""
+  redis_url_env: DORANG_REDIS_URL
+  capacity_mode: local           # local | shared-redis | shared-pg | leased
+
+auth:
+  legacy:  { enabled: false, until: "" }
+  rehash_on_use: true
+
+providers:
+  - name: plan-a
+    kind: glm
+    base_url: https://…
+    timeout: 180s
+    max_concurrency: 20          # route axis
+    capacity_group: plan-a-pool  # provider-group axis membership
+    params: { drop_unsupported: true, drop: [] }
+    retry:  { max_attempts: 2, backoff: exponential, base: 500ms }
+    usage_probe: { enabled: true, fetcher: glm, interval: 60s }
+
+credentials:
+  - id: acct-1
+    provider: cloud-a
+    key_env: CLOUD_A_KEY_1
+    capacity_group: acct-1        # ← per-account axis
+  - id: acct-2
+    provider: cloud-a
+    key_env: CLOUD_A_KEY_2
+    capacity_group: acct-2
+
+capacity:
+  provider_groups:  { cloud-a-pool: { max_concurrency: 6 } }
+  credential_groups:
+    acct-1: { max_concurrency: 3 }        # per account, all models
+    acct-2: { max_concurrency: 3 }
+  models:
+    - { provider: plan-a, model: model-x, max_concurrency: 7 }   # per (key, model)
+    - { provider: plan-a, model: model-y, max_concurrency: 7 }
+  principals: { default: { max_concurrent: 32, max_queue_wait: 30s } }
+  interactive_reserve: 0.3       # §11.1 — fraction of every axis batch may not take
+
+key_rotation:
+  strategy: least_used           # round_robin | least_used | failover | random
+  providers:
+    cloud-a:
+      affinity_group: cloud-a-accounts
+      stickiness: { scope: session, on_capacity: spill }
+      keys:
+        - { id: acct-1, key_env: CLOUD_A_KEY_1, max_concurrency: 3, capacity_group: acct-1 }
+        - { id: acct-2, key_env: CLOUD_A_KEY_2, max_concurrency: 3, capacity_group: acct-2 }
+
+models:
+  - name: model-x
+    class: chat-large
+    strategy: [prefix_sticky, lowest_cost, least_busy]
+    deployments:
+      - { provider: plan-a,  upstream_model: model-x,       credentials: [plan-a-1], weight: 10, priority: 0 }
+      - { provider: cloud-a, upstream_model: model-x:cloud, credentials: [acct-1, acct-2], weight: 5, priority: 1 }
+
+aliases: { model-small: model-y, model-large: model-x }
+classes: { chat-large: [model-x, model-z], chat-small: [model-y] }
+
+routing:
+  sticky: { enabled: true, ttl: 1h, purge_interval: 5m, key: [api_key, session_id] }
+  prefix:
+    enabled: true
+    chunk_bytes: 4096            # BYTE boundaries — no tokenizer on the hot path [R1-4]
+    checkpoints: logarithmic     # [R1-5]
+    max_bytes: 64MiB             # budget by memory, not entry count [R1-6]
+    ttl: 1h
+
+fallbacks:
+  on:
+    rate_limit:      [same_group, same_class]
+    quota_exhausted: [same_group, same_class]
+    context_window:  [same_class_larger]
+    content_policy:  [same_class]
+    upstream_5xx:    [same_group, same_class]
+    timeout:         [same_group]
+    budget_exceeded: []          # never — failing is correct
+    auth:            []
+  max_hops: 3
+  budget_ms: 120000
+
+pricing: { catalog: /etc/dorang/pricing.yaml, currency: USD }
+
+metering:
+  numeric:  { enabled: true }                  # always on, fixed cardinality [R1-2]
+  trace:    { store_messages: truncated, truncate_chars: 512,
+              sample_rate: 1.0, daily_byte_budget: 8GiB }   # [R1-3]
+  spool:    { dir: ~/.dorang/spool, max_bytes: 2GiB }       # [R1-1]
+  flush_interval: 250ms
+
+observability: { prometheus: true, otlp_endpoint: "", log_level: info, log_format: json }
+
+extensions:
+  lua:
+    enabled: false
+    dir: /etc/dorang/lua
+    hooks: [on_request, on_route, on_response, on_email]
+    limits: { instructions: 5000000, memory_mb: 32, timeout: 200ms }
