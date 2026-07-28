@@ -544,13 +544,148 @@ func (c *Config) validateCredentials(col *collector, providers map[string]*Provi
 				col.add(path+".provider", "provider %q is not declared under providers", cr.Provider)
 			}
 		}
-		cr.Key.validate(env, path, col)
+		validateCredentialAuth(col, cr, path, env)
 		if cr.CapacityGroup != "" {
 			if _, ok := c.Capacity.CredentialGroups[cr.CapacityGroup]; !ok {
 				col.add(path+".capacity_group",
 					"capacity group %q is not declared under capacity.credential_groups", cr.CapacityGroup)
 			}
 		}
+	}
+}
+
+// oauthSources, oauthFormats and oauthEncodes are what `auth: oauth` accepts.
+//
+// They are spelled here rather than imported from internal/auth because
+// internal/config imports no sibling (DESIGN §1). Two lists that can drift are
+// one list that is wrong, so they are held together by an executable check —
+// TestConfigAndAuthAgreeOnOAuthSpellings in internal/app, which is the place
+// both packages are already imported. It fails when either side moves.
+var (
+	oauthSources = []string{"file", "exec", "env"}
+	oauthFormats = []string{"claude", "codex", "gemini", "generic"}
+	oauthEncodes = []string{"form", "json"}
+)
+
+// validateCredentialAuth checks that a credential says exactly one thing about
+// how it authenticates.
+//
+// The two spellings are ALTERNATIVES on one object, not two shapes of object: a
+// credential that carries both a key and an oauth block has two answers to the
+// question the upstream call asks once, and picking one by precedence is how a
+// deployment sends the wrong credential without a line in the file to explain it.
+func validateCredentialAuth(col *collector, cr *Credential, path, env string) {
+	switch cr.Auth {
+	case "", AuthKey:
+		if cr.OAuth != nil {
+			col.add(path+".oauth",
+				"an oauth block needs `auth: oauth`; without it this credential authenticates "+
+					"with its key and the whole block is read by nothing")
+			return
+		}
+		cr.Key.validate(env, path, col)
+		return
+	case AuthOAuth:
+	default:
+		col.add(path+".auth", "unknown value %q: want %q or %q", cr.Auth, AuthKey, AuthOAuth)
+		return
+	}
+
+	if !cr.Key.IsZero() {
+		col.add(path+".auth",
+			"`auth: oauth` and a static key are alternatives: this credential sets both "+
+				"(%s), and only one of them can authenticate a request", cr.Key.Source())
+	}
+	if cr.OAuth == nil {
+		col.add(path+".oauth", "`auth: oauth` needs an oauth block naming the token store")
+		return
+	}
+	validateOAuth(col, cr.OAuth, path+".oauth", env)
+}
+
+func validateOAuth(col *collector, o *OAuth, path, env string) {
+	switch o.Source {
+	case "", "file":
+		if strings.TrimSpace(o.Path) == "" {
+			col.add(path+".path", "`source: file` needs the path of the token store")
+		}
+		if len(o.Command) > 0 {
+			col.add(path+".command", "`source: file` reads a file; command is read by nothing")
+		}
+		if o.EnvVar != "" {
+			col.add(path+".env_var", "`source: file` reads a file; env_var is read by nothing")
+		}
+	case "exec":
+		if len(o.Command) == 0 || strings.TrimSpace(o.Command[0]) == "" {
+			col.add(path+".command", "`source: exec` needs a command to run")
+		}
+	case "env":
+		if strings.TrimSpace(o.EnvVar) == "" {
+			col.add(path+".env_var", "`source: env` needs the name of a variable")
+		}
+	default:
+		col.add(path+".source", "unknown source %q: want one of %s",
+			o.Source, strings.Join(oauthSources, ", "))
+	}
+
+	if o.Format != "" && !containsString(oauthFormats, o.Format) {
+		col.add(path+".format", "unknown token store format %q: want one of %s",
+			o.Format, strings.Join(oauthFormats, ", "))
+	}
+	if o.RefreshMargin < 0 {
+		col.add(path+".refresh_margin", "must not be negative")
+	}
+	if o.PollInterval < 0 {
+		col.add(path+".poll_interval", "must not be negative")
+	}
+	if o.ExecTimeout < 0 {
+		col.add(path+".exec_timeout", "must not be negative")
+	}
+
+	if o.Refresh.IsZero() {
+		// No endpoint is a supported deployment, not an omission: dorang reads
+		// the store the vendor's CLI keeps current and never writes to it. It is
+		// stated here because the alternative reading — "refresh silently does
+		// not work" — is the defect class this file exists to catch.
+		if o.Source != "exec" && o.Source != "env" && !o.Refresh.ClientSecret.IsZero() {
+			col.add(path+".refresh", "a client secret is set with no token_url to send it to")
+		}
+		return
+	}
+	rpath := path + ".refresh"
+	switch {
+	case strings.TrimSpace(o.Refresh.TokenURL) == "":
+		col.add(rpath+".token_url", "must be set when a refresh block is configured")
+	case !strings.HasPrefix(o.Refresh.TokenURL, "https://") &&
+		!strings.HasPrefix(o.Refresh.TokenURL, "http://127.0.0.1") &&
+		!strings.HasPrefix(o.Refresh.TokenURL, "http://localhost") &&
+		!strings.HasPrefix(o.Refresh.TokenURL, "http://[::1]"):
+		col.add(rpath+".token_url",
+			"must be https: the body of a refresh is a refresh token, and posting one in "+
+				"clear hands the account to anything on the path")
+	}
+	if strings.TrimSpace(o.Refresh.ClientID) == "" {
+		col.add(rpath+".client_id", "must be set when a refresh block is configured")
+	}
+	if o.Refresh.Encoding != "" && !containsString(oauthEncodes, o.Refresh.Encoding) {
+		col.add(rpath+".encoding", "unknown encoding %q: want one of %s",
+			o.Refresh.Encoding, strings.Join(oauthEncodes, ", "))
+	}
+	if o.Refresh.Timeout < 0 {
+		col.add(rpath+".timeout", "must not be negative")
+	}
+	if !o.Refresh.ClientSecret.IsZero() {
+		o.Refresh.ClientSecret.validate(env, rpath, col)
+	}
+	if o.Source == "exec" || o.Source == "env" {
+		// The command or the environment owns the token, so a successor cannot
+		// be written back. dorang would spend the refresh token and have nowhere
+		// to record what it got — which is precisely §11.2b's
+		// token_store_write_failed, arranged in advance by the configuration.
+		col.add(rpath,
+			"a refresh endpoint needs a writable store: `source: %s` is read-only, so the "+
+				"exchanged refresh token could not be recorded anywhere and the next refresh "+
+				"would fail with a token the provider has already invalidated", o.Source)
 	}
 }
 

@@ -112,7 +112,14 @@ type OAuthConfig struct {
 	Command []string
 	// EnvVar is the variable to read, for SourceEnv.
 	EnvVar string
-	// Fields names the store's keys where they are not the defaults.
+	// StoreFormat names a vendor's store layout. Empty is [FormatGeneric].
+	//
+	// It is spelled StoreFormat rather than Format because this type carries a
+	// Format METHOD, which is what keeps a %v of a configuration from printing a
+	// path to a credential file.
+	StoreFormat StoreFormat
+	// Fields names the store's keys where they are not the format's. Each name
+	// set here overrides the format's own.
 	Fields TokenFields
 	// AccountHeader is the header the account id is sent in, where the provider
 	// requires one. Empty means the account id is not sent.
@@ -152,7 +159,12 @@ func (c *OAuthConfig) Validate() error {
 	default:
 		return fmt.Errorf("auth: oauth credential %s: unknown source", c.ID)
 	}
-	c.Fields = c.Fields.withDefaults()
+	if c.StoreFormat != "" {
+		if _, err := ParseStoreFormat(string(c.StoreFormat)); err != nil {
+			return fmt.Errorf("auth: oauth credential %s: %w", c.ID, err)
+		}
+	}
+	c.Fields = c.StoreFormat.Fields(c.Fields)
 	if c.RefreshMargin <= 0 {
 		c.RefreshMargin = DefaultRefreshMargin
 	}
@@ -229,6 +241,14 @@ type CredentialHealth struct {
 	ExpiresAt time.Time
 	// Refreshes counts successful renewals.
 	Refreshes uint64
+	// StoreLoads counts tokens adopted from the store rather than exchanged.
+	//
+	// It is here because a credential with no Refresher — the safe default, where
+	// the vendor's CLI keeps its own token current and dorang only reads it —
+	// leaves Refreshes at zero forever. Without this number that deployment has
+	// no signal at all that the credential is being kept current, and a store
+	// that silently stopped being updated looks exactly like one that is fine.
+	StoreLoads uint64
 }
 
 // String renders the health without any token material, which is why it is
@@ -242,8 +262,9 @@ func (h CredentialHealth) String() string {
 	if !h.ExpiresAt.IsZero() {
 		exp = h.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	return fmt.Sprintf("auth.CredentialHealth{id:%s provider:%s %s failures:%d expires:%s refreshes:%d}",
-		h.ID, h.Provider, state, h.Failures, exp, h.Refreshes)
+	return fmt.Sprintf(
+		"auth.CredentialHealth{id:%s provider:%s %s failures:%d expires:%s refreshes:%d loads:%d}",
+		h.ID, h.Provider, state, h.Failures, exp, h.Refreshes, h.StoreLoads)
 }
 
 // OAuthCredential is one credential that refreshes itself.
@@ -393,6 +414,7 @@ func (c *OAuthCredential) Health() CredentialHealth {
 		LastRefresh: c.lastRefresh,
 		ExpiresAt:   t.ExpiresAt,
 		Refreshes:   c.refreshes.Load(),
+		StoreLoads:  c.loads.Load(),
 	}
 }
 

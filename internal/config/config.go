@@ -351,8 +351,132 @@ type Credential struct {
 	ID       string `yaml:"id"`
 	Provider string `yaml:"provider"`
 	// Key carries key_env / key_file / key_ref / key as sibling keys.
-	Key           SecretRef `yaml:",inline"`
-	CapacityGroup string    `yaml:"capacity_group,omitempty"`
+	Key SecretRef `yaml:",inline"`
+	// Auth selects how this credential authenticates: [AuthKey] (the default) or
+	// [AuthOAuth]. It is written out rather than inferred from the presence of
+	// the oauth block, because §11.2b's example writes it out and because a
+	// credential that carries both a key and an oauth block is a mistake worth
+	// naming rather than resolving by precedence.
+	Auth string `yaml:"auth,omitempty"`
+	// OAuth is §11.2b's block. Non-nil only for `auth: oauth`.
+	OAuth         *OAuth `yaml:"oauth,omitempty"`
+	CapacityGroup string `yaml:"capacity_group,omitempty"`
+}
+
+// How a credential authenticates (§11.2b).
+const (
+	// AuthKey is a static secret: key_env, key_file or key.
+	AuthKey = "key"
+	// AuthOAuth is a token read from a store and refreshed ahead of expiry.
+	AuthOAuth = "oauth"
+)
+
+// IsOAuth reports whether this credential authenticates by OAuth.
+func (c Credential) IsOAuth() bool { return c.Auth == AuthOAuth }
+
+// OAuth is one credential's `oauth` block (§11.2b).
+//
+// It points at a token store that already exists — the vendor CLI's own — so
+// that an operator who is signed in stays signed in rather than running a second
+// authorization flow on a server. dorang reads the token out of it, and refreshes
+// it only when a `refresh` endpoint is configured.
+type OAuth struct {
+	// Source is where the token is read from: file, exec or env.
+	Source string `yaml:"source,omitempty"`
+	// Path is the store, for `source: file`. A leading ~/ expands.
+	//
+	// It is a REFERENCE to a store, never the store's content: nothing about the
+	// token reaches this file, and a path is all that is written down.
+	Path string `yaml:"path,omitempty"`
+	// Command is the argv, for `source: exec`.
+	Command []string `yaml:"command,omitempty"`
+	// EnvVar is the variable, for `source: env`.
+	EnvVar string `yaml:"env_var,omitempty"`
+
+	// Format names the store's layout: generic, codex, claude or gemini. A
+	// vendor's file is not dorang's to redesign, so its shape is named rather
+	// than spelled out by every deployment.
+	Format string `yaml:"format,omitempty"`
+
+	// The four field names, where a store departs from its format's. Each may be
+	// a dotted path into a nested object.
+	AccessTokenField  string `yaml:"access_token_field,omitempty"`
+	RefreshTokenField string `yaml:"refresh_token_field,omitempty"`
+	ExpiresAtField    string `yaml:"expires_at_field,omitempty"`
+	AccountIDField    string `yaml:"account_id_field,omitempty"`
+
+	// AccountHeader is the header the account id travels in, where a provider
+	// requires one. Empty means it is not sent.
+	AccountHeader string `yaml:"account_header,omitempty"`
+
+	// RefreshMargin is how far ahead of expiry the token is renewed.
+	RefreshMargin Duration `yaml:"refresh_margin,omitempty"`
+	// PollInterval is how often the background loop checks the clock. It is
+	// clamped to a quarter of the margin, so the margin cannot be slept through.
+	PollInterval Duration `yaml:"poll_interval,omitempty"`
+	// ExecTimeout bounds a `source: exec` command.
+	ExecTimeout Duration `yaml:"exec_timeout,omitempty"`
+
+	// Refresh is the token endpoint. Absent means dorang never exchanges
+	// anything: it reads the store, adopts what the vendor's CLI put there, and
+	// writes nothing back. That is the safe default, and for a machine where the
+	// vendor's CLI is running anyway it is also the whole feature.
+	Refresh OAuthRefresh `yaml:"refresh,omitempty"`
+}
+
+// OAuthRefresh is the RFC 6749 refresh_token exchange (§11.2b).
+//
+// The endpoint and the client id live in configuration rather than in a table of
+// vendors compiled into dorang: they are published values of a third party's
+// client registration, and a third party rotating one must not require a new
+// dorang build.
+type OAuthRefresh struct {
+	// TokenURL is the endpoint. Setting it is what turns refresh on.
+	TokenURL string `yaml:"token_url,omitempty"`
+	// ClientID identifies the OAuth client.
+	ClientID string `yaml:"client_id,omitempty"`
+	// ClientSecret carries key_env / key_file / key_ref / key as sibling keys,
+	// exactly as a credential's own secret does. Empty is the public-client
+	// case, which is what a CLI usually registers.
+	ClientSecret SecretRef `yaml:",inline"`
+	// Scope is sent when non-empty.
+	Scope string `yaml:"scope,omitempty"`
+	// Encoding is `form` (the default, RFC 6749's own) or `json`.
+	Encoding string `yaml:"encoding,omitempty"`
+	// Timeout bounds one exchange.
+	Timeout Duration `yaml:"timeout,omitempty"`
+}
+
+// IsZero reports whether no refresh endpoint is configured.
+func (r OAuthRefresh) IsZero() bool {
+	return r.TokenURL == "" && r.ClientID == "" && r.Scope == "" &&
+		r.Encoding == "" && r.Timeout == 0 && r.ClientSecret.IsZero()
+}
+
+// oauthRefreshYAML is the marshalled shape of an OAuthRefresh: the client secret
+// spelled as a reference, with no field an inline literal can land in.
+type oauthRefreshYAML struct {
+	TokenURL string   `yaml:"token_url,omitempty"`
+	ClientID string   `yaml:"client_id,omitempty"`
+	KeyEnv   string   `yaml:"key_env,omitempty"`
+	KeyFile  string   `yaml:"key_file,omitempty"`
+	KeyRef   string   `yaml:"key_ref,omitempty"`
+	Scope    string   `yaml:"scope,omitempty"`
+	Encoding string   `yaml:"encoding,omitempty"`
+	Timeout  Duration `yaml:"timeout,omitempty"`
+}
+
+// MarshalYAML writes the refresh block without its client secret, for the reason
+// [Credential.MarshalYAML] exists: `yaml:",inline"` flattens the embedded
+// SecretRef field by field and never calls its own MarshalYAML, so a literal
+// would otherwise be written straight back out.
+func (r OAuthRefresh) MarshalYAML() (any, error) {
+	env, file, ref := r.ClientSecret.Reference3()
+	return oauthRefreshYAML{
+		TokenURL: r.TokenURL, ClientID: r.ClientID,
+		KeyEnv: env, KeyFile: file, KeyRef: ref,
+		Scope: r.Scope, Encoding: r.Encoding, Timeout: r.Timeout,
+	}, nil
 }
 
 // credentialYAML is the marshalled shape of a Credential: every field, with the
@@ -363,6 +487,8 @@ type credentialYAML struct {
 	KeyEnv        string `yaml:"key_env,omitempty"`
 	KeyFile       string `yaml:"key_file,omitempty"`
 	KeyRef        string `yaml:"key_ref,omitempty"`
+	Auth          string `yaml:"auth,omitempty"`
+	OAuth         *OAuth `yaml:"oauth,omitempty"`
 	CapacityGroup string `yaml:"capacity_group,omitempty"`
 }
 
@@ -381,6 +507,7 @@ func (c Credential) MarshalYAML() (any, error) {
 	return credentialYAML{
 		ID: c.ID, Provider: c.Provider,
 		KeyEnv: env, KeyFile: file, KeyRef: ref,
+		Auth: c.Auth, OAuth: c.OAuth,
 		CapacityGroup: c.CapacityGroup,
 	}, nil
 }

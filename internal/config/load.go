@@ -87,6 +87,14 @@ func (c *Config) resolveSecrets(col *collector) {
 		if c.Credentials[i].Key.sources() == 1 {
 			c.Credentials[i].Key.resolve(env, fmt.Sprintf("credentials[%d]", i), col)
 		}
+		// An OAuth client secret is a secret like any other (§4.1): it is a
+		// reference in the file and a value only in memory, resolved by the same
+		// code as every other one so that there is no second way for one to be
+		// read.
+		if o := c.Credentials[i].OAuth; o != nil && o.Refresh.ClientSecret.sources() == 1 {
+			o.Refresh.ClientSecret.resolve(env,
+				fmt.Sprintf("credentials[%d].oauth.refresh", i), col)
+		}
 	}
 	for _, name := range sortedKeys(c.KeyRotation.Providers) {
 		kp := c.KeyRotation.Providers[name]

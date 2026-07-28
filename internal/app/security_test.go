@@ -467,7 +467,7 @@ func TestRouterRequestCarriesTheTenant(t *testing.T) {
 	}
 
 	// And it actually lands on the request the router is asked.
-	d := newDispatcher(http.DefaultClient, t.Logf, time.Now)
+	d := newDispatcher(http.DefaultClient, nil, t.Logf, time.Now)
 	d.swap(&dispatchState{})
 	rq := newDecodeRequest(t, `{"model":"m1","messages":[]}`,
 		&principal{p: &auth.Principal{KeyID: "key-1", TeamID: "team-a"}})
@@ -519,7 +519,7 @@ func newTestBatchExecutor(t *testing.T, baseURL string, owner *auth.Principal,
 			"cred-a": {id: "cred-a", provider: "p1", secret: "provider-secret-value"}, // pragma: allowlist secret — fixture
 		},
 	}
-	d := newDispatcher(http.DefaultClient, t.Logf, time.Now)
+	d := newDispatcher(http.DefaultClient, nil, t.Logf, time.Now)
 	d.swap(&dispatchState{
 		upstreams: table,
 		budget:    gate,
@@ -599,7 +599,7 @@ func TestAHostileUpstreamCannotEchoTheCredentialBack(t *testing.T) {
 			"cred-a": {id: "cred-a", provider: "p1", secret: secret}, // pragma: allowlist secret — fixture
 		},
 	}
-	d := newDispatcher(http.DefaultClient, func(string, ...any) {}, time.Now)
+	d := newDispatcher(http.DefaultClient, nil, func(string, ...any) {}, time.Now)
 	st := &dispatchState{upstreams: table}
 	d.swap(st)
 
@@ -656,7 +656,7 @@ func TestUnreachableUpstreamDoesNotNameInternalHosts(t *testing.T) {
 		},
 		creds: map[string]*credential{"cred-a": {id: "cred-a", provider: "p1"}},
 	}
-	d := newDispatcher(http.DefaultClient, func(string, ...any) {}, time.Now)
+	d := newDispatcher(http.DefaultClient, nil, func(string, ...any) {}, time.Now)
 	st := &dispatchState{upstreams: table}
 	d.swap(st)
 

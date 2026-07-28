@@ -138,6 +138,12 @@ type App struct {
 	// Notify is the §11.5 notification pipeline. Nil for `driver: none`, which
 	// is the default.
 	Notify *notify.Notifier
+	// OAuth is the §11.2b credential set: the accounts that authenticate with a
+	// token read from a vendor CLI's own store and renewed ahead of expiry. Nil
+	// when no credential declares `auth: oauth`, which is the default — the
+	// absence of the subsystem rather than an empty one, so nothing polls, no
+	// metric family is published, and the dispatcher's lookup is a nil check.
+	OAuth *auth.OAuthManager
 	// Metrics is the DESIGN §12.3 Prometheus surface. It pulls from every
 	// subsystem above rather than being pushed to by any of them, so nothing
 	// here imports internal/metrics except this package.
@@ -408,7 +414,14 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if client == nil {
 		client = backend.NewClient()
 	}
-	a.dispatch = newDispatcher(client, a.logf, a.now)
+	// The OAuth credential set (DESIGN §11.2b). It is built before the
+	// dispatcher because the dispatcher resolves through it, and its background
+	// loops start with the rest of them in startBackground — nothing on the
+	// request path waits for a refresh.
+	if a.OAuth, err = buildOAuth(cfg, a.now); err != nil {
+		return nil, err
+	}
+	a.dispatch = newDispatcher(client, a.OAuth, a.logf, a.now)
 	filters, err := buildFilters(cfg, a.logf)
 	if err != nil {
 		return nil, err
@@ -555,6 +568,12 @@ func (a *App) Reload(cfg *config.Config) error {
 	if err := checkShadowUnchanged(a.cfg.Load(), cfg); err != nil {
 		return err
 	}
+	// The OAuth credential set cannot either, for the same class of reason: a
+	// credential holds a token, a backoff and a background loop established at
+	// start-up (§11.2b). See checkOAuthUnchanged.
+	if err := checkOAuthUnchanged(a.cfg.Load(), cfg); err != nil {
+		return err
+	}
 	// §4.1 says every section hot-reloads, and extensions.lua does: a reload
 	// recompiles the policy directory and swaps the engine by pointer, so an
 	// in-flight request keeps the engine it started with. A syntax error in a
@@ -638,6 +657,14 @@ func (a *App) startBackground() {
 			a.logf("app: credential reload on start: %v", err)
 		}
 		rcancel()
+	}
+
+	// The §11.2b refresh loops, one per OAuth credential. They renew a token
+	// while the current one is still valid, so a refresh never sits on a
+	// request's critical path — which is the whole mechanism, and it only runs
+	// because something starts it.
+	if a.OAuth != nil {
+		a.OAuth.Start(ctx)
 	}
 
 	// The periodic credential reload. It is the TTL fallback for a snapshot row:
@@ -800,6 +827,14 @@ func (a *App) Close(ctx context.Context) error {
 			if err := a.Shadow.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
+		}
+		if a.OAuth != nil {
+			// Stopped before the authenticator for no reason but symmetry with
+			// construction: it holds nothing either of them owns. What matters
+			// is that it is stopped at all — a refresh loop that outlived the
+			// process's shutdown would keep writing a shared token store after
+			// dorang stopped serving.
+			a.OAuth.Close()
 		}
 		if a.Auth != nil {
 			a.Auth.Close()

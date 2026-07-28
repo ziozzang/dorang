@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/luaext"
@@ -51,8 +52,14 @@ type dispatcher struct {
 	// and is immutable — a hot reload rebuilds providers, which live on the
 	// state, not this.
 	backend *backend.Backend
-	logf    func(string, ...any)
-	now     func() time.Time
+	// oauth is the §11.2b credential set. It lives on the dispatcher rather than
+	// on the state because a credential holds a token, a backoff and a
+	// background loop that outlive a reload — the same reason the broker and the
+	// authenticator are not rebuilt either. Nil when nothing authenticates by
+	// OAuth, which makes the lookup below one nil check.
+	oauth *auth.OAuthManager
+	logf  func(string, ...any)
+	now   func() time.Time
 	// filter are the §10.5b transform-filter counters. They live on the
 	// dispatcher rather than the state because a configuration reload must not
 	// reset them: a counter that restarts on SIGHUP is a counter nobody can
@@ -105,8 +112,10 @@ type dispatchState struct {
 // own HTTP client; the client moved down a layer and the copy went with it,
 // rather than staying behind as the version nothing calls.
 
-func newDispatcher(client *http.Client, logf func(string, ...any), now func() time.Time) *dispatcher {
-	d := &dispatcher{logf: logf, now: now}
+func newDispatcher(client *http.Client, oauth *auth.OAuthManager,
+	logf func(string, ...any), now func() time.Time) *dispatcher {
+
+	d := &dispatcher{oauth: oauth, logf: logf, now: now}
 	d.backend = backend.New(backend.Options{Client: client, Credentials: d, Now: now})
 	return d
 }
@@ -121,10 +130,24 @@ func (d *dispatcher) state() *dispatchState  { return d.st.Load() }
 // rotated key has to reach the next request without rebuilding L5 under the
 // in-flight ones.
 //
-// OAuth returns nil today. internal/auth's OAuthCredential already satisfies
-// [backend.Applier], so wiring it is a lookup here and nothing in L5 — which is
-// the point of the seam.
+// An OAuth credential is resolved here and nowhere else. That comment used to
+// read "OAuth returns nil today… wiring it is a lookup here and nothing in L5",
+// and it was right on both counts: this is the lookup, and L5 did not change.
+// internal/backend still declares [backend.Applier], still calls Apply on
+// whatever it is handed, and still has no idea what a token is or where one
+// comes from — which is what the seam was for.
+//
+// The OAuth branch comes first because the two are alternatives, not a fallback
+// chain: a credential that authenticates by OAuth has no static secret, and
+// internal/config refuses one that claims both. Returning an empty secret
+// alongside the applier says the same thing to [backend.Provider.ApplyCredential],
+// which spells the credential from the applier and ignores the secret entirely.
 func (d *dispatcher) Credential(id string) (string, backend.Applier) {
+	if d.oauth != nil {
+		if c, ok := d.oauth.Credential(id); ok {
+			return "", c
+		}
+	}
 	st := d.state()
 	if st == nil || st.upstreams == nil {
 		return "", nil

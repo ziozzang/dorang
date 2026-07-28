@@ -78,7 +78,7 @@ key:      literal          # server.env가 "development"일 때만 허용
 
 가장 짧은 동작 파일은 `version: 1` + `providers` + `credentials` + `models`다.
 
-### 0.5 핫 리로드 — 그리고 하지 않는 한 절 
+### 0.5 핫 리로드 — 그리고 하지 않는 두 절 
 
 설정은 파일 변경, `SIGHUP`, 관리 리로드 엔드포인트로 다시 읽힌다. 파일은 2초마다 stat되고, 대부분의
 편집기와 형상 관리 도구가 쓰는 rename-into-place는 타임스탬프뿐 아니라 identity도 바꾸므로 탐지된다.
@@ -97,6 +97,11 @@ key:      literal          # server.env가 "development"일 때만 허용
 ⚠️ **`shadow:`는 의도적으로 핫 리로드하지 않는다.** 일일 비용 상한, 샘플 집합, 리포트 핸들이 프로세스별
 상태다. 재구성은 상한을 재무장시켜 "하루 $5"를 "`SIGHUP`당 $5"로 바꾼다. 바뀐 `shadow` 절은 **거부**되고
 돌던 설정이 유지된다.
+
+⚠️ **`auth: oauth` 크리덴셜 집합도 같은 부류의 이유로 핫 리로드하지 않는다 (§7.2).** 각 크리덴셜은 메모리
+안의 액세스 토큰, 백오프를 재는 연속 실패 횟수, 그리고 시작 시 한 번 띄운 갱신 루프를 갖는다. `SIGHUP`마다
+재구성하면 모든 저장소를 다시 읽고, 이미 실패 중인 계정의 백오프를 재무장시킨다. 집합을 추가·삭제·이동하는
+리로드는 재시작하라는 메시지와 함께 **거부**되고, 집합을 건드리지 않는 리로드는 평소대로 적용된다.
 
 ### 0.6 서빙 전에 파일 검사하기
 
@@ -366,13 +371,78 @@ effective_used = max( provider_reported_used ,
 |---|---|---|---|---|
 | `id` | string | — | 크리덴셜의 정체성. **비밀이 아니다**: 라우팅 결정, 메트릭, 헤더, 에러에 나타난다 | 빈 값·중복 거부 |
 | `provider` | string | — | 어느 프로바이더에서 인증하는가 | 선언된 프로바이더여야 한다. 다른 프로바이더의 크리덴셜을 열거한 배포는 이름과 함께 거부 |
+| `auth` | `key` \| `oauth` | `key` | 이 크리덴셜이 어떻게 인증하는가 | 그 외 값은 거부. `oauth` 블록 없는 `auth: oauth`도, `auth: oauth` 없는 `oauth` 블록도 거부 |
 | `key_env` / `key_file` / `key_ref` / `key` | secret ref | — | 비밀값 출처 (§0.3) | 0개 또는 2개 이상 거부 |
+| `oauth` | 블록 | — | §7.2. `auth: oauth`에서만 | 키와 `oauth` 블록을 **둘 다** 세운 크리덴셜은 거부된다: 둘은 택일이며, 우선순위로 푸는 것이야말로 파일에 아무 설명도 없이 잘못된 크리덴셜을 보내는 방법이다 |
 | `capacity_group` | string | `""` | `credential_group` 축 멤버십 — 계정당, 그 계정이 서빙하는 모든 모델에 걸쳐 | `capacity.credential_groups`에 선언되지 않은 그룹 거부 |
 
 > **키 자료를 두 곳에 선언할 수 있고 스키마는 어느 쪽이 이기는지 말하지 않는다.** 같은 크리덴셜 id가
 > `credentials[]`와 `key_rotation.providers[].keys[]` 양쪽에 비밀 참조를 실을 수 있다. 둘은 하나를 고르는
 > 대신 병합되며, 그것이 예시 설정의 분리 — 한쪽에 프로바이더 바인딩, 다른 쪽에 동시성 상한 — 를 말 그대로
 > 만든다. 둘이 *다른* 비밀값을 실으면 해결 순서는 미명세다. 비밀값은 한 번만 선언할 것.
+
+### 7.2 `oauth` — 키가 아니라 토큰으로 인증하는 계정
+
+어떤 프로바이더는 API 키가 아니라 구독을 판다. 그때 인증하는 것은 한 시간이 채 안 되어 만료되는 OAuth
+액세스 토큰이다. 그 토큰은 벤더의 CLI를 돌리는 기계라면 이미 디스크에 있으므로, 크리덴셜은 서버에서 두
+번째 인가 플로를 시작하는 대신 **그 CLI의 저장소를 가리킨다**.
+
+```yaml
+credentials:
+  - id: plan-oauth-1
+    provider: plan-a
+    auth: oauth
+    oauth:
+      source: file                          # file | exec | env
+      path: /path/to/the/vendor/auth.json   # CLI 자신의 저장소. 앞의 ~/ 는 확장된다
+      format: codex                         # generic | codex | claude | gemini
+      account_header: chatgpt-account-id    # 프로바이더가 계정 id를 원하는 헤더
+      refresh_margin: 5m
+      refresh:                              # 선택 — 아래 참조
+        token_url: https://auth.example.com/oauth/token
+        client_id: the-cli-s-published-client-id
+        key_env: DORANG_PLAN_A_CLIENT_SECRET   # 공개(PKCE) 클라이언트면 생략
+        encoding: form                      # form | json
+```
+
+| 키 | 타입 | 기본값 | 하는 일 | 틀리면 |
+|---|---|---|---|---|
+| `source` | `file` \| `exec` \| `env` | `file` | 토큰을 어디서 읽는가. dorang이 되쓸 수 있는 것은 `file` 뿐 | 모르는 source 거부. `path` 없는 `file`, `command` 없는 `exec`, `env_var` 없는 `env`는 각각 이름과 함께 거부 |
+| `path` | 경로 | — | `source: file`의 저장소. **참조**일 뿐이다: 토큰이 설정 파일에 들어가는 일은 없다 | 시작 시 읽히지 않으면 게이트웨이를 죽이는 대신 그 크리덴셜만 unhealthy로 표시된다 — 한 계정의 없는 파일이 다른 계정까지 끌어내려서는 안 된다 |
+| `command` | 리스트 | — | `source: exec`의 argv | 읽기 전용: 토큰의 주인은 그 명령이다 |
+| `env_var` | string | — | `source: env`의 변수 이름 | 읽기 전용: 토큰의 주인은 환경이다 |
+| `format` | `generic` \| `codex` \| `claude` \| `gemini` | `generic` | 저장소의 키 배치 | 모르는 포맷은 이 빌드가 아는 것들을 열거하며 거부 |
+| `access_token_field` / `refresh_token_field` / `expires_at_field` / `account_id_field` | string | 포맷의 값 | 포맷의 키 이름을 덮어쓴다. `tokens.access_token` 같은 점 표기 경로는 중첩 객체 안까지 닿는다 | 아무것도 가리키지 않는 이름은 에러가 아니라 저장소에 그 필드가 없다는 뜻이다 |
+| `account_header` | 헤더 이름 | `""` | 토큰과 함께 계정 id를 실어 보낼 헤더 | 비우면 보내지 않는다 |
+| `refresh_margin` | duration | `5m` | 만료 얼마 전에 갱신하는가 | 토큰이 죽은 뒤에야 일어나는 갱신은 메커니즘이 아니라 401 폴백이다 |
+| `poll_interval` | duration | `30s` | 루프가 시계를 보는 주기. `refresh_margin`의 1/4로 클램프된다 | 마진보다 느린 폴은 창 전체를 건너뛴다 |
+| `exec_timeout` | duration | `10s` | `source: exec` 명령의 시간 제한 | — |
+| `refresh.token_url` | https URL | — | RFC 6749 토큰 엔드포인트. **이걸 세우는 것이 갱신을 켜는 행위다** | 평문 `http`는 거부: 갱신 요청의 본문이 곧 리프레시 토큰이다 |
+| `refresh.client_id` | string | — | OAuth 클라이언트. `token_url`이 있으면 필수 | — |
+| `refresh.key_env` / `key_file` / `key` | secret ref | — | 클라이언트 시크릿. 다른 모든 비밀값과 같은 철자다 (§0.3). 공개 클라이언트면 생략 | `token_url` 없이 세우면 거부 |
+| `refresh.scope` | string | `""` | 비어 있지 않으면 함께 보낸다 | — |
+| `refresh.encoding` | `form` \| `json` | `form` | 요청 본문의 철자. 대부분 `form`, 일부 벤더는 `json`을 요구한다 | 모르는 encoding 거부 |
+| `refresh.timeout` | duration | `30s` | 교환 한 번의 시간 제한 | — |
+
+**갱신은 옵트인이고, 기본값이 안전한 쪽이다.** `refresh` 블록이 없으면 dorang은 저장소를 읽어 벤더의 CLI가
+마지막으로 써 둔 것을 채택할 뿐 **아무것도 쓰지 않는다**. 리프레시 토큰은 운영자가 어디에 쓸지 말한 곳에서만
+소비된다. `refresh` 블록이 있으면 갱신은 만료 전에 백그라운드 루프에서 일어나고, 교환은 크리덴셜당
+single-flight이며, 후속 토큰은 dorang이 소유하지 않은 모든 키를 보존한 채 원자적으로 되쓰인다 — 그 파일의
+주인은 CLI이고, 그 키 하나를 떨구는 쓰기는 아무도 게이트웨이 탓이라고 생각하지 않을 방식으로 CLI를 망가뜨린다.
+
+**dorang은 크리덴셜을 갱신하지 발급하지 않는다.** *첫* 리프레시 토큰을 얻는 일은 dorang이 호스팅할 곳 없는
+리다이렉트를 가진, 브라우저에 묶인 대화형 플로다. 벤더의 CLI로 로그인한 뒤, 그것이 쓴 저장소를 가리켜라.
+
+**만료 필드가 없는 저장소.** 지원하는 배치 중 하나는 만료를 아예 싣지 않는데, 만료가 없는 토큰은 미리 갱신되지
+않으므로 기능 전체가 401 폴백에 얹히게 된다. 그 배치에서는 액세스 토큰 자신의 JWT `exp` 클레임에서 만료를
+읽는다. 클레임은 읽을 뿐 검증하지 않는다: dorang은 audience가 아니고 키도 갖고 있지 않다.
+
+**크리덴셜 집합은 핫 리로드하지 않는다.** 각각이 시작 시 세워진 토큰·백오프·백그라운드 루프를 쥐고 있어서,
+OAuth 크리덴셜을 추가·삭제·이동하는 리로드는 재시작하라는 메시지와 함께 **거부**된다. 파일의 나머지는 그대로
+리로드된다. §0.5에 리로드하지 않는 다른 절이 있다.
+
+**토큰은 비밀값이다 (§0.3, DESIGN §4.1).** 이 서브시스템을 떠나는 것 중 토큰을 실을 수 있는 것은 없다: id와
+health가 전부다. 설정 파일에 있는 것은 *경로*와 *클라이언트 id*이지 토큰이 아니다.
 
 ### 7.1 크리덴셜 어피니티는 캐시 최적화가 아니라 정확성 제약이다
 
