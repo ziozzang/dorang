@@ -1203,6 +1203,108 @@ passthrough:
 **Security boundary**: unmapped prefixes are not served — this is not an open proxy. Joined
 paths are normalized and traversal is rejected. Provider credentials never reach the client.
 
+### 10.7 Metadata equivalence across protocol families
+
+The three shapes dorang must speak — OpenAI chat-completions, OpenAI responses, and
+Anthropic messages — name the same concepts differently and disagree on a few of them.
+A neutral representation is worthless if each adapter invents its own reading, so the
+mapping is **normative**, not per-adapter discretion. The rule for resolving disagreements
+is **whatever the market already does**, because the value of this table is that existing
+clients keep working, not that it is elegant.
+
+Canonical names below are the field names in `CanonicalRequest` / `CanonicalResponse`.
+`—` means the family has no equivalent, which is a §10.1 structural-loss case, not a
+droppable parameter.
+
+#### Request
+
+| Canonical | chat-completions | responses | messages |
+|---|---|---|---|
+| `Model` | `model` | `model` | `model` |
+| `Messages` | `messages[]` | `input[]` | `messages[]` |
+| `System` | `messages[role=system\|developer]` | `instructions` | `system` (top-level) |
+| `MaxOutputTokens` | `max_completion_tokens`, falling back to `max_tokens` | `max_output_tokens` | `max_tokens` (**required**) |
+| `Temperature` / `TopP` | same | same | same |
+| `TopK` | — | — | `top_k` |
+| `Stop` | `stop` | — | `stop_sequences` |
+| `Stream` | `stream` | `stream` | `stream` |
+| `Tools` | `tools[].function` | `tools[]` (flat) | `tools[]` (flat, `input_schema`) |
+| `ToolChoice` | `tool_choice` | `tool_choice` | `tool_choice` |
+| `ParallelToolCalls` | `parallel_tool_calls` | `parallel_tool_calls` | `disable_parallel_tool_use` (**inverted**) |
+| `ResponseFormat` | `response_format` | `text.format` | — |
+| `Reasoning` | `reasoning_effort` | `reasoning{effort,summary}` | `thinking{type,budget_tokens}` |
+| `Seed` | `seed` | — | — |
+| `Logprobs` | `logprobs`,`top_logprobs` | — | — |
+| `EndUser` | `user` | `user` | `metadata.user_id` |
+| `Metadata` | `metadata` | `metadata` | `metadata` |
+| `PreviousResponseID` | — | `previous_response_id` | — |
+| `Store` | — | `store` | — |
+| `ServiceTier` | `service_tier` | `service_tier` | — |
+| `CacheBreakpoints` | — | — | `cache_control` on blocks |
+
+Three of these are traps and each gets a test:
+
+- **`max_tokens` is required in messages and optional elsewhere.** Crossing into that family
+  without one must supply the model's max output from the catalog, not omit the field.
+- **`ParallelToolCalls` is inverted** in one family. A naive copy silently reverses it.
+- **`max_completion_tokens` supersedes `max_tokens`** in chat-completions. Reading the wrong
+  one caps output at the legacy value.
+
+#### Response and usage
+
+| Canonical | chat-completions | responses | messages |
+|---|---|---|---|
+| `ID` | `id` | `id` | `id` |
+| `Model` | `model` (restamped every chunk) | `model` | `model` |
+| `StopReason` | `choices[].finish_reason` | `status` + `incomplete_details.reason` | `stop_reason` |
+| `StopSequence` | — | — | `stop_sequence` |
+| `InputTokens` | `usage.prompt_tokens` | `usage.input_tokens` | `usage.input_tokens` |
+| `OutputTokens` | `usage.completion_tokens` | `usage.output_tokens` | `usage.output_tokens` |
+| `CacheReadTokens` | `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` | `usage.cache_read_input_tokens` |
+| `CacheWriteTokens` | — | — | `usage.cache_creation_input_tokens` |
+| `ReasoningTokens` | — | `usage.output_tokens_details.reasoning_tokens` | (inside output tokens) |
+| `TotalTokens` | `usage.total_tokens` | `usage.total_tokens` | — (but see COMPATIBILITY 6.8) |
+
+**Token accounting is the part that must be exactly right**, because it feeds cost, quota,
+and budget — a mis-mapped cache field does not produce a visible error, it produces a wrong
+invoice. Two normalizations are mandatory:
+
+1. **Input tokens are reported the same way in all three directions.** One family reports
+   cache reads *inside* the input count; another reports them *outside* it. dorang normalizes
+   to **exclusive** — `InputTokens` never includes cache reads or writes — and re-adds on the
+   way out for whichever family expects inclusive. Getting this wrong double-counts or
+   under-counts every cached request, which is most of them in an agentic workload.
+2. **Reasoning tokens are billed as output.** One family breaks them out, another folds them
+   in. `ReasoningTokens` is reported separately *and* is already contained in
+   `OutputTokens`, so cost never adds them twice. A test asserts
+   `OutputTokens >= ReasoningTokens`.
+
+#### Streaming events
+
+| Canonical | chat-completions | messages |
+|---|---|---|
+| stream open | first chunk with `delta.role` | `message_start` |
+| text delta | `delta.content` | `content_block_delta{text_delta}` |
+| tool call start | `delta.tool_calls[i]` with `id`+`name` | `content_block_start{tool_use}` |
+| tool argument delta | `delta.tool_calls[i].function.arguments` | `content_block_delta{input_json_delta}` |
+| block end | (implicit) | `content_block_stop` |
+| stop | `finish_reason` | `message_delta{stop_reason}` |
+| usage | final chunk when opted in | `message_delta.usage` |
+| stream end | `data: [DONE]` | `message_stop` |
+
+The asymmetry that costs the most: one family has **explicit block boundaries** and the other
+has **implicit** ones. Going from implicit to explicit means synthesizing `content_block_stop`
+at every transition and holding the terminal event until the block is closed — the stateful
+part of COMPATIBILITY 6.6, and the reason that adapter has its own fuzz target.
+
+#### TODO — Vertex
+
+Aligning with Vertex/Gemini shapes (`contents[]`, `systemInstruction`, `generationConfig`,
+`usageMetadata`) is **noted, not planned**. It is a fourth naming of the same concepts with
+its own quirks, and it earns its place only when a deployment actually needs it. The table
+above is deliberately structured so a fourth column can be added without disturbing the
+three that carry real traffic.
+
 ---
 
 ## 11. Batch, users, administration
