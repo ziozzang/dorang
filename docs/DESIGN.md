@@ -1463,6 +1463,14 @@ A provider may declare a metrics endpoint to scrape. Queue depth and cache utili
 become routing signals for `least_busy` and `highest_tps`. Collection ships first; using it
 for routing is opt-in behind a flag.
 
+For vLLM specifically — a **day-zero** backend, not an afterthought — the metric names,
+their four traps, the per-response load header that beats polling, and the load endpoint
+that returns an attractive-looking zero forever when unconfigured are all specified in
+[VLLM.md](VLLM.md) §3. That document also resolves two things this design had left open:
+a vLLM deployment's real context window is readable with one unauthenticated GET (§1.1),
+and `priority` is **silently ignored** under the default scheduler policy while its own
+field description claims otherwise (§1.2).
+
 ---
 
 ## 13. Clustering
