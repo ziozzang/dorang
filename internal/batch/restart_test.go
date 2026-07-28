@@ -148,8 +148,13 @@ func TestCloseLeavesAWaitingBatchForTheNextProcess(t *testing.T) {
 	second := h.create(h.upload(jsonlFile(8, "m1")))
 	h.await(second.ID, StatusQueued)
 
-	go g.allow(4)
+	// Supplied for the length of the drain rather than by a fixed count, for the
+	// reason gate.feed documents: the count consumed depends on scheduling. The
+	// second batch still cannot start — it never held a dispatch slot, and the
+	// close stops handing them out.
+	stop := g.feed()
 	h.restart(nil)
+	stop()
 
 	waiting, err := h.svc.Retrieve(context.Background(), second.ID, "")
 	if err != nil {

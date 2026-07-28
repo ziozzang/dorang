@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -362,6 +363,86 @@ func TestRateLimitDoesNotCountAgainstAvailability(t *testing.T) {
 	if got := h.health.Stats("g1").State; got != health.Closed {
 		t.Fatalf("the circuit must stay closed after repeated 429s: %v", got)
 	}
+}
+
+// TestMalformedRequestsCannotStandDownAHealthyDeployment is the denial of
+// service the 4xx boundary exists to close, exercised as the attack rather than
+// as a classification.
+//
+// A 400 is the REQUEST being wrong. The deployment that produced it read the
+// body, judged it correctly and answered immediately — it is working. Counting
+// that against availability opened a circuit that is shared by every tenant of
+// the deployment, so any caller holding any key could take a healthy backend
+// away from everyone else for the price of three requests.
+//
+// The group here holds ONE deployment on purpose. With two, the victim would be
+// quietly moved to the sibling and the test would pass while the attack still
+// worked; with one, losing the deployment is losing the model.
+func TestMalformedRequestsCannotStandDownAHealthyDeployment(t *testing.T) {
+	soloGroup := Config{
+		Groups: []Group{{Name: "g", Class: "chat-large", Deployments: []Deployment{
+			dep("g1", "p1", "openai", "model-x"),
+		}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3, Budget: 2 * time.Minute},
+	}
+	h := newHarness(t, soloGroup, harnessOpts{})
+
+	// The attack: one key, a stream of malformed bodies. Far more than the
+	// three consecutive failures that open a circuit. A refusal here is not the
+	// assertion — the attacker losing the deployment is only the attacker's
+	// problem — so the loop stops rather than failing, and the victim below is
+	// what the test is about.
+	for range 20 {
+		d, err := h.r.Route(context.Background(), Request{
+			Model: "g", Principal: "attacker", Tenant: "attacker"})
+		if err != nil {
+			break
+		}
+		h.r.Report(d, Outcome{Err: errFake, Status: 400, Total: time.Millisecond})
+	}
+
+	// The victim: a different tenant, a well-formed request. The circuit is per
+	// deployment and not per tenant, so if the attack opened it this route has
+	// nowhere left to go.
+	d, err := h.r.Route(context.Background(), Request{
+		Model: "g", Principal: "victim", Tenant: "victim"})
+	if err != nil {
+		t.Fatalf("malformed requests from one caller took the deployment away from "+
+			"every other tenant: %v", err)
+	}
+	if d.Deployment != "g1" {
+		t.Fatalf("the well-formed request landed on %s", d.Deployment)
+	}
+	h.ok(d)
+
+	if st := h.health.Stats("g1"); st.Failures != 0 || st.Opens != 0 || st.State != health.Closed {
+		t.Fatalf("a working backend was charged with %d failures and %d opens, state %v",
+			st.Failures, st.Opens, st.State)
+	}
+
+	t.Run("one bad body does not tour the class either", func(t *testing.T) {
+		// The same misclassification also handed the request upstream_5xx's
+		// chain, so a single malformed body was retried on the group and then on
+		// every class sibling — opening a circuit at each stop. It is terminal
+		// where it happened.
+		h := newHarness(t, classConfig(), harnessOpts{})
+		d := h.route(Request{Model: "g"})
+		h.r.Report(d, Outcome{Err: errFake, Status: 400, Total: time.Millisecond})
+
+		re := h.routeErr(Request{Model: "g", Previous: d})
+		if re.Code != CodeNotChainable {
+			t.Fatalf("code = %q, want %q: a malformed body is malformed on every backend",
+				re.Code, CodeNotChainable)
+		}
+		if re.Status != 400 {
+			t.Errorf("status = %d, want 400: the caller's request is what was refused", re.Status)
+		}
+		for _, id := range []string{"g1", "g2", "h1"} {
+			if st := h.health.Stats(id).Failures; st != 0 {
+				t.Errorf("%s was charged %d failures for another tenant's malformed body", id, st)
+			}
+		}
+	})
 }
 
 // TestUpstream5xxOpensTheCircuit is the control: a 5xx is exactly the signal

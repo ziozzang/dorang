@@ -3,6 +3,7 @@ package backend
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -220,7 +221,7 @@ func (s *openaiSource) next() ([]canonical.StreamEvent, error) {
 		if s.done {
 			return s.flush()
 		}
-		payload, err := nextSSEData(s.br, &s.data)
+		payload, err := nextSSEData(s.br, &s.data, maxStreamFrame)
 		if err != nil {
 			s.done = true
 			if err != io.EOF {
@@ -271,6 +272,40 @@ func (s *openaiSource) note(evs []canonical.StreamEvent) {
 	}
 }
 
+// maxStreamFrame bounds ONE SSE frame: one line, and the data payload a frame
+// accumulates across its `data:` lines.
+//
+// The stream as a whole stays unbounded, which is the point of a stream. What is
+// bounded is how much of it dorang holds at once — and here it was not bounded
+// at all. [nextSSEData] read a line with bufio.Reader.ReadString, whose contract
+// is to keep growing until it finds a newline no matter how far away that is,
+// and appended it to a strings.Builder nothing measured. An upstream that
+// answers a streaming request with `data: ` and then megabytes without a newline
+// made the gateway buffer every byte, per concurrent stream, from the far side
+// of the trust boundary. It is the streaming twin of the unbounded success-path
+// read [readUpstreamBody] exists to prevent, and both openaiSource and
+// geminiSource reach it.
+//
+// The value is the repository's existing answer to the same question rather than
+// a new one. Both other SSE readers on this path already bound a frame at
+// [openai.DefaultMaxFrameBytes] — internal/wire/anthropic's FrameReader through
+// bufio.Scanner.Buffer, and internal/wire/openai's relay Scanner through
+// checkOverflow — and this reader sitting between them with no ceiling was the
+// omission, not the number.
+//
+// What differs is the response to hitting it. The relay Scanner degrades: it
+// forwards the over-long frame and stops trying to rewrite it, which it can
+// afford because it is copying bytes. This reader has to DECODE a frame to cross
+// protocol families, so there is nothing to forward and refusing is the only
+// answer available.
+const maxStreamFrame = openai.DefaultMaxFrameBytes
+
+// errStreamFrameTooLarge is the sentinel for a frame that hit the ceiling. It
+// surfaces to the client as an error event on the stream itself, because by the
+// time a frame is being read the status is already spent (§7.6).
+var errStreamFrameTooLarge = errors.New(
+	"upstream stream frame exceeded the size this gateway will buffer")
+
 // nextSSEData reads one frame's data payload.
 //
 // It returns io.EOF at the end of the stream, and never returns an empty
@@ -279,9 +314,15 @@ func (s *openaiSource) note(evs []canonical.StreamEvent) {
 // discarded rather than delivered — every one of these protocols terminates its
 // stream explicitly, so an unterminated trailing frame is a truncated stream,
 // and half an event is worse than none.
-func nextSSEData(br *bufio.Reader, buf *strings.Builder) (string, error) {
+//
+// limit bounds both the line and the accumulated payload; see [maxStreamFrame].
+func nextSSEData(br *bufio.Reader, buf *strings.Builder, limit int) (string, error) {
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLineLimited(br, limit)
+		if err == errStreamFrameTooLarge {
+			buf.Reset()
+			return "", err
+		}
 		if line == "" && err != nil {
 			buf.Reset()
 			if err == io.EOF {
@@ -306,10 +347,18 @@ func nextSSEData(br *bufio.Reader, buf *strings.Builder) (string, error) {
 		if strings.HasPrefix(trimmed, ":") {
 			// An SSE comment. Keep-alives arrive as one, and they carry nothing.
 		} else if v, ok := strings.CutPrefix(trimmed, "data:"); ok {
+			v = strings.TrimPrefix(v, " ")
+			// A frame may spread its payload over many data: lines, so the
+			// ceiling has to be checked against the accumulation and not only
+			// against the line that was just read.
+			if buf.Len()+len(v)+1 > limit {
+				buf.Reset()
+				return "", errStreamFrameTooLarge
+			}
 			if buf.Len() > 0 {
 				buf.WriteByte('\n')
 			}
-			buf.WriteString(strings.TrimPrefix(v, " "))
+			buf.WriteString(v)
 		}
 		// Every other field (event:, id:, retry:) is not carried by these
 		// shapes and is dropped rather than guessed at.
@@ -318,6 +367,28 @@ func nextSSEData(br *bufio.Reader, buf *strings.Builder) (string, error) {
 			buf.Reset()
 			return "", io.EOF
 		}
+	}
+}
+
+// readLineLimited reads one line, including its newline, holding at most limit
+// bytes plus whatever bufio's own buffer already held.
+//
+// It replaces bufio.Reader.ReadString, whose contract is to keep growing until
+// it finds the delimiter. ReadSlice returns what fits and says so, which is what
+// makes the ceiling enforceable while the bytes are still arriving rather than
+// after they have all been buffered.
+func readLineLimited(br *bufio.Reader, limit int) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if sb.Len()+len(chunk) > limit {
+			return "", errStreamFrameTooLarge
+		}
+		sb.Write(chunk)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return sb.String(), err
 	}
 }
 

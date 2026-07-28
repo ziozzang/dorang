@@ -578,7 +578,7 @@ func statusFor(c Cause) int {
 		return 401
 	case CauseBudgetExceeded:
 		return 402
-	case CauseContextWindow, CauseContentPolicy:
+	case CauseContextWindow, CauseContentPolicy, CauseBadRequest:
 		return 400
 	case CauseTimeout:
 		return 504
@@ -1344,16 +1344,15 @@ func (r *Router) Report(d *Decision, o Outcome) {
 	if cause == CauseNone && o.Err != nil {
 		cause = Classify(o.Status, o.Err)
 		if cause == CauseNone {
-			cause = CauseUpstream5xx
+			cause = unclassifiedCause(o.Status)
 		}
 	}
 	ok := cause == CauseNone && o.Err == nil
 
-	// Failure is set deliberately, never inferred from Err. A 429 or a content
-	// refusal is an error to the caller and says nothing at all about whether
-	// the deployment is alive; counting them would open the circuit on a
-	// backend that is answering perfectly.
-	failure := cause == CauseUpstream5xx || cause == CauseTimeout
+	// Failure is set deliberately, never inferred from Err (see
+	// [countsAgainstAvailability]). An error to the CALLER and a failure of the
+	// DEPLOYMENT are different facts, and only the second one belongs here.
+	failure := countsAgainstAvailability(cause)
 	r.deps.Health.Report(d.Deployment, health.Outcome{
 		Err:          o.Err,
 		Failure:      failure,
@@ -1414,6 +1413,87 @@ func (r *Router) Report(d *Decision, o Outcome) {
 	if st != nil && st.stickySet && discardsPin(cause) {
 		r.sticky.discard(st.sticky)
 	}
+}
+
+// unclassifiedCause settles a failure neither the caller nor [Classify] could
+// name. It is the last word: nothing further is known about this attempt.
+//
+// A 4xx is the caller's request being refused. Every 4xx that means something
+// else is already named by Classify, so what arrives here is a 400, a 422, a
+// 404 — a body, a field or a route the caller got wrong. The deployment
+// examined it and said no, quickly and correctly, which is a backend WORKING.
+//
+// Defaulting it to CauseUpstream5xx, as this once did, made every such refusal
+// a liveness failure. internal/health opens a circuit after three consecutive
+// failures and an open circuit removes the deployment from selection for EVERY
+// tenant, so three malformed requests from any caller holding any key took a
+// healthy deployment away from everybody else — a cross-tenant denial of
+// service costing an attacker three requests. It also gave the request an
+// upstream_5xx fallback chain, so ONE bad body toured the group and then the
+// whole class, opening a circuit at each stop.
+//
+// Anything that is not a 4xx keeps the old default. A failure with no status at
+// all, or with a 2xx status and an error, is dorang unable to complete an
+// exchange it started: no response arrived, or the response could not be read,
+// converted or relayed. That is the deployment's side of the wire, and there is
+// nobody else to attribute it to.
+func unclassifiedCause(status int) Cause {
+	if status >= 400 && status < 500 {
+		return CauseBadRequest
+	}
+	return CauseUpstream5xx
+}
+
+// countsAgainstAvailability reports whether a cause is evidence about the
+// DEPLOYMENT rather than about the request, the caller or the credential.
+//
+// This is the whole of the router's half of the bargain internal/health
+// describes: that package tracks liveness and leaves the verdict here, because
+// only the router knows what the status meant. An open circuit is shared — it
+// removes the deployment from selection for every tenant at once — so the bar
+// for counting something is that the deployment itself is at fault.
+//
+// It is an allow-list over the vocabulary rather than a list of exclusions, so
+// that a cause added later counts for nothing until somebody argues it onto the
+// list. The safe direction is leaving a broken backend in service one request
+// longer, not standing a working one down.
+func countsAgainstAvailability(c Cause) bool {
+	switch c {
+	case CauseUpstream5xx, CauseTimeout:
+		// The deployment failed on its own account, or did not answer at all.
+		// This is the condition availability tracking exists for, and the only
+		// one: consecutive occurrences open the circuit, the cooldown elapses,
+		// and one probe decides whether it recovered.
+		return true
+
+	case CauseBadRequest, CauseContextWindow, CauseContentPolicy:
+		// The REQUEST was refused. All three are the backend reading the body
+		// and correctly declining it — a fast, accurate 4xx is a healthy
+		// deployment, not a failing one. They are also the three a caller can
+		// produce at will, which is what makes counting them a denial of service
+		// against every other tenant of the same deployment rather than a
+		// tuning mistake.
+		return false
+
+	case CauseRateLimit, CauseQuotaExhausted:
+		// Capacity, not liveness — and already acted on above:
+		// MarkUnavailable stands the deployment down for exactly the
+		// Retry-After the provider named. Counting it here as well would stack
+		// a second, unrelated cooldown on top of the one that was asked for.
+		return false
+
+	case CauseAuth:
+		// A dead credential, not a dead backend. Also already acted on:
+		// MarkUnavailable holds it out for AuthCooldown, which is long because
+		// a wrong key does not fix itself the way an overloaded backend does.
+		return false
+
+	case CauseBudgetExceeded:
+		// dorang's own refusal. The upstream was never called and has nothing
+		// to answer for.
+		return false
+	}
+	return false
 }
 
 func discardsPin(c Cause) bool {

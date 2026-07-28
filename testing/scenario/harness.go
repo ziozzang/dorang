@@ -48,13 +48,11 @@
 package scenario
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strconv"
 	"strings"
@@ -62,13 +60,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/health"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/router"
-	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/tokenest"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -300,10 +298,24 @@ func (f Family) shape() fake.Shape {
 	return fake.ShapeOpenAI
 }
 
+// api is the wire shape this family is spelled as everywhere below the
+// frontend. It is [catalog]'s vocabulary because that is what internal/backend
+// selects an adapter and a client encoder by.
+func (f Family) api() catalog.API {
+	if f == FamilyAnthropic {
+		return catalog.APIAnthropicMessages
+	}
+	return catalog.APIOpenAIChat
+}
+
 // Backend is where one deployment's traffic goes.
 type Backend struct {
-	// URL is the upstream's base URL.
-	URL string
+	// Provider is the resolved upstream, built by [backend.NewProvider] from
+	// the fake's URL. It is a real Provider and not a description of one: the
+	// endpoint derivation, the credential spelling, the wire adapter and the
+	// self-hosted engine profile all come from the package that decides them in
+	// production.
+	Provider *backend.Provider
 	// Family is the wire protocol the upstream speaks, which is not necessarily
 	// the client's.
 	Family Family
@@ -313,10 +325,17 @@ type Backend struct {
 }
 
 // Gateway is the composition under test.
+//
+// L5 is the real [backend.Backend]. Nothing in this file encodes a request,
+// converts a response or relays a stream: those are what the system under test
+// is responsible for producing, and a harness that produced its own copy would
+// hold its own bugs — which is how a complete second dispatch path once carried
+// four tool-call fixes that production never got, with a green suite either
+// side of it (DESIGN §17.1).
 type Gateway struct {
 	Router   *router.Router
+	L5       *backend.Backend
 	Backends map[string]Backend
-	Client   *http.Client
 
 	// MaxHops bounds fail-back attempts, mirroring router.FallbackConfig.
 	MaxHops int
@@ -378,7 +397,25 @@ func newGateway(t *testing.T, cfg router.Config, o rigOpts, backends map[string]
 	t.Helper()
 	r := newRig(t, cfg, o)
 	g := &gwRig{rig: r, ups: make(map[string]*fake.Upstream, len(backends))}
-	gw := &Gateway{Router: r.router, Backends: map[string]Backend{}, MaxHops: cfg.Fallback.MaxHops}
+	gw := &Gateway{
+		Router:   r.router,
+		L5:       backend.New(backend.Options{Now: r.clock.now}),
+		Backends: map[string]Backend{},
+		MaxHops:  cfg.Fallback.MaxHops,
+	}
+	// The deployment's KIND selects the self-hosted engine profile, and that
+	// profile is load-bearing: it decides the direction of the priority field
+	// and whether service_tier may be sent at all (§4.4, §7.5). Reading it off
+	// the same router.Config the router was built from is what keeps the
+	// engine the transport talks to and the engine the router normalized for
+	// from being two different engines.
+	kinds := make(map[string]string, len(backends))
+	for gi := range cfg.Groups {
+		for di := range cfg.Groups[gi].Deployments {
+			d := &cfg.Groups[gi].Deployments[di]
+			kinds[d.ID] = d.Kind
+		}
+	}
 	for id, opts := range backends {
 		if opts.Name == "" {
 			opts.Name = id
@@ -390,7 +427,13 @@ func newGateway(t *testing.T, cfg router.Config, o rigOpts, backends map[string]
 		if opts.Shape == fake.ShapeAnthropic {
 			fam = FamilyAnthropic
 		}
-		gw.Backends[id] = Backend{URL: u.URL, Family: fam, MaxTokens: 4096}
+		p, err := backend.NewProvider(backend.Spec{
+			Name: "prov-" + id, Kind: kinds[id], API: fam.api(), BaseURL: u.URL,
+		})
+		if err != nil {
+			t.Fatalf("backend.NewProvider(%s): %v", id, err)
+		}
+		gw.Backends[id] = Backend{Provider: p, Family: fam, MaxTokens: 4096}
 	}
 	g.gw = gw
 	return g
@@ -516,325 +559,132 @@ type dispatchResult struct {
 	firstByte bool
 }
 
-// dispatch encodes the neutral request for the target's family, sends it, and
-// converts the answer back into the client's family.
+// dispatch runs one attempt through internal/backend — the same L5 the
+// interactive dispatcher runs — and renders its result the way internal/app
+// does.
+//
+// What is faked here is a dependency and nothing else: the upstream is a fake
+// server on a real socket, and the client's connection is an
+// [httptest.ResponseRecorder]. What is NOT faked is anything the system under
+// test produces. The request encoding, the priority splice, the endpoint, the
+// response conversion and the streaming relay all come from internal/backend,
+// so a defect in any of them fails a scenario instead of being papered over by
+// a second implementation that happens to be right (DESIGN §17.1).
 func (g *Gateway) dispatch(ctx context.Context, c Call, req *canonical.Request, d *router.Decision) (dispatchResult, router.Outcome) {
 	be, ok := g.Backends[d.Deployment]
 	if !ok {
 		return dispatchResult{}, router.Outcome{Err: fmt.Errorf("no backend for deployment %q", d.Deployment)}
 	}
 
-	// DESIGN §7.2: upstream always receives the REAL model id.
-	upBody, err := encodeRequest(be, req, d.UpstreamModel)
-	if err != nil {
-		return dispatchResult{}, router.Outcome{Err: err}
-	}
-	// The priority on the decision is already direction-normalized for this
-	// engine (§7.5): it is the number that goes on the wire, not the canonical
-	// class value. Emitting it is the transport's job, and this is the
-	// transport.
-	if upBody, err = emitPriority(upBody, d); err != nil {
-		return dispatchResult{}, router.Outcome{Err: err}
-	}
+	// The client's socket. A stream is written through it frame by frame by the
+	// real relay; a recorder is where those frames land instead of a network
+	// connection. It implements http.Flusher, so the relay's per-frame flush is
+	// exercised rather than skipped.
+	w := httptest.NewRecorder()
 
-	start := time.Now()
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, be.URL+be.Family.shape().Path(), bytes.NewReader(upBody))
-	if err != nil {
-		return dispatchResult{}, router.Outcome{Err: err}
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	// §15.2.3: identity encoding upstream. The relay has to read the terminal
-	// usage frame anyway, so it never wanted compressed bytes.
-	httpReq.Header.Set("Accept-Encoding", "identity")
+	res := g.L5.Do(ctx, backend.Target{
+		Provider:      be.Provider,
+		Credential:    d.Credential,
+		UpstreamModel: d.UpstreamModel,
+		// Already direction-normalized for this engine by internal/router
+		// (§7.5). It is passed through untouched: the harness computing its own
+		// wire value is how a suite ends up agreeing with a router that has the
+		// sign backwards.
+		PriorityField: d.PriorityField,
+		Priority:      d.Priority,
+		PriorityTier:  d.PriorityTier,
+	}, &backend.Call{
+		Op:        backend.OpChat,
+		ClientAPI: c.Family.api(),
+		// DESIGN §7.2: the CLIENT's name goes in the answer, and the real
+		// upstream id goes on the wire. Both halves are the backend's to apply.
+		Model:            req.Model,
+		Body:             c.Body,
+		Request:          req,
+		Stream:           req.Stream,
+		DefaultMaxTokens: be.MaxTokens,
+		IncludeUsage:     req.IncludeUsage(),
+	}, w)
 
-	client := g.Client
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return dispatchResult{}, router.Outcome{Err: err, Total: time.Since(start)}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		oc := router.Outcome{
-			Err:    fmt.Errorf("upstream %d", resp.StatusCode),
-			Status: resp.StatusCode,
-			Total:  time.Since(start),
-		}
-		// A context overflow reaches dorang as a 400 whose only distinguishing
-		// mark is the body, which is why [router.Outcome.Cause] documents itself
-		// as the frontend's job for exactly this condition. server.Normalize
-		// decodes all five upstream envelope shapes; router.ClassifyBody reads
-		// the result. Leaving Cause zero for anything unrecognised keeps every
-		// other 400 terminal, as before.
-		//
-		// NativeMessage, not Message: COMPATIBILITY §11.3 moved the upstream's
-		// own text out of the client-facing Message, which is now a function of
-		// the status line alone. This is the same field internal/app's
-		// upstreamCause reads, and it has to be — a classifier scanning dorang's
-		// own words for a vendor's phrase finds none and silently stops
-		// classifying.
-		if e := server.Normalize(resp.StatusCode, body); e != nil {
-			oc.Cause = router.ClassifyBody(resp.StatusCode, e.Code, e.NativeMessage)
-		}
-		if ra := resp.Header.Get("retry-after"); ra != "" {
-			if secs, err := strconv.Atoi(ra); err == nil {
-				oc.RetryAfter = time.Duration(secs) * time.Second
-			}
-		}
-		if reset := resp.Header.Get("x-ratelimit-reset-requests"); reset != "" {
-			if at, err := time.Parse(time.RFC3339, reset); err == nil {
-				oc.ResetAt = at
-			}
-		}
-		return dispatchResult{status: resp.StatusCode, body: body}, oc
-	}
-
-	if req.Stream {
-		return g.relayStream(c, req, d, be, resp, start)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return dispatchResult{status: 200}, router.Outcome{Err: err, Total: time.Since(start)}
-	}
-	out, u, err := convertResponse(be.Family, c.Family, body, req.Model)
-	if err != nil {
-		return dispatchResult{status: 200}, router.Outcome{Err: err, Total: time.Since(start)}
-	}
-	oc := router.Outcome{Status: 200, Total: time.Since(start)}
-	if u != nil {
-		oc.InputTokens, oc.OutputTokens = int64(u.InputTokens), int64(u.OutputTokens)
-	}
-	return dispatchResult{status: 200, body: out}, oc
+	return backendResult(res, w)
 }
 
-// relayStream converts an upstream stream into the client's family.
+// backendResult renders one exchange in the two shapes the loop above needs: a
+// [router.Outcome] for Report, and the bytes the client saw.
 //
-// Two paths, and the difference is the point of §15.2.3:
-//   - same family, and the model name has to change: the single-pass scanner,
-//     which never decodes a frame.
-//   - crossing families: decode to neutral events and re-encode, because there
-//     is no byte-level correspondence between the two framings.
-func (g *Gateway) relayStream(c Call, req *canonical.Request, d *router.Decision, be Backend, resp *http.Response, start time.Time) (dispatchResult, router.Outcome) {
-	var out bytes.Buffer
-	oc := router.Outcome{Status: 200}
-
-	if be.Family == FamilyOpenAI && c.Family == FamilyOpenAI {
-		sc := openai.NewScanner(&out, openai.ScannerOptions{
-			From: d.UpstreamModel, To: req.Model, CollectUsage: true,
-		})
-		n, err := io.Copy(sc, resp.Body)
-		_ = sc.Flush()
-		oc.Total = time.Since(start)
-		if n > 0 {
-			oc.FirstByteSent = true
-		}
-		if err != nil {
-			oc.Err = err
-			return dispatchResult{status: 200, body: out.Bytes(), firstByte: n > 0}, oc
-		}
-		if u, ok := sc.Usage(); ok {
-			oc.InputTokens, oc.OutputTokens = int64(u.InputTokens), int64(u.OutputTokens)
-		}
-		// An in-band error frame is a failure the status can no longer report
-		// (COMPATIBILITY 1.3). It is surfaced as one so the scenario can assert
-		// that no further hop follows it.
-		if bytes.Contains(out.Bytes(), []byte(`"error":`)) {
-			oc.Err = errMidStream
-		}
-		return dispatchResult{status: 200, body: out.Bytes(), firstByte: n > 0}, oc
+// It mirrors internal/app's function of the same name, and that mirroring is
+// the one duplication left in this file. It exists because app's version is
+// unexported; see the note in DESIGN §17.1.
+func backendResult(res backend.Result, w *httptest.ResponseRecorder) (dispatchResult, router.Outcome) {
+	out := dispatchResult{status: res.Status, firstByte: res.FirstByteSent}
+	switch {
+	case res.FirstByteSent:
+		// Once a byte is out the status is 200 and cannot change
+		// (COMPATIBILITY 1.3), and the body is whatever reached the client.
+		out.status, out.body = http.StatusOK, w.Body.Bytes()
+	case res.Body != nil:
+		out.body = res.Body
+	case res.ErrorBody != nil:
+		// The upstream's own envelope, credential-scrubbed. A scenario that
+		// asserts on an error body is asserting on what the vendor said.
+		out.body = res.ErrorBody
 	}
 
-	events, usage, midErr, err := decodeStream(be.Family, resp.Body)
-	oc.Total = time.Since(start)
-	if err != nil {
-		oc.Err = err
-		return dispatchResult{status: 200}, oc
+	if res.Err == nil {
+		return out, router.Outcome{
+			Status: res.Status, TTFT: res.TTFT, Total: res.Total,
+			FirstByteSent: res.FirstByteSent,
+			InputTokens:   int64(res.Usage.InputTokens),
+			OutputTokens:  int64(res.Usage.OutputTokens),
+		}
 	}
-	body, werr := encodeStream(c.Family, req, events, usage)
-	if werr != nil {
-		oc.Err = werr
-		return dispatchResult{status: 200}, oc
+	oc := router.Outcome{
+		Err: res.Err, Status: res.Status, Cause: upstreamCause(res),
+		TTFT: res.TTFT, Total: res.Total,
+		FirstByteSent: res.FirstByteSent, RetryAfter: res.RetryAfter,
 	}
-	if usage != nil {
-		oc.InputTokens, oc.OutputTokens = int64(usage.InputTokens), int64(usage.OutputTokens)
-	}
-	oc.FirstByteSent = len(body) > 0
-	if midErr != nil {
-		oc.Err = midErr
-	}
-	return dispatchResult{status: 200, body: body, firstByte: len(body) > 0}, oc
+	return out, oc
 }
 
-var errMidStream = errors.New("scenario: upstream failed mid-stream")
+// upstreamCause is the half of the classification a frontend owns.
+//
+// [router.Classify] reads the status line and stops there, deliberately, so
+// [router.Report] can do the rest for itself. The one thing it cannot do is
+// recognise a context overflow, because a 400 that overflowed and a 400 that
+// was malformed differ only in the body — which is why [router.Outcome.Cause]
+// documents reading it as the caller's job. internal/backend has already
+// decoded that body out of whichever of the five upstream envelope shapes
+// arrived; this asks the decoded fields the one question.
+//
+// Everything else is left zero on purpose. Handing the router a cause derived
+// from the status line here would be this harness deciding something the router
+// decides in production, and the two could then disagree without any test
+// noticing.
+//
+// The field is NativeMessage and not Message, exactly as internal/app's
+// upstreamCause reads it: COMPATIBILITY §11.3 gives the envelope dorang's own
+// canonical wording, and the upstream's own sentence — the only place an
+// overflow signature exists — survives beside it. Reading Message here scans
+// dorang's constant for vLLM's phrasing and never matches.
+func upstreamCause(res backend.Result) router.Cause {
+	if res.Status < 400 || res.Err == nil {
+		return router.CauseNone
+	}
+	return router.ClassifyBody(res.Status, res.Err.Code, res.Err.NativeMessage)
+}
 
 // -----------------------------------------------------------------------------
-// wire conversion
+// the client's own protocol
 // -----------------------------------------------------------------------------
 
+// decodeRequest is the frontend's half: turning the caller's bytes into the
+// neutral form. internal/server does this in the assembled binary, over the
+// same two wire packages.
 func decodeRequest(f Family, b []byte) (*canonical.Request, error) {
 	if f == FamilyAnthropic {
 		return anthropic.DecodeRequest(b)
 	}
 	return openai.DecodeRequest(b)
-}
-
-// emitPriority splices the decision's wire priority into an encoded request.
-//
-// It is a splice rather than a field on the neutral request because the value
-// is per-ENGINE: the same canonical class produces +10 on vLLM and -10 on
-// SGLang, so it cannot be decided before the deployment is known. A neutral
-// request carrying one number would be an inversion on one of the two engines,
-// which is the failure DESIGN §7.5 exists to prevent.
-func emitPriority(body []byte, d *router.Decision) ([]byte, error) {
-	if d.PriorityField == "" && d.PriorityTier == "" {
-		return body, nil
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return nil, err
-	}
-	if d.PriorityField != "" {
-		obj[d.PriorityField] = json.RawMessage(strconv.Itoa(d.Priority))
-	}
-	if d.PriorityTier != "" {
-		tier, err := json.Marshal(d.PriorityTier)
-		if err != nil {
-			return nil, err
-		}
-		obj["service_tier"] = tier
-	}
-	return json.Marshal(obj)
-}
-
-func encodeRequest(be Backend, req *canonical.Request, upstreamModel string) ([]byte, error) {
-	if be.Family == FamilyAnthropic {
-		max := be.MaxTokens
-		if max == 0 {
-			max = 4096
-		}
-		return anthropic.MarshalRequest(req, &anthropic.EncodeOptions{
-			Model: upstreamModel, DefaultMaxTokens: max,
-		})
-	}
-	return openai.MarshalRequest(req, &openai.EncodeOptions{Model: upstreamModel})
-}
-
-// convertResponse renders an upstream response in the client's family, with the
-// model field carrying the name the CLIENT asked for (DESIGN §7.2).
-func convertResponse(from, to Family, body []byte, clientModel string) ([]byte, *canonical.Usage, error) {
-	var (
-		r   *canonical.Response
-		err error
-	)
-	if from == FamilyAnthropic {
-		r, err = anthropic.DecodeResponse(body, &anthropic.DecodeOptions{Model: clientModel})
-	} else {
-		r, err = openai.DecodeResponse(body, &openai.DecodeOptions{Model: clientModel})
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-	r.Model = clientModel
-
-	var out []byte
-	if to == FamilyAnthropic {
-		out, err = anthropic.MarshalResponse(r, &anthropic.ResponseOptions{Model: clientModel})
-	} else {
-		out, err = openai.MarshalResponse(r, &openai.ResponseOptions{Model: clientModel})
-	}
-	return out, r.Usage, err
-}
-
-// decodeStream reads an upstream stream into neutral events. midErr is non-nil
-// when the upstream delivered an in-band error.
-func decodeStream(from Family, body io.Reader) (events []canonical.StreamEvent, usage *canonical.Usage, midErr error, err error) {
-	raw, err := io.ReadAll(body)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if from == FamilyAnthropic {
-		evs, derr := anthropic.DecodeStream(raw, nil)
-		if derr != nil {
-			return nil, nil, nil, derr
-		}
-		for i := range evs {
-			ev := evs[i]
-			if ev.Type == canonical.EventError {
-				midErr = errMidStream
-				continue
-			}
-			if ev.Usage != nil {
-				u := *ev.Usage
-				usage = &u
-			}
-			events = append(events, ev)
-		}
-		return events, usage, midErr, nil
-	}
-
-	for _, frame := range sseFrames(raw) {
-		payload := strings.TrimPrefix(frame, "data: ")
-		if payload == "[DONE]" {
-			continue
-		}
-		if strings.HasPrefix(payload, `{"error"`) {
-			midErr = errMidStream
-			continue
-		}
-		c, evs, derr := openai.DecodeChunk([]byte(payload), nil)
-		if derr != nil {
-			return nil, nil, nil, derr
-		}
-		if c.Usage != nil {
-			usage = &canonical.Usage{
-				InputTokens:  c.Usage.PromptTokens,
-				OutputTokens: c.Usage.CompletionTokens,
-			}
-		}
-		events = append(events, evs...)
-	}
-	return events, usage, midErr, nil
-}
-
-// streamWriter is the half of a wire package's StreamWriter this relay uses.
-// Both families satisfy it, which is what keeps the two branches below to their
-// one real difference — which encoder is constructed.
-type streamWriter interface {
-	WriteEvent(canonical.StreamEvent) error
-	Close() error
-}
-
-func encodeStream(to Family, req *canonical.Request, events []canonical.StreamEvent, usage *canonical.Usage) ([]byte, error) {
-	// buf.Bytes() captures the length at the moment it is called, so it must
-	// never be evaluated before Close: `return buf.Bytes(), w.Close()` silently
-	// truncates the terminal frames, which on the Anthropic side means a stream
-	// with no message_delta and no message_stop — a shape this family's SDK
-	// treats as a transport failure.
-	var buf bytes.Buffer
-	var w streamWriter
-	if to == FamilyAnthropic {
-		w = anthropic.NewStreamWriter(&buf, anthropic.StreamConfig{Model: req.Model})
-	} else {
-		w = openai.NewStreamWriter(&buf, openai.StreamConfig{
-			Model: req.Model, IncludeUsage: req.IncludeUsage(),
-		})
-	}
-	for _, ev := range events {
-		if err := w.WriteEvent(ev); err != nil {
-			return buf.Bytes(), err
-		}
-	}
-	if usage != nil {
-		if err := w.WriteEvent(canonical.StreamEvent{Type: canonical.EventUsage, Usage: usage}); err != nil {
-			return buf.Bytes(), err
-		}
-	}
-	err := w.Close()
-	return buf.Bytes(), err
 }
 
 // sseFrames cuts an SSE body into frames.

@@ -85,18 +85,6 @@ type Request struct {
 	// Session identifies the conversation for session stickiness. Empty means
 	// no pin is created and none is consulted.
 	Session string
-	// PrincipalMax is this caller's own concurrency ceiling, from the key,
-	// user or team column max_parallel_requests — the most restrictive of the
-	// three. Zero means the subject declares none and only the deployment's
-	// static capacity.principals table applies.
-	//
-	// It travels on the request rather than living in internal/capacity's
-	// configuration because it is a per-credential value that arrives with the
-	// credential, and the broker's table is static YAML loaded at startup. The
-	// column existed, was imported, was administered, and reached no enforcement
-	// at all until it was carried here.
-	PrincipalMax int
-
 	// Required is what this request actually uses (§10.1). Its structural bits
 	// are a filter: a deployment that cannot express them is removed before
 	// ranking, never chosen and silently downgraded.
@@ -119,6 +107,18 @@ type Request struct {
 	// PriorityHint is a client hint, clamped to the principal's permitted range
 	// (§10.5). Nil means the class alone decides.
 	PriorityHint *int
+	// PrincipalMax is this caller's own concurrency ceiling, from the key, user
+	// or team column max_parallel_requests — the most restrictive of the three.
+	// Zero means the subject declares none and only the deployment's static
+	// capacity.principals table applies. It tightens the principal capacity axis
+	// for this request; see capacity.Request.
+	//
+	// It travels on the request rather than living in internal/capacity's
+	// configuration because it is a per-credential value that arrives with the
+	// credential, and the broker's table is static YAML loaded at startup. The
+	// column existed, was imported, was administered, and reached no enforcement
+	// at all until it was carried here.
+	PrincipalMax int
 
 	// InputTokens is the estimated prompt size. §10.5a requires the estimate to
 	// err pessimistic: an over-estimate costs an unnecessary route to a larger
@@ -289,6 +289,21 @@ func (o Outcome) OK() bool { return o.Err == nil && o.Cause == CauseNone }
 // a content-policy refusal are both 400 with a vendor-specific signature, and
 // §15.5 forbids regular expressions on this path. The frontend that decoded the
 // body sets [Outcome.Cause] for those two.
+//
+// # The 4xx boundary
+//
+// Most of a status line's information is in the first digit, and the one place
+// that is not true is 4xx. A 4xx normally means the REQUEST was wrong, which
+// says nothing whatever about the deployment that said so — but four of them are
+// the deployment or the credential talking, and each is named below with the
+// reason it is on that side. Everything else returns [CauseNone] and is settled
+// by [Router.Report], which is the last point where anything more is known; see
+// [unclassifiedCause] for why the default there is not "the upstream failed".
+//
+// Getting this wrong in the permissive direction is not a cosmetic error. A
+// cause on the availability side opens a circuit that is SHARED by every tenant,
+// so a 4xx wrongly counted there is a cross-tenant outage that any caller with a
+// key can trigger by sending a handful of bad requests.
 func Classify(status int, err error) Cause {
 	if err != nil {
 		if quota.IsTerminal(err) && errors.Is(err, quota.ErrBudgetExceeded) {
@@ -305,6 +320,9 @@ func Classify(status int, err error) Cause {
 		}
 		return CauseNone
 	case status == 401:
+		// The CREDENTIAL is dead, not the request and not the backend. §7.6
+		// marks it exhausted rather than counting a liveness failure, because a
+		// wrong key stays wrong for longer than any circuit cooldown.
 		return CauseAuth
 	case status == 403:
 		// 403 is ambiguous on purpose: every vendor uses it for at least two of
@@ -314,12 +332,39 @@ func Classify(status int, err error) Cause {
 		// as content policy sends a broken credential around the whole class.
 		return CauseAuth
 	case status == 408 || status == 504:
+		// The deployment did not answer in time. That is a statement about the
+		// deployment, whichever side of 500 the status happens to fall.
 		return CauseTimeout
-	case status == 429:
+	case status == 409:
+		// Capacity wearing a 4xx. Several OpenAI-compatible servers answer 409
+		// while a model is still loading, which internal/batch already records
+		// as transient in DefaultRetryStatus. It is the deployment being
+		// temporarily unable to serve — a 503 in all but the digit — so it
+		// classifies as one and is counted, probed and recovered like one.
+		return CauseUpstream5xx
+	case status == 425 || status == 429:
+		// Both are back-pressure: 429 outright, and 425 ("too early") as the
+		// server asking for the same request again later. Neither is a liveness
+		// verdict, and Report already stands the deployment down for exactly the
+		// Retry-After the provider named.
 		return CauseRateLimit
 	case status >= 500:
 		return CauseUpstream5xx
 	}
+	// Everything else, including every remaining 4xx. Notably NOT here:
+	//
+	//   - 400 and 422. Malformed or invalid bodies. A backend that answers one
+	//     is working; this is the status the caller controls completely, and
+	//     counting it against availability is the cross-tenant denial of service
+	//     described above.
+	//   - 404. A model or route the deployment does not have. It is a
+	//     configuration error, and it will be a configuration error on the next
+	//     request too — a circuit that opens, cools down and re-opens forever
+	//     hides that from the operator instead of showing it to them.
+	//   - 413. The caller's body is too large. Sending it to a second backend
+	//     reaches an identical refusal one hop later.
+	//   - 499. dorang's own code for "the client hung up" (internal/server's
+	//     passthrough). The upstream never got the chance to fail.
 	return CauseNone
 }
 
