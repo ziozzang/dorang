@@ -86,7 +86,9 @@ func newResponsesStore(st *store.Store, now func() time.Time) *responsesStore {
 // §11.2's "Unknown resource" row): distinguishing them turns the endpoint into
 // an oracle over other callers' ids.
 func responseNotFound() error {
-	return server.NewError(http.StatusNotFound, server.TypeInvalidRequest,
+	// The canonical spelling; server.Error.ForFamily projects it onto the
+	// caller's family (COMPATIBILITY §11.2's two type columns).
+	return server.NewError(http.StatusNotFound, server.TypeNotFound,
 		"no such response").WithCode("not_found").WithParam("previous_response_id")
 }
 

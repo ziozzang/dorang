@@ -439,7 +439,7 @@ func (a *App) handleBatchCreate(w http.ResponseWriter, rq *server.Request) error
 	}
 	if err := json.Unmarshal(rq.Body.Bytes(), &body); err != nil {
 		return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-			err.Error()).WithCode("invalid_body")
+			err.Error()).WithCode(server.CodeInvalidRequest)
 	}
 	// The create body names no model, so there is nothing here to put through
 	// AuthorizeModel. What makes that safe is stated rather than assumed: the
@@ -515,7 +515,7 @@ func (a *App) handleFileUpload(w http.ResponseWriter, rq *server.Request) error 
 	mr, err := rq.HTTP.MultipartReader()
 	if err != nil {
 		return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-			"expected a multipart/form-data body").WithCode("invalid_body")
+			"expected a multipart/form-data body").WithCode(server.CodeInvalidRequest)
 	}
 	purpose := ""
 	for {
@@ -525,7 +525,7 @@ func (a *App) handleFileUpload(w http.ResponseWriter, rq *server.Request) error 
 		}
 		if err != nil {
 			return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-				err.Error()).WithCode("invalid_body")
+				err.Error()).WithCode(server.CodeInvalidRequest)
 		}
 		switch part.FormName() {
 		case "purpose":
@@ -616,7 +616,7 @@ func batchError(err error) error {
 	}
 	switch {
 	case errors.Is(err, batch.ErrNotFound):
-		return server.NewError(http.StatusNotFound, server.TypeInvalidRequest, err.Error()).
+		return server.NewError(http.StatusNotFound, server.TypeNotFound, err.Error()).
 			WithCode("not_found")
 	case errors.Is(err, batch.ErrInvalidRequest):
 		return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest, err.Error()).

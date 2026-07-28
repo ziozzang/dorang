@@ -1024,3 +1024,62 @@ func TestVersionMustMatch(t *testing.T) {
 		t.Errorf("want an unsupported-version problem, got %v", err)
 	}
 }
+
+// TestCompatRefusesWhatThisBuildCannotServe is COMPATIBILITY §3.3 and §6.8 kept
+// honest at load time.
+//
+// Both keys are documented as operator-settable and neither reaches its
+// consumer: the value would have to travel through backend.Call into
+// internal/wire, and backend.Call has no field for it. DESIGN §17.1 names a
+// setting that loads and does nothing as this repository's dominant defect, so
+// these are refused rather than accepted and ignored — an operator who sets one
+// finds out at the moment they set it.
+func TestCompatRefusesWhatThisBuildCannotServe(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"usage_chunk_choices empty", "compat: {usage_chunk_choices: empty}\n",
+			"compat.usage_chunk_choices"},
+		{"usage_chunk_choices nonsense", "compat: {usage_chunk_choices: banana}\n",
+			"compat.usage_chunk_choices"},
+		{"anthropic_total_tokens false", "compat: {anthropic_total_tokens: false}\n",
+			"compat.anthropic_total_tokens"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LoadBytes([]byte("version: 1\n" + c.yaml))
+			if err == nil {
+				t.Fatalf("%s loaded; a setting that does nothing must be refused, not ignored", c.yaml)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the refusal does not name the key: %v", err)
+			}
+		})
+	}
+
+	// The values this build DOES serve load, so the refusal is about the gap and
+	// not about the block existing.
+	for _, y := range []string{
+		"compat: {legacy_headers: true}\n",
+		"compat: {usage_chunk_choices: stub, anthropic_total_tokens: true}\n",
+	} {
+		cfg, err := LoadBytes([]byte("version: 1\n" + y))
+		if err != nil {
+			t.Fatalf("%s: %v", y, err)
+		}
+		if cfg.Compat.UsageChunkChoices != UsageChunkChoicesStub {
+			t.Errorf("%s: usage_chunk_choices defaulted to %q", y, cfg.Compat.UsageChunkChoices)
+		}
+		if cfg.Compat.AnthropicTotalTokens == nil || !*cfg.Compat.AnthropicTotalTokens {
+			t.Errorf("%s: anthropic_total_tokens did not default to true", y)
+		}
+	}
+
+	// And the block is reachable at all, which it was not: `compat:` was an
+	// unknown key under the strict decode of §0.1.
+	if _, err := LoadBytes([]byte("version: 1\ncompat: {legacy_headers: false}\n")); err != nil {
+		t.Fatalf("the compat block is not in the schema: %v", err)
+	}
+}

@@ -389,7 +389,12 @@ func (s *Server) handleModelRetrieve(w http.ResponseWriter, rq *Request) error {
 		}
 	}
 	if found == nil || (rq.Principal != nil && !rq.Principal.AllowsModel(id)) {
-		return NewError(http.StatusNotFound, TypeInvalidRequest,
+		// TypeNotFound, not TypeInvalidRequest: a raiser sets the canonical
+		// (Anthropic) spelling and [Error.ForFamily] projects it, so no site has
+		// to know which family it is on. This route is OpenAI-shaped and the
+		// projection folds it back to invalid_request_error; writing that here
+		// would be right by accident.
+		return NewError(http.StatusNotFound, TypeNotFound,
 			"no such model").WithCode(CodeModelNotFound).WithParam("model")
 	}
 
