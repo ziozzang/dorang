@@ -371,11 +371,48 @@ func MarshalModerationRequest(req *canonical.ModerationRequest, model string) ([
 	return Marshal(w)
 }
 
+// ErrNotAModerationResponse is a JSON object that parsed cleanly and is not a
+// moderations answer.
+//
+// The same condition [ErrNotAResponse] names on the chat surface, found by
+// looking for the class rather than waiting for a report of it. A vendor that
+// answers HTTP 200 with `{"code":500,"msg":"404 NOT_FOUND","success":false}`
+// unmarshalls into a zero-valued [ModerationResponse] without error, and this
+// surface makes that WORSE than an empty answer rather than better: every member
+// dorang does not model rides through Extra and is re-serialized on the way out,
+// so the client received the vendor's error envelope whole, with dorang's own
+// `model` spliced into it and an empty `results` array beside it, over a 200.
+var ErrNotAModerationResponse = errorString("openai: the body is a JSON object but not a moderation response")
+
+// IsModerationResponse reports whether a decoded body is a moderations answer.
+//
+// This surface has NO discriminator to accept on. The `object: "list"` member
+// [ObjectModerationList] names is not on a moderations answer — it is the
+// embeddings and models lists that carry it — so the "either ground" rule the
+// chat gate states reduces here to its second ground alone: `results` must be
+// PRESENT.
+//
+// Presence, not value. `{"results":[]}` is the correct answer to a request whose
+// input array was empty, and requiring a non-empty verdict would refuse it.
+//
+// `id` and `model` are deliberately not grounds. Both are members a vendor error
+// envelope can plausibly carry — `model` in particular is echoed by several
+// error shapes — and accepting on them would put the gate back where it started.
+func IsModerationResponse(w *ModerationResponse) bool {
+	return w != nil && w.Results != nil
+}
+
 // DecodeModerationResponse parses a moderation answer into the neutral form.
+//
+// It returns [ErrNotAModerationResponse] for a JSON object that is not one.
+// Parsing without error is not the same fact as "this is an answer".
 func DecodeModerationResponse(b []byte, model string) (*canonical.ModerationResponse, error) {
 	var w ModerationResponse
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
+	}
+	if !IsModerationResponse(&w) {
+		return nil, ErrNotAModerationResponse
 	}
 	out := &canonical.ModerationResponse{ID: w.ID, Model: w.Model, Extra: w.Extra}
 	if model != "" {

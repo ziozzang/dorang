@@ -90,8 +90,17 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	//     string across frames — surgery on a scanner that deliberately does not
 	//     parse. §10.5 settles the trade: reconstruction is the normal case, so a
 	//     filtered request takes the neutral path, and only a filtered one pays.
+	//   - compat.usage_chunk_choices asking for the strict shape (§3.3). On this
+	//     path the usage chunk is the UPSTREAM's bytes, forwarded whole, so
+	//     dorang does not decide its `choices` array — the backend does. An
+	//     operator who selects `empty` is asking for a guarantee the relay cannot
+	//     give, and honouring it on the crossing path while ignoring it here
+	//     would be the same "loads and does nothing" defect one layer down. Only
+	//     the non-default value pays: `stub` and unset both stay on the relay,
+	//     which is what all but a handful of deployments run.
 	if x.call.ClientAPI == catalog.APIOpenAIChat && x.prov.api == catalog.APIOpenAIChat &&
-		x.names.Len() == 0 && x.call.Transform == nil {
+		x.names.Len() == 0 && x.call.Transform == nil &&
+		x.call.UsageChunkChoices != openai.UsageChunkChoicesEmpty {
 		// The scanner forwards bytes, so nothing on this path decodes a frame —
 		// and nothing on it noticed an upstream that stopped answering either.
 		// [relayWatch] sits between the scanner and the client and reads the two
@@ -269,6 +278,10 @@ func newEventSink(c *Call, w io.Writer, now func() time.Time) (eventSink, error)
 			Model:        c.Model,
 			IncludeUsage: c.IncludeUsage,
 			Now:          now,
+			// COMPATIBILITY §3.3. Empty is UsageChunkChoicesStub inside
+			// NewStreamWriter, so an unset call keeps the reference proxy's
+			// shape and nothing branches for the default.
+			UsageChunkChoices: c.UsageChunkChoices,
 		})}, nil
 	}
 	return nil, noOperation(string(c.ClientAPI), OpChat, "no streaming encoder for this caller protocol")

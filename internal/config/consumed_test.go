@@ -159,21 +159,23 @@ var readExempt = map[string]bool{
 	// Refused here as well: numeric metering cannot be turned off, so the flag
 	// exists to carry the refusal rather than to be consulted downstream.
 	"Config.Metering.Numeric": true,
-	// Refused at their non-default value by validateCompat, for a reason the
-	// refusal message states: the value would have to reach internal/wire
-	// through a field on backend.Call, and there is no such field. They are
-	// here rather than in knownUnwired because they are not inert — a
-	// configuration that asks for the shape this build cannot serve fails to
-	// load instead of being quietly ignored. COMPATIBILITY §3.3 and §6.8;
-	// docs/CONFIG.md §23.1 carries the same two rows in prose.
+	// Config.Compat.UsageChunkChoices and Config.Compat.AnthropicTotalTokens
+	// were here, refused at their non-default value because the value had no
+	// path from configuration into internal/wire. Both are wired now — they
+	// travel on backend.Call, filled from dispatchState in internal/app — so the
+	// entries are gone with the refusals they documented.
 	//
-	// Config.Compat.UsageChunkChoices in particular must stay listed even
-	// though the scan currently finds the name: the identifier it matches is
-	// internal/wire/openai's own UsageChunkChoices TYPE, not a read of this
-	// field, so the check passes for the wrong reason and would keep passing if
-	// this were deleted.
-	"Config.Compat.UsageChunkChoices":    true,
-	"Config.Compat.AnthropicTotalTokens": true,
+	// The removal is deliberately not evidence of anything. This check is
+	// SILENT for a readExempt entry that is read: the case body is empty, so
+	// unlike knownUnwired there is no back-pressure telling you to delete a
+	// stale one. UsageChunkChoices makes it worse — the scan matches
+	// internal/wire/openai's own UsageChunkChoices TYPE by containment, so it
+	// would report "read" whether or not this field were, and it did so for the
+	// whole time it was refused. What proves the wiring is
+	// TestUsageChunkChoicesIsSelectableFromConfiguration and
+	// TestAnthropicTotalTokensIsSelectableFromConfiguration in internal/app,
+	// which drive a loaded configuration to an emitted frame and assert the
+	// shape changes with it.
 }
 
 // knownUnwired is the ledger of settings that still load and do nothing. It is

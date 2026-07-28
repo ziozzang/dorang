@@ -124,6 +124,81 @@ func SpeechMediaType(format string) string {
 	}
 }
 
+// ErrNotSpeechAudio is an upstream 200 on the speech route whose body is not an
+// audio container.
+//
+// It is the same defect class as [ErrNotAResponse] on a surface where the JSON
+// rule cannot be applied at all, and it is the worst-placed member of the class
+// in this build. Speech is a pure BYTE RELAY: the upstream's bytes are handed to
+// the client unexamined, and dorang stamps its OWN content type on them —
+// derived from the container the caller asked for, not from what the backend
+// said, because a self-hosted engine routinely mislabels real audio. So a vendor
+// error envelope came back out as `{"code":500,"msg":"404 NOT_FOUND"}` under
+// `Content-Type: audio/mpeg`, over a 200. Nothing downstream can tell that from
+// audio until a player, a browser or an ffmpeg in someone's pipeline fails on it,
+// a long way from the gateway that produced it.
+var ErrNotSpeechAudio = errorString("openai: the speech route answered 200 with a body that is not audio")
+
+// IsSpeechAudio reports whether a speech answer is an audio container.
+//
+// # Why the JSON rule does not apply here
+//
+// Every other gate in this package asks whether a decoded object carries one of
+// the members its family's answers have. A speech answer has no members: it is
+// an MP3, an Ogg page, a FLAC frame or raw PCM. There is no discriminator to
+// read, no payload key to find present, and unmarshalling it is not a thing that
+// can be attempted. The pair of facts that IS available is what the upstream
+// labelled the body and whether there are any bytes in it, so that is the test.
+//
+// It refuses on exactly three grounds:
+//
+//  1. The body is empty. No audio container is zero bytes — every one of them
+//     has a header — and a client handed nothing has nothing to play. This is
+//     the deliberate opposite of the transcription rule: an empty TRANSCRIPT is
+//     a correct transcript of silence, an empty RECORDING is not a recording of
+//     silence.
+//  2. The upstream labelled it as one of the text types in
+//     [speechNotAudioTypes]. No speech route answers any of them.
+//  3. The bytes are a complete JSON object, whatever the label says. This is the
+//     clause that does the work, because the label is the part that cannot be
+//     trusted: a misrouted host answers `{"code":500,…}` under
+//     `application/json` when it sets a type at all and under nothing when it
+//     does not, and Go's own sniffer then calls it `text/plain`.
+//
+// What it does NOT do is require the label to say `audio/*`. That would break
+// every self-hosted deployment, because answering `application/octet-stream` for
+// real audio is the ordinary case there — it is the reason [SpeechMediaType]
+// exists at all. An unhelpful or unrecognized label is therefore read as no
+// information rather than as a verdict, and the bytes are asked instead. Raw PCM
+// whose first byte happens to be '{' is not also balanced, valid JSON to its
+// last byte, so clause 3 costs nothing real.
+//
+// A `stream_format: sse` body passes: `text/event-stream` is deliberately not in
+// [speechNotAudioTypes], and an SSE frame sequence is not a JSON object.
+func IsSpeechAudio(b []byte, mediaType string) bool {
+	if len(trimSpace(b)) == 0 {
+		return false
+	}
+	for _, t := range speechNotAudioTypes {
+		if hasPrefixFold(mediaType, t) {
+			return false
+		}
+	}
+	return !isJSONObject(b)
+}
+
+// speechNotAudioTypes are the response types a speech route never answers.
+//
+// It is an enumeration rather than a `text/*` wildcard on purpose. `audio/*`,
+// `application/octet-stream`, `text/event-stream` and every label dorang has not
+// heard of are all ACCEPTED, because refusing a container this build does not
+// know the name of is a worse failure than relaying an oddly-labelled error: one
+// breaks a working deployment, the other is caught by the byte test below it.
+var speechNotAudioTypes = []string{
+	"application/json", "text/json", "text/plain", "text/html", "text/xml",
+	"application/xml",
+}
+
 // ---------------------------------------------------------------------------
 // Transcription and translation
 // ---------------------------------------------------------------------------
@@ -346,13 +421,69 @@ type TranscriptionUsage struct {
 	Seconds      float64 `json:"seconds,omitempty"`
 }
 
+// ErrNotATranscriptionResponse is a JSON object that parsed cleanly and is not a
+// transcript.
+//
+// The audio surface reached the client with the vendor's error envelope as the
+// ENTIRE answer: `text` is empty so it is omitted from the re-serialized object,
+// leaving nothing but the upstream's `code`/`msg`/`success` carried out through
+// Extra. A caller reading `.text` off that got the empty string and no error at
+// all.
+var ErrNotATranscriptionResponse = errorString("openai: the body is a JSON object but not a transcription response")
+
+// transcriptionPayload is the member set that makes a JSON body a transcript.
+//
+// `task` is the discriminator — the vendor emits "transcribe" or "translate" on
+// the verbose form — and the rest are the payload. Accepting on ANY of them is
+// the same either-ground rule the chat gate states: a backend that omits `task`
+// still sends `text`, and a verbose answer whose text member the vendor happens
+// to omit still sends `segments`.
+var transcriptionPayload = []string{"text", "segments", "words", "usage", "task"}
+
+// IsTranscriptionResponse reports whether a body is a transcript of this family.
+//
+// It takes BYTES rather than the decoded struct, unlike the other gates in this
+// package, and the reason is specific: this surface's payload member is `text`,
+// a plain string with no absence marker on the struct. `{"text":""}` — the
+// correct transcript of silence — and a body with no `text` at all decode to the
+// identical value, so the question can only be answered before the decode.
+//
+// A body that is not a JSON object is accepted unconditionally. That is not a
+// gap: see [DecodeTranscriptionResponse] for why the raw form has no shape to
+// test, and why an empty one is a correct answer rather than a missing one.
+func IsTranscriptionResponse(b []byte) bool {
+	if !isJSONObject(b) {
+		return true
+	}
+	return hasAnyMember(b, transcriptionPayload...)
+}
+
 // DecodeTranscriptionResponse parses a transcription answer.
 //
 // mediaType is what the backend labelled the body. A non-JSON response format
 // (text, srt, vtt) has no fields to read, so the bytes are carried verbatim and
 // the text is filled from them, which keeps metering and the ledger seeing the
 // same thing on every path.
+//
+// It returns [ErrNotATranscriptionResponse] for a JSON object that is not a
+// transcript, and the check runs BEFORE the JSON/raw split rather than inside
+// the JSON branch. That placement is the whole fix on this surface, because the
+// raw branch is a byte relay and is where a misrouted upstream actually lands:
+// [isJSONBody] trusts a media type that clearly says something else, so a vendor
+// error envelope answered under a sniffed `text/plain` — which is what a body
+// with no Content-Type at all becomes — was handed to the client verbatim AS THE
+// TRANSCRIPT. Checking first covers both branches with one rule.
+//
+// What the raw branch is deliberately NOT checked for is emptiness. Silence
+// transcribes to an empty string, so zero bytes is a correct answer here — the
+// opposite of the speech surface, where zero bytes is not a playable container.
+// Nothing else about a subtitle file is decidable: dorang cannot tell a wrong
+// transcript from a right one, and only refuses the one case it can name, which
+// is a body that is a whole JSON object carrying none of a transcript's members.
 func DecodeTranscriptionResponse(b []byte, mediaType string) (*canonical.TranscriptionResponse, error) {
+	if !IsTranscriptionResponse(b) {
+		return nil, ErrNotATranscriptionResponse
+	}
 	if !isJSONBody(b, mediaType) {
 		return &canonical.TranscriptionResponse{
 			Text: string(b),

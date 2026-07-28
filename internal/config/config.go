@@ -218,12 +218,16 @@ type TokenGuard struct {
 // All three were documented as settable and existed only as Go constants, so a
 // configuration that set any of them failed to load with an unknown-key error
 // and the document was describing a knob that was not there. Two of the three
-// still cannot be turned off in this build — the value has to reach
-// internal/wire through internal/backend and nothing carries it — and those two
-// are REFUSED at their non-default value rather than accepted and ignored.
-// Refusing names the gap at the moment an operator makes the decision; accepting
-// would let them believe they had changed something. docs/CONFIG.md §23.1
-// records both, and the refusal message names the file and line a fix lands in.
+// then loaded but could not be honoured — the value had to reach internal/wire
+// through internal/backend and nothing carried it — so they were REFUSED at
+// their non-default value rather than accepted and ignored, which named the gap
+// at the moment an operator made the decision instead of letting them believe
+// they had changed something.
+//
+// All three are served at both values now. The carrier is backend.Call's
+// UsageChunkChoices and AnthropicTotalTokens, filled from dispatchState in
+// internal/app; the refusals in Validate are gone and so are the CONFIG §23.1
+// rows that recorded them.
 type Compat struct {
 	// LegacyHeaders mirrors the reference proxy's response header names
 	// alongside dorang's own (§7.7). Off by default: they are another vendor's
@@ -235,13 +239,20 @@ type Compat struct {
 	// `choices` array (§3.3): "stub" is the reference proxy's
 	// [{"index":0,"delta":{}}] and "empty" is strict OpenAI's [].
 	//
-	// Only "stub" is served. "empty" is refused at load.
+	// Default "stub", because the clients that exist were built against it.
+	// Selecting "empty" also takes a same-family stream off the byte-relay fast
+	// path: on that path the usage chunk is the upstream's own bytes and dorang
+	// does not choose its shape, so the guarantee can only be made by decoding.
 	UsageChunkChoices string `yaml:"usage_chunk_choices,omitempty"`
 
 	// AnthropicTotalTokens reproduces the reference implementation's non-spec
 	// `usage.total_tokens` on non-streaming Anthropic responses (§6.8).
 	//
-	// Only true is served. false is refused at load.
+	// Default true. It is a pointer because "unset" and "false" have to be
+	// distinguishable: unset means no opinion and gets the compat asymmetry,
+	// false means the strict vendor shape was asked for. Streaming responses
+	// never carry the field at either setting — that asymmetry IS §6.8, not a
+	// gap in the switch.
 	AnthropicTotalTokens *bool `yaml:"anthropic_total_tokens,omitempty"`
 }
 

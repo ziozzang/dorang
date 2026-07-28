@@ -2,6 +2,8 @@ package openai
 
 import (
 	"bytes"
+	"encoding/json"
+	"strings"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/wire/wirejson"
@@ -55,3 +57,43 @@ func putBuf(b *bytes.Buffer) { wirejson.PutBuf(b) }
 // constantly because "absent" and "zero" are different on this wire
 // (COMPATIBILITY 2.1).
 func ptr[T any](v T) *T { return &v }
+
+// isJSONObject reports whether b is, in its entirety, a JSON object.
+//
+// It is the precondition for asking a shape question at all. A body that is not
+// an object cannot be checked for the presence of a member, and refusing it on
+// that ground would refuse every non-JSON answer this package serves — an SRT
+// transcript, a WAV file, an empty body.
+func isJSONObject(b []byte) bool {
+	b = trimSpace(b)
+	if len(b) == 0 || b[0] != '{' {
+		return false
+	}
+	return json.Valid(b)
+}
+
+// hasAnyMember reports whether a JSON object carries at least one of the named
+// top-level keys.
+//
+// PRESENCE is the test, never the value. `{"text":""}` is a correct transcript
+// of silence and `{"results":[]}` is a correct verdict on an empty input array;
+// a check that looked at the value would refuse both.
+//
+// The comparison folds case for the same reason [wirejson.SplitExtraFold]
+// exists: encoding/json fills these response structs case-insensitively, so a
+// backend that spells the member "Results" has already populated the field, and
+// a gate that then refused the body would reject an answer dorang can read.
+func hasAnyMember(b []byte, names ...string) bool {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return false
+	}
+	for k := range obj {
+		for _, want := range names {
+			if k == want || strings.EqualFold(k, want) {
+				return true
+			}
+		}
+	}
+	return false
+}

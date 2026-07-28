@@ -413,6 +413,14 @@ would address `…/v1/openai/v1/chat/completions`.
 > and `{"code":500,"msg":"404 NOT_FOUND"}`, which dorang rendered as a successful assistant
 > turn with empty content. Both halves are now fixed: the version is appended, and an
 > upstream 200 that is not a response of its family is a `502 upstream_shape`.
+>
+> That second half now covers **every** surface, not only chat: embeddings, `count_tokens`,
+> rerank, moderations, images, transcription, translation, speech and the Gemini adapter each
+> refuse a 200 whose body is not an answer of the shape they serve. The test is the presence of
+> a payload-bearing member or the family's own discriminator — either one, never both — so a
+> vendor that omits the discriminator and a genuinely empty result set both still pass. Speech
+> is the exception that proves the rule: its answer is an audio container with no members at
+> all, so the test there is a body that is neither empty nor a JSON object.
 
 **The escape hatch, if a vendor really serves the unversioned route.** A `base_url` that
 already ends in the operation's own path is used verbatim — write
@@ -1378,22 +1386,28 @@ unknown-key error and the document was describing a knob that was not there.
 ```yaml
 compat:
   legacy_headers: false         # mirror the reference proxy's response header names
-  usage_chunk_choices: stub     # stub | empty   — only `stub` is served
-  anthropic_total_tokens: true  # only `true` is served
+  usage_chunk_choices: stub     # stub | empty
+  anthropic_total_tokens: true  # true | false
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
 |---|---|---|---|---|
 | `legacy_headers` | bool | `false` | Adds the reference proxy's response header spellings **alongside** dorang's own (COMPATIBILITY §7.7a lists them name by name). Nothing is renamed and nothing is removed | Nothing breaks; it emits another vendor's names, which is why it is off by default. Turn it on for a cutover and off once nothing reads them. The failure it prevents is silent: an exporter reading `x-litellm-response-cost` does not error when the header stops arriving, it reports **zero** |
-| `usage_chunk_choices` | string | `stub` | COMPATIBILITY §3.3. `stub` is the reference proxy's `"choices":[{"index":0,"delta":{}}]`; `empty` is strict OpenAI's `[]` | **`empty` is refused at load.** This build serves only `stub` — see §23.1. Any other value is refused as unknown |
-| `anthropic_total_tokens` | bool | `true` | COMPATIBILITY §6.8. Reproduces the reference implementation's non-spec `usage.total_tokens` on non-streaming Anthropic responses | **`false` is refused at load.** This build always emits it — see §23.1 |
+| `usage_chunk_choices` | string | `stub` | COMPATIBILITY §3.3. `stub` is the reference proxy's `"choices":[{"index":0,"delta":{}}]`; `empty` is strict OpenAI's `[]`. **Both are served.** | A client written against the reference proxy reads `choices[0].delta` off the usage chunk and gets an index error on `empty`, so the default stays `stub`. Selecting `empty` also takes a same-family stream off the byte-relay fast path — on that path the usage chunk is the upstream's own bytes and dorang does not choose its shape, so the guarantee costs one decode per frame. Any value other than the two is refused at load as unknown, rather than falling back to the default |
+| `anthropic_total_tokens` | bool | `true` | COMPATIBILITY §6.8. Reproduces the reference implementation's non-spec `usage.total_tokens` on non-streaming Anthropic responses. **Both values are served**; `false` is the strict vendor shape | Nothing breaks either way — the member is additive and every SDK in the family tolerates one it does not model. It applies to non-streaming answers only: a **streamed** message carries no `usage.total_tokens` at either setting, because that asymmetry *is* §6.8 and not a gap in the switch |
 
-Two of the three are refused at their non-default value rather than accepted and ignored. That
-is deliberate and is the point of §23: DESIGN §17.1 names "a setting that loads, validates and
-is read by nothing" as this repository's dominant defect, and the two ways not to commit it are
-to wire the setting or to refuse it. Refusing names the gap at the moment an operator makes the
-decision, and the refusal message names the file the fix lands in. Accepting would let them
-believe they had changed something.
+Two of the three used to be **refused** at their non-default value. The reason is worth keeping
+because it is the point of §23: DESIGN §17.1 names "a setting that loads, validates and is read
+by nothing" as this repository's dominant defect, and the two ways not to commit it are to wire
+the setting or to refuse it. `internal/wire` had encoded both shapes of both pairs since it was
+written and `internal/config` had parsed both spellings, but no expression related one to the
+other — so the loader refused, and the refusal message named the missing hop.
+
+That hop exists now: `backend.Call.UsageChunkChoices` and `backend.Call.AnthropicTotalTokens`,
+filled per request from the reloadable dispatch state. All three keys are served at both of
+their values, and the refusals are gone with the gap they described. What is still refused is a
+value this schema does not know — `usage_chunk_choices: stubb` is a load error, because
+defaulting a typo silently would hand an operator the shape they did not ask for.
 
 ---
 
@@ -1464,8 +1478,6 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 | `cluster.redis_url_env` | Required for `capacity_mode: shared-redis` and no Redis client is constructed anywhere |
 | `observability.otlp_endpoint` | No exporter is wired |
 | `observability.log_level`, `.log_format` | No logger reads either; diagnostics go through the `Logf` hook the embedder supplies |
-| `compat.usage_chunk_choices: empty` | **Refused, not inert.** The value would have to reach `openai.StreamConfig` in `internal/backend/stream.go`, which reads only `backend.Call`, and `backend.Call` has no field for it. Every streaming usage chunk carries the `stub` shape. COMPATIBILITY §3.3 |
-| `compat.anthropic_total_tokens: false` | **Refused, not inert.** `anthropic.ResponseOptions.TotalTokens` is never set in `internal/backend/backend.go` and defaults to emitting the field, and `anthropic.StreamConfig` has no such field at all. A non-streaming Anthropic response always carries `usage.total_tokens`. COMPATIBILITY §6.8 |
 
 `internal/config/consumed_test.go` holds this list as executable state rather than prose:
 adding a setting with no consumer fails the build, and so does wiring one without striking it
@@ -1491,6 +1503,8 @@ Everything below used to be in the table above.
 | `providers[].prefix_ttl`, `models[].deployments[].prefix_ttl` | New. The affinity lifetime is per backend, because that is what it models; `until_evicted` is the honest value for vLLM and SGLang |
 | `DORANG_STATE_DIR` | Wired. A leading `~` in any state path resolves to it, so the image's defaults land inside its declared volume |
 | `compat.legacy_headers` | New, and wired end to end. It had existed as a `server.Options` field with a working consumer that **no configuration could reach** — `internal/app` never set it — so COMPATIBILITY §7.7's mirroring claim was true of the code and false of every deployment. §21a |
+| `compat.usage_chunk_choices` | Wired. `empty` reaches `openai.StreamConfig.UsageChunkChoices` through `backend.Call`, so a streaming usage chunk now carries strict OpenAI's `"choices":[]` when it is asked for. It had been **refused** at that value: the encoder had emitted both shapes since it was written and no configuration could select one. Selecting it also takes a same-family stream off the byte-relay fast path, where the usage chunk is the upstream's bytes rather than dorang's. §21a, COMPATIBILITY §3.3 |
+| `compat.anthropic_total_tokens` | Wired. `false` reaches `anthropic.ResponseOptions.TotalTokens`, so a non-streaming Anthropic answer omits the non-spec `usage.total_tokens`. Also **refused** at that value before. Streaming is unchanged at either setting, deliberately — the asymmetry is §6.8 itself. §21a |
 
 ### 23.2 Designed and not in the schema at all
 

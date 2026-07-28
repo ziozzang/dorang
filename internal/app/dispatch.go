@@ -86,6 +86,16 @@ type dispatchState struct {
 
 	prefixOn bool
 	chunk    int
+
+	// usageChunkChoices and anthropicTotalTokens are COMPATIBILITY §3.3 and
+	// §6.8, resolved from `compat:` once per load and carried onto every
+	// backend.Call. They live here rather than on the dispatcher because they
+	// are hot-reloadable like everything else in this struct, and they are
+	// resolved to the WIRE package's types here rather than in the backend so
+	// that the mapping from a configured spelling to a wire constant happens
+	// once, in the layer that reads configuration.
+	usageChunkChoices    openai.UsageChunkChoices
+	anthropicTotalTokens anthropic.TotalTokensMode
 }
 
 // The non-streaming upstream body is bounded in internal/backend, which is the
@@ -568,7 +578,7 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		Priority:      dec.Priority,
 		PriorityTier:  dec.PriorityTier,
 	}
-	return backendResult(d.backend.Do(ctx, target, d.backendCall(c, dec, rq), w))
+	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
 }
 
 // backendCall renders one hop's request in the terms L5 takes.
@@ -577,7 +587,9 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 // are properties of the DEPLOYMENT — the catalogued output ceiling, and the
 // callback that stamps the routing decision — and a hop that reused the previous
 // deployment's would describe an attempt that did not happen.
-func (d *dispatcher) backendCall(c *call, dec *router.Decision, rq *server.Request) *backend.Call {
+func (d *dispatcher) backendCall(st *dispatchState, c *call, dec *router.Decision,
+	rq *server.Request) *backend.Call {
+
 	return &backend.Call{
 		Op:            c.operation(),
 		ClientAPI:     c.clientAPI,
@@ -599,7 +611,13 @@ func (d *dispatcher) backendCall(c *call, dec *router.Decision, rq *server.Reque
 		// rather than a guess (§10.7).
 		DefaultMaxTokens: d.defaultMaxTokens(dec.Kind, dec.UpstreamModel),
 		IncludeUsage:     c.allowUsg,
-		Transform:        c.transform(),
+		// COMPATIBILITY §3.3 and §6.8, read off the SAME state snapshot the rest
+		// of this attempt used rather than re-loaded here. A reload that changed
+		// `compat:` must not leave a request in flight rendering one shape on
+		// its second attempt and the other on its third.
+		UsageChunkChoices:    st.usageChunkChoices,
+		AnthropicTotalTokens: st.anthropicTotalTokens,
+		Transform:            c.transform(),
 		// The extension headers are stamped on the first write and anything set
 		// afterwards is invisible (DESIGN §10.4). For a stream the first write
 		// happens inside the backend, so this is the last moment the routing

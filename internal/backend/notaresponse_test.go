@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -89,6 +90,10 @@ func TestUpstream200WithANonResponseBodyIsNotAnEmptyStream(t *testing.T) {
 		{"byte relay", catalog.APIOpenAIChat, catalog.APIOpenAIChat},
 		{"crossing", catalog.APIOpenAIChat, catalog.APIAnthropicMessages},
 		{"messages upstream", catalog.APIAnthropicMessages, catalog.APIOpenAIChat},
+		// This family sends no terminator frame at all, so "the stream ended"
+		// and "the stream ended correctly" are the same event to its reader.
+		// The generic no-frames guard is the only thing separating them.
+		{"gemini upstream", catalog.APIGemini, catalog.APIOpenAIChat},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeUpstream(t)
@@ -259,6 +264,374 @@ func TestAMinimalResponseIsStillAResponse(t *testing.T) {
 			var obj map[string]json.RawMessage
 			if err := json.Unmarshal(res.Body, &obj); err != nil {
 				t.Fatalf("the rendered answer is not a JSON object: %v", err)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the class: the T1 surfaces, rerank and Gemini
+// ---------------------------------------------------------------------------
+
+// Minimal calls for the surfaces the first pass did not reach. Each is the
+// smallest request its operation accepts; none of them matters to the assertion,
+// because the defect is entirely on the answer side.
+
+func moderationCall() *Call {
+	return &Call{
+		Op: OpModerations, ClientAPI: catalog.APIOpenAIChat, Model: "client-model",
+		Moderation: &canonical.ModerationRequest{
+			Model:  "client-model",
+			Inputs: []canonical.ModerationInput{{Kind: canonical.ModerationText, Text: "hello"}},
+		},
+	}
+}
+
+func speechCall() *Call {
+	return &Call{
+		Op: OpSpeech, ClientAPI: catalog.APIOpenAIChat, Model: "client-model",
+		Speech: &canonical.SpeechRequest{Model: "client-model", Input: "hello", Voice: "alloy"},
+	}
+}
+
+func transcriptionCall() *Call {
+	return &Call{
+		Op: OpTranscription, ClientAPI: catalog.APIOpenAIChat, Model: "client-model",
+		Transcription: &canonical.TranscriptionRequest{
+			Model: "client-model",
+			File:  canonical.File{Field: "file", Name: "a.mp3", Data: []byte{0x00, 0x01, 0x02}},
+		},
+	}
+}
+
+func imageCall() *Call {
+	return &Call{
+		Op: OpImageGenerate, ClientAPI: catalog.APIOpenAIChat, Model: "client-model",
+		Image: &canonical.ImageRequest{
+			Op: canonical.ImageGenerate, Model: "client-model", Prompt: "a cat",
+		},
+	}
+}
+
+func rerankCall() *Call {
+	return &Call{
+		Op: OpRerank, ClientAPI: catalog.APIOpenAIChat, Model: "client-model",
+		Rerank: &canonical.RerankRequest{
+			Model: "client-model", Query: "q",
+			Documents: []canonical.RerankDocument{{Text: "d"}},
+		},
+	}
+}
+
+// TestUpstream200WithANonResponseBodyOnEveryRemainingSurface closes the class.
+//
+// The first pass fixed the two surfaces a live probe happened to cover. These
+// are the ones its case table never reached, and every one of them had the same
+// defect: the vendor's 200-wrapped error envelope unmarshalled into an
+// all-optional struct, and the zero value was rendered as a successful answer.
+//
+// The assertion is what the CLIENT receives, not what a decoder returns. On
+// these surfaces that distinction has teeth beyond the chat ones: the wire types
+// all carry an `Extra` map for members dorang does not model, so the vendor's
+// own `code`/`msg`/`success` members were re-serialized INTO the answer
+// alongside dorang's spliced `model`. That is the relay failure mode reached
+// through a converting path — the client got the vendor's error envelope whole,
+// wearing dorang's fingerprints, over a 200.
+func TestUpstream200WithANonResponseBodyOnEveryRemainingSurface(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		api  catalog.API
+		call *Call
+	}{
+		{"moderations", catalog.APIOpenAIChat, moderationCall()},
+		{"image generation", catalog.APIOpenAIChat, imageCall()},
+		{"transcription", catalog.APIOpenAIChat, transcriptionCall()},
+		{"speech", catalog.APIOpenAIChat, speechCall()},
+		{"rerank, generic dialect", catalog.APIOpenAIChat, rerankCall()},
+		{"rerank, jina dialect", catalog.APIJina, rerankCall()},
+		{"rerank, cohere dialect", catalog.APICohere, rerankCall()},
+		{"gemini generateContent", catalog.APIGemini, chatCall(catalog.APIOpenAIChat)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.answer(http.StatusOK, zaiNotFound)
+			p := testProvider(t, f, "openai", tc.api)
+
+			res := testBackend("k").Do(context.Background(), target(p), tc.call, nil)
+
+			if res.Err == nil {
+				t.Fatalf("the exchange succeeded and handed the client %q;\n"+
+					"a vendor error body wearing a 200 must not become an answer", res.Body)
+			}
+			if res.Body != nil {
+				t.Errorf("Body = %q, want nothing rendered", res.Body)
+			}
+			if got := string(res.Body); strings.Contains(got, "404 NOT_FOUND") {
+				t.Errorf("the vendor's error envelope reached the client: %q", got)
+			}
+			if res.Err.Status != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502", res.Err.Status)
+			}
+			if res.Err.Code != CodeUpstreamShape {
+				t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamShape)
+			}
+			if !res.Retryable {
+				t.Error("the failure must be offered to the fallback chain: nothing was " +
+					"generated, so there is no billed turn a sibling deployment would repeat")
+			}
+			if res.Usage.InputTokens != 0 || res.Usage.OutputTokens != 0 {
+				t.Errorf("usage = %+v, want nothing metered", res.Usage)
+			}
+		})
+	}
+}
+
+// TestSpeechRelaysBytesAndRefusesAnErrorEnvelope is the speech surface stated on
+// its own, because its gate cannot be the JSON rule the others use.
+//
+// A speech answer is an audio container: bytes, with no members to be present or
+// absent and no discriminator to read. Asking "is this a response of this
+// family" of an MP3 has no JSON answer at all, so the test is the pair the
+// surface does have — the upstream did not label the body as JSON, and there are
+// bytes to play. Nothing weaker distinguishes an error envelope from audio;
+// nothing stronger can be applied without parsing a container format, which
+// would refuse every codec dorang has not heard of.
+//
+// Getting this wrong is not the quiet empty answer the JSON surfaces produced.
+// The relay stamps dorang's OWN content type on whatever came back, derived from
+// the container the caller asked for, so the client is handed a JSON error
+// envelope labelled `audio/mpeg` — and a browser, a player or an `ffmpeg` in a
+// pipeline fails on it far from the gateway that produced it.
+func TestSpeechRelaysBytesAndRefusesAnErrorEnvelope(t *testing.T) {
+	t.Run("an error envelope labelled JSON is not audio", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, zaiNotFound)
+		})
+		p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+		res := testBackend("k").Do(context.Background(), target(p), speechCall(), nil)
+		if res.Err == nil {
+			t.Fatalf("the client was handed %q as %s", res.Body, res.ContentType)
+		}
+		if res.Err.Code != CodeUpstreamShape {
+			t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamShape)
+		}
+	})
+
+	t.Run("an unlabelled error envelope is not audio", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+			// Self-hosted engines routinely answer application/octet-stream, so
+			// the label alone cannot decide. A body that is a whole JSON object
+			// is not an audio container.
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = io.WriteString(w, zaiNotFound)
+		})
+		p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+		res := testBackend("k").Do(context.Background(), target(p), speechCall(), nil)
+		if res.Err == nil {
+			t.Fatalf("the client was handed %q as %s", res.Body, res.ContentType)
+		}
+	})
+
+	t.Run("an empty body is not audio", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.answer(http.StatusOK, "")
+		p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+		res := testBackend("k").Do(context.Background(), target(p), speechCall(), nil)
+		if res.Err == nil {
+			t.Fatalf("zero bytes of audio were served as a successful answer, as %s", res.ContentType)
+		}
+	})
+
+	t.Run("audio the backend mislabelled is still audio", func(t *testing.T) {
+		// The whole reason the gate is not "the label must say audio": an
+		// engine that answers application/octet-stream is the ordinary case,
+		// and refusing it would break every self-hosted speech deployment.
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte{0xff, 0xfb, 0x90, 0x64, 0x00})
+		})
+		p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+		res := testBackend("k").Do(context.Background(), target(p), speechCall(), nil)
+		if res.Err != nil {
+			t.Fatalf("a mislabelled but real audio body was refused: %v", res.Err.Message)
+		}
+		if res.ContentType != "audio/mpeg" {
+			t.Errorf("ContentType = %q, want the container the caller asked for", res.ContentType)
+		}
+	})
+}
+
+// TestTranscriptionRefusesAnErrorEnvelopeOnBothOfItsPaths.
+//
+// This surface has two answer paths and the defect was on both, which is why the
+// gate runs before the split rather than inside the JSON branch.
+//
+// The JSON path is the ordinary one. The RAW path is a byte relay — a transcript
+// asked for as srt, vtt or text is carried through verbatim — and it is reached
+// by more traffic than it looks: [openai.DecodeTranscriptionResponse] trusts a
+// media type that clearly says something other than JSON, and a body with no
+// Content-Type at all is labelled `text/plain` by content sniffing before dorang
+// ever sees it. So a misrouted upstream's error envelope arrived on the raw path
+// and was served to the client AS THE TRANSCRIPT.
+func TestTranscriptionRefusesAnErrorEnvelopeOnBothOfItsPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ctype string
+	}{
+		{"the JSON path", "application/json"},
+		{"the raw path, reached by content sniffing", "text/plain; charset=utf-8"},
+		{"the raw path, labelled as a subtitle file", "text/vtt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.ctype)
+				_, _ = io.WriteString(w, zaiNotFound)
+			})
+			p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+			res := testBackend("k").Do(context.Background(), target(p), transcriptionCall(), nil)
+			if res.Err == nil {
+				t.Fatalf("the client was handed %q as the transcript", res.Body)
+			}
+			if res.Err.Code != CodeUpstreamShape {
+				t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamShape)
+			}
+		})
+	}
+}
+
+// TestARawTranscriptIsNotCheckedForBeingEmpty pins the asymmetry with speech.
+//
+// Silence transcribes to an empty string, so zero bytes is a CORRECT answer on
+// this surface — the exact opposite of the speech relay, where zero bytes is not
+// a container. A gate that refused an empty body here would turn every silent
+// recording into a 502.
+func TestARawTranscriptIsNotCheckedForBeingEmpty(t *testing.T) {
+	for _, tc := range []struct{ name, ctype, body string }{
+		{"a transcript of silence", "text/plain", ""},
+		{"an srt file", "application/x-subrip",
+			"1\n00:00:00,000 --> 00:00:01,000\nhello\n"},
+		{"a vtt file with no cues", "text/vtt", "WEBVTT\n\n"},
+		{"a JSON transcript the backend mislabelled as text", "text/plain", `{"text":"hi"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.setHandler(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.ctype)
+				_, _ = io.WriteString(w, tc.body)
+			})
+			p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+
+			res := testBackend("k").Do(context.Background(), target(p), transcriptionCall(), nil)
+			if res.Err != nil {
+				t.Fatalf("a valid raw transcript was refused: %v (%s)", res.Err.Message, res.Err.Code)
+			}
+		})
+	}
+}
+
+// TestAMinimalT1OrRerankResponseIsStillAResponse is the boundary check for the
+// gates above, and the reason each accepts on EITHER ground rather than both.
+//
+// Every body here is a legitimate answer a real backend sends. A gate tightened
+// one notch — requiring a non-empty result set, or requiring a discriminator
+// three of these four surfaces do not even define — turns each of them into a
+// 502, which is a worse failure than the one being fixed because it breaks
+// traffic that works today.
+func TestAMinimalT1OrRerankResponseIsStillAResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		api  catalog.API
+		call *Call
+		body string
+	}{
+		{
+			// An empty input array is a legal moderations request, and its
+			// answer has an empty result set.
+			name: "a moderation answer with an empty results array",
+			api:  catalog.APIOpenAIChat, call: moderationCall(),
+			body: `{"id":"modr-1","model":"m","results":[]}`,
+		},
+		{
+			name: "a moderation answer with no id or model",
+			api:  catalog.APIOpenAIChat, call: moderationCall(),
+			body: `{"results":[{"flagged":false,"categories":{"hate":false},` +
+				`"category_scores":{"hate":0.0001}}]}`,
+		},
+		{
+			// A flagged generation returns no image but is still billed, and
+			// `created` alone is not what makes this a response — `usage` is.
+			name: "an image answer carrying only usage",
+			api:  catalog.APIOpenAIChat, call: imageCall(),
+			body: `{"created":1,"usage":{"input_tokens":9,"output_tokens":0,"total_tokens":9}}`,
+		},
+		{
+			name: "an image answer with no created member",
+			api:  catalog.APIOpenAIChat, call: imageCall(),
+			body: `{"data":[{"b64_json":"aGk="}]}`,
+		},
+		{
+			// Silence transcribes to an empty string. The key is present; its
+			// value is not what is being tested.
+			name: "a transcript of silence",
+			api:  catalog.APIOpenAIChat, call: transcriptionCall(),
+			body: `{"text":""}`,
+		},
+		{
+			name: "a verbose transcript with no text member",
+			api:  catalog.APIOpenAIChat, call: transcriptionCall(),
+			body: `{"task":"transcribe","language":"en","duration":1.5,"segments":[]}`,
+		},
+		{
+			// TEI and Infinity send results and nothing else — no id, no model,
+			// no billing block of either spelling.
+			name: "a rerank answer with results only",
+			api:  catalog.APIOpenAIChat, call: rerankCall(),
+			body: `{"results":[{"index":0,"relevance_score":0.9}]}`,
+		},
+		{
+			name: "a rerank answer over an empty corpus",
+			api:  catalog.APIJina, call: rerankCall(),
+			body: `{"model":"m","results":[],"usage":{"total_tokens":4}}`,
+		},
+		{
+			name: "a cohere rerank answer, which has no discriminator at all",
+			api:  catalog.APICohere, call: rerankCall(),
+			body: `{"id":"r-1","results":[{"index":0,"relevance_score":0.9}],` +
+				`"meta":{"billed_units":{"search_units":1}}}`,
+		},
+		{
+			// A blocked prompt IS an answer of this family: no candidates at
+			// all, only the feedback that says why. Refusing it would report a
+			// working safety filter as a broken gateway.
+			name: "a gemini answer with no candidates, only prompt feedback",
+			api:  catalog.APIGemini, call: chatCall(catalog.APIOpenAIChat),
+			body: `{"promptFeedback":{"blockReason":"SAFETY"},"modelVersion":"m",` +
+				`"usageMetadata":{"promptTokenCount":7,"totalTokenCount":7}}`,
+		},
+		{
+			name: "a gemini answer with an empty candidates array",
+			api:  catalog.APIGemini, call: chatCall(catalog.APIOpenAIChat),
+			body: `{"candidates":[],"modelVersion":"m"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.answer(http.StatusOK, tc.body)
+			p := testProvider(t, f, "openai", tc.api)
+
+			res := testBackend("k").Do(context.Background(), target(p), tc.call, nil)
+			if res.Err != nil {
+				t.Fatalf("a valid minimal response was refused: %v (%s)", res.Err.Message, res.Err.Code)
 			}
 		})
 	}

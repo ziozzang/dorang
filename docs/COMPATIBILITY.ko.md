@@ -63,7 +63,7 @@
 |---|---|
 | 3.1 | usage 청크는 `stream_options.include_usage`가 정확히 `true`일 때 **만** 나간다. truthy로는 부족하다. |
 | 3.2 | `stream_options`가 없으면 usage는 계산되지만 **와이어에 나가지 않는다**. |
-| 3.3 | ⚠️ **OpenAI와의 차이.** 참조 프록시의 usage 청크는 `"choices":[{"index":0,"delta":{}}]`를 담고, OpenAI는 `"choices": []`를 보낸다. dorang은 **참조 프록시를 따른다** — 기존 클라이언트가 그것을 대상으로 만들어졌기 때문이다. 엄격한 OpenAI 형태를 원하는 호출자를 위해 `compat.usage_chunk_choices: empty`를 제공한다. |
+| 3.3 | ⚠️ **OpenAI와의 차이.** 참조 프록시의 usage 청크는 `"choices":[{"index":0,"delta":{}}]`를 담고, OpenAI는 `"choices": []`를 보낸다. dorang은 **참조 프록시를 따른다** — 기존 클라이언트가 그것을 대상으로 만들어졌기 때문이다. 엄격한 OpenAI 형태를 원하는 호출자를 위해 `compat.usage_chunk_choices: empty`를 제공하며, **두 값 모두 서비스된다**. `empty`를 고르면 같은 계열 스트림이 바이트 릴레이 우회 경로에서 빠진다 — 그 경로에서 usage 청크는 업스트림의 바이트 그대로이고 dorang이 그 형태를 정하지 않기 때문이다. CONFIG §21a. |
 | 3.4 | 일부 백엔드는 `finish_reason` **이후에** usage를 보낸다. 누산기는 finish에서 닫지 말고 늦은 usage를 받아야 한다. |
 | 3.5 | usage는 비-OpenAI 확장(비용, 캐시 토큰 상세, 서버 툴 사용)을 실을 수 있다. dorang은 자기 것을 `x-dorang-*` 헤더로 내보내고, 널리 읽히는 usage 확장 필드는 호환을 위해 미러링한다. |
 
@@ -99,7 +99,7 @@ Anthropic 형태 요청이 OpenAI 형태 백엔드로 가는 일이 매우 흔�
 | 6.5 | 어댑터 경로에서 `stop_sequence`는 `null`. |
 | 6.6 | 컨텐트 블록 인덱싱은 **상태를 갖는다**: 보류된 `message_delta`, 청크 큐, 블록 전환 시 합성되는 `content_block_stop` → `content_block_start` 쌍. `content_block_stop`은 항상 마지막 `message_delta`보다 먼저 나가야 한다. 게이트웨이 전체에서 가장 복잡한 상태 기계이며 별도 퍼즈 타깃을 갖는다. |
 | 6.7 | 프롬프트 캐싱: `message_start`가 캐시 카운터를 0으로 심고, 마지막 `message_delta`가 실제 값을 채운다. 캐시 필드는 **0보다 클 때만** 나타난다. `input_tokens = prompt − cache_read − cache_creation`(0에서 클램프). 백엔드가 OpenAI 관례를 쓰면 cache_read는 그쪽 필드로 폴백한다. |
-| 6.8 | ⚠️ 비스트리밍 응답은 **비표준 `usage.total_tokens`** 를 포함하는데 스트리밍은 생략한다. 두 형태가 필드 하나만큼 다르다. dorang은 기본적으로 `compat.anthropic_total_tokens: true`로 이 비대칭을 재현한다. |
+| 6.8 | ⚠️ 비스트리밍 응답은 **비표준 `usage.total_tokens`** 를 포함하는데 스트리밍은 생략한다. 두 형태가 필드 하나만큼 다르다. dorang은 기본적으로 `compat.anthropic_total_tokens: true`로 이 비대칭을 재현하고, `false`로 엄격한 벤더 형태도 낼 수 있다. 이 스위치는 **비스트리밍** 쪽만 지배한다 — 스트리밍 메시지는 어느 설정에서도 이 필드를 담지 않으며, 그 비대칭이 곧 §6.8이 기술하는 대상이다. CONFIG §21a. |
 | 6.9 | `/v1/messages/count_tokens`는 정확히 `{"input_tokens": <숫자>}` 를 반환하고 `?beta=true`를 받는다. |
 
 ## 7. 전 영역 공통

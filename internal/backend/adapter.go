@@ -8,7 +8,9 @@ import (
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
+	"github.com/ziozzang/dorang/internal/wire/rerank"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -206,6 +208,25 @@ var errNotAnObject = errors.New("backend: the body is not a JSON object")
 // parses cleanly everywhere, and on a relay path the envelope reaches the
 // client verbatim.
 var errNotAResponse = errors.New("backend: the body is a JSON object but not a response")
+
+// isNotAResponse reports the whole defect class: an upstream 200 whose body
+// parsed cleanly and is not an answer of the surface it arrived on.
+//
+// Every wire package raises its own sentinel rather than a shared one, because
+// the message names the family and that is what an operator reading a log line
+// needs. They are collected here so [Backend.convert] has one condition to test
+// and so a new surface's sentinel has an obvious place to be added — the
+// alternative, an errors.Is chain that grows inline at the call site, is how one
+// of these gets left out.
+func isNotAResponse(err error) bool {
+	return errors.Is(err, errNotAResponse) ||
+		errors.Is(err, anthropic.ErrNotAResponse) ||
+		errors.Is(err, openai.ErrNotAResponse) ||
+		errors.Is(err, openai.ErrNotAModerationResponse) ||
+		errors.Is(err, openai.ErrNotAnImageResponse) ||
+		errors.Is(err, openai.ErrNotATranscriptionResponse) ||
+		errors.Is(err, rerank.ErrNotAResponse)
+}
 
 // noOperation builds an errNoOperation.
 func noOperation(api string, op Operation, detail string) error {

@@ -1025,61 +1025,74 @@ func TestVersionMustMatch(t *testing.T) {
 	}
 }
 
-// TestCompatRefusesWhatThisBuildCannotServe is COMPATIBILITY §3.3 and §6.8 kept
-// honest at load time.
+// TestCompatAcceptsBothShapesAndRefusesNeither is COMPATIBILITY §3.3 and §6.8
+// kept honest at load time.
 //
-// Both keys are documented as operator-settable and neither reaches its
-// consumer: the value would have to travel through backend.Call into
-// internal/wire, and backend.Call has no field for it. DESIGN §17.1 names a
-// setting that loads and does nothing as this repository's dominant defect, so
-// these are refused rather than accepted and ignored — an operator who sets one
-// finds out at the moment they set it.
-func TestCompatRefusesWhatThisBuildCannotServe(t *testing.T) {
-	cases := []struct {
-		name string
-		yaml string
-		want string
+// It used to be TestCompatRefusesWhatThisBuildCannotServe, and the inversion is
+// the point. Both keys were documented as operator-settable and neither reached
+// its consumer — the value had to travel through backend.Call into
+// internal/wire, and backend.Call had no field for it — so both were refused at
+// their non-default value rather than accepted and ignored. The field exists
+// now, so refusing would be the mirror-image lie: a validator rejecting a
+// configuration the gateway can honour.
+//
+// What is still refused is a value this schema does not know. That check was
+// never about the gap and outlives it: it catches a typo, which is the case
+// where silently falling back to the default is worst.
+func TestCompatAcceptsBothShapesAndRefusesNeither(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		yaml   string
+		choice string
+		total  bool
 	}{
-		{"usage_chunk_choices empty", "compat: {usage_chunk_choices: empty}\n",
-			"compat.usage_chunk_choices"},
-		{"usage_chunk_choices nonsense", "compat: {usage_chunk_choices: banana}\n",
-			"compat.usage_chunk_choices"},
-		{"anthropic_total_tokens false", "compat: {anthropic_total_tokens: false}\n",
-			"compat.anthropic_total_tokens"},
-	}
-	for _, c := range cases {
+		{"the strict OpenAI usage chunk", "compat: {usage_chunk_choices: empty}\n",
+			UsageChunkChoicesEmpty, true},
+		{"the reference proxy's usage chunk", "compat: {usage_chunk_choices: stub}\n",
+			UsageChunkChoicesStub, true},
+		{"the strict Anthropic usage object", "compat: {anthropic_total_tokens: false}\n",
+			UsageChunkChoicesStub, false},
+		{"both non-default at once",
+			"compat: {usage_chunk_choices: empty, anthropic_total_tokens: false}\n",
+			UsageChunkChoicesEmpty, false},
+	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := LoadBytes([]byte("version: 1\n" + c.yaml))
-			if err == nil {
-				t.Fatalf("%s loaded; a setting that does nothing must be refused, not ignored", c.yaml)
+			cfg, err := LoadBytes([]byte("version: 1\n" + c.yaml))
+			if err != nil {
+				t.Fatalf("a shape this build serves was refused at load: %v", err)
 			}
-			if !strings.Contains(err.Error(), c.want) {
-				t.Errorf("the refusal does not name the key: %v", err)
+			if cfg.Compat.UsageChunkChoices != c.choice {
+				t.Errorf("usage_chunk_choices = %q, want %q",
+					cfg.Compat.UsageChunkChoices, c.choice)
+			}
+			if cfg.Compat.AnthropicTotalTokens == nil {
+				t.Fatal("anthropic_total_tokens is nil after defaulting")
+			}
+			if *cfg.Compat.AnthropicTotalTokens != c.total {
+				t.Errorf("anthropic_total_tokens = %v, want %v",
+					*cfg.Compat.AnthropicTotalTokens, c.total)
 			}
 		})
 	}
 
-	// The values this build DOES serve load, so the refusal is about the gap and
-	// not about the block existing.
-	for _, y := range []string{
-		"compat: {legacy_headers: true}\n",
-		"compat: {usage_chunk_choices: stub, anthropic_total_tokens: true}\n",
-	} {
-		cfg, err := LoadBytes([]byte("version: 1\n" + y))
-		if err != nil {
-			t.Fatalf("%s: %v", y, err)
-		}
-		if cfg.Compat.UsageChunkChoices != UsageChunkChoicesStub {
-			t.Errorf("%s: usage_chunk_choices defaulted to %q", y, cfg.Compat.UsageChunkChoices)
-		}
-		if cfg.Compat.AnthropicTotalTokens == nil || !*cfg.Compat.AnthropicTotalTokens {
-			t.Errorf("%s: anthropic_total_tokens did not default to true", y)
-		}
+	// A typo is still a load error. Falling back to the default here would give
+	// an operator the shape they did not ask for and no way to notice.
+	if _, err := LoadBytes([]byte("version: 1\ncompat: {usage_chunk_choices: banana}\n")); err == nil {
+		t.Error("an unknown usage_chunk_choices value loaded")
+	} else if !strings.Contains(err.Error(), "compat.usage_chunk_choices") {
+		t.Errorf("the refusal does not name the key: %v", err)
 	}
 
-	// And the block is reachable at all, which it was not: `compat:` was an
-	// unknown key under the strict decode of §0.1.
-	if _, err := LoadBytes([]byte("version: 1\ncompat: {legacy_headers: false}\n")); err != nil {
+	// The defaults are what this build served before either value could be
+	// selected, so an absent block changes nothing.
+	cfg, err := LoadBytes([]byte("version: 1\ncompat: {legacy_headers: false}\n"))
+	if err != nil {
 		t.Fatalf("the compat block is not in the schema: %v", err)
+	}
+	if cfg.Compat.UsageChunkChoices != UsageChunkChoicesStub {
+		t.Errorf("usage_chunk_choices defaulted to %q", cfg.Compat.UsageChunkChoices)
+	}
+	if cfg.Compat.AnthropicTotalTokens == nil || !*cfg.Compat.AnthropicTotalTokens {
+		t.Error("anthropic_total_tokens did not default to true")
 	}
 }

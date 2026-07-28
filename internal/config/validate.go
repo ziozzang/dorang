@@ -201,35 +201,25 @@ func (c *Config) validate(col *collector) {
 // validateCompat checks the three divergence switches of COMPATIBILITY §3.3,
 // §6.8 and §7.7.
 //
-// Two of them are accepted only at the value this build serves. That is not
-// timidity about the schema: the switch has to reach internal/wire, the only
-// path there is a field on backend.Call, and no such field exists — so a
-// deployment that set `usage_chunk_choices: empty` would send every client the
-// stub shape anyway. DESIGN §17.1 calls a setting that loads and does nothing
-// this repository's dominant defect, and the two ways not to commit it are to
-// wire it or to refuse it. This refuses, and names what wiring it needs, so the
-// refusal is a work item rather than a wall.
+// All three are now served at both of their values, so the only thing left to
+// check is that the spelling is one this schema knows. Two of them used to be
+// REFUSED at their non-default value, and the refusal message named the hop that
+// was missing — a field on backend.Call, and the two lines in internal/app that
+// fill it. That hop exists, so the refusal is gone with it: keeping it would
+// have been a validator rejecting a configuration the gateway can honour, which
+// is the same class of lie as accepting one it cannot.
+//
+// The unknown-value branch stays. It is a different check from the one that was
+// removed — it catches a typo, not a gap in the build — and it is the reason
+// `usage_chunk_choices: stubb` is a load error rather than a silent fallback to
+// the default.
 func (c *Config) validateCompat(col *collector) {
 	switch c.Compat.UsageChunkChoices {
-	case "", UsageChunkChoicesStub:
-	case UsageChunkChoicesEmpty:
-		col.add("compat.usage_chunk_choices",
-			"%q is not served by this build: every streaming usage chunk carries the "+
-				"reference proxy's %q shape. The value has to reach openai.StreamConfig "+
-				"in internal/backend/stream.go, which reads only backend.Call, and "+
-				"backend.Call has no field for it. Remove the key or set %q",
-			UsageChunkChoicesEmpty, UsageChunkChoicesStub, UsageChunkChoicesStub)
+	case "", UsageChunkChoicesStub, UsageChunkChoicesEmpty:
 	default:
 		col.add("compat.usage_chunk_choices",
 			"unknown value %q: expected %q or %q",
 			c.Compat.UsageChunkChoices, UsageChunkChoicesStub, UsageChunkChoicesEmpty)
-	}
-	if c.Compat.AnthropicTotalTokens != nil && !*c.Compat.AnthropicTotalTokens {
-		col.add("compat.anthropic_total_tokens",
-			"false is not served by this build: a non-streaming Anthropic response always "+
-				"carries usage.total_tokens, because anthropic.ResponseOptions.TotalTokens "+
-				"is never set in internal/backend/backend.go and defaults to emitting it. "+
-				"Remove the key or set true")
 	}
 }
 

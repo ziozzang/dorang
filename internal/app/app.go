@@ -46,6 +46,8 @@ import (
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/shadow"
 	"github.com/ziozzang/dorang/internal/store"
+	"github.com/ziozzang/dorang/internal/wire/anthropic"
+	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -423,6 +425,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		filters:   filters,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
+
+		usageChunkChoices:    usageChunkChoices(cfg),
+		anthropicTotalTokens: anthropicTotalTokens(cfg),
 	})
 	a.models = newModelList(cfg)
 
@@ -582,6 +587,9 @@ func (a *App) Reload(cfg *config.Config) error {
 		filters:   filters,
 		prefixOn:  cfg.Routing.Prefix.IsEnabled(),
 		chunk:     int(cfg.Routing.Prefix.ChunkBytes.Bytes()),
+
+		usageChunkChoices:    usageChunkChoices(cfg),
+		anthropicTotalTokens: anthropicTotalTokens(cfg),
 	})
 	a.models.swap(cfg)
 	a.targets.swap(buildTargets(cfg, cat))
@@ -929,4 +937,36 @@ func (q *quotaSet) record(credential string, now time.Time, u quota.Usage) {
 	if m, ok := q.meters[credential]; ok && m != nil {
 		m.Record(now, u)
 	}
+}
+
+// usageChunkChoices and anthropicTotalTokens resolve `compat:` onto the wire
+// packages' own types.
+//
+// They are two functions and four lines, and they are the entirety of what was
+// missing. COMPATIBILITY §3.3 and §6.8 name two shapes each; internal/wire has
+// encoded both members of both pairs since it was written; internal/config has
+// parsed, defaulted and documented both spellings. What did not exist was any
+// expression relating one to the other, so the loader REFUSED the non-default
+// value rather than accept a setting it could not honour — CONFIG §23.1 carried
+// both rows and the refusal message named this hop. This is that hop.
+//
+// The direction of the mapping matters. Each wire type's ZERO value is the shape
+// this build already served, so an unset or absent `compat:` block resolves to
+// the empty string and no behaviour changes anywhere; only an operator who names
+// the other value gets a different frame.
+func usageChunkChoices(cfg *config.Config) openai.UsageChunkChoices {
+	if cfg != nil && cfg.Compat.UsageChunkChoices == config.UsageChunkChoicesEmpty {
+		return openai.UsageChunkChoicesEmpty
+	}
+	return openai.UsageChunkChoicesStub
+}
+
+// anthropicTotalTokens reads a *bool, so "unset" and "false" are distinct: unset
+// means the operator expressed no opinion and gets §6.8's compat asymmetry,
+// false means they asked for the strict vendor shape and gets it.
+func anthropicTotalTokens(cfg *config.Config) anthropic.TotalTokensMode {
+	if cfg != nil && cfg.Compat.AnthropicTotalTokens != nil && !*cfg.Compat.AnthropicTotalTokens {
+		return anthropic.TotalTokensOmit
+	}
+	return anthropic.TotalTokensCompat
 }

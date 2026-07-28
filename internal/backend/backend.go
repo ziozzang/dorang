@@ -165,6 +165,26 @@ type Call struct {
 	// IncludeUsage mirrors the caller's stream_options.include_usage.
 	IncludeUsage bool
 
+	// UsageChunkChoices and AnthropicTotalTokens are COMPATIBILITY §3.3 and
+	// §6.8, the two deliberate divergences an operator can select between.
+	//
+	// They are the field this struct did not have, and their absence is why
+	// `compat.usage_chunk_choices: empty` and `compat.anthropic_total_tokens:
+	// false` were REFUSED at load rather than served: internal/wire has
+	// implemented both shapes all along, internal/config has accepted both
+	// spellings all along, and there was no path between them. DESIGN §17.1
+	// names a setting that loads and does nothing as this repository's dominant
+	// defect; refusing was the honest interim, and this is the path.
+	//
+	// They are on the CALL rather than on [Options] because [Backend] is
+	// immutable after construction and a hot reload rebuilds providers, not the
+	// backend — so a setting that can change under reload has to arrive with the
+	// request. The zero value of each is the served default in the wire package
+	// it feeds, which means a caller that never sets them gets today's behaviour
+	// with no branch.
+	UsageChunkChoices    openai.UsageChunkChoices
+	AnthropicTotalTokens anthropic.TotalTokensMode
+
 	// Transform is the response half of a §10.5b transform filter, nil when the
 	// model carries none — which is the ordinary case and costs one nil check.
 	//
@@ -628,8 +648,7 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 				server.TypeAPIError, "the upstream answer was not a JSON object").
 				WithCode(CodeUpstreamShape)
 		}
-		if errors.Is(err, errNotAResponse) ||
-			errors.Is(err, anthropic.ErrNotAResponse) || errors.Is(err, openai.ErrNotAResponse) {
+		if isNotAResponse(err) {
 			// A JSON object that parsed and is not a response of this family.
 			// The status is 502 and NOT 200: the upstream's own 200 was the
 			// defect, and passing it on is what made a misrouted deployment
@@ -645,6 +664,18 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 	}
 	if dec.raw != nil {
 		return dec.raw, dec.ctype, dec.usage, nil
+	}
+	if dec.resp == nil {
+		// An adapter returned neither rendered bytes nor a neutral response.
+		// That is dorang's own invariant, not the upstream's, and the reason it
+		// is a named 502 rather than an assertion is that it used to be a nil
+		// dereference one line below: a transcript of silence renders to zero
+		// bytes, `raw` came back nil rather than empty, and the process took a
+		// SIGSEGV on a request that was entirely valid. The decoder now returns
+		// an empty slice for that case; this is the floor under every other one.
+		return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway,
+			server.TypeAPIError, "the upstream answer produced nothing to send").
+			WithCode(CodeUpstreamShape)
 	}
 
 	adoptEngineReasoning(dec.resp, x.prov.engine)
@@ -747,7 +778,10 @@ func malformedToolCall(r *canonical.Response) (string, bool) {
 func encodeClient(r *canonical.Response, c *Call, now int64) ([]byte, error) {
 	switch c.ClientAPI {
 	case catalog.APIAnthropicMessages:
-		opt := &anthropic.ResponseOptions{Model: c.Model}
+		// TotalTokens is COMPATIBILITY §6.8. The zero value is the compat shape
+		// the reference implementation emits, so an unset call is unchanged; the
+		// strict vendor shape is reachable only because the value now travels.
+		opt := &anthropic.ResponseOptions{Model: c.Model, TotalTokens: c.AnthropicTotalTokens}
 		if !r.SameFamily(canonical.FamilyAnthropicMessages) {
 			opt.ID = anthropic.NewMessageID()
 		}

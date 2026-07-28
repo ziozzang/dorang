@@ -347,11 +347,45 @@ type ImageInputTokenDetails struct {
 	ImageTokens int `json:"image_tokens"`
 }
 
+// ErrNotAnImageResponse is a JSON object that parsed cleanly and is not an
+// answer of the image family.
+//
+// Same class as [ErrNotAResponse]. What it produced here before the gate existed
+// was `{"created":0,"data":[],…}` plus every member of the vendor's error
+// envelope, carried out through Extra — a 200 with no images, a timestamp in
+// 1970, and the upstream's own failure text wearing dorang's `model`.
+var ErrNotAnImageResponse = errorString("openai: the body is a JSON object but not an image response")
+
+// IsImageResponse reports whether a decoded body is an answer of this family.
+//
+// Like moderations, this surface defines no discriminator — there is no `object`
+// member on an images answer — so the rule is the presence of a payload-bearing
+// member: `data` (the rendered images) or `usage` (what they cost).
+//
+// Presence, not value: `{"created":1,"data":[]}` is what a generation that
+// produced nothing looks like, and `{"created":1,"usage":{…}}` is what a
+// billed-but-empty one looks like on the models that report usage. Both are
+// answers.
+//
+// `created` is deliberately NOT a ground. It is on every real answer, but it is
+// also the one member of this shape that carries no information about whether
+// anything was generated — a body consisting of a timestamp and nothing else is
+// not an image response by any reading, and admitting it would let a vendor
+// envelope that happens to carry a `created` through.
+func IsImageResponse(w *ImageResponse) bool {
+	return w != nil && (w.Data != nil || w.Usage != nil)
+}
+
 // DecodeImageResponse parses an image answer into the neutral form.
+//
+// It returns [ErrNotAnImageResponse] for a JSON object that is not one.
 func DecodeImageResponse(b []byte) (*canonical.ImageResponse, error) {
 	var w ImageResponse
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
+	}
+	if !IsImageResponse(&w) {
+		return nil, ErrNotAnImageResponse
 	}
 	out := &canonical.ImageResponse{
 		Created:      w.Created,

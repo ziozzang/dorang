@@ -89,7 +89,38 @@ func (geminiAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 	if err := json.Unmarshal(body, &w); err != nil {
 		return nil, err
 	}
+	if !isGeminiResponse(&w) {
+		return nil, errNotAResponse
+	}
 	return &decoded{resp: geminiToCanonical(&w, x.call.Model)}, nil
+}
+
+// isGeminiResponse reports whether a decoded body is a GenerateContentResponse.
+//
+// The same rule the wire decoders apply, on the family that needed it least
+// obviously and had it just as badly: a vendor's 200-wrapped error envelope
+// unmarshalled into a zero-valued [geminiResponse] and left through the chat
+// encoder as `{"object":"chat.completion","choices":[],…}` with a synthesized
+// `chatcmpl-` id — an answer to a question this upstream never saw, in a
+// protocol it does not even speak.
+//
+// This family defines no discriminator either, so the test is the presence of a
+// payload-bearing member. There are three, not two, and the third is the
+// interesting one:
+//
+//   - `candidates` — the generated turns.
+//   - `usageMetadata` — what they cost.
+//   - `promptFeedback` — the reason there are NO candidates. A prompt this
+//     family's safety filter blocked answers with feedback and nothing else,
+//     and that is a real answer: the request was received, evaluated and
+//     refused. Refusing it here would report a working safety filter as a
+//     broken gateway, so it is accepted and rendered as the empty turn it is.
+//
+// Presence, not value: `{"candidates":[]}` is accepted for the same reason
+// `{"choices":[]}` is on the chat surface.
+func isGeminiResponse(w *geminiResponse) bool {
+	return w != nil &&
+		(w.Candidates != nil || w.UsageMetadata != nil || len(w.PromptFeedback) > 0)
 }
 
 func (geminiAdapter) source(r io.Reader, x *exchange) (eventSource, error) {
@@ -186,6 +217,13 @@ type geminiResponse struct {
 	UsageMetadata *geminiUsage      `json:"usageMetadata,omitempty"`
 	ModelVersion  string            `json:"modelVersion,omitempty"`
 	ResponseID    string            `json:"responseId,omitempty"`
+	// PromptFeedback is why a request produced no candidates at all — the
+	// family's safety filter refusing the PROMPT rather than the completion.
+	// It is kept raw and never converted: nothing in the neutral form expresses
+	// it. It is modelled solely so [isGeminiResponse] can see that a body with
+	// no candidates is nonetheless an answer, which is the difference between
+	// reporting a working filter as an empty turn and reporting it as a 502.
+	PromptFeedback json.RawMessage `json:"promptFeedback,omitempty"`
 }
 
 type geminiCandidate struct {

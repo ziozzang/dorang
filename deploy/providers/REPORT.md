@@ -36,8 +36,8 @@ Files:
 | D4 | MEDIUM | Non-streaming conversion emitted `created: 0` | **Closed** |
 | D5 | LOW | The upstream id crossed families verbatim on one path only | **Closed — decided, not defaulted** |
 | D6 | judgement | The converted OpenAI stream omitted `role: "assistant"` on the first delta | **Closed** |
-| D7 | judgement | The usage chunk's `choices` shape has no operator knob | **Open — belongs to the `compat:` work** |
-| D8 | HIGH | *(found while fixing D2)* The same silent-success defect on every relay surface | **Closed for embeddings and count_tokens; open elsewhere** |
+| D7 | judgement | The usage chunk's `choices` shape has no operator knob | **Closed** — and so is `compat.anthropic_total_tokens`, its twin |
+| D8 | HIGH | *(found while fixing D2)* The same silent-success defect on every relay surface | **Closed** — every remaining surface (rerank, moderations, images, transcription, speech, Gemini) is gated |
 
 Everything marked closed is pinned by a named test. Each fix was reverted and the named test
 observed to fail; the table is at the end.
@@ -314,15 +314,19 @@ The stream usage chunk carries `choices:[{"index":0,"delta":{}}]` where OpenAI d
 empty array. This is a deliberate divergence, already documented as COMPATIBILITY 3.3: the
 reference proxy sends the stub and the clients that exist were built against it.
 
-**Open, and deliberately not touched here.** The knob already exists in the wire layer —
-`openai.StreamConfig.UsageChunkChoices`, with `stub` and `empty` — and COMPATIBILITY 3.3 records
-that `compat.usage_chunk_choices` is in the config schema and that this build refuses `empty` at
-load. Wiring it is **one field in `newEventSink`** (`internal/backend/stream.go`) once the
-`compat:` config section lands. Duplicating that work from this side would have produced a
-second reading of one flag.
+**Closed.** The knob already existed in the wire layer — `openai.StreamConfig.UsageChunkChoices`,
+with `stub` and `empty` — and `compat.usage_chunk_choices` already existed in the config schema,
+where `empty` was refused at load because nothing carried the value between them. The carrier is
+`backend.Call.UsageChunkChoices`, filled from the dispatch state in `internal/app` and read by
+`newEventSink` (`internal/backend/stream.go`), exactly as predicted here. Selecting `empty` also
+takes a same-family stream off the byte-relay fast path, which was the part not predicted: on
+that path the usage chunk is the upstream's own bytes, so honouring the setting requires
+decoding the stream.
 
-`anthropic.ResponseOptions.TotalTokens` (COMPATIBILITY 6.8) is the other wire-side knob in the
-same position, wired the same way, from `encodeClient`.
+`anthropic.ResponseOptions.TotalTokens` (COMPATIBILITY 6.8) was the other wire-side knob in the
+same position, and is wired the same way, from `encodeClient`. The refusals in
+`internal/config` are gone with the gap they described, and both are pinned by tests in
+`internal/app` that drive a loaded configuration to an emitted frame.
 
 ---
 

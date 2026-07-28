@@ -103,6 +103,17 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 		// asked for, rather than the backend's label: a self-hosted engine
 		// routinely answers application/octet-stream and a browser handed that
 		// plays nothing.
+		//
+		// Which is exactly why this surface needs its own gate. It is the one
+		// operation whose answer is not JSON at all: the upstream's bytes are
+		// relayed unexamined and RELABELLED on the way out, so an upstream error
+		// envelope reached the client as JSON wearing `audio/mpeg`, over a 200.
+		// [openai.IsSpeechAudio] carries the rule, and the reason the member-
+		// presence test every other surface uses cannot be asked of a container
+		// format.
+		if !openai.IsSpeechAudio(body, x.respType) {
+			return nil, errNotAResponse
+		}
 		format := ""
 		if c.Speech != nil {
 			format = c.Speech.Format
@@ -117,6 +128,14 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 		out, mt, err := openai.MarshalTranscriptionResponse(cresp)
 		if err != nil {
 			return nil, err
+		}
+		if out == nil {
+			// A transcript of silence in a raw response format renders to zero
+			// bytes, and a nil slice here means "no rendered answer" to
+			// [Backend.convert] — which then read the neutral response that a
+			// raw answer does not have. An empty answer and an absent one are
+			// different facts and only one of them is this.
+			out = []byte{}
 		}
 		d := &decoded{raw: out, ctype: mt}
 		if cresp.Usage != nil {

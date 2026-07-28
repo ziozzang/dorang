@@ -312,14 +312,61 @@ func RequestToCanonical(w *Request) (*canonical.RerankRequest, error) {
 	return out, nil
 }
 
+// ErrNotAResponse is a JSON object that parsed cleanly and is not a rerank
+// answer.
+//
+// It is a distinct condition from a decode failure, and the same one the chat
+// decoders name. A vendor that answers HTTP 200 with
+// `{"code":500,"msg":"404 NOT_FOUND","success":false}` — a real answer from a
+// real host to a request addressed at a route it does not serve — unmarshals
+// into a zero-valued [Response] without error.
+//
+// What reached the client was not merely an empty ranking. [Response] carries an
+// Extra map so a member dorang does not model survives the crossing, and
+// [MarshalResponse] splices it back on the way out, so the vendor's own error
+// members were re-serialized INTO the answer next to dorang's spliced `model`
+// and an empty `results` array — the relay failure mode, reached through a
+// converting path. Nothing downstream could tell it from a ranking of nothing:
+// retries never fired, §7.6 fallback never engaged, health counted a success,
+// and neither billing block was present so cost recorded zero.
+var ErrNotAResponse = errors.New("rerank: the body is a JSON object but not a rerank response")
+
+// IsResponse reports whether a decoded body is a rerank answer.
+//
+// None of the three dialects defines a discriminator — there is no `object` or
+// `type` member on a rerank answer in the generic, Cohere or Jina spelling — so
+// the "accept on either ground" rule the chat gates state reduces here to its
+// second ground alone: a payload-bearing member must be PRESENT. Those are
+// `results`, which is the ranking, and `usage`, which is what it cost. It is the
+// same pair the embeddings relay requires, for the same reason.
+//
+// Presence, not value. A rerank over an empty document list answers
+// `{"results":[]}`, and a check for a non-empty ranking would refuse it.
+//
+// `meta` is deliberately NOT a ground, even though the Cohere dialect sends it
+// on every answer. It is a metadata sidecar — api_version, warnings — of exactly
+// the kind a vendor's error envelope also carries, so accepting on it would
+// admit the bodies this exists to refuse. Every real answer that has a `meta`
+// has a `results` beside it.
+func IsResponse(w *Response) bool {
+	return w != nil && (w.Results != nil || w.Usage != nil)
+}
+
 // DecodeResponse parses a rerank answer into the neutral form.
 //
 // json.Unmarshal and not the strict filter: these bytes are a backend's, not a
 // caller's, and nothing is authorized against a response.
+//
+// It returns [ErrNotAResponse] for a JSON object that is not a rerank answer.
+// Parsing without error is not the same fact as "this is an answer"; see
+// [ErrNotAResponse] and [IsResponse].
 func DecodeResponse(b []byte, flavor Flavor, model string) (*canonical.RerankResponse, error) {
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
+	}
+	if !IsResponse(&w) {
+		return nil, ErrNotAResponse
 	}
 	return ResponseToCanonical(&w, flavor, model)
 }
