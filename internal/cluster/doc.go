@@ -37,6 +37,18 @@
 //	shared-pg     0                      one store round trip per acquire
 //	leased        block x (nodes - 1)    one round trip per block, none in between
 //
+// Every one of those except the first holds under a CONDITION, and the
+// condition is published beside the number ([Accuracy.Holds],
+// [Accuracy.PerLapse]) rather than left to a comment in whichever package does
+// the wiring. The shared modes are exact while every holder renews its lease;
+// a lease that lapses returns its units to the counter underneath a holder that
+// is still using them, and each such lapse is worth up to the whole limit. That
+// is not a hypothetical: two nodes admitted 104 against a ceiling of 64 with an
+// undersized cluster.node_ttl, and the ledger admitted 190 against 100 when a
+// live node's lease was reclaimed on a lapsed heartbeat -- which is why
+// [Ledger.ReclaimNode] and [LeaseStore.ReclaimNode] now require the lease to
+// have expired and not merely the heartbeat.
+//
 // The leased figure is the concurrent bound: a node holds one lease per key, so
 // at most one reclaimed-but-still-spending block per other node can exist at a
 // time. Repeated crashes inside one period can each contribute again, which is
@@ -67,13 +79,22 @@
 //     [Election.IsLeader] demotes a node whose safe window has passed, so a
 //     process frozen by a GC pause, a suspended container or a paused debugger
 //     steps down on the way back instead of resuming as a second leader.
-//  3. The safe window ends one guard band before the lease does, because a
-//     successor may take the lease the instant it expires and an incumbent that
-//     stopped exactly then would still overlap by however long its last task
-//     takes to notice.
-//  4. A fencing token accompanies leadership for the case no timeout closes: a
-//     write already in flight at the moment of demotion. It advances when the
-//     lock changes hands and never on a renewal.
+//  3. The safe window ends one guard band before the lease does -- measured
+//     from the expiry the STORE granted, not from this node's clock once the
+//     acquire returned. Computing it the second way made the margin
+//     `guard - acquire latency`, which is not a margin at all when the store is
+//     slow: a 15s lease with a 5s guard and an 8s acquire gave two nodes three
+//     seconds of simultaneous leadership with both clocks reading identically.
+//     Derived from the row, the band is one guard band for any latency, and
+//     what it bounds is clock disagreement between nodes.
+//  4. A fencing token accompanies leadership for what no duration closes: a
+//     write already in flight at demotion, and clocks that disagree by more
+//     than the guard band. It advances when the lock changes hands and never on
+//     a renewal, and [Node] checks it against the store before dispatching each
+//     due leader job -- so a superseded leader runs none. [Fence] states
+//     precisely what that reaches and what it does not: a job that writes
+//     through another package's transaction is fenced at dispatch, not at
+//     commit, and must carry the token itself to close the difference.
 //
 // The leader owns partition pre-creation and retention, expiry sweeps for both
 // capacity reservations (DESIGN 5.3) and budget reservations (DESIGN 6.4),
@@ -99,12 +120,20 @@
 // traffic against the published overshoot.
 //
 // Charging the block up front is what makes this safe rather than merely fast.
-// A node that dies mid-block has already had the whole block counted, so the
-// failure mode is a budget that under-spends until the lease is reclaimed,
-// never one that overspends. [Ledger.ReclaimExpired] returns the part the dead
-// node had not used, from the `used` column checkpointed on every draw, every
-// renewal and every tick; a graceful [Ledger.Close] returns the exact
-// remainder, so a planned restart costs nothing at all.
+// A node that dies mid-block has already had the whole block counted, so a LIVE
+// lease can never over-grant. What it can do is have its reclaim return more
+// than it left: [Ledger.ReclaimExpired] gives back amount - used, and `used` is
+// only as fresh as the last checkpoint. That residue is bounded by one block
+// per death, which is the published leased figure and not a separate promise.
+// The `used` column is checkpointed on every draw, every renewal and every
+// tick; a graceful [Ledger.Close] returns the exact remainder, so a planned
+// restart costs nothing at all.
+//
+// [Ledger.Maintain] also reclaims the blocks of periods that are over and
+// settled for. The map was append-only before -- one entry per key per period
+// for the life of the process, with no delete anywhere -- and the boundary is
+// not the period ending but its last settlement arriving, which is counted
+// rather than waited out.
 //
 // # Shapes worth knowing
 //

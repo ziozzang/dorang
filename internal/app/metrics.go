@@ -335,13 +335,20 @@ func (a *App) recordMetrics(ev *server.Event) {
 //
 // Total is preferred when the dispatcher filled it, because a backend that
 // reports a total which is not the sum of its parts is reporting the number it
-// will bill for. Falling back to the sum keeps the ceiling working against a
-// backend that reports only the parts.
+// will bill for. Falling back to input plus output keeps the ceiling working
+// against a backend that reports only the parts.
+//
+// The fallback is NOT a sum of every field. CacheRead and CacheWrite are the
+// parts of Input that came from and went to cache, and Reasoning is the part of
+// Output that was reasoning; adding them again charges a cached, reasoning-heavy
+// request nearly twice its true consumption against the ceiling. Same rule as
+// meter.Tokens.Total and canonical.Usage.TotalTokens, which is the point — a
+// second rule here is how the ledger came to disagree with the wire.
 func totalTokens(u server.Usage) int64 {
 	if u.Total > 0 {
 		return u.Total
 	}
-	return u.Input + u.Output + u.CacheRead + u.CacheWrite + u.Reasoning
+	return u.Input + u.Output
 }
 
 // prefixHitPrefix is what internal/router stamps on a decision made by cache

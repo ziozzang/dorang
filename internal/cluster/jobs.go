@@ -24,6 +24,20 @@ type Job struct {
 	// Run does the work. It must honour ctx: the context is cancelled when this
 	// node stops leading, and a job that ignores it is a job that will run
 	// concurrently with its successor's copy.
+	//
+	// ctx also carries this term's fencing token ([FenceFrom]). A job whose
+	// writes go through [Ledger] or [LeaseStore] is fenced by that without
+	// asking. A job that opens its own transaction somewhere else is checked
+	// once, before it is dispatched, and not again -- so a handover landing
+	// after that check and before its commit is not caught, and closing that
+	// gap means putting [Fence.In] in its own transaction.
+	//
+	// One thing ctx does NOT do is expire on its own. Demotion by the passage
+	// of time is observed when something asks ([Election.IsLeader],
+	// [Election.Leader], [Election.Campaign]), and a single job that runs for
+	// longer than the safe window blocks the tick that would have asked. A job
+	// that can run that long should take its own deadline, or check the fence
+	// itself as it goes.
 	Run func(ctx context.Context) error
 }
 
@@ -135,14 +149,18 @@ func ReservationSweepJob(s *store.Store, sweepCapacity func() int, every time.Du
 //
 // It reclaims three things, in an order that matters:
 //
-//  1. The leases of nodes whose heartbeat has lapsed. A node that is gone is
-//     not coming back to release them, and waiting out a TTL its own writes had
-//     been extending would keep its share out of circulation for as long as it
-//     was alive.
+//  1. The expired leases of nodes whose heartbeat has lapsed, targeted at the
+//     node so a failure is attributable to it.
 //  2. Block leases whose TTL has passed, returning their unspent part to the
 //     durable counter. Without this a budget shrinks by one block every time a
 //     node dies.
 //  3. Shared counter leases whose TTL has passed, returning their units.
+//
+// Every step requires expiry, including the first, which is the correction
+// described at [Ledger.ReclaimNode]: a lapsed heartbeat says a node is probably
+// gone, and a lapsed lease is the only thing that says it has stopped spending.
+// This job used to trust the first, and a two-node cluster with a limit of 100
+// then admitted 190 with nobody dead.
 //
 // Pruning the dead node rows happens last, so that a pass which fails part way
 // through has not yet forgotten which node it was reclaiming from.
@@ -175,7 +193,7 @@ func LeaseReclaimJob(reg *Registry, ledger *Ledger, shared *LeaseStore, every ti
 					}
 				}
 				if shared != nil {
-					if _, err := shared.ReclaimNode(ctx, d.ID); err != nil {
+					if _, err := shared.ReclaimNode(ctx, d.ID, t); err != nil {
 						errs = append(errs, err)
 					}
 				}

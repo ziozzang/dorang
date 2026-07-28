@@ -117,6 +117,14 @@ func CompareKey(a, b Key) int {
 }
 
 // Tokens is the token breakdown carried by both paths.
+//
+// Input is INCLUSIVE: it is the whole prompt count, and CacheRead and
+// CacheWrite are the parts of it that were served from and written to cache.
+// Output is inclusive too, and Reasoning is the part of it that was reasoning.
+// That is the same convention [canonical.Usage] carries, because these numbers
+// are copied straight across from it — see internal/backend/gemini.go's
+// normalization, which keeps "OutputTokens >= ReasoningTokens and cost never
+// adds them twice".
 type Tokens struct {
 	Input     int64
 	Output    int64
@@ -127,9 +135,22 @@ type Tokens struct {
 	Reasoning  int64
 }
 
-// Total is the sum of every token dimension.
+// Total is the request's total token count: input plus output, and NOT a sum of
+// every field.
+//
+// The breakdown fields are subsets, not addends. Summing all five double-counts
+// the cached prefix and the reasoning tokens, and it did: the ledger recorded
+// 128 for a request whose own response body said `"total_tokens": 120`, and a
+// live session's rollup read 30,929 against 30,355 on the wire. An operator
+// reconciling dorang's ledger against the answers dorang gave found neither
+// number reproducible from the other.
+//
+// This is deliberately the same function as canonical.Usage.TotalTokens — one
+// definition of "total tokens" in the binary, on the side the client was told.
+// TestLedgerTotalTokensEqualsTheAnswerTheClientGot in cmd/dorang asserts the
+// equality against a real response body rather than against this function.
 func (t Tokens) Total() int64 {
-	return t.Input + t.Output + t.CacheRead + t.CacheWrite + t.Reasoning
+	return t.Input + t.Output
 }
 
 // IsZero reports whether no token was counted.
@@ -160,6 +181,21 @@ type TraceInfo struct {
 	// UpstreamModel is the provider-side name actually sent, which may differ
 	// from ModelGroup after aliasing (DESIGN 7.2).
 	UpstreamModel string
+
+	// DeploymentID is WHICH deployment of the model group served the request.
+	//
+	// It is on the trace path rather than in [Key] for the same reason UserID
+	// is: the ledger has a deployment_id column and §9.4's rollups are keyed by
+	// key, model and team. It is the value x-dorang-deployment carries, and the
+	// column held nothing at all while the header held it — the worst of the
+	// two arrangements, since an operator who checks the header believes it was
+	// recorded.
+	DeploymentID string
+
+	// Streamed reports that the client was answered with an event stream. The
+	// ledger has a streamed column; nothing filled it, so every row said false
+	// including rows for turns whose bodies were SSE.
+	Streamed bool
 
 	// Excerpt is the message content excerpt. It is truncated to
 	// Config.ExcerptChars runes and subject to Config.ExcerptMode; under
@@ -307,8 +343,13 @@ type Trace struct {
 	CredentialID  string
 	Endpoint      string
 	UpstreamModel string
+	// DeploymentID is which deployment served the request — the value
+	// x-dorang-deployment carries on the response.
+	DeploymentID string
 
 	Status int
+	// Streamed reports that the client was answered with an event stream.
+	Streamed bool
 
 	// Excerpt is the truncated message excerpt, or under ExcerptHash the hex
 	// SHA-256 of it prefixed with "sha256:", or empty under ExcerptNone.

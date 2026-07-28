@@ -238,6 +238,11 @@ func (c *Config) validateServer(col *collector) {
 	if c.Server.RequestTimeout <= 0 {
 		col.add("server.request_timeout", "must be greater than zero")
 	}
+	// server.max_body_bytes has no check here on purpose. A negative size is
+	// refused by ByteSize's own parser before this runs, and zero is
+	// indistinguishable from unset — ApplyDefaults has already replaced it with
+	// the documented 32 MiB. A branch for either would be unreachable, and an
+	// unreachable validation rule reads like a guarantee nobody is enforcing.
 	nonNegative(col, "server.shutdown_grace", int64(c.Server.ShutdownGrace))
 	nonNegative(col, "server.pre_stop_delay", int64(c.Server.PreStop()))
 }

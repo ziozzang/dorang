@@ -92,9 +92,34 @@ type fault struct {
 	// needs more than prose: which dependency is missing, what the maximum
 	// range is. It is omitted when empty.
 	Detail map[string]any
+
+	// wrapped is the sentinel this refusal also IS, so that a fault carrying a
+	// specific message still answers errors.Is. Without it a dependency has to
+	// choose between the identity and the reason, and both callers of that
+	// choice have been wrong: returning the bare sentinel loses the message,
+	// and building an error of one's own around the sentinel's TEXT loses the
+	// identity — which is how an unfiltered /spend/logs came to answer 500.
+	wrapped error
 }
 
 func (f *fault) Error() string { return f.Message }
+
+// Unwrap exposes the sentinel a fault stands for, or nil.
+func (f *fault) Unwrap() error { return f.wrapped }
+
+// Unsupported builds a refusal that is BOTH errors.Is(err, ErrUnsupported) and
+// carries its own operator-facing reason to the client.
+//
+// A dependency that returns the bare sentinel gets [faultFor]'s generic "not
+// implemented", which for a ledger query tells the caller nothing they can act
+// on — and "add a query parameter" is the entire content of that refusal. Use
+// this whenever the reason is dorang's own words rather than a dependency's;
+// the text goes on the wire, so it must not be an error string from a driver.
+func Unsupported(format string, a ...any) error {
+	f := unimplemented(CodeNotImplemented, format, a...)
+	f.wrapped = ErrUnsupported
+	return f
+}
 
 // newFault builds a refusal.
 func newFault(status int, code, typ, format string, a ...any) *fault {

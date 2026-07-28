@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -178,6 +179,127 @@ func TestEveryModePublishesANumber(t *testing.T) {
 		}
 		t.Logf("%v", a)
 	}
+}
+
+// TestAConditionalZeroSaysSoWhereItIsPublished is DESIGN §5.6 read strictly.
+//
+// "Every mode publishes its maximum possible overshoot as a number" was
+// satisfied by two modes publishing 0, and the 0 was true only while every
+// holder renewed its lease. The qualifier existed -- in a comment in
+// internal/app, beside the wiring -- which is not a place anybody reads a bound.
+// An operator sizing a fleet reads the number, and a number that is sometimes
+// true published as though it were always true is the most expensive kind of
+// wrong.
+func TestAConditionalZeroSaysSoWhereItIsPublished(t *testing.T) {
+	p := Params{Limit: 64, Nodes: 4, Block: 8}
+	for _, m := range Modes() {
+		a, err := Publish(m, p)
+		if err != nil {
+			t.Fatalf("Publish(%s): %v", m, err)
+		}
+		if a.Holds == "" {
+			// An unconditional figure must not claim a cost for violating a
+			// condition it does not have.
+			if a.PerLapse != 0 || a.PerLapseFormula != "" {
+				t.Fatalf("%s publishes an unconditional figure and a per-lapse cost of %d",
+					m, a.PerLapse)
+			}
+			continue
+		}
+		if a.PerLapse <= 0 || a.PerLapseFormula == "" {
+			t.Fatalf("%s says its number holds only while %q and does not say what one "+
+				"violation costs", m, a.Holds)
+		}
+		if !strings.Contains(a.String(), a.Holds) {
+			t.Fatalf("%s renders as %q, which drops the condition the number depends on",
+				m, a.String())
+		}
+	}
+
+	// The two modes that publish exactness are exactly the two that must say
+	// what exactness rests on. This is the specific regression: shared-pg and
+	// shared-redis are exact because a counter is the sum of LIVE lease rows,
+	// and a row that lapses stops being counted while its holder is still using
+	// it.
+	for _, m := range []Mode{ModeSharedPG, ModeSharedRedis} {
+		a, err := Publish(m, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.MaxOvershoot != 0 {
+			t.Fatalf("%s no longer publishes 0; this test is about the condition on that 0", m)
+		}
+		if a.Holds == "" {
+			t.Fatalf("%s publishes 0 with no condition attached", m)
+		}
+		if a.PerLapse != p.Limit {
+			t.Fatalf("%s prices one lapsed lease at %d; a holder can be occupying up to the "+
+				"whole limit of %d when its row is dropped", m, a.PerLapse, p.Limit)
+		}
+	}
+}
+
+// TestSharedPGExactnessLapsesWithTheLease measures the condition rather than
+// asserting the sentence.
+//
+// The published figure for this mode is 0, and [TestPublishedOvershootIsNeverExceeded]
+// checks it under load that finishes inside one lease. This checks the other
+// side: with a lease allowed to lapse under a holder that is still occupying its
+// units, the mode admits the limit twice over, and the amount is the PerLapse
+// figure the mode publishes rather than an unbounded surprise.
+func TestSharedPGExactnessLapsesWithTheLease(t *testing.T) {
+	eachCluster(t, 2, func(t *testing.T, stores []*store.Store, clk *clock) {
+		ctx := context.Background()
+		const key = "q/lapse/1"
+		const limit = int64(64)
+		p := Params{Limit: limit, Nodes: 2, Clustered: true}
+
+		pub, err := Publish(ModeSharedPG, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		a, err := NewLeaseStore(stores[0], "node-a", clk.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := NewLeaseStore(stores[1], "node-b", clk.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var admitted int64
+		got, err := a.Reserve(ctx, key, limit, limit, 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admitted += got
+		if got, err := b.Reserve(ctx, key, 1, limit, 30*time.Second); err != nil || got != 0 {
+			t.Fatalf("node-b got %d while node-a held the limit (err %v): the mode is not "+
+				"exact even under its own condition", got, err)
+		}
+
+		// node-a's renewal does not arrive. It has released nothing and its
+		// requests are still in flight; the row simply lapses.
+		clk.Add(31 * time.Second)
+		got, err = b.Reserve(ctx, key, limit, limit, 30*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		admitted += got
+
+		overshoot := admitted - limit
+		if overshoot <= 0 {
+			t.Fatal("a lapsed lease admitted nothing extra; the condition on the published " +
+				"zero would then be describing something that cannot happen")
+		}
+		if overshoot > pub.PerLapse {
+			t.Fatalf("one lapsed lease cost %d units of overshoot against a published "+
+				"per-lapse figure of %d (%s)", overshoot, pub.PerLapse, pub.PerLapseFormula)
+		}
+		t.Logf("shared-pg published max overshoot %d while %q; one lapse measured %d "+
+			"against a published %d", pub.MaxOvershoot, pub.Holds, overshoot, pub.PerLapse)
+	})
 }
 
 // TestPublishedFiguresAreTheDocumentedArithmetic pins the formulas of

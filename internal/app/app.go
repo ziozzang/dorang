@@ -547,6 +547,7 @@ func (a *App) serverOptions(cfg *config.Config) server.Options {
 		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
 		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
 		PreStopDelay:      cfg.Server.PreStop().Duration(),
+		MaxBodyBytes:      cfg.Server.MaxBodyBytes.Bytes(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		LegacyHeaders:     cfg.Compat.LegacyHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),

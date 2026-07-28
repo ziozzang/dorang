@@ -223,10 +223,18 @@ func TestLeaseOutlivingItsNodeIsReclaimed(t *testing.T) {
 	})
 }
 
-// TestDeadNodeLeasesAreReclaimedByHeartbeat covers the other trigger: a node
-// whose heartbeat lapsed. Waiting for a TTL its own writes had been extending
-// would keep its budget out of circulation for as long as it was alive.
-func TestDeadNodeLeasesAreReclaimedByHeartbeat(t *testing.T) {
+// TestDeadNodeLeasesAreReclaimedOnTheLeaseAndNotTheHeartbeat covers the other
+// trigger and the correction to it.
+//
+// A lapsed heartbeat is what makes the leader LOOK at a node's leases. It is
+// not what makes them safe to take: [Registry.Dead] reports a heartbeat that
+// did not arrive, which one slow store write produces on a node that is serving
+// perfectly well, and the block's hot path reads an in-memory expiry and no
+// store at all -- so the only thing that stops a holder spending is its own
+// lease running out. This test asserts both halves, because the earlier version
+// asserted only the second and would pass against the behaviour that admitted
+// 190 against a limit of 100.
+func TestDeadNodeLeasesAreReclaimedOnTheLeaseAndNotTheHeartbeat(t *testing.T) {
 	eachCluster(t, 2, func(t *testing.T, stores []*store.Store, clk *clock) {
 		ctx := context.Background()
 		const limit = 10 * 1_000_000_000
@@ -247,14 +255,14 @@ func TestDeadNodeLeasesAreReclaimedByHeartbeat(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// node-a stops heartbeating. The node TTL is 6s in the harness; the
-		// ledger lease TTL is a minute, so only the heartbeat can catch this.
+		// node-a stops heartbeating. The node TTL is 6s in the harness and the
+		// ledger lease TTL is a minute, so for the next fifty seconds node-a is
+		// declared dead and is still able to spend every unit it drew.
 		clk.Add(10 * time.Second)
 		tick(t, b)
 		if !b.IsLeader() {
 			t.Fatal("the survivor did not become leader")
 		}
-
 		dead, err := b.Registry().Dead(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -266,9 +274,315 @@ func TestDeadNodeLeasesAreReclaimedByHeartbeat(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if v != usd(1) {
+			t.Fatalf("the leader returned %d nano of a DECLARED-dead node's live lease; "+
+				"the block is still spendable from memory, so those units would be spent twice",
+				usd(1)-v)
+		}
+
+		// Once the lease itself lapses the holder's hot path refuses it too, and
+		// the two agree on the same instant. Now the reclaim is safe, and it
+		// gives back exactly the part node-a had not used.
+		clk.Add(time.Minute)
+		tick(t, b)
+		v, err = b.Ledger().Committed(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if v != usd(0.4) {
-			t.Fatalf("after the leader reclaimed a dead node's lease the budget shows %d nano, want %d",
+			t.Fatalf("after the lease lapsed the budget shows %d nano, want the %d node-a used",
 				v, usd(0.4))
+		}
+	})
+}
+
+// TestReclaimingALiveNodeCannotExceedTheLimit is the schedule that admitted 190
+// against a limit of 100, asserted on the spend rather than on the reclaim.
+//
+// The arithmetic of the defect, so that the numbers below are not magic. A block
+// of 100 against a limit of 100: node-a draws the lot, charges it to the durable
+// counter before spending a unit of it (DESIGN §9.6), spends 10 and checkpoints.
+// Its heartbeat then lapses -- ten seconds, against a node TTL of six -- while
+// its block lease still has fifty seconds to run and its hot path, which reads
+// an in-memory expiry and no store at all, is perfectly willing to keep serving.
+// The leader declares it dead and returns the unspent 90 to the counter, which
+// drops to 10. The leader draws 90 of the 90 that now look free and spends them.
+// node-a spends the 90 it still holds. 10 + 90 + 90 = 190, against 100, with
+// nobody dead.
+//
+// [Ledger.ReclaimNode] used to be guarded by node_id alone, on the argument that
+// a dead node's lease would otherwise stay out of circulation "for as long as it
+// was alive". It would not: a node that dies stops renewing, so its last
+// renewal lapses one lease TTL later. That is the delay this guard costs, and it
+// buys the only version of "the limit is not exceeded" that can be demonstrated.
+func TestReclaimingALiveNodeCannotExceedTheLimit(t *testing.T) {
+	eachCluster(t, 2, func(t *testing.T, stores []*store.Store, clk *clock) {
+		ctx := context.Background()
+		const limit = int64(100)
+		const block = int64(100)
+		key := QuotaKey("credential", "c-1", quota.Rolling(time.Hour), quota.MetricRequests, clk.Now())
+
+		live := newLedger(t, stores[0], "node-a", clk, block, time.Minute)
+		leader := newLedger(t, stores[1], "node-b", clk, block, time.Minute)
+		t.Cleanup(func() {
+			_ = live.Close(ctx)
+			_ = leader.Close(ctx)
+		})
+
+		var admitted int64
+		take := func(l *Ledger, who string, n int64) {
+			t.Helper()
+			h, err := l.Reserve(ctx, key, limit, n)
+			if errors.Is(err, ErrExhausted) {
+				t.Logf("%s was refused %d units: %v", who, n, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s Reserve(%d): %v", who, n, err)
+			}
+			if err := l.Settle(h, n); err != nil {
+				t.Fatal(err)
+			}
+			admitted += n
+		}
+
+		take(live, "node-a", 10)
+		if err := live.Checkpoint(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// node-a's heartbeat lapses. It is not dead: it never stopped, its lease
+		// has fifty seconds left, and it is about to serve more traffic.
+		clk.Add(10 * time.Second)
+		res, err := leader.ReclaimNode(ctx, "node-a", clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Reported and not fatal, so the run reaches the assertion that actually
+		// matters: what the two nodes together are allowed to spend.
+		if res.Returned != 0 {
+			t.Errorf("the leader returned %d units of a live node's lease; the holder's hot "+
+				"path can still spend every one of them", res.Returned)
+		}
+
+		// Both nodes now go for whatever the counter says is left. Whatever the
+		// answer, the two of them together must not get more than the limit.
+		take(leader, "node-b", 90)
+		take(live, "node-a", 90)
+
+		if admitted > limit {
+			t.Fatalf("admitted %d against a limit of %d", admitted, limit)
+		}
+		if admitted != limit {
+			t.Fatalf("admitted %d of a limit of %d: the guard is refusing traffic it should "+
+				"serve, which is a different defect and not an acceptable fix for this one",
+				admitted, limit)
+		}
+
+		// And once the lease really has lapsed the reclaim happens, so the guard
+		// delays the return rather than preventing it.
+		clk.Add(2 * time.Minute)
+		res, err = leader.ReclaimNode(ctx, "node-a", clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Leases != 1 {
+			t.Fatalf("after the lease lapsed the reclaim took %d leases, want 1", res.Leases)
+		}
+	})
+}
+
+// TestReclaimNodeWillNotTakeTheCallersOwnLeases is the self-guard, on both
+// implementations rather than on the one that had it.
+//
+// The leader is a node like any other: it holds leases against the same limits
+// from its own request path. A registry that briefly reports it dead -- its own
+// heartbeat write lost a race with a slow store, or its clock stepped -- would
+// otherwise have it delete its own live rows and hand the units out again.
+// [Ledger.ReclaimNode] guarded against this; [LeaseStore.ReclaimNode] did not.
+func TestReclaimNodeWillNotTakeTheCallersOwnLeases(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *store.Store, clk *clock) {
+		ctx := context.Background()
+		const limit = int64(64)
+		const key = "q/self/1"
+
+		shared, err := NewLeaseStore(s, "node-a", clk.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := shared.Reserve(ctx, key, 40, limit, time.Minute); err != nil || got != 40 {
+			t.Fatalf("Reserve = %d, %v; want 40", got, err)
+		}
+
+		// The lease is live and it is this node's. Both facts are reasons to
+		// refuse; either alone would be enough.
+		if n, err := shared.ReclaimNode(ctx, "node-a", clk.Now()); err != nil || n != 0 {
+			t.Fatalf("the store reclaimed %d of its own rows (err %v)", n, err)
+		}
+		if v, err := shared.Held(ctx, key); err != nil || v != 40 {
+			t.Fatalf("this node now holds %d of the 40 it reserved (err %v)", v, err)
+		}
+
+		ledger := newLedger(t, s, "node-a", clk, 16, time.Minute)
+		t.Cleanup(func() { _ = ledger.Close(ctx) })
+		ck := QuotaKey("credential", "c-self", quota.Rolling(time.Hour), quota.MetricRequests, clk.Now())
+		h, err := ledger.Reserve(ctx, ck, limit, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Settle(h, 8); err != nil {
+			t.Fatal(err)
+		}
+		clk.Add(2 * time.Minute) // the lease has lapsed; only the self-guard is left
+		res, err := ledger.ReclaimNode(ctx, "node-a", clk.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Leases != 0 {
+			t.Fatalf("the ledger reclaimed %d of its own leases", res.Leases)
+		}
+	})
+}
+
+// TestFinishedPeriodsAreReclaimed is the third defect: [Ledger.blocks] had no
+// delete anywhere, so a long-running node accumulated one entry per key per
+// period for the life of the process.
+//
+// The bound asserted is a constant and not "smaller than it was". Twenty
+// one-minute windows for one key must leave at most the periods still inside
+// their retention grace, whatever the loop count -- which is what makes this a
+// statement about the map being reclaimed rather than about it growing slower.
+func TestFinishedPeriodsAreReclaimed(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *store.Store, clk *clock) {
+		ctx := context.Background()
+		const limit = int64(1 << 40)
+		const periods = 20
+		w := quota.Rolling(time.Minute)
+
+		l, err := NewLedger(LedgerConfig{
+			Store: s, NodeID: "node-a", Block: 16, TTL: 30 * time.Second,
+			RenewBefore: 10 * time.Second, Retain: time.Minute, Now: clk.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l.Close(ctx) })
+
+		var spent int64
+		for i := 0; i < periods; i++ {
+			key := QuotaKey("key", "k", w, quota.MetricRequests, clk.Now())
+			h, err := l.Reserve(ctx, key, limit, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := l.Settle(h, 3); err != nil {
+				t.Fatal(err)
+			}
+			spent += 3
+			clk.Add(time.Minute)
+			if err := l.Maintain(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// The last period ends, plus the retention grace.
+		clk.Add(2 * time.Minute)
+		if err := l.Maintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// One block per period would be `periods`. The bound is the periods a
+		// grace of one minute can still be covering, and nothing more.
+		if got := len(l.Stats()); got > 2 {
+			t.Fatalf("%d blocks retained after %d finished one-minute periods; the map is "+
+				"append-only for the life of the process", got, periods)
+		}
+
+		// Reclaimed does not mean forgotten. The counters are the truth and they
+		// still hold every unit, so a backfilled row against a closed period
+		// draws again rather than starting the period over.
+		first := QuotaKey("key", "k", w, quota.MetricRequests, epoch)
+		v, err := l.Committed(ctx, first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != 3 {
+			t.Fatalf("the first period's counter reads %d after its block was reclaimed, want 3", v)
+		}
+		// And no lease rows were stranded: a block dropped without being
+		// returned would leave its row to expire on its own TTL, holding units
+		// nobody could see.
+		var rows int
+		if err := s.DB().QueryRow(rebind(s.Driver(),
+			`SELECT COUNT(*) FROM quota_leases WHERE node_id = ?`), "node-a").Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 0 {
+			t.Fatalf("%d lease rows outlived their reclaimed blocks", rows)
+		}
+	})
+}
+
+// TestAPeriodThatIsOverIsNotAPeriodThatIsSettled is the boundary the reclaim has
+// to get right.
+//
+// Settlement is the path that RETURNS units: the estimate is an upper bound and
+// the actual is normally smaller (DESIGN §6.4). A request that reserved just
+// before a period boundary settles just after it, so a block dropped on the
+// clock alone would forfeit that refund into a period nobody accounts any more.
+// Counting the outstanding holds answers this exactly; a grace period long
+// enough to cover it would only be a guess.
+func TestAPeriodThatIsOverIsNotAPeriodThatIsSettled(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *store.Store, clk *clock) {
+		ctx := context.Background()
+		const limit = int64(1 << 40)
+		w := quota.Rolling(time.Minute)
+
+		l, err := NewLedger(LedgerConfig{
+			Store: s, NodeID: "node-a", Block: 100, TTL: time.Minute, Retain: 0, Now: clk.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l.Close(ctx) })
+
+		key := QuotaKey("key", "late", w, quota.MetricRequests, clk.Now())
+		h, err := l.Reserve(ctx, key, limit, 40)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The period ends, and every grace period anybody would have chosen goes
+		// with it. The hold is still open.
+		clk.Add(time.Hour)
+		if err := l.Maintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(l.Stats()); got != 1 {
+			t.Fatalf("a block with an unsettled hold was reclaimed after %d blocks remained; "+
+				"the refund below has nowhere to land", got)
+		}
+
+		// The settlement arrives, an hour late, and the refund reaches the block
+		// it was drawn from.
+		if err := l.Settle(h, 5); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Checkpoint(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.Maintain(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(l.Stats()); got != 0 {
+			t.Fatalf("%d blocks retained once the last settlement arrived", got)
+		}
+		v, err := l.Committed(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v != 5 {
+			t.Fatalf("the counter reads %d after a late settlement of 5 against an estimate "+
+				"of 40; the refund was lost with the block", v)
 		}
 	})
 }

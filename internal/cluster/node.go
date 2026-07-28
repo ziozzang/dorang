@@ -395,6 +395,16 @@ func (n *Node) Tick(ctx context.Context) error {
 // it race the successor that is already starting the same work. The leadership
 // check is repeated between jobs for the same reason: a pass with five jobs
 // must not finish all five on the strength of a check made before the first.
+//
+// The check is [Election.Fenced] and not [Election.IsLeader], which is the
+// difference between asking this node's clock and asking the row every node
+// shares. The fencing token used to be discarded here. It is the only mechanism
+// in the design that survives a clock disagreement: a superseded leader is
+// recognisable by a token that moved, with no assumption that two nodes measure
+// "now" the same way. What it buys is stated exactly on [Fence], including what
+// it does not reach -- a job whose writes go through another package's
+// transaction is fenced at dispatch and not at commit, and has to carry the
+// token itself ([FenceFrom]) if that gap matters to it.
 func (n *Node) runDueJobs(ctx context.Context) error {
 	n.mu.Lock()
 	jobs := make([]*jobState, len(n.jobs))
@@ -404,22 +414,39 @@ func (n *Node) runDueJobs(ctx context.Context) error {
 	now := n.now()
 	var errs []error
 	for _, j := range jobs {
-		lctx, _, ok := n.el.Leader()
-		if !ok {
-			break
-		}
 		if !j.due(now) {
 			continue
 		}
-		// The leader context ends the job; the caller's context bounds it. Both
-		// matter: one is demotion, the other is shutdown.
+		lctx, fence, err := n.el.Fenced(ctx)
+		if err != nil {
+			if errors.Is(err, ErrNotLeader) || errors.Is(err, ErrLeadershipLost) {
+				// Superseded, or never held it. Stopping is the outcome, not a
+				// failure to report: for all but one node, not leading is the
+				// normal state.
+				break
+			}
+			// The store could not answer. Leader work that cannot prove its
+			// term does not run.
+			errs = append(errs, fmt.Errorf("cluster: fence check: %w", err))
+			break
+		}
+		// The leader context ends the job; the caller's context bounds it; the
+		// fence travels with it so that a reclaim the job triggers is refused
+		// rather than raced if the term ends mid-transaction. All three matter:
+		// demotion, shutdown, and supersession this node has not noticed.
 		runCtx, cancel := mergeCancel(ctx, lctx)
-		err := j.run(runCtx, now)
+		err = j.run(WithFence(runCtx, fence), now)
 		cancel()
 		if err != nil {
 			if errors.Is(err, context.Canceled) && !n.el.IsLeader() {
 				// Demoted mid-task. Stopping is the correct outcome, not a
 				// failure to report.
+				break
+			}
+			if errors.Is(err, ErrLeadershipLost) {
+				// The job's own write was fenced out. That is the mechanism
+				// working, not a fault.
+				n.logf("cluster: leader job %s was fenced out: %v", j.job.Name, err)
 				break
 			}
 			n.logf("cluster: leader job %s failed: %v", j.job.Name, err)
@@ -428,6 +455,15 @@ func (n *Node) runDueJobs(ctx context.Context) error {
 	}
 	return errors.Join(errs...)
 }
+
+// Fence returns the precondition a leader-owned write carries under this node's
+// current term, or nil when this node does not lead.
+//
+// It is exported for the jobs this package cannot fence for itself: a [Job]
+// that opens its own transaction elsewhere is checked at dispatch and not at
+// commit, and closing that gap means carrying the token into the write. Inside
+// a leader job the same value is on the context ([FenceFrom]).
+func (n *Node) Fence() *Fence { return n.el.Fence() }
 
 // Start registers the node and runs [Node.Tick] on an interval until
 // [Node.Close]. Calling it twice, or after Close, is refused rather than

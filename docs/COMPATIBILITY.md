@@ -104,7 +104,7 @@ not a passthrough.
 | 6.5 | `stop_sequence` is `null` on the adapter path. |
 | 6.6 | Content-block indexing is **stateful**: a held `message_delta`, a chunk queue, and synthesized `content_block_stop` → `content_block_start` pairs on block transitions. A `content_block_stop` must always precede the terminal `message_delta`. This is the most intricate state machine in the whole gateway and gets its own fuzz target. |
 | 6.7 | Prompt caching: the final `message_delta` carries the real values, and cache fields appear **only when `> 0`** — so `message_start` omits them rather than zero-seeding. An earlier draft said both "seeds at 0" and "only when > 0", which cannot both be literal. The vendor itself emits explicit zeros there, so a golden captured from the vendor will not match one captured from a proxy. `input_tokens = prompt − cache_read − cache_creation`, clamped at zero — which only type-checks if the canonical count is **inclusive** (DESIGN §10.7). |
-| 6.8 | ⚠️ Non-streaming responses include a **non-spec `usage.total_tokens`** while streaming responses omit it. The two shapes differ by one field. dorang reproduces this asymmetry. `compat.anthropic_total_tokens` selects it and **both values are served**: `true` is the default, `false` is the strict vendor shape with no `total_tokens` anywhere. It used to be refused at `false`. The switch governs the NON-STREAMING half only — a streamed message omits the member at either setting, because the asymmetry is what §6.8 describes and reproducing it is the point. CONFIG §21a. |
+| 6.8 | ⚠️ **Some** reference-proxy builds add a non-spec `usage.total_tokens` to non-streaming `/v1/messages` answers while streaming answers omit it, so the two shapes differ by one field. `compat.anthropic_total_tokens` selects which shape dorang serves and **both values are served**: `true` is the default and adds the member, `false` is the strict vendor shape with no `total_tokens` anywhere. It used to be refused at `false`. The switch governs the NON-STREAMING half only — a streamed message omits the member at either setting. **This is not universal, and the default is not a claim that it is:** a deployment measured in 2026-07 emitted `{"input_tokens":68,"output_tokens":8}` with no `total_tokens` at all, so byte-parity with *that* incumbent wants `anthropic_total_tokens: false`. Check the incumbent before assuming the default matches it; the member is additive and every SDK in the family tolerates one it does not model, which is why the default errs toward emitting. CONFIG §21a. |
 | 6.9 | `/v1/messages/count_tokens` returns exactly `{"input_tokens": <number>}` and accepts `?beta=true`. |
 
 ## 7. Cross-cutting
@@ -136,7 +136,7 @@ anyone can perform if taking over quietly zeroes the numbers.
 | `x-litellm-call-id` | `x-dorang-request-id` | yes |
 | `x-dorang-real-model` | `x-dorang-upstream-model` | yes |
 | `x-litellm-model-id` | `x-dorang-deployment` | yes |
-| `x-litellm-response-cost` | `x-dorang-cost-usd` | yes |
+| `x-litellm-response-cost` | `x-dorang-cost-usd`, **and `0` when nothing is priced** | yes, always |
 | `x-litellm-key-spend` | `x-dorang-spend-usd` | detail only (§10.4) |
 | `x-litellm-key-max-budget` | `x-dorang-budget-usd` | detail only |
 | `x-litellm-attempted-retries` | `x-dorang-attempt`, **less one** | detail only |
@@ -148,8 +148,34 @@ always on". `attempted-retries` is deliberately not a copy — dorang counts att
 the reference proxy counts retries from 0, so copying the number across would report one retry
 for every request that never retried.
 
+**`x-litellm-response-cost` is the one mirror that is not a straight copy, and it is on
+purpose.** `x-dorang-cost-usd` is *absent* when no price rule matched, because dorang's own
+vocabulary distinguishes "not priced" from "free". The legacy name has no such distinction —
+the proxy it belongs to always sends it — so a mirror that vanished would reproduce the exact
+failure this section exists to prevent, silently, for every model without a price rule. That
+was the shipped behaviour: a deployment with no `pricing:` block emitted the call id, the model
+id, the retry count and the duration, and no cost header at all. **Read the pair:**
+
+| `x-litellm-response-cost` | `x-dorang-cost-usd` | means |
+|---|---|---|
+| `0` | absent | no price rule matched this model — the number is unknown, not zero |
+| `0` | `0` | priced, and this request came to nothing |
+| *n* | *n* | priced at *n* |
+
+`TestUnpricedRequestStillMirrorsTheCostHeaderAsZero` and
+`TestPricedRequestMirrorsTheCostHeaderExactly` pin both halves.
+
 **Names dorang does not mirror, and why.** A header emitted with an invented value is worse
 than an absent one: the reader cannot tell it apart from a measurement.
+
+The list below is longer than it was, and the reason is worth stating: a live deployment of the
+reference proxy was measured emitting **17 distinct `x-litellm-*` names** across 40 request
+shapes, against the 8 modelled above. Four of the unmodelled ones are cost-related and appeared
+on 17 of 20 successful responses, while `x-litellm-response-cost` itself appeared on 1 of 20 —
+so a cost exporter pointed at *that* deployment is more likely to be reading a name dorang does
+not model than the one it does. Naming them is not a promise to emit them; it is the difference
+between an operator discovering the gap during a cutover and discovering it in a reconciliation
+three weeks later.
 
 | Legacy name | Why not |
 |---|---|
@@ -160,6 +186,16 @@ than an absent one: the reader cannot tell it apart from a measurement.
 | `x-litellm-key-rpm-limit`, `x-litellm-key-tpm-limit` | dorang publishes the same facts in the standard-form `x-ratelimit-limit-requests` / `-tokens`, which more clients already read. Mirroring them twice would create two names that can disagree. |
 | `x-litellm-overhead-duration-ms` | `x-dorang-queue-ms` is a capacity wait, not proxy overhead. They are near enough to be confused and not near enough to be equal. |
 | `x-litellm-timeout`, `x-litellm-applied-guardrails` | No dorang equivalent is computed per request. |
+| `x-litellm-response-cost-original` | The reference proxy reports a pre-adjustment cost beside the adjusted one. dorang's pricing applies its adjustment rules inside `Settle` and publishes one figure; §8.5's second figure is `x-dorang-notional-usd`, which is the **list-rate** equivalent and a different quantity — a discount is not a list price. Mirroring one onto the other would put a number under a name that does not mean it. |
+| `x-litellm-margin-amount`, `x-litellm-margin-percent`, `x-litellm-discount-amount` | dorang has no margin or discount model on a request. Adjustment rules (§8.4) can add or subtract, but they are not classified into margin and discount, so there is no per-request value to put here and any split would be invented. An operator who needs these must derive them from `pricing:` — which is where dorang keeps the rule, rather than restating a derived number on every response. |
+
+The measured deployment emitted a handful of further names that are not enumerated here,
+because the observation was of one deployment's responses and not of that proxy's contract:
+listing a name dorang saw once would read as a commitment about a surface dorang does not own.
+**The claim this section makes is bounded accordingly** — it states what dorang mirrors and why
+each named omission is an omission, not that the mirrored set is complete against any
+particular build of the reference proxy. An operator whose tooling reads a `x-litellm-*` name
+absent from both tables above should expect it not to arrive.
 
 ## 8. Routing behavior is part of compatibility
 
@@ -314,9 +350,10 @@ they set the alternate spelling explicitly where they are raised.
 | No healthy deployment | 429 | `rate_limit_error` | `no_healthy_deployment` | `overloaded_error` |
 | Capacity wait timed out (§5.4) | 429 | `rate_limit_error` | `capacity_unavailable` | `overloaded_error` |
 | Gateway fault | 500 | `api_error` | `internal_error` | `api_error` |
-| Upstream 5xx after fallback | 502 | `api_error` | the upstream's own string `code` when it sent one, else `"502"` | `api_error` |
+| Upstream 5xx after fallback | **the upstream's own 5xx**, passed through | `api_error` | the upstream's own string `code` when it sent one, else the status as a string | `api_error` |
+| Upstream answered nothing dorang could use | 502 | `api_error` | `upstream_*`, naming which way it failed | `api_error` |
 | Route declared but unimplemented (§0.2) | 501 | `api_error` | `route_not_implemented` | `api_error` |
-| Upstream timeout | 504 | `api_error` | `timeout` when dorang's own deadline fired, else as the 502 row | `api_error` |
+| Upstream timeout | 504 | `api_error` | `timeout` when dorang's own deadline fired, else as the upstream-5xx row | `api_error` |
 
 Three of these deserve their reasoning stated, because a plausible alternative is wrong:
 
@@ -330,7 +367,20 @@ Three of these deserve their reasoning stated, because a plausible alternative i
 - **No healthy deployment is 429 and not 503.** It is a capacity condition with a
   `Retry-After`, and clients already back off correctly on `429`.
 
-The `code` column of the 502 and 504 rows says what it says because §11.3's preservation rule
+- **An upstream 5xx keeps its own status; it is not folded into 502.** A `500` from the
+  provider leaves dorang as a `500` and a `502` as a `502`. This row read "Upstream 5xx
+  after fallback → 502" until an audit measured it: dorang has always passed the status
+  through (`backend.upstreamError` hands the upstream's status straight to
+  `server.Normalize`), and the passthrough is what keeps dorang status-identical to the
+  incumbent on every upstream failure — nine of them in the reproduction that found this.
+  Folding would be worse as well as untrue: `502` says *dorang* could not reach a working
+  backend, and a client that retries on `502` and gives up on `500` would be told to retry
+  a model the provider has retired. `502` is reserved for the case where dorang got no
+  usable answer at all — no response, an unreadable body, a refused redirect, a failure
+  inside a stream already begun — which is a statement about the *hop*, not about the
+  provider's opinion of the request. `TestUpstream5xxKeepsItsOwnStatus` pins it.
+
+The `code` column of the upstream-5xx and 504 rows says what it says because §11.3's preservation rule
 comes first: a backend that sent a usable **string** code already satisfies §7.1, and that code
 is more useful to a client than `upstream_error` would be. It is passed through; a code that
 cannot go in the envelope — a number, an object, an array — is replaced by dorang's canonical

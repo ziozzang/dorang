@@ -230,8 +230,20 @@ func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 		ghost  = "node-ghost"
 		budget = "team-eng"
 	)
+	//
+	// Its clock is set an hour back, so both of the things a dead peer stops
+	// doing have already stopped: its heartbeat lapsed AND its block lease
+	// expired. The second is not decoration. The leader reclaims a departed
+	// node's blocks on the LEASE and not on the heartbeat, because a lapsed
+	// heartbeat is a declaration — one slow store write produces it on a node
+	// that is serving fine — while a lapsed lease is the same instant the
+	// holder's own hot path stops spending. A ghost whose lease was still live
+	// would be asserting that the leader takes units out from under a peer that
+	// can still hand them out, which is how a two-node cluster admitted 190
+	// against a limit of 100.
+	stale := func() time.Time { return time.Now().Add(-time.Hour) }
 	ghostLedger, err := cluster.NewLedger(cluster.LedgerConfig{
-		Store: a.Store, NodeID: ghost, Block: block,
+		Store: a.Store, NodeID: ghost, Block: block, Now: stale,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -271,14 +283,14 @@ func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 	// for. Registration goes through the real Registry so the row's shape is
 	// the one the leader will read.
 	//
-	// Its clock is set an hour back, so the row lands with a heartbeat that has
-	// already lapsed. That is the harness substituting a DEPENDENCY — a peer
-	// that last beat an hour ago — and not a value the gateway is responsible
-	// for producing: whether that peer counts as dead, whether its leases are
-	// this leader's to reclaim, and how much comes back are all still decided
-	// by the code under test (§17.1). Sleeping out the TTL instead would assert
-	// exactly the same thing and take ten seconds to do it.
-	stale := func() time.Time { return time.Now().Add(-time.Hour) }
+	// It registers on the same backdated clock, so the row lands with a
+	// heartbeat that has already lapsed. That is the harness substituting a
+	// DEPENDENCY — a peer that last beat an hour ago — and not a value the
+	// gateway is responsible for producing: whether that peer counts as dead,
+	// whether its leases are this leader's to reclaim, and how much comes back
+	// are all still decided by the code under test (§17.1). Sleeping out the
+	// TTL instead would assert exactly the same thing and take ten seconds to
+	// do it.
 	ghostReg, err := cluster.NewRegistry(a.Store, ghost, clusterTimings.ClusterNodeTTL, stale)
 	if err != nil {
 		t.Fatal(err)

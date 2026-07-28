@@ -797,6 +797,7 @@ func (s *Server) finish(cfg *snapshot, rq *Request, rw *responseWriter) {
 		BytesIn:     rq.bytesIn,
 		BytesOut:    rw.n,
 		Passthrough: family == FamilyPassthrough,
+		Streamed:    rw.sse,
 		ErrorShape:  rw.errShape,
 	})
 }

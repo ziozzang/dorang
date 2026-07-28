@@ -91,6 +91,14 @@ func (a *App) buildNode(cfg *config.Config, st *store.Store) error {
 	// Key.Window inside internal/quota rather than passing a different number
 	// from here. It costs nothing today because the request path does not yet
 	// route quota through this coordinator; it must be closed before it does.
+	//
+	// The same fact has a second consequence, and this comment used to be the
+	// only place it was written down: a lease that lapses under a holder still
+	// using its units is what breaks the "overshoot 0" §5.6 publishes for the
+	// shared modes. A qualifier on a published bound that lives in the caller's
+	// wiring is a qualifier nobody reads. It is now on the figure itself
+	// (cluster.Accuracy.Holds and .PerLapse), so it travels into the start-up
+	// log below and into /metrics with the number it qualifies.
 	coord, err := node.Coordinator(quota.CoordinatorConfig{})
 	if err != nil {
 		return fmt.Errorf("app: cluster.capacity_mode %q: %w", cfg.Cluster.CapacityMode, err)

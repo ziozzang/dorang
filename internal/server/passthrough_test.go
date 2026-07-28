@@ -324,7 +324,12 @@ func TestPassthroughMetersBestEffort(t *testing.T) {
 	if !ev.Passthrough {
 		t.Error("event not marked as passthrough")
 	}
-	if ev.Result.Tokens.Input != 40 || ev.Result.Tokens.Output != 9 || ev.Result.Tokens.CacheRead != 12 {
+	// input_tokens 40 is the Anthropic family's CACHE-EXCLUSIVE count, so the
+	// inclusive input the ledger holds is 52 and the total is 61. Recording 40
+	// would put a number in the ledger that is short by the whole cached prefix
+	// and that no other column adds up to.
+	if ev.Result.Tokens.Input != 52 || ev.Result.Tokens.Output != 9 ||
+		ev.Result.Tokens.CacheRead != 12 || ev.Result.Tokens.Total != 61 {
 		t.Errorf("usage %+v", ev.Result.Tokens)
 	}
 }

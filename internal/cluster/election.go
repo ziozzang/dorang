@@ -45,16 +45,29 @@ const DefaultTick = 5 * time.Second
 //     second leader -- which is exactly the "old leader revives" case, and no
 //     amount of store availability would catch it.
 //
-//  3. The safe window ends before the lease does, by one guard band. A
-//     successor may take the lease the instant it expires, so an incumbent that
-//     stopped exactly at expiry would still overlap by however long its last
-//     task takes to notice cancellation. The guard band is that margin, and it
-//     is why leadership is given up early rather than late.
+//  3. The safe window ends before the lease does, by one guard band, and it is
+//     measured from the expiry the STORE recorded rather than from this node's
+//     clock once [Lock.Acquire] returned. That distinction is the difference
+//     between a guard band and a number that looks like one: safeUntil is
+//     expires_at - guard by construction, so it holds for an acquire that took
+//     a microsecond and for one that took longer than the lease. Deriving it
+//     from the clock afterwards instead made the margin
+//     `guard - acquire latency`, which goes negative exactly when the store is
+//     slow -- and a store slow enough to matter is the condition under which
+//     leadership changes hands in the first place. Measured, before this was
+//     derived from the row: a 15s lease with a 5s guard and an 8s acquire gave
+//     two nodes three full seconds of simultaneous leadership, with both
+//     clocks reading identically.
 //
-// A fencing token accompanies leadership for the fourth case, the one no
-// timeout can close: a write already in flight at the moment of demotion. It
-// increases on every change of holder, so a superseded write is recognisable
-// as such by anything that cares to check.
+//  4. A fencing token accompanies leadership for what durations cannot close:
+//     a write already in flight at the moment of demotion, and a clock
+//     disagreement wider than the guard band. It advances on every change of
+//     holder, so a superseded holder is recognisable by one read of the row
+//     rather than by an argument about elapsed time. [Node] checks it against
+//     the store before dispatching each leader job; [Fence.In] puts the
+//     assertion inside a caller's own transaction. What the token cannot reach
+//     is a job that writes through some other package's transaction -- see
+//     [Fence].
 type Election struct {
 	lock   Lock
 	nodeID string
@@ -85,6 +98,14 @@ type ElectionConfig struct {
 	// Guard is how far before the lease expires this node gives leadership up.
 	// Zero means a third of the TTL. It must be smaller than the TTL, or
 	// leadership would end before it began.
+	//
+	// What it bounds, now that the safe window is derived from the lease the
+	// store granted, is the disagreement between two nodes' clocks plus the
+	// time a leader task takes to notice cancellation. It does NOT bound the
+	// acquire round trip; that is handled by construction. A deployment whose
+	// clocks can differ by more than this has two leaders for the difference,
+	// and the fencing token rather than this number is what makes that
+	// survivable.
 	Guard time.Duration
 	// OnChange, if set, is called after every promotion and demotion, outside
 	// the election's lock. It is for logging and metrics; correctness must not
@@ -155,28 +176,43 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	// it can no longer prove it held continuously.
 	e.IsLeader()
 
-	held, fence, err := e.lock.Acquire(ctx, e.ttl)
+	held, fence, expires, err := e.lock.Acquire(ctx, e.ttl)
 	if err != nil {
 		return e.IsLeader(), err
 	}
 
+	// The safe window is the granted lease less the guard band, and is computed
+	// from nothing else. Adding the TTL to the clock here instead would place
+	// it one round trip after the expiry the row holds, which is the arithmetic
+	// that produced two leaders with no clock skew at all.
 	now := e.now()
+	safe := expires.Add(-e.guard)
 	var notify []func()
 
 	e.mu.Lock()
 	switch {
 	case !held:
 		notify = append(notify, e.demoteLocked(ErrLeadershipLost)...)
+	case expires.IsZero() || !now.Before(safe):
+		// The lock was taken, but the round trip consumed the whole safe window
+		// -- or the lock cannot say when its lease ends. Either way there is no
+		// interval left in which this node can prove it leads, so it does not
+		// claim to. The lease still stands and this node renews it on the next
+		// campaign; what it must not do is act on a window that has already
+		// closed. Refusing leadership is the conservative outcome: the cluster
+		// goes without a leader for a tick, which costs a deferred sweep, and
+		// the alternative costs a second leader.
+		notify = append(notify, e.demoteLocked(ErrLeadershipLost)...)
 	case e.leader && fence != e.fence:
 		// The lease changed hands and came back. Whatever ran under the old
 		// term must not continue under the new one, so this is a demotion
 		// followed by a promotion, not a renewal.
 		notify = append(notify, e.demoteLocked(ErrLeadershipLost)...)
-		notify = append(notify, e.promoteLocked(fence, now)...)
+		notify = append(notify, e.promoteLocked(fence, safe)...)
 	case e.leader:
-		e.safeUntil = now.Add(e.ttl - e.guard)
+		e.safeUntil = safe
 	default:
-		notify = append(notify, e.promoteLocked(fence, now)...)
+		notify = append(notify, e.promoteLocked(fence, safe)...)
 	}
 	leader := e.leader
 	e.mu.Unlock()
@@ -187,13 +223,14 @@ func (e *Election) Campaign(ctx context.Context) (bool, error) {
 	return leader, nil
 }
 
-// promoteLocked opens a new term. The caller holds e.mu.
-func (e *Election) promoteLocked(fence uint64, now time.Time) []func() {
+// promoteLocked opens a new term, safe until the instant the caller derived
+// from the granted lease. The caller holds e.mu.
+func (e *Election) promoteLocked(fence uint64, safeUntil time.Time) []func() {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	e.leader = true
 	e.fence = fence
 	e.term++
-	e.safeUntil = now.Add(e.ttl - e.guard)
+	e.safeUntil = safeUntil
 	e.ctx, e.cancel = ctx, cancel
 	term := e.term
 	if e.onChange == nil {
@@ -274,12 +311,62 @@ func (e *Election) Term() uint64 {
 	return e.term
 }
 
-// Fence returns the current fencing token, or zero if this node does not lead.
-func (e *Election) Fence() uint64 {
-	if _, f, ok := e.Leader(); ok {
-		return f
+// Fence returns the precondition a leader-owned write carries under the
+// current term, or nil if this node does not lead. [Fence.Token] on the result
+// is the raw token and is safe on nil.
+func (e *Election) Fence() *Fence {
+	_, f, ok := e.Leader()
+	if !ok {
+		return nil
 	}
-	return 0
+	return e.lock.Fence(f)
+}
+
+// SafeUntil reports the instant this node's leadership stops being provable. It
+// is the granted lease less the guard band, so it is always at least one guard
+// band before the lease a successor tests against -- whatever the acquire cost.
+// Zero means this node does not lead.
+func (e *Election) SafeUntil() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.leader {
+		return time.Time{}
+	}
+	return e.safeUntil
+}
+
+// Fenced returns the leader-scoped context and this term's fencing token,
+// having first asserted the token against the STORE rather than against this
+// node's memory.
+//
+// It is what a caller uses before doing leader work, and it differs from
+// [Election.Leader] in the one way that matters when clocks disagree: Leader
+// answers from a safe window this node computed, and Fenced answers from the
+// row every node shares. A node that has been superseded is demoted here -- the
+// leader-scoped context is cancelled with [ErrLeadershipLost], so work already
+// running under it stops too -- and gets [ErrLeadershipLost] back.
+//
+// It costs one store round trip. That is why it guards a due job rather than
+// every tick: leadership is renewed on the campaign, and this is the second
+// opinion taken at the moment work is about to happen.
+func (e *Election) Fenced(ctx context.Context) (context.Context, *Fence, error) {
+	lctx, token, ok := e.Leader()
+	if !ok {
+		return nil, nil, ErrNotLeader
+	}
+	f := e.lock.Fence(token)
+	if err := f.Check(ctx); err != nil {
+		if errors.Is(err, ErrLeadershipLost) {
+			e.mu.Lock()
+			notify := e.demoteLocked(err)
+			e.mu.Unlock()
+			for _, fn := range notify {
+				fn()
+			}
+		}
+		return nil, nil, err
+	}
+	return lctx, f, nil
 }
 
 // Resign gives leadership up deliberately: the leader-scoped context is

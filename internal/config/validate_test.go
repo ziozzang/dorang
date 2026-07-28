@@ -362,6 +362,15 @@ func TestValidationRules(t *testing.T) {
 			// zero is indistinguishable from unset, so the default applies
 		},
 		{
+			// The cap the 413 has always named. It had no schema key at all, so
+			// an operator hitting it was told the name of a knob that did not
+			// exist and the only remedy was a rebuild. A negative value is
+			// refused by ByteSize itself, before validation sees it
+			// (TestParseByteSize).
+			name: "the body cap reads a unit suffix",
+			f:    fragments{top: "server: {max_body_bytes: 64MiB}\n"},
+		},
+		{
 			name: "numeric metering cannot be turned off",
 			f:    fragments{top: "metering: {numeric: {enabled: false}}\n"},
 			path: "metering.numeric.enabled",

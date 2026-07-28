@@ -62,6 +62,23 @@ type Server struct {
 	RequestTimeout Duration `yaml:"request_timeout,omitempty"`
 	ShutdownGrace  Duration `yaml:"shutdown_grace,omitempty"`
 
+	// MaxBodyBytes caps one request body. Past it the request is refused with
+	// 413 and a message that names this key.
+	//
+	// It is configuration because the refusal already claimed it was. The
+	// message has always read "request body exceeds max_body_bytes (N bytes)",
+	// and there was no `max_body_bytes` anywhere in the schema — so an operator
+	// whose client posts a 40 MiB transcript or a batch of base64 images was
+	// told the name of a knob that did not exist, and the only remedy was a
+	// rebuild. It is the one compatibility gap a working client cannot route
+	// around.
+	//
+	// The ceiling is real and stays hard: a body is buffered to be replayable
+	// across a fallback (§15.5), so this bounds what one request can pin. Raise
+	// it deliberately, against `metering.max_replay_bytes` and the process
+	// memory budget, not to the largest number that parses.
+	MaxBodyBytes ByteSize `yaml:"max_body_bytes,omitempty"`
+
 	// PreStopDelay is how long the process keeps serving AFTER readiness has
 	// gone false and BEFORE the listener closes (§13).
 	//

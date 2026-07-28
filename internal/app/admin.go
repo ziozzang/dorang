@@ -616,8 +616,19 @@ func (l *adminLedger) Report(context.Context, admin.ReportQuery) (admin.Report, 
 			"/spend/logs serves the per-request ledger")
 }
 
+// unsupportedLedger builds the refusal for a ledger query this build has no
+// index to answer.
+//
+// admin.Unsupported carries the sentinel AND the message. It used to paste the
+// sentinel in as text —
+// `errors.New("app: " + msg + " (" + admin.ErrUnsupported.Error() + ")")` —
+// which reads identically in a log and is invisible to errors.Is. The 501 case
+// in admin.faultFor therefore never matched, an unfiltered /spend/logs answered
+// `500 internal_error`, and msg — the only part of the refusal a caller can act
+// on — went with it. A 500 says "gateway fault, retry"; the truth was "add a
+// query parameter", and this says which.
 func unsupportedLedger(msg string) error {
-	return errors.New("app: " + msg + " (" + admin.ErrUnsupported.Error() + ")")
+	return admin.Unsupported("%s", msg)
 }
 
 func adminLogRow(r store.RequestLog) admin.LogRow {

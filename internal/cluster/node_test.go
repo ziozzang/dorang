@@ -80,7 +80,7 @@ func TestStartAndCloseRunTheLoop(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		held, _, err := lock.Acquire(ctx, time.Second)
+		held, _, _, err := lock.Acquire(ctx, time.Second)
 		if err != nil {
 			t.Fatal(err)
 		}

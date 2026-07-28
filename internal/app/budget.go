@@ -216,7 +216,8 @@ func (g *budgetGate) reserveFor(ctx context.Context, subs []budgetSubject,
 				"the budget could not be reserved: "+err.Error()).WithCode("budget_unavailable")
 		}
 		h.holds = append(h.holds, hold)
-		if minLimit < 0 || s.limit < minLimit {
+		binding := minLimit < 0 || s.limit < minLimit
+		if binding {
 			minLimit = s.limit
 		}
 
@@ -228,8 +229,23 @@ func (g *budgetGate) reserveFor(ctx context.Context, subs []budgetSubject,
 		//
 		// Without the deduplication this fires on every request past the
 		// threshold, which is the difference between an alert and a filter rule.
-		if spent, seen := hold.Consumed(); seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
+		spent, seen := hold.Consumed()
+		if seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
 			g.raise(notify.EventBudget80, subject, now, spent, seen, s.window, nil)
+		}
+		// x-dorang-spend-usd and its legacy mirror x-litellm-key-spend read
+		// Result.SpendNanoUSD, and NOTHING filled it: both headers reported a
+		// flat $0.00 spend on every response of every deployment that has a
+		// budget at all. The figure is free here — Consumed is two atomic loads
+		// on a hold this path already took — and it is the same estimate the
+		// budget_80pct threshold above is judged against, so the header and the
+		// alert cannot tell an operator two different stories.
+		//
+		// It is the spend of the BINDING subject, the one whose ceiling
+		// x-dorang-budget-usd reports, so that the pair "spent / limit" is two
+		// numbers about one budget rather than two budgets' halves.
+		if binding && rq != nil {
+			rq.Result.SpendNanoUSD = spent
 		}
 	}
 	return h, minLimit, nil

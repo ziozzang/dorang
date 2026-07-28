@@ -152,6 +152,14 @@ const (
 	// the moment it expires has already had a window in which it was not
 	// provably held.
 	DefaultRenewBefore = 20 * time.Second
+	// DefaultRetain is how long after a period ends its block is kept before
+	// [Ledger.Maintain] reclaims it. Zero in the config means this.
+	//
+	// It is the ledger's lease TTL for a reason rather than by coincidence: a
+	// block that has been idle for as long as a lease can be held costs exactly
+	// one draw to rebuild from the store, and the store is where the truth was
+	// all along.
+	DefaultRetain = DefaultLedgerTTL
 )
 
 // LedgerConfig configures [NewLedger].
@@ -171,8 +179,16 @@ type LedgerConfig struct {
 	// TTL is the lease lifetime. Zero means [DefaultLedgerTTL].
 	TTL time.Duration
 	// RenewBefore is how far ahead of expiry [Ledger.Maintain] renews. Zero
-	// means [DefaultRenewBefore], capped at a third of the TTL.
+	// means [DefaultRenewBefore]; a value at or above the TTL is replaced by a
+	// third of it, because a lease renewed before it was taken is not a lease.
 	RenewBefore time.Duration
+	// Retain is how long after a period ends [Ledger.Maintain] keeps that
+	// period's block before reclaiming it. Zero means [DefaultRetain].
+	//
+	// It is a grace and not the whole test: see [Ledger.Maintain] for why a
+	// period being over is not the same fact as its settlements having all
+	// arrived, and which of the two actually decides.
+	Retain time.Duration
 	// Now overrides the clock.
 	Now func() time.Time
 }
@@ -205,19 +221,29 @@ type LedgerConfig struct {
 //
 // Charging the block up front is what makes the arrangement safe rather than
 // merely fast: a node that dies mid-block has already had the whole block
-// counted against the budget. The failure mode is a budget that under-spends
-// until the lease is reclaimed, never one that overspends. The reclaim
-// ([Ledger.ReclaimExpired]) returns the part the dead node had not spent, which
-// is recorded in the lease row's `used` column and checkpointed whenever a
-// block is drawn or renewed.
+// counted against the budget, so the counter is conservative while the block is
+// live. The reclaim ([Ledger.ReclaimExpired]) returns the part the dead node
+// had not spent, which is recorded in the lease row's `used` column and
+// checkpointed whenever a block is drawn or renewed.
 //
-// # Accuracy
+// # Accuracy, stated as something demonstrable
 //
-// [Publish] with [ModeLeased] gives the number, and the arithmetic is the same:
-// block x (nodes - 1). The residue comes from a crash between a checkpoint and
-// the spend that followed it, which makes the reclaim return slightly more than
-// it should. A graceful [Ledger.Close] checkpoints and returns the exact
-// remainder, so a planned restart contributes nothing at all.
+// This used to say the failure mode is "a budget that under-spends until the
+// lease is reclaimed, never one that overspends". That is not true, and
+// [Publish] with [ModeLeased] has always said so in the same package: the
+// reclaim returns amount - used, `used` is only as fresh as the last
+// checkpoint, and a node that dies between a checkpoint and the spend that
+// followed it therefore has more returned than it left behind. The next node to
+// draw sees room that is not there. The bound is one block per such death --
+// block x (nodes - 1) concurrently -- which is exactly the published figure,
+// and a graceful [Ledger.Close] contributes nothing at all because it
+// checkpoints and returns the exact remainder.
+//
+// The direction that really is impossible is the one this arrangement is built
+// for: a LIVE lease can never over-grant, because every block is charged before
+// a unit of it is spent. What made the old sentence false in a second, larger
+// way was reclaiming a live node's lease on a lapsed heartbeat -- see
+// [Ledger.ReclaimNode], which no longer does.
 //
 // A Ledger is safe for concurrent use.
 type Ledger struct {
@@ -226,6 +252,7 @@ type Ledger struct {
 	block  int64
 	ttl    time.Duration
 	renew  time.Duration
+	retain time.Duration
 	now    func() time.Time
 
 	mu     sync.RWMutex
@@ -266,10 +293,25 @@ type ledgerBlock struct {
 	limitSeen     atomic.Int64
 	counterAtDraw atomic.Int64
 
+	// pending counts holds taken from this block and not yet settled.
+	//
+	// It exists so that reclaiming a finished period is decided by a fact
+	// rather than by a hope. A period being over says nothing about whether its
+	// settlements have arrived: a request that reserved a microsecond before
+	// midnight settles after it, and settlement is the path that RETURNS
+	// units, so dropping the block first would forfeit the refund into a period
+	// nobody is accounting any more. The two atomic adds this costs the hot
+	// path are the price of not guessing a grace period long enough.
+	pending atomic.Int64
+
 	// mu guards the slow path: drawing, renewing, checkpointing and closing.
 	// The hot path never takes it.
-	mu    sync.Mutex
-	drawn int64
+	mu sync.Mutex
+	// evicted marks a block that [Ledger.Maintain] has returned and unlinked.
+	// A caller holding a pointer to it from before must draw against the
+	// replacement rather than write a lease row nothing will ever renew.
+	evicted bool
+	drawn   int64
 	// checkpointed is the consumption last written to the lease row. The gap
 	// between it and the true figure is what a reclaim over-returns if this
 	// node dies now, so it is tracked in order to be closed rather than left
@@ -300,6 +342,7 @@ func NewLedger(cfg LedgerConfig) (*Ledger, error) {
 		block:  orInt64(cfg.Block, DefaultBlockSize),
 		ttl:    ttl,
 		renew:  renew,
+		retain: orDuration(cfg.Retain, DefaultRetain),
 		now:    now,
 		blocks: map[string]*ledgerBlock{},
 	}, nil
@@ -372,38 +415,59 @@ func (l *Ledger) Reserve(ctx context.Context, key CounterKey, limit, amount int6
 		return nil, err
 	}
 
-	b, err := l.blockFor(key)
-	if err != nil {
-		return nil, err
-	}
-	// The ceiling is a per-call argument, so the block never learns it except
-	// here. Stored only when it changes, so the steady state is one atomic load
-	// rather than a store.
-	if b.limitSeen.Load() != limit {
-		b.limitSeen.Store(limit)
-	}
-	if amount == 0 {
-		return &Hold{Key: key, Amount: 0, block: b}, nil
-	}
+	// The retry is for one case and bounded to one attempt: a block that
+	// [Ledger.Maintain] reclaimed between this call finding it and this call
+	// drawing against it. The replacement is already in the map by then, so a
+	// second look always finds a live block.
+	for attempt := 0; ; attempt++ {
+		b, err := l.blockFor(key)
+		if err != nil {
+			return nil, err
+		}
+		// The ceiling is a per-call argument, so the block never learns it
+		// except here. Stored only when it changes, so the steady state is one
+		// atomic load rather than a store.
+		if b.limitSeen.Load() != limit {
+			b.limitSeen.Store(limit)
+		}
+		if amount == 0 {
+			return b.hold(key, 0), nil
+		}
 
-	// Hot path: an atomic compare-and-swap against the block this node already
-	// holds. This is the arrangement DESIGN 9.6 asks for, and it is the whole
-	// reason a synchronous budget reservation is affordable.
-	if b.take(amount, now) {
-		return &Hold{Key: key, Amount: amount, block: b}, nil
+		// Hot path: an atomic compare-and-swap against the block this node
+		// already holds. This is the arrangement DESIGN 9.6 asks for, and it is
+		// the whole reason a synchronous budget reservation is affordable.
+		if b.take(amount, now) {
+			return b.hold(key, amount), nil
+		}
+		// Slow path. It draws and takes in one critical section rather than
+		// drawing and then re-entering the hot path, because the two-step
+		// version has no progress guarantee: under contention a caller that has
+		// just paid for a store round trip loses the units to callers that have
+		// not, and eventually reports the limit exhausted when the limit is
+		// nowhere near exhausted. Reporting contention as exhaustion is not a
+		// cosmetic error -- for a budget, exhaustion is terminal and surfaces
+		// as a 400.
+		err = l.drawAndTake(ctx, b, limit, amount, now)
+		if errors.Is(err, errBlockEvicted) && attempt == 0 {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return b.hold(key, amount), nil
 	}
-	// Slow path. It draws and takes in one critical section rather than
-	// drawing and then re-entering the hot path, because the two-step version
-	// has no progress guarantee: under contention a caller that has just paid
-	// for a store round trip loses the units to callers that have not, and
-	// eventually reports the limit exhausted when the limit is nowhere near
-	// exhausted. Reporting contention as exhaustion is not a cosmetic error --
-	// for a budget, exhaustion is terminal and surfaces as a 400.
-	if err := l.drawAndTake(ctx, b, limit, amount, now); err != nil {
-		return nil, err
-	}
-	return &Hold{Key: key, Amount: amount, block: b}, nil
 }
+
+// hold records one outstanding reservation against this block.
+func (b *ledgerBlock) hold(key CounterKey, amount int64) *Hold {
+	b.pending.Add(1)
+	return &Hold{Key: key, Amount: amount, block: b}
+}
+
+// errBlockEvicted reports a draw against a block Maintain has already returned.
+// It never leaves [Ledger.Reserve].
+var errBlockEvicted = errors.New("cluster: block was reclaimed")
 
 // Settle records what a request actually cost and returns the difference.
 //
@@ -426,9 +490,16 @@ func (l *Ledger) Settle(h *Hold, actual int64) error {
 	if !h.done.CompareAndSwap(false, true) {
 		return nil
 	}
-	if refund := h.Amount - actual; refund != 0 && h.block != nil {
+	if h.block == nil {
+		return nil
+	}
+	if refund := h.Amount - actual; refund != 0 {
 		h.block.remaining.Add(refund)
 	}
+	// The block is now one hold closer to being reclaimable. This is the last
+	// thing done, after the refund has landed, so a block observed at zero
+	// outstanding holds has no refund still on its way.
+	h.block.pending.Add(-1)
 	return nil
 }
 
@@ -522,6 +593,13 @@ func (l *Ledger) drawAndTake(ctx context.Context, b *ledgerBlock, limit, amount 
 	// Somebody else may have refilled while this goroutine waited for the lock.
 	if b.take(amount, l.now()) {
 		return nil
+	}
+	// Maintain may have reclaimed this block while this goroutine waited.
+	// Drawing now would write a lease row against a block that is no longer in
+	// the map, so nothing would renew it and nothing would return it until its
+	// TTL lapsed. The caller looks the key up again and finds the replacement.
+	if b.evicted {
+		return errBlockEvicted
 	}
 	// Close may have run while this goroutine waited. Drawing now would write a
 	// fresh lease row for a ledger that has already returned everything and has
@@ -697,6 +775,44 @@ func (l *Ledger) Stats() []LedgerStat {
 // that never ticked at all is still bounded only by the block -- but it is the
 // difference between a bound and a typical case, and the write costs one UPDATE
 // per active counter per tick, which is not per request.
+//
+// # Reclaiming finished periods
+//
+// It also drops the blocks whose period is over. Without that the map was
+// append-only: one entry per key per period, for the life of the process, so a
+// node that had been up for a month held every hourly window of that month for
+// every key it had ever seen. Nothing ever deleted from it.
+//
+// Two conditions, and the second is the one that is easy to get wrong:
+//
+//   - The period ended more than Retain ago. This is the cheap half and it is
+//     not sufficient on its own.
+//   - The block has no outstanding holds. A period that is OVER is not a period
+//     whose settlements have all ARRIVED: settlement is the path that returns
+//     units, a request that reserved just before the boundary settles after it,
+//     and a block dropped in between forfeits that refund into a period nobody
+//     is accounting any more. Counting the holds answers this exactly, where a
+//     grace period long enough to cover it would only be a guess -- and the
+//     backfill guard exists because late rows against a closed period are a
+//     real shape here, not a hypothetical one.
+//
+// A reclaimed block is RETURNED first, exactly as [Ledger.Close] returns one:
+// the hot path is closed, the lease row is deleted and the unspent units go
+// back to the durable counter in one transaction. Dropping the map entry
+// without that would strand the lease until its TTL and hide the units from
+// every node for that long. The counter keeps the truth, so a key that comes
+// back -- a backfilled row against a closed month -- simply draws again.
+//
+// # What this bounds, and what it does not
+//
+// It bounds the PERIOD axis: entries no longer accumulate for the life of the
+// process. It does not bound the KEY axis inside a live period -- a monthly
+// budget keeps a block per subject for the month, whether or not that subject is
+// still sending traffic -- so the map is proportional to the tenants a node has
+// served in the current period rather than to its uptime. Nor does it reclaim a
+// block whose hold was never settled: that pins the entry, and it is a leak in
+// the caller rather than one this can paper over, so it stays visible in
+// [Ledger.Stats] instead of being timed out.
 func (l *Ledger) Maintain(ctx context.Context) error {
 	now := l.now()
 	l.mu.RLock()
@@ -712,6 +828,12 @@ func (l *Ledger) Maintain(ctx context.Context) error {
 
 	var firstErr error
 	for _, b := range blocks {
+		if b.finished(now, l.retain) {
+			if err := l.retire(ctx, b, now); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		exp := store.TimeAt(b.expiresUS.Load())
 		if exp.IsZero() {
 			continue
@@ -722,6 +844,47 @@ func (l *Ledger) Maintain(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// finished reports whether this block's period is over and settled for.
+func (b *ledgerBlock) finished(now time.Time, retain time.Duration) bool {
+	if b.pending.Load() != 0 {
+		return false
+	}
+	// PeriodEnd is computed from the block's own period start rather than from
+	// now, so a block for a period two months old is judged against the end of
+	// THAT period. PeriodStart is idempotent, which is what makes passing it
+	// back in correct for calendar and rolling windows alike.
+	end := b.key.Window.PeriodEnd(b.key.PeriodStart)
+	return !now.Before(end.Add(retain))
+}
+
+// retire returns a block and unlinks it.
+//
+// The order is what keeps a concurrent reservation correct. Marking the block
+// first means a draw that is already waiting on b.mu discovers the block is
+// gone and looks the key up again, instead of writing a lease row into a block
+// nothing will renew. If the return fails the mark comes off, so a store error
+// costs a retry rather than a block that can never be drawn against again.
+func (l *Ledger) retire(ctx context.Context, b *ledgerBlock, now time.Time) error {
+	b.mu.Lock()
+	b.evicted = true
+	b.mu.Unlock()
+
+	if err := l.returnBlock(ctx, b, now); err != nil {
+		b.mu.Lock()
+		b.evicted = false
+		b.mu.Unlock()
+		return err
+	}
+
+	id := b.key.String()
+	l.mu.Lock()
+	if cur, ok := l.blocks[id]; ok && cur == b {
+		delete(l.blocks, id)
+	}
+	l.mu.Unlock()
+	return nil
 }
 
 // refreshBlock checkpoints one lease's consumption and, when renew is set,
@@ -862,7 +1025,7 @@ func (l *Ledger) returnBlock(ctx context.Context, b *ledgerBlock, now time.Time)
 	// exists.
 	b.expiresUS.Store(0)
 	unspent := maxInt64(b.remaining.Swap(0), 0)
-	b.drawn = 0
+	b.drawn, b.checkpointed = 0, 0
 	if unspent == 0 {
 		_, err := l.c.exec(ctx, `DELETE FROM quota_leases WHERE id = ? AND node_id = ?`, b.rowID, l.nodeID)
 		return err
@@ -918,27 +1081,54 @@ func (l *Ledger) ReclaimExpired(ctx context.Context, now time.Time) (ReclaimResu
 		` AND expires_at <= ?`, []any{cutoff})
 }
 
-// ReclaimNode returns the unspent blocks of a node whose heartbeat has lapsed,
-// whether or not its leases have expired.
+// ReclaimNode returns the unspent, EXPIRED blocks of a node the registry has
+// declared gone.
 //
-// Waiting for a TTL that the dead node's own writes were extending would keep
-// its budget out of circulation for as long as it was alive, and a node that is
-// gone is not coming back to return it.
+// # Why expiry is required, when the node is supposed to be dead
+//
+// "Dead" here is a declaration, not a fact: [Registry.Dead] reports a heartbeat
+// that lapsed, which a GC pause, one slow store write or an undersized
+// cluster.node_ttl produces on a node that is serving requests perfectly well.
+// The hot path of a block is deliberately unable to notice -- [ledgerBlock.take]
+// reads an in-memory expiry and touches no store, which is what makes DESIGN
+// 9.6's write-per-block affordable -- so the ONLY thing that stops a holder
+// spending is its own lease expiring. Reclaiming a lease before that instant
+// hands its unspent part to somebody else while the holder is still handing out
+// the same units, and both spend them.
+//
+// Measured before this required expiry: a two-node cluster with a limit of 100
+// admitted 190, with no node dead at all. The whole 90 came from a live node's
+// lease being returned underneath it and granted to the leader; each node then
+// spent its own copy. The comment above this function used to argue the
+// opposite -- that waiting for a TTL "the dead node's own writes were
+// extending" would hold its budget out of circulation for as long as it was
+// alive -- and that is simply not how the arithmetic runs: a dead node stops
+// extending when it dies, so its last renewal expires one lease TTL later, not
+// one lifetime later. The cost of this guard is that bounded delay
+// ([DefaultLedgerTTL]) instead of the heartbeat lapse ([DefaultNodeTTL]), and
+// what it buys is the only version of "never overspends" that can be
+// demonstrated.
+//
+// What remains node-scoped is the targeting: this pass takes one departed
+// node's rows, so a failure is attributable to it, and it runs before the
+// general sweep of [Ledger.ReclaimExpired] rather than instead of it.
 func (l *Ledger) ReclaimNode(ctx context.Context, nodeID string, now time.Time) (ReclaimResult, error) {
 	if nodeID == "" || nodeID == l.nodeID {
 		// Reclaiming this node's own leases would pull the block out from under
 		// its own hot path. A node releases its own leases through Close.
 		return ReclaimResult{}, nil
 	}
-	// The delete is guarded by node_id rather than by expiry: the node is gone,
-	// so the row cannot legitimately have been renewed, but it could have been
-	// taken over by a restarted node of the same name -- in which case the
-	// guard still holds and the reclaim is correct either way.
+	// node_id guards against a restarted node of the same name having taken the
+	// row over; expires_at guards against the holder still spending. Both are
+	// on the delete as well as on the select, because between the two the
+	// holder may have renewed -- which is precisely the evidence that it was
+	// never gone.
+	cutoff := store.Micros(now)
 	return l.reclaim(ctx, now,
 		`SELECT id, scope, scope_key, "window", metric, amount, used FROM quota_leases
-		  WHERE scope <> ? AND node_id = ?`,
-		[]any{leaseScopeShared, nodeID},
-		` AND node_id = ?`, []any{nodeID})
+		  WHERE scope <> ? AND node_id = ? AND expires_at <= ?`,
+		[]any{leaseScopeShared, nodeID, cutoff},
+		` AND node_id = ? AND expires_at <= ?`, []any{nodeID, cutoff})
 }
 
 type reclaimable struct {
@@ -980,6 +1170,16 @@ func (l *Ledger) reclaim(ctx context.Context, now time.Time, q string, args []an
 	var out ReclaimResult
 	for _, r := range todo {
 		err := l.c.withTx(ctx, func(ctx context.Context, t tx) error {
+			// The leader term this pass belongs to, asserted inside the same
+			// transaction as the write it guards. A leader that has been
+			// superseded -- by a clock disagreement wider than the guard band,
+			// or by a handover that landed after this pass was dispatched --
+			// finds the token has moved and returns nobody's units.
+			// Leader-before-everything is this package's lock order, so it goes
+			// first.
+			if err := FenceFrom(ctx).In(ctx, t); err != nil {
+				return err
+			}
 			if err := t.lock(ctx, "ledger/"+r.key.String()); err != nil {
 				return err
 			}

@@ -44,7 +44,11 @@ func scanUsage(b []byte) (Usage, bool) {
 		}
 		i = skipSpace(b, i+1)
 		if !esc && string(key) == "usage" && i < len(b) && b[i] == '{' {
-			return parseUsageObject(b, i)
+			u, shape, ok := parseUsageObject(b, i)
+			if !ok {
+				return u, false
+			}
+			return normalizeUsage(u, shape), true
 		}
 		i = skipValue(b, i)
 		if i < 0 {
@@ -53,50 +57,100 @@ func scanUsage(b []byte) (Usage, bool) {
 	}
 }
 
+// usageShape records which family's spelling the scanned object used, which is
+// the only thing that says what the cache counts mean.
+//
+// The two families disagree, and they disagree silently because the numbers are
+// all plausible either way: OpenAI's prompt_tokens INCLUDES the cached prefix
+// and prompt_tokens_details.cached_tokens is the part of it that was cached,
+// while Anthropic's input_tokens EXCLUDES cache_read_input_tokens and
+// cache_creation_input_tokens, which are counted beside it. Adding the cache
+// counts to the wrong one either double-counts the prefix or loses it.
+type usageShape uint8
+
+const (
+	shapeUnknown usageShape = iota
+	// shapeInclusive is the OpenAI family: prompt_tokens already contains the
+	// cached prefix. This is also dorang's own convention (canonical.Usage).
+	shapeInclusive
+	// shapeExclusive is the Anthropic family: input_tokens is cache-exclusive.
+	shapeExclusive
+)
+
+// normalizeUsage converts a scanned usage object into dorang's own convention —
+// Input inclusive of both cache counts, Total = Input + Output — so that a
+// relayed response is accounted by the same rule as a converted one.
+//
+// Without this the ledger holds two definitions again: a passthrough prefix
+// pointed at an Anthropic-native surface would record an input count short by
+// the whole cached prefix, and a total the client never saw.
+func normalizeUsage(u Usage, shape usageShape) Usage {
+	if shape == shapeExclusive {
+		u.Input += u.CacheRead + u.CacheWrite
+	}
+	if u.Total == 0 {
+		// The upstream stated no total. Deriving it is what the encoders do
+		// (canonical.Usage.TotalTokens), and the breakdown fields are subsets:
+		// summing all five would charge the cached prefix and the reasoning
+		// tokens twice.
+		u.Total = u.Input + u.Output
+	}
+	return u
+}
+
 // parseUsageObject reads the fields of a usage object starting at b[i] == '{'.
-func parseUsageObject(b []byte, i int) (Usage, bool) {
+// It returns the counts as the body stated them, unnormalized, plus which
+// family's spelling was used; [normalizeUsage] is what converts them.
+func parseUsageObject(b []byte, i int) (Usage, usageShape, bool) {
 	var u Usage
+	shape := shapeUnknown
 	found := false
 	i++
 	for {
 		i = skipSpace(b, i)
 		if i >= len(b) {
-			return u, false
+			return u, shape, false
 		}
 		if b[i] == '}' {
-			return u, found
+			return u, shape, found
 		}
 		if b[i] == ',' {
 			i++
 			continue
 		}
 		if b[i] != '"' {
-			return u, false
+			return u, shape, false
 		}
 		keyStart := i + 1
 		keyEnd, esc, ok := scanString(b, i)
 		if !ok {
-			return u, false
+			return u, shape, false
 		}
 		key := string(b[keyStart : keyEnd-1])
 		i = skipSpace(b, keyEnd)
 		if i >= len(b) || b[i] != ':' {
-			return u, false
+			return u, shape, false
 		}
 		i = skipSpace(b, i+1)
 		valStart := i
 		i = skipValue(b, i)
 		if i < 0 {
-			return u, false
+			return u, shape, false
 		}
 		if esc {
 			continue
 		}
 		n, isNum := parseInt(b[valStart:i])
 		switch key {
-		case "prompt_tokens", "input_tokens":
+		case "prompt_tokens":
 			if isNum {
 				u.Input, found = n, true
+				shape = shapeInclusive
+			}
+		case "input_tokens":
+			if isNum {
+				u.Input, found = n, true
+				shape = shapeExclusive
 			}
 		case "completion_tokens", "output_tokens":
 			if isNum {
@@ -121,7 +175,9 @@ func parseUsageObject(b []byte, i int) (Usage, bool) {
 		case "prompt_tokens_details", "completion_tokens_details":
 			// Nested detail objects carry cached and reasoning counts on the
 			// OpenAI surface. One level down is worth reading; deeper is not.
-			if sub, ok := parseUsageObject(b, valStart); ok {
+			// The nested object never carries an input count, so its shape is
+			// not consulted — the enclosing object's spelling decides.
+			if sub, _, ok := parseUsageObject(b, valStart); ok {
 				if sub.CacheRead > 0 {
 					u.CacheRead, found = sub.CacheRead, true
 				}

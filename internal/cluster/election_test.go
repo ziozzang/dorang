@@ -79,10 +79,16 @@ func TestKillingTheLeaderPromotesTheOther(t *testing.T) {
 
 		// Capture the leader-scoped context before the leader dies. It must end
 		// up cancelled, and with a cause that says why.
-		lctx, term, ok := dead.Election().Leader()
+		//
+		// The term is read from Term(). Leader()'s second value is the FENCING
+		// TOKEN, not the term: the two happen to both be 1 on a first election,
+		// which is why binding one to a variable called `term` went unnoticed
+		// here until the token started being used for something.
+		lctx, _, ok := dead.Election().Leader()
 		if !ok {
 			t.Fatal("the leader has no leader context")
 		}
+		term := dead.Election().Term()
 
 		// The lease is 6s. Before it expires nobody may take it: a successor
 		// elected early is two leaders, which is the failure this whole
@@ -273,13 +279,13 @@ func TestFenceAdvancesOnlyOnHandover(t *testing.T) {
 		if got[0] == b.ID() {
 			lead, other = b, a
 		}
-		first := lead.Election().Fence()
+		first := lead.Election().Fence().Token()
 
 		for i := 0; i < 3; i++ {
 			clk.Add(time.Second)
 			tick(t, lead)
 		}
-		if f := lead.Election().Fence(); f != first {
+		if f := lead.Election().Fence().Token(); f != first {
 			t.Fatalf("the fence moved from %d to %d across renewals; a renewal is not a handover", first, f)
 		}
 
@@ -288,7 +294,7 @@ func TestFenceAdvancesOnlyOnHandover(t *testing.T) {
 		if !other.IsLeader() {
 			t.Fatal("no handover happened")
 		}
-		if f := other.Election().Fence(); f <= first {
+		if f := other.Election().Fence().Token(); f <= first {
 			t.Fatalf("the fence is %d after a handover, want more than %d", f, first)
 		}
 	})
@@ -338,6 +344,11 @@ func TestConcurrentCampaignsElectOne(t *testing.T) {
 
 // fakeLock is a Lock with no store behind it, for the assertions that are about
 // the election's own clock rather than about persistence.
+//
+// It returns a nil Fence, which is this package's way of saying "this lock
+// cannot express a precondition". That is the honest answer for a lock with no
+// row to assert against, and it is why the fencing assertions below use the
+// real [NewLock] instead.
 type fakeLock struct {
 	mu       sync.Mutex
 	holder   string
@@ -347,21 +358,23 @@ type fakeLock struct {
 	now      func() time.Time
 }
 
-func (f *fakeLock) Acquire(_ context.Context, ttl time.Duration) (bool, uint64, error) {
+func (f *fakeLock) Acquire(_ context.Context, ttl time.Duration) (bool, uint64, time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.acquires++
 	now := f.now()
 	if f.holder != "" && f.holder != "node-a" && now.Before(f.expires) {
-		return false, f.fence, nil
+		return false, f.fence, f.expires, nil
 	}
 	if f.fence == 0 {
 		f.fence = 1
 	}
 	f.holder = "node-a"
 	f.expires = now.Add(ttl)
-	return true, f.fence, nil
+	return true, f.fence, f.expires, nil
 }
+
+func (f *fakeLock) Fence(uint64) *Fence { return nil }
 
 func (f *fakeLock) Release(context.Context) error {
 	f.mu.Lock()

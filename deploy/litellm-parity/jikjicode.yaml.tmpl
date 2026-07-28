@@ -1,0 +1,66 @@
+# jikjicode roster for the cutover run — one chat provider, rendered twice.
+#
+# WHAT THIS IS
+#   The cutover test needs a real agent client doing real work, once against
+#   dorang and once against the LiteLLM it would replace, with nothing else
+#   different. `jikjicode --config <file>` disables config discovery entirely,
+#   so rendering this template twice — once with dorang's listener as
+#   CUTOVER_BASE_URL, once with the LiteLLM base URL — is the whole A/B.
+#
+# WHY IT IS NOT THE OPERATOR'S OWN CONFIG
+#   The operator uses ~/.jikji/jikjicode.yaml daily. It is never read and never
+#   written by `cutover.sh`: a copy would drag in a roster of subscription
+#   providers the test does not need and would spend against them on startup,
+#   and an edit in place would leave the operator's tooling changed. This file
+#   is the minimum that starts an agent session.
+#
+# WHY orchestration IS OFF
+#   The embedded orchestration runtime spawns sub-agents. They are real model
+#   calls against the same provider, they are not what is being measured, and
+#   they are the one thing in this test that could spend without bound.
+#
+# RENDER
+#   CUTOVER_MODEL=... CUTOVER_BASE_URL=... CUTOVER_KEY_ENV=... \
+#     envsubst < jikjicode.yaml.tmpl > "$RUNDIR/jc-dorang.yaml"
+#
+#   Only the three CUTOVER_* variables are substituted. The credential is NOT
+#   substituted: `api_key_env` names the variable and the agent reads it from
+#   its own environment, so no rendered file holds a key.
+
+runtime:
+  name: jikjicode
+  mode: development
+
+typebackbone:
+  default_provider: gw
+  default_model: "${CUTOVER_MODEL}"
+  # A gateway in front of a gateway in front of a hosted model can be quiet for
+  # a while before the first token. These are the client-side limits, and they
+  # are deliberately shorter than dorang's own request_timeout so that a stall
+  # surfaces here rather than as a 100-minute hang.
+  streaming:
+    first_event_timeout: 5m
+    read_idle_timeout: 3m
+  providers:
+    - name: gw
+      kind: openai-compatible
+      category: chat
+      model: "${CUTOVER_MODEL}"
+      base_url: "${CUTOVER_BASE_URL}"
+      api_key_env: "${CUTOVER_KEY_ENV}"
+      timeout: 600s
+      context_window: 128000
+      max_output: 8000
+      # One in flight. This is a correctness test, not a load test.
+      max_concurrency: 1
+      supports_tools: true
+      supports_streaming: true
+
+jikjicode:
+  mode: local
+  model: "${CUTOVER_MODEL}"
+  # workspace-write lets the agent read and write inside the scratch workspace
+  # and denies shell.run, so the task can exercise tool calls without the run
+  # being able to touch anything outside it.
+  sandbox: workspace-write
+  orchestration: false

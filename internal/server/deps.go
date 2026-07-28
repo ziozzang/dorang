@@ -190,6 +190,13 @@ type Event struct {
 	// body was never parsed and the numbers are counts and bytes rather than
 	// tokens (DESIGN §10.6 step 5).
 	Passthrough bool
+	// Streamed reports that the client was answered with an event stream.
+	//
+	// It is taken from the Content-Type actually written, not from the
+	// `stream: true` the request asked for: a request that asks to stream and
+	// is refused before the first frame did not stream, and the ledger column
+	// is read to answer "was this a streamed turn", not "what was requested".
+	Streamed bool
 	// ErrorShape records which upstream envelope shape produced the error,
 	// when the request failed.
 	ErrorShape Shape

@@ -73,8 +73,15 @@ func (a *meterAdapter) Record(ev server.Event) {
 		Latency:  time.Duration(ev.DurationNS),
 		TTFT:     time.Duration(r.TTFTNS),
 		Trace: meter.TraceInfo{
-			RequestID:      ev.RequestID,
-			UpstreamModel:  r.UpstreamModel,
+			RequestID:     ev.RequestID,
+			UpstreamModel: r.UpstreamModel,
+			// The SAME field x-dorang-deployment is stamped from
+			// (server.stampHeaders reads r.Deployment), so the ledger row and
+			// the response header cannot disagree about which deployment served
+			// the request. They used to: the header carried it and the column
+			// was empty on every row.
+			DeploymentID:   r.Deployment,
+			Streamed:       ev.Streamed,
 			QueueWait:      time.Duration(r.QueueNS),
 			CapacityWait:   time.Duration(r.QueueNS),
 			Retries:        max(r.Attempt-1, 0),
@@ -165,10 +172,12 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			TeamID:           t.TeamID,
 			CredentialID:     t.CredentialID,
 			ProviderID:       t.Provider,
+			DeploymentID:     t.DeploymentID,
 			ModelGroup:       t.ModelGroup,
 			UpstreamModel:    t.UpstreamModel,
 			Endpoint:         t.Endpoint,
 			Status:           t.Status,
+			Streamed:         t.Streamed,
 			PromptTokens:     t.Tokens.Input,
 			CompletionTokens: t.Tokens.Output,
 			CachedTokens:     t.Tokens.CacheRead,

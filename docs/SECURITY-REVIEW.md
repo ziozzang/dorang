@@ -474,14 +474,17 @@ recur. The third recurs the most.
   capacity check is consulted, and requests that then queue for a slot hold their buffer for
   up to `MaxQueueWait` (30 s default). The per-key concurrency ceiling bounds *dispatched*
   requests, not *buffered* ones. There is no `netutil.LimitListener` or equivalent
-  (`cmd/dorang/main.go:173` is a plain `net.Listen`), and `MaxBodyBytes` is not exposed in
-  YAML at all — `DefaultMaxBodyBytes = 32 << 20` (`internal/server/server.go:20`) is what
-  every deployment gets and no operator can lower it.
+  (`cmd/dorang/main.go:173` is a plain `net.Listen`). **The cap itself is configurable now** —
+  `server.max_body_bytes` (CONFIG §2) reaches `server.Options.MaxBodyBytes`, so an operator can
+  lower it; that closes the half of this finding that said no operator could. The admission
+  half stands: the buffer is still taken before the concurrency gate, and lowering the cap
+  reduces the per-connection cost rather than bounding the number of concurrent buffers.
 - **Evidence:** `serve` reads the body at `internal/server/server.go:391` and only calls
   `rt.Handler` at `:418`; the capacity acquisition is inside `st.router.Route` at
   `internal/app/dispatch.go:103`, which `handleInference` reaches after the read.
 - **Fix:** acquire a cheap per-principal admission token before `rq.body.read`, released when
-  the request finishes; and surface `server.max_body_bytes` in configuration.
+  the request finishes. Surfacing `server.max_body_bytes` in configuration is **done**
+  (`TestConfiguredBodyCapIsHonoured`).
 
 ---
 
@@ -1257,7 +1260,8 @@ the second unbounded read the review did not mention is closed by the same code
 rather than by a second copy of it.
 
 `MaxResponseBytes` is an option on the backend but is **not yet surfaced in
-YAML**. Same gap the review notes for `server.max_body_bytes`.
+YAML**. `server.max_body_bytes` had the same gap and no longer does (CONFIG §2),
+which leaves this one on its own.
 
 Tests: `TestOversizedUpstreamResponseIsRefused` — which now counts what the
 reader was ASKED FOR, because the first version of it passed against an
@@ -1417,8 +1421,8 @@ pass:
 
 - **Store lookups for unknown keys are unbounded** (finding 6, second half).
   The largest remaining item.
-- [MEDIUM] request bodies buffered before the concurrency gate;
-  `server.max_body_bytes` and the new `max_response_bytes` not exposed in YAML.
+- [MEDIUM] request bodies buffered before the concurrency gate, and
+  `max_response_bytes` not exposed in YAML. `server.max_body_bytes` is exposed now.
 - [MEDIUM] no `ReadTimeout`/`IdleTimeout`, no body-read deadline — slow POST.
 - [MEDIUM] `/v1/files` has no per-key quota, no file count limit, no expiry.
 - [MEDIUM] embeddings relay does not apply the strict fold-collision filter.

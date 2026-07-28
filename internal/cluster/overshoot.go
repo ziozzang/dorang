@@ -35,6 +35,18 @@ const DefaultMinLeasable int64 = 16
 // mode, and how much budget [Ledger] draws per store write.
 const DefaultBlockSize int64 = 16
 
+// holdsWhileLeasesLive is the condition the shared modes' zero depends on.
+//
+// It is one string for both because it is one mechanism: the counter is the sum
+// of live lease rows, so exactness is a statement about the rows still being
+// there. What makes a row disappear under a holder that is still using it is a
+// renewal that did not arrive in time -- an undersized cluster.node_ttl, a
+// store write that missed its window, a heartbeat lost to a pause -- and the
+// units are then free for every other node while the holder's requests are
+// still in flight.
+const holdsWhileLeasesLive = "every holder renews its lease while it is still using the units; " +
+	"a lease that lapses returns them to the counter underneath its holder"
+
 // Params describes the deployment a published accuracy figure is about.
 type Params struct {
 	// Limit is the ceiling being coordinated, in the metric's own units.
@@ -66,11 +78,28 @@ func (p Params) fill() Params {
 // 'Approximately accurate' is not an acceptable specification." This type is
 // that number, together with the arithmetic that produced it, so that the
 // figure can be recomputed by a reader rather than trusted.
+//
+// # Why a number alone was not enough
+//
+// Two of these modes published 0 and meant it only under a condition that was
+// stated nowhere an operator would look. Exactness in the shared modes comes
+// from a lease table, and a lease that lapses returns its units to the counter
+// while its holder may still be occupying them -- so "0" holds while every
+// holder renews, and not otherwise. That qualifier lived in a comment in
+// internal/app, next to the wiring, which is not where anybody reads a bound.
+// Measured against it: two nodes admitted 104 against a ceiling of 64 with an
+// undersized cluster.node_ttl, and the ledger admitted 190 against 100 when a
+// live node's lease was reclaimed underneath it.
+//
+// So the figure travels with the condition it depends on ([Accuracy.Holds]) and
+// with what one violation costs ([Accuracy.PerLapse]). A number true only
+// sometimes, published as though it were true always, is worse than no number:
+// it is the one an operator sizes a fleet against.
 type Accuracy struct {
 	// Mode is the mode described.
 	Mode Mode
 	// MaxOvershoot is the largest number of units that all nodes together can
-	// admit beyond Limit. Zero means exact.
+	// admit beyond Limit while Holds is true. Zero means exact.
 	MaxOvershoot int64
 	// Formula is the arithmetic, with the parameters substituted.
 	Formula string
@@ -78,11 +107,33 @@ type Accuracy struct {
 	Why string
 	// HotPathCost describes what a request pays for this accuracy.
 	HotPathCost string
+	// Holds is the condition MaxOvershoot depends on. Empty means the figure is
+	// unconditional -- which, among these four modes, only `local` is, because
+	// its bound already assumes every node carries the whole ceiling.
+	Holds string
+	// PerLapse is what ONE violation of Holds adds to the overshoot, and
+	// PerLapseFormula is its arithmetic.
+	//
+	// It is deliberately a per-event figure and not a total. Nothing bounds how
+	// many times a lease can lapse inside one period, so there is no honest
+	// total to publish; an operator sizing against this has to multiply by how
+	// often a holder can miss its renewal, which is a property of the
+	// deployment and not of the mode. Publishing a total here would be the same
+	// error one level up.
+	PerLapse        int64
+	PerLapseFormula string
 }
 
-// String renders the figure for a log line or a status page.
+// String renders the figure for a log line or a status page, condition
+// included. A renderer that dropped the condition would recreate the defect
+// this field exists to close.
 func (a Accuracy) String() string {
-	return fmt.Sprintf("%s: max overshoot %d (%s); %s", a.Mode, a.MaxOvershoot, a.Formula, a.HotPathCost)
+	s := fmt.Sprintf("%s: max overshoot %d (%s); %s", a.Mode, a.MaxOvershoot, a.Formula, a.HotPathCost)
+	if a.Holds != "" {
+		s += fmt.Sprintf("; holds while %s, and each lapse adds %d (%s)",
+			a.Holds, a.PerLapse, a.PerLapseFormula)
+	}
+	return s
 }
 
 // Publish returns a mode's maximum possible overshoot for a deployment.
@@ -118,7 +169,10 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Formula:      "0",
 			Why: "the read, the ceiling test and the write are one atomic script, so two nodes " +
 				"cannot both see room for the last unit",
-			HotPathCost: "one round trip to Redis per acquire",
+			HotPathCost:     "one round trip to Redis per acquire",
+			Holds:           holdsWhileLeasesLive,
+			PerLapse:        p.Limit,
+			PerLapseFormula: fmt.Sprintf("limit = %d", p.Limit),
 		}, nil
 
 	case ModeSharedPG:
@@ -128,7 +182,10 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Formula:      "0",
 			Why: "the read-modify-write happens inside one transaction, serialized against every " +
 				"other transaction on the same key by an advisory lock",
-			HotPathCost: "one round trip to the store per acquire, costlier than Redis",
+			HotPathCost:     "one round trip to the store per acquire, costlier than Redis",
+			Holds:           holdsWhileLeasesLive,
+			PerLapse:        p.Limit,
+			PerLapseFormula: fmt.Sprintf("limit = %d", p.Limit),
 		}, nil
 
 	case ModeLeased:
@@ -147,10 +204,16 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			MaxOvershoot: p.Block * (n - 1),
 			Formula:      fmt.Sprintf("block x (nodes - 1) = %d x %d", p.Block, n-1),
 			Why: "blocks come from the shared authority, so live leases never exceed the limit; " +
-				"the bound is one reclaimed-but-still-spending block per other node. This " +
-				"implementation never spends against an expired lease, so the figure is an " +
-				"upper bound and not an estimate",
+				"the bound is one reclaimed-but-still-spending block per other node. The hot " +
+				"path refuses to spend against an expired lease and the reclaim refuses to take " +
+				"an unexpired one, so the two agree on the same instant and the figure is an " +
+				"upper bound rather than an estimate",
 			HotPathCost: fmt.Sprintf("one round trip per %d units, none in between", p.Block),
+			Holds: "a holder and the leader agree on when its lease expired -- the hot path and " +
+				"the reclaim test the same expires_at, so this is clock agreement between two " +
+				"nodes and nothing more",
+			PerLapse:        p.Block,
+			PerLapseFormula: fmt.Sprintf("block = %d", p.Block),
 		}, nil
 	}
 	return Accuracy{}, fmt.Errorf("%w: %v", ErrUnknownMode, mode)

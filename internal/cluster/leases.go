@@ -33,15 +33,27 @@ const leaseScopeShared = "shared"
 // This is why DESIGN 5.6 says lease table rather than counter: the accounting
 // and the failure recovery are the same mechanism.
 //
-// # Accuracy
+// # Accuracy, and the condition on it
 //
-// Exact. Every acquire is a read-modify-write inside one transaction, and the
-// transaction is serialized against every other transaction touching the same
-// key -- by pg_advisory_xact_lock on PostgreSQL, by the immediate transaction
-// on SQLite. Two nodes cannot both see room for the last unit. The cost is one
+// Exact while every lease is live. Every acquire is a read-modify-write inside
+// one transaction, serialized against every other transaction touching the same
+// key -- by pg_advisory_xact_lock on PostgreSQL, by the immediate transaction on
+// SQLite -- so two nodes cannot both see room for the last unit. The cost is one
 // round trip on the hot path, which is what DESIGN 5.6 prices this mode at.
-// [Publish] reports its maximum overshoot as zero, and that is a claim the
-// tests check rather than a claim this comment makes.
+//
+// The condition is not a footnote, because the recovery mechanism and the
+// accuracy claim are the same mechanism pointed in opposite directions. The
+// counter is the sum of the LIVE rows: that is what makes a dead holder's units
+// come back with no supervisor, and it is also what makes a live holder's units
+// come back if its renewal is late. A holder whose row lapses while its requests
+// are still in flight has its share handed to everybody else, and the mode
+// admits the limit twice.
+//
+// [Publish] carries that: 0 under [Accuracy.Holds], and up to the whole limit
+// per lapse ([Accuracy.PerLapse]). Both halves are measured by tests --
+// TestPublishedOvershootIsNeverExceeded for the figure and
+// TestSharedPGExactnessLapsesWithTheLease for the condition -- rather than
+// asserted by this comment.
 //
 // # Dialects
 //
@@ -198,30 +210,55 @@ func (l *LeaseStore) Held(ctx context.Context, key string) (int64, error) {
 // this exists for the keys nobody is asking about, whose units would otherwise
 // stay held by a node that no longer exists.
 func (l *LeaseStore) ReclaimExpired(ctx context.Context, now time.Time) (int64, error) {
-	res, err := l.c.exec(ctx,
-		`DELETE FROM quota_leases WHERE scope = ? AND expires_at <= ?`,
-		leaseScopeShared, store.Micros(now))
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return l.drop(ctx, `AND expires_at <= ?`, store.Micros(now))
 }
 
-// ReclaimNode drops every shared lease held by a node, whether or not it has
-// expired. It is what the leader does with a node whose heartbeat lapsed: a
-// node that is gone is not coming back to release its own units, and waiting
-// out a TTL that its own writes were extending would leave them held for as
-// long as the node was alive.
-func (l *LeaseStore) ReclaimNode(ctx context.Context, nodeID string) (int64, error) {
-	if nodeID == "" {
+// ReclaimNode drops the EXPIRED shared leases of a node the registry has
+// declared gone.
+//
+// Two guards, and both were missing.
+//
+// The first is the self-guard [Ledger.ReclaimNode] has and this did not: a
+// leader must not reclaim its own rows. The leader is a node like any other, it
+// holds shared leases against the same limits, and a registry that briefly
+// reports it dead -- its own heartbeat write lost a race, or its clock stepped
+// -- would have had it delete its own live reservations and then hand them out
+// again.
+//
+// The second is expiry, for the reason set out at [Ledger.ReclaimNode]: a
+// lapsed heartbeat is a declaration and not a fact, and dropping a live node's
+// lease frees units it is still occupying. The published "overshoot 0" of
+// DESIGN 5.6 for this mode is exact only while every holder's lease is live;
+// see [Publish], which now says so where an operator reads it rather than
+// leaving the qualifier in a caller's comment. Removing a live holder's row was
+// the one way this package could break that figure by itself, and it no longer
+// does.
+func (l *LeaseStore) ReclaimNode(ctx context.Context, nodeID string, now time.Time) (int64, error) {
+	if nodeID == "" || nodeID == l.nodeID {
 		return 0, nil
 	}
-	res, err := l.c.exec(ctx,
-		`DELETE FROM quota_leases WHERE scope = ? AND node_id = ?`, leaseScopeShared, nodeID)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return l.drop(ctx, `AND node_id = ? AND expires_at <= ?`, nodeID, store.Micros(now))
+}
+
+// drop deletes shared lease rows matching a guard, under the leader term the
+// context carries. The fence assertion shares the transaction with the delete,
+// so a superseded leader returns nobody's units.
+func (l *LeaseStore) drop(ctx context.Context, guard string, args ...any) (int64, error) {
+	var n int64
+	err := l.c.withTx(ctx, func(ctx context.Context, t tx) error {
+		if err := FenceFrom(ctx).In(ctx, t); err != nil {
+			return err
+		}
+		res, err := t.exec(ctx,
+			`DELETE FROM quota_leases WHERE scope = ? `+guard,
+			append([]any{leaseScopeShared}, args...)...)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return n, err
 }
 
 // Close releases every unit this node still holds, so a draining node's share

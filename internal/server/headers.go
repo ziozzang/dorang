@@ -175,7 +175,22 @@ const (
 	// what dorang calls a deployment. It is deliberately not HeaderUpstreamModel,
 	// which is the provider-side model name.
 	LegacyHeaderModelID = "X-Litellm-Model-Id"
-	// LegacyHeaderResponseCost mirrors HeaderCostUSD.
+	// LegacyHeaderResponseCost mirrors HeaderCostUSD, and — unlike it — is
+	// ALWAYS emitted, carrying 0 when no price rule matched.
+	//
+	// This is the one mirror that is not a straight copy of its source, and the
+	// asymmetry is deliberate. x-dorang-cost-usd is absent on an unpriced
+	// request because dorang's own vocabulary distinguishes "no price rule
+	// matched" from "this request was free". The legacy name has no such
+	// distinction — the proxy it belongs to always sends the header — so a
+	// cost exporter built against it treats absence as zero anyway, or raises
+	// on a missing key. Suppressing the mirror therefore reproduces the exact
+	// failure §7.7a exists to prevent, silently, for every model without a
+	// price rule.
+	//
+	// The pair is the discriminator, and COMPATIBILITY §7.7a says so: legacy
+	// header present with 0 AND x-dorang-cost-usd absent means "not priced";
+	// both present and 0 means "priced, and free".
 	LegacyHeaderResponseCost = "X-Litellm-Response-Cost"
 	// LegacyHeaderKeySpend mirrors HeaderSpendUSD.
 	LegacyHeaderKeySpend = "X-Litellm-Key-Spend"
@@ -203,10 +218,15 @@ func stampLegacyHeaders(h http.Header, rq *Request, r *Result) {
 	if r.Deployment != "" {
 		h.Set(LegacyHeaderModelID, r.Deployment)
 	}
+	// Unconditional: see LegacyHeaderResponseCost. An unpriced request reports
+	// 0 here and nothing on x-dorang-cost-usd, which is what tells the two
+	// apart.
+	var cb [32]byte
+	cost := int64(0)
 	if r.Priced {
-		var b [32]byte
-		h.Set(LegacyHeaderResponseCost, string(appendNanoUSD(b[:0], r.CostNanoUSD)))
+		cost = r.CostNanoUSD
 	}
+	h.Set(LegacyHeaderResponseCost, string(appendNanoUSD(cb[:0], cost)))
 	if !rq.Detail {
 		return
 	}
@@ -328,9 +348,20 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int) {
 	setInt(h, HeaderTokensCacheWrite, u.CacheWrite)
 	setInt(h, HeaderTokensReasoning, u.Reasoning)
 
-	if r.Priced {
+	if r.NotionalPriced {
+		// NotionalPriced, not Priced. They are separate flags because they are
+		// separate questions (DESIGN §8.5 rule 5): a request can be billed
+		// exactly and still have no list-rate equivalent, which is the normal
+		// case on a subscription nobody has written a notional_rate rule for.
+		// Emitting 0 there is the one thing §8.5 forbids by name — it makes a
+		// subscription look infinitely efficient — and gating this on Priced
+		// did exactly that, while internal/app's metric for the same value
+		// already honoured the flag. Two answers to one question.
 		var b [32]byte
 		h.Set(HeaderNotionalUSD, string(appendNanoUSD(b[:0], r.NotionalNanoUSD)))
+	}
+	if r.Priced {
+		var b [32]byte
 		h.Set(HeaderSpendUSD, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
 		if r.BudgetNanoUSD > 0 {
 			h.Set(HeaderBudgetUSD, string(appendNanoUSD(b[:0], r.BudgetNanoUSD)))

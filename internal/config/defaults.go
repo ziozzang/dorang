@@ -20,6 +20,15 @@ const (
 	// arithmetic.
 	defaultPreStopDelay = 10 * time.Second
 
+	// defaultMaxBodyBytes is server.DefaultMaxBodyBytes. It is spelled out here
+	// rather than imported because internal/config imports nothing of the
+	// gateway — it is the schema, and a schema that depends on the HTTP surface
+	// cannot be loaded by a tool that does not build one.
+	//
+	// The duplication is pinned by TestConfigBodyCapDefaultMatchesTheServers in
+	// internal/app, which is the one package that imports both.
+	defaultMaxBodyBytes = 32 << 20
+
 	defaultStorageDriver = "sqlite"
 	defaultSQLitePath    = "~/.dorang/dorang.db"
 	defaultPostgresEnv   = "DORANG_DATABASE_URL"
@@ -212,6 +221,9 @@ func (c *Config) ApplyDefaults() {
 	setStr(&c.Server.KeyPepperEnv, defaultKeyPepperEnv)
 	setDur(&c.Server.RequestTimeout, defaultRequestTimeout)
 	setDur(&c.Server.ShutdownGrace, defaultShutdownGrace)
+	if c.Server.MaxBodyBytes == 0 {
+		c.Server.MaxBodyBytes = defaultMaxBodyBytes
+	}
 	if c.Server.PreStopDelay == nil {
 		c.Server.PreStopDelay = durPtr(defaultPreStopDelay)
 	}

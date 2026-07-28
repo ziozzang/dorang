@@ -30,10 +30,10 @@ import (
 // correctness", and nothing is reported as damage.
 const (
 	spoolMagic     = "DRSP"
-	spoolVersion   = 3
+	spoolVersion   = 4
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 3
+	traceCodecVer  = 4
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -172,6 +172,16 @@ func decodeBucket(p []byte) (Bucket, error) {
 	return b, nil
 }
 
+// appendBool encodes a flag as a varint, so it decodes through the same takeInt
+// the numeric fields use and a field-list change stays one shape.
+func appendBool(dst []byte, b bool) []byte {
+	var v int64
+	if b {
+		v = 1
+	}
+	return binary.AppendVarint(dst, v)
+}
+
 func appendStr(dst []byte, s string) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(s)))
 	return append(dst, s...)
@@ -213,7 +223,9 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = appendStr(dst, t.CredentialID)
 	dst = appendStr(dst, t.Endpoint)
 	dst = appendStr(dst, t.UpstreamModel)
+	dst = appendStr(dst, t.DeploymentID)
 	dst = binary.AppendVarint(dst, int64(t.Status))
+	dst = appendBool(dst, t.Streamed)
 
 	dst = appendStr(dst, t.Excerpt)
 
@@ -269,10 +281,12 @@ func decodeTrace(p []byte) (Trace, error) {
 	t.Time = time.UnixMicro(num()).UTC()
 
 	if !str(&t.APIKeyID) || !str(&t.SecretID) || !str(&t.UserID) || !str(&t.TeamID) || !str(&t.ModelGroup) ||
-		!str(&t.Provider) || !str(&t.CredentialID) || !str(&t.Endpoint) || !str(&t.UpstreamModel) {
+		!str(&t.Provider) || !str(&t.CredentialID) || !str(&t.Endpoint) || !str(&t.UpstreamModel) ||
+		!str(&t.DeploymentID) {
 		return t, errCorrupt
 	}
 	t.Status = int(num())
+	t.Streamed = num() != 0
 	if !str(&t.Excerpt) {
 		return t, errCorrupt
 	}

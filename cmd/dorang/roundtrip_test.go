@@ -235,12 +235,17 @@ func TestRoundTripStreamRelay(t *testing.T) {
 
 // loadRoundTripConfig writes and loads a configuration whose only fake part is
 // the provider's address.
-func loadRoundTripConfig(t *testing.T, dir, upstreamURL string) *config.Config {
+//
+// serverExtra is spliced into the `server:` block verbatim, for tests that need
+// one more key there than the shared fixture carries. Each entry must already be
+// indented and newline-terminated.
+func loadRoundTripConfig(t *testing.T, dir, upstreamURL string, serverExtra ...string) *config.Config {
 	t.Helper()
 	src := fmt.Sprintf(`version: 1
 server:
   listen: 127.0.0.1:0
   env: development
+%s
 storage:
   driver: sqlite
   sqlite:
@@ -285,7 +290,7 @@ pricing:
       class: marginal_usage
       match: {provider: fake}
       rates: {input: "3.00", output: "15.00"}
-`, dir, dir, upstreamURL)
+`, strings.Join(serverExtra, ""), dir, dir, upstreamURL)
 
 	path := filepath.Join(dir, "roundtrip.yaml")
 	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {

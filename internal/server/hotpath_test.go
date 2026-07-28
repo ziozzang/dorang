@@ -379,6 +379,13 @@ func TestReplayBudgetIsProcessWide(t *testing.T) {
 }
 
 // TestUsageScanning covers the bounded tee the passthrough meter reads.
+//
+// It also pins the normalization, which is the difference between one
+// definition of "input tokens" in the binary and two. The OpenAI family's
+// prompt_tokens ALREADY contains the cached prefix; the Anthropic family's
+// input_tokens does not and counts it beside. A relayed body is scanned into
+// the same shape a converted one produces — Input inclusive, Total = Input +
+// Output — because both end up in the same ledger column.
 func TestUsageScanning(t *testing.T) {
 	cases := []struct {
 		body string
@@ -387,10 +394,20 @@ func TestUsageScanning(t *testing.T) {
 	}{
 		{`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
 			Usage{Input: 10, Output: 5, Total: 15}, true},
+		// Anthropic spelling: input_tokens 3 EXCLUDES the 2 cached, so the
+		// inclusive input is 5 and the total the client is owed is 9.
 		{`{"id":"x","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":2}}`, // pragma: allowlist secret — test fixture
-			Usage{Input: 3, Output: 4, CacheRead: 2}, true},
+			Usage{Input: 5, Output: 4, CacheRead: 2, Total: 9}, true},
+		// OpenAI spelling: the 7 cached are already inside prompt_tokens... which
+		// is 1, so this body is self-contradictory. It is scanned as stated
+		// rather than repaired: inventing an input count is worse than relaying
+		// the upstream's own arithmetic.
 		{`{"usage":{"prompt_tokens":1,"prompt_tokens_details":{"cached_tokens":7}}}`, // pragma: allowlist secret — test fixture
-			Usage{Input: 1, CacheRead: 7}, true},
+			Usage{Input: 1, CacheRead: 7, Total: 1}, true},
+		// A stated total is never overwritten: it is the number the client was
+		// handed, even when it disagrees with the parts.
+		{`{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":99}}`,
+			Usage{Input: 10, Output: 5, Total: 99}, true},
 		{`{"choices":[{"usage":{"prompt_tokens":99}}]}`, Usage{}, false}, // nested, not top level
 		{`{"no":"usage"}`, Usage{}, false},
 		{`not json`, Usage{}, false},

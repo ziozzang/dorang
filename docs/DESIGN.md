@@ -3265,6 +3265,46 @@ between what it does and what the subject does is a defect list.** Where the dif
 be closed in the same change, it belongs in the suite as a characterization subtest that skips
 itself the day the real path catches up — not as a silently narrower assertion.
 
+#### Where the class shows up next: the accounting surface
+
+A cutover reproduction against a live incumbent found the same shape twice more, both in the
+ledger and neither reachable from any request table:
+
+| Column | Had | Lacked |
+|---|---|---|
+| `request_logs.deployment_id` | a writer, a reader, a JSON name on `/spend/logs`, and the value on `x-dorang-deployment` | anything that assigned it |
+| `request_logs.streamed` | a writer, a reader, a JSON name | anything that assigned it |
+
+Per-deployment attribution was therefore *in the response header and not in the row* — the worst
+of the two arrangements, because an operator who checks the header believes it was recorded.
+Both are wired now, and both are asserted against the response rather than against a
+constructor: `TestLedgerTotalTokensEqualsTheAnswerTheClientGot` compares `deployment_id` to the
+header on the same request, and `TestStreamedRequestIsRecordedAsStreamed` drives a turn the
+client reads as an event stream.
+
+**The same reproduction found the class's sharper form: not a value nobody reads, but one value
+computed two ways.** `meter.Tokens.Total` summed all five token dimensions while
+`canonical.Usage.TotalTokens` — the wire — is input plus output, because the cache counts are
+part of the input and the reasoning count is part of the output. Both functions were internally
+consistent and each had passing tests; what disagreed was dorang's answer against dorang's bill.
+A request whose body said `"total_tokens": 120` was recorded as 128, and a live session's rollup
+read 30,929 against 30,355 on the wire. Cost was unaffected only because no `reasoning` rate
+happened to be configured — a property of one catalog, not of the code.
+
+Two rules follow, and they are the reason this sits beside the wired-to-nothing entries rather
+than under a heading of its own:
+
+1. **A number the client is given and a number the operator is billed for the same request are
+   one value, and must be produced by one expression.** There is now one: `Tokens.Total` is the
+   same function `canonical.Usage.TotalTokens` is, and `server.Usage` carries the same
+   convention on the relay path — `scanUsage` normalizes the Anthropic family's cache-exclusive
+   `input_tokens` into dorang's inclusive one, so a passthrough row is not a third definition.
+2. **The assertion has to compare the two artifacts, not the two functions.** A test that
+   `Total()` returns a particular sum passes throughout this defect. The test that does not is
+   the one that reads `usage.total_tokens` out of the response body and compares it to the
+   ledger row for that request id — which is what the named test above does, with a fixture
+   carrying cache and reasoning counts precisely so the two rules give different answers.
+
 ## 18. Open risks
 
 | # | Risk | Status |
