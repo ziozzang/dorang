@@ -219,6 +219,14 @@ type KindDefaults struct {
 	API   API
 	Cache CacheScheme
 
+	// BaseURL is the canonical endpoint this kind's adapter addresses. It is
+	// a DEFAULT for provider configuration, not an identity: a deployment
+	// names its own base URL and that wins. It is recorded because the same
+	// vendor often exposes several routes with different limits and even
+	// different wire shapes, and a kind that names its route is one an
+	// operator can recognise.
+	BaseURL string
+
 	// ReasoningHint names the reasoning shape the adapter for this kind
 	// implements. It is NOT a capability claim about any model on this kind:
 	// keying folding on it is exactly the defect REVIEW C5 records. Use
@@ -253,6 +261,185 @@ type KindDefaults struct {
 type ModelRef struct {
 	Kind  string
 	Model string
+}
+
+// OriginKind classifies where a value came from, coarsely enough to answer
+// "is this dorang's opinion or mine?" without reading a path.
+type OriginKind string
+
+// Origins. OriginDefault is the package's own fallback — the value no file
+// stated — and is deliberately distinguishable from a file that happens to
+// state the same thing.
+const (
+	OriginNone     OriginKind = ""
+	OriginDefault  OriginKind = "default"
+	OriginEmbedded OriginKind = "embedded"
+	OriginFile     OriginKind = "file"
+	OriginEnv      OriginKind = "env"
+)
+
+// Catalog field names, in their YAML spelling. [Catalog.Explain] and
+// [Catalog.ExplainKind] report origins keyed by these, so an operator reads the
+// name they would type into a file.
+const (
+	FieldAPI               = "api"
+	FieldBaseURL           = "base_url"
+	FieldCache             = "cache"
+	FieldReasoningHint     = "reasoning" // kind-level shape hint, not a claim
+	FieldCategory          = "category"
+	FieldContextWindow     = "context_window"
+	FieldMaxOutputTokens   = "max_output_tokens"
+	FieldSupportsTools     = "supports_tools"
+	FieldSupportsStreaming = "supports_streaming"
+	FieldMetrics           = "metrics"
+	FieldPriority          = "priority"
+	FieldReasoning         = "reasoning"
+	FieldPricing           = "pricing"
+	FieldVerified          = "verified"
+	FieldNote              = "note"
+)
+
+// Layer names, matching ModelInfo.Layers.
+const (
+	LayerKind   = "kind"
+	LayerPrefix = "prefix"
+	LayerModel  = "model"
+)
+
+// fieldSource is the internal record of which loaded layer last wrote a field.
+type fieldSource struct {
+	kind   OriginKind
+	source string
+}
+
+// FieldOrigin says where one resolved field's value came from: which of the
+// three composition layers won it, and which file wrote it.
+//
+// An operator whose context window is wrong needs to know which file to edit,
+// and an operator who wrote an overlay needs to know whether it applied. Both
+// are guesses without this.
+type FieldOrigin struct {
+	// Field is the YAML spelling of the field, e.g. "context_window".
+	Field string
+
+	// Layer is "kind", "prefix" or "model" — which composition layer supplied
+	// the winning value. Empty when no layer did.
+	Layer string
+
+	// Origin classifies Source: embedded data, an operator file, a file named
+	// by the environment, or the package's own default. OriginNone means the
+	// field is undeclared everywhere and holds its zero value.
+	Origin OriginKind
+
+	// Source is the file the value came from: an embedded file name, or the
+	// path exactly as it was given to the loader. Empty for OriginDefault and
+	// OriginNone.
+	Source string
+
+	// Value is the resolved value rendered for display. It is for reading, not
+	// for parsing; use the ModelInfo field for the typed value.
+	Value string
+}
+
+// Declared reports whether any file or package default supplied this field. A
+// false result means the ModelInfo field holds its zero value because nothing
+// said otherwise — undeclared, which is not the same as zero (DESIGN §4.3).
+func (o FieldOrigin) Declared() bool { return o.Origin != OriginNone }
+
+// String renders one origin as a single report line.
+func (o FieldOrigin) String() string {
+	var b strings.Builder
+	b.WriteString(o.Field)
+	b.WriteString("=")
+	if o.Value == "" {
+		b.WriteString(`""`)
+	} else {
+		b.WriteString(o.Value)
+	}
+	if !o.Declared() {
+		b.WriteString(" (undeclared)")
+		return b.String()
+	}
+	b.WriteString(" from ")
+	b.WriteString(string(o.Origin))
+	if o.Source != "" {
+		b.WriteString(" ")
+		b.WriteString(o.Source)
+	}
+	if o.Layer != "" {
+		b.WriteString(" layer=")
+		b.WriteString(o.Layer)
+	}
+	return b.String()
+}
+
+// Severity separates a catalog that is wrong from one that is merely
+// suspicious. An error means the data contradicts itself or the schema; a
+// warning means it is shaped like a mistake that has bitten before.
+type Severity string
+
+// Severities.
+const (
+	SeverityError   Severity = "error"
+	SeverityWarning Severity = "warning"
+)
+
+// Problem is one finding from [Catalog.Validate] or [LintFiles]. Findings are
+// values, not errors, because the point is to report every problem in one pass
+// rather than stop at the first.
+type Problem struct {
+	Severity Severity
+
+	// Source is the file the problem is attributable to, empty when it cannot
+	// be pinned to one (a contradiction between two files, for instance).
+	Source string
+
+	// Kind, Model and Field locate the problem. Any may be empty.
+	Kind  string
+	Model string
+	Field string
+
+	Message string
+}
+
+// String renders one problem as a report line. Kind and model are labelled
+// rather than joined, because a model name may contain any character and a
+// joined identifier would invite the splitting REVIEW C3 forbids.
+func (p Problem) String() string {
+	var b strings.Builder
+	b.WriteString(string(p.Severity))
+	b.WriteString(": ")
+	if p.Source != "" {
+		b.WriteString(p.Source)
+		b.WriteString(": ")
+	}
+	if p.Kind != "" {
+		b.WriteString("kind=")
+		b.WriteString(p.Kind)
+		b.WriteString(" ")
+	}
+	if p.Model != "" {
+		b.WriteString("model=")
+		b.WriteString(p.Model)
+		b.WriteString(" ")
+	}
+	if p.Field != "" {
+		b.WriteString(p.Field)
+		b.WriteString(": ")
+	}
+	b.WriteString(p.Message)
+	return b.String()
+}
+
+// HasErrors reports whether any problem in the list is error severity. A
+// warning-only result is a catalog that loads.
+func HasErrors(ps []Problem) bool {
+	for _, p := range ps {
+		if p.Severity == SeverityError {
+			return true
+		}
+	}
+	return false
 }
 
 // ModelInfo is the composition of the three layers named in DESIGN §4.3 — kind

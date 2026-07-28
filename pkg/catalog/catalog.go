@@ -4,7 +4,9 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -27,6 +29,7 @@ type prefixRule struct {
 	supportsTools     *bool
 	supportsStreaming *bool
 	note              string
+	origins           map[string]fieldSource
 }
 
 // modelEntry is the top layer of a lookup: what is declared for exactly one
@@ -43,15 +46,20 @@ type modelEntry struct {
 	pricing           Pricing
 	verified          string
 	note              string
+	origins           map[string]fieldSource
 }
 
 // Catalog is an immutable snapshot of provider-kind defaults and model
 // entries. It is safe for concurrent use; nothing mutates after construction.
 type Catalog struct {
-	kinds     map[string]KindDefaults
-	kindOrder []string
-	aliases   map[string]string // alias -> canonical kind, fully resolved
-	rules     []prefixRule      // longest prefix first
+	kinds       map[string]KindDefaults
+	kindOrder   []string
+	kindOrigins map[string]map[string]fieldSource
+
+	aliases      map[string]string // alias -> canonical kind, fully resolved
+	aliasOrigins map[string]fieldSource
+
+	rules     []prefixRule // longest prefix first
 	models    map[ModelRef]modelEntry
 	modelRefs []ModelRef // declaration order
 }
@@ -77,34 +85,161 @@ func Default() *Catalog {
 	return defaultCat
 }
 
-// Load returns the embedded catalog with operator files overlaid in order.
+// EnvCatalogPath names the environment variable holding a PATH-style list of
+// catalog files and directories, separated by [os.PathListSeparator] (':' on
+// Unix). It is applied as the LAST overlay layer, after everything the
+// configuration named, so an operator can correct a running deployment without
+// editing its configuration file.
+const EnvCatalogPath = "DORANG_CATALOG_PATH"
+
+// Loader describes the layers to compose into a Catalog.
 //
-// An overlay merges field by field, so changing one key does not require
-// restating an entry, and later files win. Overlays may add kinds, aliases,
-// prefix rules and models, and may correct any field of an existing entry.
-// They cannot remove an embedded entry: a catalog that can be silently emptied
-// is a catalog whose absences mean nothing. Load with no paths is Default's
-// data in an independent snapshot.
+// The embedded data is always the base layer. It is a default, not a ceiling:
+// every later layer may correct it, and may introduce provider kinds, aliases,
+// prefix rules and models that dorang has never heard of. An operator can run
+// against a provider this build has no knowledge of using configuration alone.
+type Loader struct {
+	// Paths are files or directories, applied in order after the embedded
+	// data. A directory contributes its *.yaml and *.yml entries, sorted by
+	// name, non-recursively — so a deployment can keep one file per provider
+	// and rely on the ordering being the one it sees in a listing.
+	Paths []string
+
+	// EnvVar names an environment variable holding a PATH-style list of files
+	// and directories, applied after Paths. Empty disables the layer;
+	// [Load] sets it to [EnvCatalogPath].
+	EnvVar string
+}
+
+// Load composes the catalog described by l.
+//
+// Layers compose field by field, later winning, so an overlay changes one key
+// without restating an entry. An entry may instead say `merge: replace` to
+// discard everything inherited for it, which is the only way to REMOVE a wrong
+// inherited value rather than change it.
+//
+// No layer can remove an entry outright: a catalog that can be silently
+// emptied is a catalog whose absences mean nothing. Correct entries; do not
+// delete them.
 //
 // The same validation applies to operator data as to embedded data, including
 // the rule that a concrete reasoning capability must carry the date it was
-// verified against a live endpoint.
-func Load(paths ...string) (*Catalog, error) {
+// verified against a live endpoint. [Catalog.Explain] reports which layer each
+// resolved field came from.
+func (l Loader) Load() (*Catalog, error) {
 	srcs := embeddedSources()
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
+
+	for _, p := range l.Paths {
+		got, err := expand(p, OriginFile)
 		if err != nil {
 			return nil, fmt.Errorf("catalog: %w", err)
 		}
-		srcs = append(srcs, source{name: p, data: data})
+		srcs = append(srcs, got...)
 	}
+
+	if l.EnvVar != "" {
+		for _, p := range splitEnvPaths(os.Getenv(l.EnvVar)) {
+			got, err := expand(p, OriginEnv)
+			if err != nil {
+				return nil, fmt.Errorf("catalog: %s: %w", l.EnvVar, err)
+			}
+			srcs = append(srcs, got...)
+		}
+	}
+
 	return buildFrom(srcs)
+}
+
+// Load returns the embedded catalog with operator layers overlaid in order:
+// each element of paths — a file or a directory — and then whatever
+// [EnvCatalogPath] names.
+//
+// Load with no paths and no environment variable set is [Default]'s data in an
+// independent snapshot. To load without consulting the environment, use
+// Loader{Paths: paths}.Load().
+func Load(paths ...string) (*Catalog, error) {
+	return Loader{Paths: paths, EnvVar: EnvCatalogPath}.Load()
+}
+
+// EnvPaths returns the entries of [EnvCatalogPath], in order, with empty
+// segments dropped. It is exported so a `dorangctl lint` can check exactly
+// what a `dorangctl serve` would load:
+//
+//	catalog.LintFiles(append(configured, catalog.EnvPaths()...)...)
+func EnvPaths() []string {
+	return splitEnvPaths(os.Getenv(EnvCatalogPath))
+}
+
+// splitEnvPaths splits a PATH-style list, dropping empty segments so that a
+// trailing or doubled separator is harmless rather than an error.
+func splitEnvPaths(v string) []string {
+	var out []string
+	for _, p := range filepath.SplitList(v) {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// catalogFileExts are the extensions a directory layer picks up.
+var catalogFileExts = []string{".yaml", ".yml"}
+
+// expand turns one path into the sources it contributes: a file is itself, a
+// directory is its *.yaml and *.yml entries sorted by name.
+//
+// A path that does not exist is an error, including one named by the
+// environment. PATH-like variables conventionally skip missing entries, but
+// this package exists so that "did my overlay apply?" has an answer, and a
+// silently skipped layer is exactly that question with no answer.
+func expand(path string, origin OriginKind) ([]source, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		return []source{{name: path, origin: origin, data: data}}, nil
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if slices.Contains(catalogFileExts, ext) {
+			names = append(names, e.Name())
+		}
+	}
+	// os.ReadDir already sorts, but the contract is worth being explicit
+	// about: an operator reading a directory listing must be able to predict
+	// which file wins.
+	slices.Sort(names)
+
+	out := make([]source, 0, len(names))
+	for _, n := range names {
+		full := filepath.Join(path, n)
+		data, err := os.ReadFile(full)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, source{name: full, origin: origin, data: data})
+	}
+	return out, nil
 }
 
 func embeddedSources() []source {
 	return []source{
-		{name: "provider_defaults.yaml", data: embeddedProviderDefaults},
-		{name: "model_catalog.yaml", data: embeddedModelCatalog},
+		{name: "provider_defaults.yaml", origin: OriginEmbedded, data: embeddedProviderDefaults},
+		{name: "model_catalog.yaml", origin: OriginEmbedded, data: embeddedModelCatalog},
 	}
 }
 
@@ -116,7 +251,7 @@ func buildFrom(srcs []source) (*Catalog, error) {
 			return nil, err
 		}
 		for _, doc := range docs {
-			b.add(src.name, doc)
+			b.add(src, doc)
 		}
 	}
 	c, err := b.build()
@@ -178,6 +313,13 @@ func (c *Catalog) Models() []ModelRef {
 // applied through KindKnown, ModelKnown and Layers, with undeclared numeric
 // capabilities left at zero and reasoning left unknown.
 func (c *Catalog) Model(kind, model string) ModelInfo {
+	info, _ := c.compose(kind, model, false)
+	return info
+}
+
+// compose is Model, optionally recording where each winning field came from.
+// One implementation, so Explain can never drift from the answer it explains.
+func (c *Catalog) compose(kind, model string, trace bool) (ModelInfo, map[string]FieldOrigin) {
 	canonKind := c.canonical(kind)
 
 	out := ModelInfo{
@@ -186,7 +328,21 @@ func (c *Catalog) Model(kind, model string) ModelInfo {
 		Reasoning: Reasoning{Capability: ReasoningUnknown},
 	}
 
+	var org map[string]FieldOrigin
+	if trace {
+		org = make(map[string]FieldOrigin, len(modelInfoFields))
+	}
+	// note records a field's winning layer and source; a no-op when untraced.
+	note := func(field, layer string, origins map[string]fieldSource) {
+		if !trace {
+			return
+		}
+		fs := origins[field]
+		org[field] = FieldOrigin{Field: field, Layer: layer, Origin: fs.kind, Source: fs.source}
+	}
+
 	if kd, ok := c.kinds[canonKind]; ok {
+		ko := c.kindOrigins[canonKind]
 		out.KindKnown = true
 		out.API = kd.API
 		out.Cache = kd.Cache
@@ -195,62 +351,263 @@ func (c *Catalog) Model(kind, model string) ModelInfo {
 		out.MaxOutputTokens = kd.MaxOutputTokens
 		out.SupportsTools = kd.SupportsTools
 		out.SupportsStreaming = kd.SupportsStreaming
-		out.Layers = append(out.Layers, "kind")
+		out.Layers = append(out.Layers, LayerKind)
+
+		note(FieldAPI, LayerKind, ko)
+		note(FieldCache, LayerKind, ko)
+		note(FieldCategory, LayerKind, ko)
+		if kd.ContextWindow > 0 {
+			note(FieldContextWindow, LayerKind, ko)
+		}
+		if kd.MaxOutputTokens > 0 {
+			note(FieldMaxOutputTokens, LayerKind, ko)
+		}
+		note(FieldSupportsTools, LayerKind, ko)
+		note(FieldSupportsStreaming, LayerKind, ko)
 	}
 
 	if rule, ok := c.matchPrefix(canonKind, model); ok {
 		out.MatchedPrefix = rule.prefix
 		if rule.category != "" {
 			out.Category = rule.category
+			note(FieldCategory, LayerPrefix, rule.origins)
 		}
 		if rule.contextWindow > 0 {
 			out.ContextWindow = rule.contextWindow
+			note(FieldContextWindow, LayerPrefix, rule.origins)
 		}
 		if rule.maxOutputTokens > 0 {
 			out.MaxOutputTokens = rule.maxOutputTokens
+			note(FieldMaxOutputTokens, LayerPrefix, rule.origins)
 		}
 		if rule.supportsTools != nil {
 			out.SupportsTools = *rule.supportsTools
+			note(FieldSupportsTools, LayerPrefix, rule.origins)
 		}
 		if rule.supportsStreaming != nil {
 			out.SupportsStreaming = *rule.supportsStreaming
+			note(FieldSupportsStreaming, LayerPrefix, rule.origins)
 		}
 		if rule.note != "" {
 			out.Note = rule.note
+			note(FieldNote, LayerPrefix, rule.origins)
 		}
-		out.Layers = append(out.Layers, "prefix")
+		out.Layers = append(out.Layers, LayerPrefix)
 	}
 
 	// Exact match on the whole name. Nothing here is prefix-based: identity
 	// is identity.
 	if entry, ok := c.models[ModelRef{Kind: canonKind, Model: model}]; ok {
+		mo := entry.origins
 		out.ModelKnown = true
 		out.Verified = entry.verified
+		note(FieldVerified, LayerModel, mo)
 		if entry.category != "" {
 			out.Category = entry.category
+			note(FieldCategory, LayerModel, mo)
 		}
 		if entry.contextWindow > 0 {
 			out.ContextWindow = entry.contextWindow
+			note(FieldContextWindow, LayerModel, mo)
 		}
 		if entry.maxOutputTokens > 0 {
 			out.MaxOutputTokens = entry.maxOutputTokens
+			note(FieldMaxOutputTokens, LayerModel, mo)
 		}
 		if entry.supportsTools != nil {
 			out.SupportsTools = *entry.supportsTools
+			note(FieldSupportsTools, LayerModel, mo)
 		}
 		if entry.supportsStreaming != nil {
 			out.SupportsStreaming = *entry.supportsStreaming
+			note(FieldSupportsStreaming, LayerModel, mo)
 		}
 		out.Reasoning = entry.reasoning
 		out.Reasoning.Levels = slices.Clone(entry.reasoning.Levels)
 		out.Pricing = entry.pricing
+		if entry.reasoning.Effective() != ReasoningUnknown {
+			note(FieldReasoning, LayerModel, mo)
+		}
+		if !entry.pricing.IsZero() {
+			note(FieldPricing, LayerModel, mo)
+		}
 		if entry.note != "" {
 			out.Note = entry.note
+			note(FieldNote, LayerModel, mo)
 		}
-		out.Layers = append(out.Layers, "model")
+		out.Layers = append(out.Layers, LayerModel)
 	}
 
+	return out, org
+}
+
+// modelInfoFields is the order Explain reports in: the shape of a lookup
+// answer, not alphabetical, so the reasoning claim and the numbers that bound
+// it stay next to each other.
+var modelInfoFields = []string{
+	FieldAPI,
+	FieldCache,
+	FieldCategory,
+	FieldContextWindow,
+	FieldMaxOutputTokens,
+	FieldSupportsTools,
+	FieldSupportsStreaming,
+	FieldReasoning,
+	FieldPricing,
+	FieldVerified,
+	FieldNote,
+}
+
+// Explain reports, for every field of [Catalog.Model]'s answer, which layer
+// supplied the winning value and which file wrote it.
+//
+// An operator debugging a wrong context window needs to know which file to
+// edit, and an operator who has just written an overlay needs to know whether
+// it applied at all. Both are guesswork otherwise — the composition is three
+// layers deep across an arbitrary number of files, and an overlay that missed
+// (wrong kind spelling, wrong model name by one byte) looks exactly like an
+// overlay that applied and agreed.
+//
+// Every field is reported, in a fixed order. A field nothing declared comes
+// back with Origin [OriginNone] and [FieldOrigin.Declared] false, which is how
+// "undeclared" is told apart from "declared as zero" (DESIGN §4.3).
+func (c *Catalog) Explain(kind, model string) []FieldOrigin {
+	info, org := c.compose(kind, model, true)
+
+	out := make([]FieldOrigin, 0, len(modelInfoFields))
+	for _, f := range modelInfoFields {
+		o := org[f]
+		o.Field = f
+		o.Value = renderModelField(info, f)
+		out = append(out, o)
+	}
 	return out
+}
+
+// ExplainKind reports where each field of a provider kind's defaults came
+// from, resolving kind aliases. The bool is false for an undeclared kind.
+func (c *Catalog) ExplainKind(name string) ([]FieldOrigin, bool) {
+	canon := c.canonical(name)
+	kd, ok := c.kinds[canon]
+	if !ok {
+		return nil, false
+	}
+	origins := c.kindOrigins[canon]
+
+	fields := []string{
+		FieldAPI, FieldBaseURL, FieldCache, FieldReasoningHint, FieldCategory,
+		FieldContextWindow, FieldMaxOutputTokens,
+		FieldSupportsTools, FieldSupportsStreaming,
+		FieldMetrics, FieldPriority, FieldVerified, FieldNote,
+	}
+	out := make([]FieldOrigin, 0, len(fields))
+	for _, f := range fields {
+		fs := origins[f]
+		out = append(out, FieldOrigin{
+			Field:  f,
+			Layer:  LayerKind,
+			Origin: fs.kind,
+			Source: fs.source,
+			Value:  renderKindField(kd, f),
+		})
+	}
+	return out, true
+}
+
+// AliasOrigin reports which file declared a kind alias, and the kind it
+// resolves to. The bool is false when name is not an alias.
+func (c *Catalog) AliasOrigin(name string) (target string, origin FieldOrigin, ok bool) {
+	target, ok = c.aliases[name]
+	if !ok {
+		return "", FieldOrigin{}, false
+	}
+	fs := c.aliasOrigins[name]
+	return target, FieldOrigin{
+		Field:  "kind_aliases",
+		Origin: fs.kind,
+		Source: fs.source,
+		Value:  target,
+	}, true
+}
+
+func renderModelField(info ModelInfo, f string) string {
+	switch f {
+	case FieldAPI:
+		return string(info.API)
+	case FieldCache:
+		return string(info.Cache)
+	case FieldCategory:
+		return string(info.Category)
+	case FieldContextWindow:
+		return strconv.Itoa(info.ContextWindow)
+	case FieldMaxOutputTokens:
+		return strconv.Itoa(info.MaxOutputTokens)
+	case FieldSupportsTools:
+		return strconv.FormatBool(info.SupportsTools)
+	case FieldSupportsStreaming:
+		return strconv.FormatBool(info.SupportsStreaming)
+	case FieldReasoning:
+		return info.Reasoning.String()
+	case FieldPricing:
+		return renderPricing(info.Pricing)
+	case FieldVerified:
+		return info.Verified
+	case FieldNote:
+		return info.Note
+	}
+	return ""
+}
+
+func renderKindField(kd KindDefaults, f string) string {
+	switch f {
+	case FieldAPI:
+		return string(kd.API)
+	case FieldBaseURL:
+		return kd.BaseURL
+	case FieldCache:
+		return string(kd.Cache)
+	case FieldReasoningHint:
+		return string(kd.ReasoningHint)
+	case FieldCategory:
+		return string(kd.Category)
+	case FieldContextWindow:
+		return strconv.Itoa(kd.ContextWindow)
+	case FieldMaxOutputTokens:
+		return strconv.Itoa(kd.MaxOutputTokens)
+	case FieldSupportsTools:
+		return strconv.FormatBool(kd.SupportsTools)
+	case FieldSupportsStreaming:
+		return strconv.FormatBool(kd.SupportsStreaming)
+	case FieldMetrics:
+		return kd.Metrics
+	case FieldPriority:
+		return kd.Priority
+	case FieldVerified:
+		return kd.Verified
+	case FieldNote:
+		return kd.Note
+	}
+	return ""
+}
+
+func renderPricing(p Pricing) string {
+	if p.IsZero() {
+		return ""
+	}
+	var b strings.Builder
+	if p.Currency != "" {
+		b.WriteString(p.Currency)
+		b.WriteString(" ")
+	}
+	b.WriteString("in=")
+	b.WriteString(string(p.InputPerMTok))
+	b.WriteString(" out=")
+	b.WriteString(string(p.OutputPerMTok))
+	if p.CachedInputPerMTok != "" {
+		b.WriteString(" cached=")
+		b.WriteString(string(p.CachedInputPerMTok))
+	}
+	return b.String()
 }
 
 // matchPrefix returns the longest rule whose prefix literally prefixes the

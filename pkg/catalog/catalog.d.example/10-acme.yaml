@@ -1,0 +1,53 @@
+# A provider dorang has never heard of, described in configuration alone.
+#
+# Nothing here refers to anything embedded. The kind, its wire adapter, its
+# cache scheme, its prefix rule and its models are all declared below, and the
+# catalog is complete enough to route against as soon as this file is loaded.
+# That is the contract: the embedded data is a default, never a ceiling.
+
+version: 1
+
+kinds:
+  acme:
+    api: openai-chat
+    base_url: https://api.acme.example/v1
+    cache: openai_cache_key
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    verified: 2026-07-28
+    note: Fictional. Present so the directory example is runnable.
+
+kind_aliases:
+  acme-inc: acme
+
+# Capability defaults for a whole name family, so a model released next month
+# works without an edit. A prefix rule is a literal string-prefix test and
+# supplies defaults ONLY: it cannot make an unlisted name a catalogued model,
+# and the schema gives it nowhere to put a reasoning capability (REVIEW C5).
+prefix_rules:
+  - kind: acme
+    prefix: "acme-lodestar-"
+    context_window: 128000
+    max_output_tokens: 16000
+    note: Family default for the lodestar line.
+
+models:
+  # Names are opaque. A colon, a slash, a bracket and a dot are literal bytes
+  # here; nothing in dorang splits on any of them (DESIGN §2.1, REVIEW C3).
+  - { kind: acme, model: "acme-lodestar-2",        context_window: 200000, max_output_tokens: 32000 }
+  - { kind: acme, model: "acme-lodestar-2:turbo",  context_window: 200000, max_output_tokens: 32000 }
+  - { kind: acme, model: "acme/anvil-1.5" }
+  - kind: acme
+    model: "acme-forge-9"
+    context_window: 64000
+    max_output_tokens: 8000
+    reasoning:
+      capability: effort_scale
+      levels: [low, medium, high]
+      default_level: medium
+      verified: 2026-07-28
+      note: >-
+        A concrete capability may be claimed only with the date it was checked
+        against the live endpoint. Drop the date and this file stops loading —
+        which is the point.

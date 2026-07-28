@@ -56,10 +56,20 @@ func TestDefaultParses(t *testing.T) {
 		t.Fatal("Default() has no kinds")
 	}
 
-	// The 2026-07-28 fetch. A change here should be a deliberate data edit.
+	// The 2026-07-28 live fetch, pinned. These are the entries dorang's own
+	// operator confirmed against the provider, which is what `verified:`
+	// means; everything absorbed from a third-party catalog deliberately
+	// carries no date and is excluded here. Counting only the dated entries
+	// keeps this assertion about the fetch, not about how much has since been
+	// read out of somebody else's repository.
 	perKind := map[string]int{}
+	dated := 0
 	for _, ref := range c.Models() {
+		if c.Model(ref.Kind, ref.Model).Verified == "" {
+			continue
+		}
 		perKind[ref.Kind]++
+		dated++
 	}
 	want := map[string]int{
 		"ollama-cloud":    19,
@@ -71,21 +81,69 @@ func TestDefaultParses(t *testing.T) {
 	}
 	for kind, n := range want {
 		if perKind[kind] != n {
-			t.Errorf("kind %q has %d models, want %d", kind, perKind[kind], n)
+			t.Errorf("kind %q has %d dated models, want %d", kind, perKind[kind], n)
 		}
 	}
 	sum := 0
 	for _, n := range want {
 		sum += n
 	}
-	if total := len(c.Models()); total != sum {
-		t.Errorf("catalog has %d models, want %d", total, sum)
+	if dated != sum {
+		t.Errorf("catalog has %d dated models, want %d", dated, sum)
+	}
+
+	// Absorbed data must never acquire a date by accident. A date is a claim
+	// that somebody looked, and the whole absorbed set is on the probe list
+	// precisely because nobody did.
+	for _, ref := range c.Models() {
+		info := c.Model(ref.Kind, ref.Model)
+		if info.Verified == "" {
+			continue
+		}
+		if _, ok := want[ref.Kind]; !ok {
+			t.Errorf("kind=%s model=%s carries verified=%s but is not from the dated fetch",
+				ref.Kind, ref.Model, info.Verified)
+		}
 	}
 
 	// Retired upstream, so deliberately absent. Re-adding it needs a fetch,
 	// not a memory.
 	if c.Model("ollama-cloud", "deepseek-v3.2").ModelKnown {
 		t.Error("deepseek-v3.2 is present; the provider no longer offers it")
+	}
+}
+
+// TestEmbeddedCoverage is a floor, not a pin. It fails when the absorbed
+// breadth silently collapses — a bad merge, a truncated file — without
+// demanding an edit every time a provider is added.
+func TestEmbeddedCoverage(t *testing.T) {
+	c := Default()
+
+	if n := len(c.Kinds()); n < 50 {
+		t.Errorf("catalog declares %d kinds; the absorbed set is much larger, "+
+			"so this is a truncation, not a trim", n)
+	}
+	if n := len(c.Models()); n < 200 {
+		t.Errorf("catalog declares %d models; likewise", n)
+	}
+
+	// Breadth is the point: a provider an operator might switch to should
+	// already be described, with the route it addresses.
+	for _, name := range []string{
+		"groq", "cerebras", "together", "fireworks", "deepinfra", "novita",
+		"nvidia", "baseten", "chutes", "venice", "gmi", "stepfun", "xiaomi",
+		"byteplus", "volcengine", "qianfan", "opencode", "opencode-go",
+		"kimi-coding", "synthetic", "anthropic-vertex", "arcee", "meta",
+	} {
+		kd, ok := c.Kind(name)
+		if !ok {
+			t.Errorf("kind %q is missing", name)
+			continue
+		}
+		if kd.BaseURL == "" {
+			t.Errorf("kind %q declares no base_url; an operator cannot recognise "+
+				"the route it addresses", name)
+		}
 	}
 }
 
@@ -142,9 +200,30 @@ func TestEveryKindResolves(t *testing.T) {
 		}
 	}
 
+	// Every OTHER kind — the absorbed breadth — is checked structurally
+	// rather than by name. Pinning the list by name would mean an operator
+	// could not add a provider without editing a test, which is the opposite
+	// of what this package is for.
 	for _, name := range c.Kinds() {
-		if !slices.Contains(required, name) {
-			t.Errorf("undeclared-in-test kind %q; update the required list", name)
+		if slices.Contains(required, name) {
+			continue
+		}
+		kd, ok := c.Kind(name)
+		if !ok {
+			t.Errorf("kind %q listed but does not resolve", name)
+			continue
+		}
+		if !validAPIs[kd.API] {
+			t.Errorf("kind %q declares unknown api %q", name, kd.API)
+		}
+		if !validCaches[kd.Cache] {
+			t.Errorf("kind %q declares unknown cache %q", name, kd.Cache)
+		}
+		// An absorbed kind must not carry a kind-wide context window: it
+		// would be applied to every model on the kind, including the ones
+		// nobody has looked at (DESIGN §4.3).
+		if kd.ContextWindow != 0 {
+			t.Errorf("kind %q declares a kind-wide context_window %d", name, kd.ContextWindow)
 		}
 	}
 

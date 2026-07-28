@@ -43,6 +43,18 @@ kind_aliases:
   gemini: google
   vertex-ai: vertex
   azure-openai: azure
+  microsoft-foundry: azure
+  # openclaw's Foundry default API is openai-completions
+  # (extensions/microsoft-foundry/shared.ts:22), which is dorang's azure kind.
+  grok: xai                # hermes plugins/model-providers/xai/__init__.py:6-13
+  "x.ai": xai              # same
+  zhipu: glm               # hermes plugins/model-providers/zai/__init__.py:111-125
+  google-gemini: google    # hermes plugins/model-providers/gemini/__init__.py:51-59
+  google-ai-studio: google # same
+  kimi: moonshot           # jikji internal/typebackbone/provider_defaults.yaml:2-7
+  llama-cpp: llamacpp
+  "llama.cpp": llamacpp
+  local: ollama            # hermes plugins/model-providers/custom/__init__.py:84-101
 
 kinds:
 
@@ -50,6 +62,10 @@ kinds:
 
   openai:
     api: openai-chat
+    base_url: https://api.openai.com/v1
+    # openclaw extensions/openai/openclaw.plugin.json:39, which declares
+    # api openai-responses for this base; dorang keeps two kinds for the two
+    # surfaces the one host serves.
     cache: openai_cache_key
     reasoning: effort_scale
     category: chat
@@ -58,6 +74,7 @@ kinds:
 
   openai-responses:
     api: openai-responses
+    base_url: https://api.openai.com/v1   # openclaw extensions/openai/openclaw.plugin.json:39-40
     cache: openai_cache_key
     # §4.3 writes `reasoning_effort` here; on the Responses surface the wire
     # form is the `reasoning: {effort, summary}` object of §10.2.
@@ -91,7 +108,12 @@ kinds:
 
   anthropic:
     api: anthropic-messages
+    base_url: https://api.anthropic.com
+    # openclaw extensions/anthropic/openclaw.plugin.json:89-90
+    # hermes plugins/model-providers/anthropic/__init__.py:44-52 agrees.
     cache: anthropic_cache_control
+    # openclaw extensions/anthropic/register.runtime.ts:974 marks every model
+    # on this kind cache-TTL eligible.
     reasoning: thinking_budget
     category: chat
     supports_tools: true
@@ -99,6 +121,14 @@ kinds:
 
   minimax:
     api: anthropic-messages
+    base_url: https://api.minimax.io/anthropic
+    # openclaw extensions/minimax/model-definitions.ts:6
+    # hermes plugins/model-providers/minimax/__init__.py:62-93 agrees, and
+    # notes that the /anthropic path suffix is what selects this wire; a
+    # deployment pointed at https://api.minimax.io/v1 gets the OpenAI wire and
+    # must override `api`. The `minimax-cn` alias maps to this kind but the CN
+    # route is a different host, https://api.minimaxi.com/anthropic — a
+    # deployment there overrides base_url.
     cache: anthropic_cache_control
     category: chat
     supports_tools: true
@@ -112,13 +142,28 @@ kinds:
     supports_streaming: true
     note: >-
       §4.3 elides bedrock's defaults. It fronts several model families, so this
-      is a starting point a deployment is expected to override.
+      is a starting point a deployment is expected to override. Both mined
+      sources disagree with the wire shape recorded here: openclaw declares
+      api "bedrock-converse-stream" (extensions/amazon-bedrock/discovery.ts:695)
+      and hermes api_mode "bedrock_converse"
+      (plugins/model-providers/bedrock/__init__.py:21-28). dorang has no
+      Converse adapter, and naming an API that no adapter implements would be
+      a worse lie than this one. No models are listed: openclaw's
+      KNOWN_CONTEXT_WINDOWS (discovery.ts:68-139) and hermes'
+      BEDROCK_CONTEXT_LENGTHS (agent/bedrock_adapter.py:1351-1391) are both
+      hand-maintained tables their own authors label as stale-prone fallbacks
+      (bedrock_adapter.py:1509-1514).
 
   # ---- Google-shaped -------------------------------------------------------
 
   google:
     api: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    # openclaw extensions/google/provider-catalog.ts:12
+    # hermes plugins/model-providers/gemini/__init__.py:51-59 agrees.
     cache: google_cached_contents
+    # openclaw extensions/google/transport-stream.ts:744-761 sets
+    # params.cachedContent and omits system/tools when a handle is present.
     category: chat
     supports_tools: true
     supports_streaming: true
@@ -137,6 +182,13 @@ kinds:
 
   glm:
     api: openai-chat
+    base_url: https://api.z.ai/api/coding/paas/v4
+    # The CODING PLAN, which is the endpoint this kind addresses:
+    #   jikji internal/foundry/configbuilder/provider_catalog.go:67
+    #   <operator config: jikjicode.yaml>:62, <operator config: jikji.yaml>:52
+    # openclaw's `zai` provider is a DIFFERENT route,
+    # https://api.z.ai/api/paas/v4 (extensions/zai/openclaw.plugin.json:33),
+    # with materially different limits — see model_catalog.overlay.example.yaml.
     cache: openai_cache_key
     # §4.3 calls this shape `glm_thinking`; §10.2 classifies it as the boolean
     # {thinking: {type: enabled|disabled}} form.
@@ -147,6 +199,14 @@ kinds:
     verified: 2026-07-28
 
   qwen:
+    base_url: https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+    # openclaw extensions/qwen/openclaw.plugin.json:92
+    # jikji internal/foundry/configbuilder/provider_catalog.go:81
+    # CONTRADICTION on the wire shape for this exact URL: openclaw declares
+    # api openai-completions (:93); jikji declares openai-responses (:79) and
+    # so does the operator's own running config (<operator config: jikjicode.yaml>:37).
+    # The operator's configuration is first-party for this deployment and is
+    # what this kind follows.
     # §4.3 lists `openai-chat`. The token-plan endpoint in use speaks the
     # Responses surface, which is what this default reflects; a deployment on
     # the plain compatible-mode endpoint overrides `api` back to openai-chat.
@@ -165,6 +225,11 @@ kinds:
 
   deepseek:
     api: openai-chat
+    base_url: https://api.deepseek.com
+    # openclaw extensions/deepseek/openclaw.plugin.json:29
+    # hermes plugins/model-providers/deepseek/__init__.py:85-98 writes
+    # https://api.deepseek.com/v1 for the same provider. Recorded without the
+    # suffix, as the manifest has it.
     cache: openai_cache_key
     reasoning: effort_scale
     category: chat
@@ -173,6 +238,10 @@ kinds:
 
   moonshot:
     api: openai-chat
+    base_url: https://api.moonshot.ai/v1
+    # openclaw extensions/moonshot/openclaw.plugin.json:50-51
+    # hermes plugins/model-providers/kimi-coding/__init__.py:98-118 agrees for
+    # its legacy-key path. See the `kimi-coding` kind for the other route.
     cache: openai_cache_key
     category: chat
     supports_tools: true
@@ -180,6 +249,7 @@ kinds:
 
   mistral:
     api: openai-chat
+    base_url: https://api.mistral.ai/v1   # openclaw extensions/mistral/openclaw.plugin.json:25-26
     cache: openai_cache_key
     category: chat
     supports_tools: true
@@ -187,6 +257,15 @@ kinds:
 
   xai:
     api: openai-chat
+    base_url: https://api.x.ai/v1
+    # openclaw extensions/xai/model-definitions.ts:6
+    # hermes plugins/model-providers/xai/__init__.py:6-13 agrees on the URL.
+    # CONTRADICTION on the wire shape: BOTH sources say this endpoint speaks
+    # the Responses surface (openclaw extensions/xai/provider-catalog.ts:37;
+    # hermes api_mode="codex_responses"), while DESIGN §4.3 says openai-chat.
+    # §4.3 is first-party and chat-completions is the more widely accepted of
+    # the two, so it stands — but this is the highest-value item on the probe
+    # list, because a wrong wire shape fails every request, not some.
     cache: openai_cache_key
     reasoning: effort_scale
     category: chat
@@ -196,7 +275,16 @@ kinds:
 
   openrouter:
     api: openai-chat
+    base_url: https://openrouter.ai/api/v1
+    # openclaw extensions/openrouter/provider-catalog.ts:11
+    # hermes plugins/model-providers/openrouter/__init__.py:170-186 agrees,
+    # and separates the inference URL from the catalog URL
+    # (https://openrouter.ai/api/v1/models).
     cache: openrouter_cache
+    # Model-gated in openclaw, not provider-wide: only ids prefixed
+    # anthropic/, deepseek/, moonshot/, moonshotai/, zai/ are cache-eligible
+    # (extensions/openrouter/index.ts:45-51). Declared at kind level anyway
+    # because DESIGN §4.3 does; the gate belongs in the adapter.
     category: chat
     supports_tools: true
     supports_streaming: true
@@ -205,7 +293,15 @@ kinds:
 
   ollama:
     api: openai-chat
+    base_url: http://127.0.0.1:11434/v1
+    # jikji examples/config/airgapped-ollama.yaml:41 names this exact
+    # OpenAI-compatible path. openclaw's OLLAMA_DEFAULT_BASE_URL
+    # (extensions/ollama/src/defaults.ts:2) is the same host without /v1,
+    # because openclaw speaks Ollama's native API there.
     cache: ollama_keep_alive
+    # openclaw extensions/ollama/src/stream.ts:279 carries keep_alive as a
+    # top-level parameter. It is model RESIDENCY, not prompt caching; the
+    # scheme name says what dorang sends, not what the backend caches.
     category: chat
     supports_tools: true
     supports_streaming: true
@@ -215,6 +311,11 @@ kinds:
   # hold a model resident, so no prompt-cache scheme applies.
   ollama-cloud:
     api: openai-chat
+    base_url: https://ollama.com/v1
+    # hermes plugins/model-providers/ollama-cloud/__init__.py:81-87 names this
+    # exact URL. openclaw addresses the same provider at https://ollama.com on
+    # Ollama's native wire (extensions/ollama/openclaw.plugin.json:80-81),
+    # where the same models carry a `:cloud` tag.
     cache: none
     category: chat
     supports_tools: true
@@ -223,6 +324,9 @@ kinds:
 
   vllm:
     api: openai-chat
+    base_url: http://127.0.0.1:8000/v1
+    # openclaw extensions/vllm/defaults.ts:2
+    # jikji internal/foundry/configbuilder/provider_catalog.go:180 agrees.
     cache: none
     category: chat
     supports_tools: true
@@ -235,6 +339,11 @@ kinds:
   cohere:
     api: cohere
     cache: none
+    # No base_url: the only one the sources give is openclaw's OpenAI
+    # COMPATIBILITY route, https://api.cohere.ai/compatibility/v1
+    # (extensions/cohere/openclaw.plugin.json:13-14), which the `cohere` wire
+    # adapter does not address. A deployment wanting that route sets
+    # api: openai-chat and the URL itself.
     category: chat
     supports_tools: true
     supports_streaming: true
@@ -246,6 +355,530 @@ kinds:
     supports_tools: false
     supports_streaming: false
     verified: 2026-07-28
+
+  # =========================================================================
+  # Absorbed 2026-07-28 from openclaw and hermes-agent. Read this first.
+  # =========================================================================
+  #
+  # Everything below carries the `path:line` it came from, relative to
+  # . Nothing below was probed against a live endpoint by
+  # dorang, so no kind here carries `verified:` — that date means dorang's
+  # operator checked, and reading somebody else's repository is not that.
+  #
+  # `cache:` defaults to `none` for every absorbed kind. That is a finding, not
+  # laziness: openclaw has ZERO occurrences of `promptCacheKey` /
+  # `prompt_cache_key` anywhere under extensions/, and its per-provider cache
+  # hooks (`isCacheTtlEligible`) exist for only a handful of providers. An
+  # OpenAI-compatible endpoint is not an OpenAI prompt-cache endpoint, and
+  # declaring a scheme the backend ignores costs a wasted cache breakpoint on
+  # every request. Where a source does state a scheme, it is set and cited.
+  #
+  # `context_window` is NOT set on any absorbed kind, even where the sources
+  # offer a provider-wide number. A kind-level window is applied to every model
+  # on the kind including the ones nobody looked at (DESIGN §4.3), and every
+  # provider-wide number on offer turned out to be that provider's own fallback
+  # constant. Catalog.Validate warns about kind-level windows for this reason.
+
+  # ---- Vendor-native, OpenAI wire ------------------------------------------
+
+  groq:
+    api: openai-chat
+    base_url: https://api.groq.com/openai/v1   # openclaw extensions/groq/openclaw.plugin.json:49-50
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  cerebras:
+    api: openai-chat
+    base_url: https://api.cerebras.ai/v1       # openclaw extensions/cerebras/openclaw.plugin.json:24-25
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  together:
+    api: openai-chat
+    base_url: https://api.together.xyz/v1      # openclaw extensions/together/openclaw.plugin.json:45-46
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  fireworks:
+    api: openai-chat
+    base_url: https://api.fireworks.ai/inference/v1
+    # openclaw extensions/fireworks/openclaw.plugin.json:35-36
+    # hermes plugins/model-providers/fireworks/__init__.py:16-33 agrees on the
+    # base URL and records that model ids carry the full
+    # `accounts/fireworks/models/<slug>` path form.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  deepinfra:
+    api: openai-chat
+    base_url: https://api.deepinfra.com/v1/openai
+    # openclaw extensions/deepinfra/openclaw.plugin.json:34-35
+    # hermes plugins/model-providers/deepinfra/__init__.py:51-79 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Prompt caching here is per model, not per kind: openclaw injects
+      Anthropic ephemeral cache_control markers only for model ids starting
+      `anthropic/` (extensions/deepinfra/cache-wrapper.ts:11-26, gate at
+      extensions/deepinfra/index.ts:121). A kind-level scheme would apply it to
+      every model, so this declares none.
+
+  novita:
+    api: openai-chat
+    base_url: https://api.novita.ai/openai/v1  # openclaw extensions/novita/openclaw.plugin.json:72-73
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  nvidia:
+    api: openai-chat
+    base_url: https://integrate.api.nvidia.com/v1
+    # openclaw extensions/nvidia/openclaw.plugin.json:26-27
+    # hermes plugins/model-providers/nvidia/__init__.py:6-19 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  baseten:
+    api: openai-chat
+    base_url: https://inference.baseten.co/v1  # openclaw extensions/baseten/openclaw.plugin.json:23-24
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  chutes:
+    api: openai-chat
+    base_url: https://llm.chutes.ai/v1         # openclaw extensions/chutes/openclaw.plugin.json:65-66
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  venice:
+    api: openai-chat
+    base_url: https://api.venice.ai/api/v1     # openclaw extensions/venice/openclaw.plugin.json:44-45
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  huggingface:
+    api: openai-chat
+    base_url: https://router.huggingface.co/v1
+    # openclaw extensions/huggingface/models.ts:13
+    # hermes plugins/model-providers/huggingface/__init__.py:6-18 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      No models listed. openclaw's three seed rows state 131072/8192, which are
+      byte-identical to HUGGINGFACE_DEFAULT_CONTEXT_WINDOW / _MAX_TOKENS
+      (extensions/huggingface/models.ts:24-25) — indistinguishable from "nobody
+      looked", so nothing was taken.
+
+  gmi:
+    api: openai-chat
+    base_url: https://api.gmi-serving.com/v1
+    # openclaw extensions/gmi/openclaw.plugin.json:74-75
+    # hermes plugins/model-providers/gmi/__init__.py:7-30 agrees, and notes at
+    # agent/model_metadata.py:2529-2534 that GMI exposes an authoritative
+    # context_length on /models that models.dev does not carry.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  kilocode:
+    api: openai-chat
+    base_url: https://api.kilo.ai/api/gateway/
+    # openclaw extensions/kilocode/openclaw.plugin.json:53-54 (trailing slash)
+    # hermes plugins/model-providers/kilocode/__init__.py:6-11 writes the same
+    # URL WITHOUT the trailing slash. Recorded as openclaw has it; a joined
+    # path is the deployment's business, not this file's.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  featherless:
+    api: openai-chat
+    base_url: https://api.featherless.ai/v1    # openclaw extensions/featherless/openclaw.plugin.json:45-46
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  longcat:
+    api: openai-chat
+    base_url: https://api.longcat.chat/openai  # openclaw extensions/longcat/openclaw.plugin.json:20-21
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  arcee:
+    api: openai-chat
+    base_url: https://api.arcee.ai/api/v1
+    # openclaw extensions/arcee/models.ts:8
+    # hermes plugins/model-providers/arcee/__init__.py:6-10 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  upstage:
+    api: openai-chat
+    base_url: https://api.upstage.ai/v1        # hermes plugins/model-providers/upstage/__init__.py:99-112
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      No models listed. hermes' Solar context windows (agent/model_metadata.py:337-340)
+      live in its DEFAULT_CONTEXT_LENGTHS substring table, which its own comment
+      at :208-210 calls "thin fallback defaults" that fire only when every live
+      source misses. A substring catch-all is not a measurement.
+
+  nous:
+    api: openai-chat
+    base_url: https://inference-api.nousresearch.com/v1
+    # hermes plugins/model-providers/nous/__init__.py:52-64
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      hermes resolves this provider's context windows from a live portal probe
+      and explicitly refuses to persist the OpenRouter-derived value, because
+      "a single portal blip will freeze the wrong value in forever"
+      (agent/model_metadata.py:2102-2104). Nothing static to absorb.
+
+  stepfun:
+    api: openai-chat
+    base_url: https://api.stepfun.ai/v1        # openclaw extensions/stepfun/openclaw.plugin.json:25-26
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  stepfun-plan:
+    api: openai-chat
+    base_url: https://api.stepfun.ai/step_plan/v1
+    # openclaw extensions/stepfun/openclaw.plugin.json:85-86
+    # hermes plugins/model-providers/stepfun/__init__.py:6-11 names THIS route,
+    # not the /v1 one, as its `stepfun` provider. Two names, two routes.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  xiaomi:
+    api: openai-chat
+    base_url: https://api.xiaomimimo.com/v1
+    # openclaw extensions/xiaomi/openclaw.plugin.json:25-26
+    # hermes plugins/model-providers/xiaomi/__init__.py:6-14 agrees, and notes
+    # that /v1/models answers 401 even with a valid key, so discovery fails.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  xiaomi-token-plan:
+    api: openai-chat
+    base_url: https://token-plan-sgp.xiaomimimo.com/v1
+    # openclaw extensions/xiaomi/openclaw.plugin.json:59-60
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  byteplus:
+    api: openai-chat
+    base_url: https://ark.ap-southeast.bytepluses.com/api/v3
+    # openclaw extensions/byteplus/openclaw.plugin.json:23-24
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  byteplus-plan:
+    api: openai-chat
+    base_url: https://ark.ap-southeast.bytepluses.com/api/coding/v3
+    # openclaw extensions/byteplus/openclaw.plugin.json:69-70
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  volcengine:
+    api: openai-chat
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    # openclaw extensions/volcengine/openclaw.plugin.json:41-42
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  volcengine-plan:
+    api: openai-chat
+    base_url: https://ark.cn-beijing.volces.com/api/coding/v3
+    # openclaw extensions/volcengine/openclaw.plugin.json:112-113
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  qianfan:
+    api: openai-chat
+    base_url: https://qianfan.baidubce.com/v2  # openclaw extensions/qianfan/openclaw.plugin.json:21-22
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  tencent-tokenhub:
+    api: openai-chat
+    base_url: https://tokenhub.tencentmaas.com/v1
+    # openclaw extensions/tencent/openclaw.plugin.json:12-13
+    # hermes agent/model_metadata.py:504 maps this host to `tencent-tokenhub`.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  tencent-tokenplan:
+    api: openai-chat
+    base_url: https://api.lkeap.cloud.tencent.com/plan/v3
+    # openclaw extensions/tencent/openclaw.plugin.json:73-74
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  opencode:
+    api: openai-chat
+    base_url: https://opencode.ai/zen/v1
+    # openclaw extensions/opencode/openclaw.plugin.json:30-31
+    # hermes plugins/model-providers/opencode-zen/__init__.py:130-136 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      A relay: openclaw's own manifest carries per-model `api` overrides here
+      (anthropic-messages at :36, openai-responses at :61, google-generative-ai
+      at :107). The kind names the majority shape; a deployment routing to a
+      Claude or Gemini model through this relay must set `api` explicitly.
+
+  opencode-go:
+    api: openai-chat
+    base_url: https://opencode.ai/zen/go/v1
+    # openclaw extensions/opencode-go/openclaw.plugin.json:26-27
+    # hermes plugins/model-providers/opencode-zen/__init__.py:138-144 agrees.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  alibaba:
+    api: openai-chat
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    # hermes plugins/model-providers/alibaba/__init__.py:6-11
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Naming collision worth knowing about: hermes treats `dashscope` as an
+      alias of THIS kind (alibaba/__init__.py:6-11), while DESIGN §4.3 aliases
+      `dashscope` to `qwen`, which in dorang is the token-plan endpoint. Two
+      different base URLs behind one alias. dorang keeps §4.3's mapping; a
+      deployment on DashScope's compatible-mode endpoint should name `alibaba`.
+
+  alibaba-coding-plan:
+    api: openai-chat
+    base_url: https://coding-intl.dashscope.aliyuncs.com/v1
+    # hermes plugins/model-providers/alibaba-coding-plan/__init__.py:10-19,
+    # whose comment at :3-4 states it is deliberately separate from `alibaba`
+    # because it is a different endpoint with a dedicated API key tier.
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  qwen-portal:
+    api: openai-chat
+    base_url: https://portal.qwen.ai/v1        # hermes plugins/model-providers/qwen-oauth/__init__.py:99-106
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Cache scheme is `none` on purpose despite hermes injecting
+      `cache_control: {type: ephemeral}` on the system message
+      (qwen-oauth/__init__.py:63-76). That is an Anthropic-shaped marker on an
+      OpenAI-shaped request, which none of dorang's declared schemes describes;
+      claiming one would promise an adapter behaviour that does not exist.
+
+  github-copilot:
+    api: openai-chat
+    base_url: https://api.githubcopilot.com    # hermes plugins/model-providers/copilot/__init__.py:66-72
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      The two sources contradict each other on BOTH fields. openclaw declares
+      api openai-responses at https://api.individual.githubcopilot.com
+      (extensions/github-copilot/openclaw.plugin.json:24-25) with per-model
+      anthropic-messages overrides at :30,:39,:48,:57. hermes declares the
+      chat-completions default at api.githubcopilot.com and states outright
+      (copilot/__init__.py:2-11) that the real shape is per model: GPT-5+/Codex
+      to Responses, Claude to Anthropic Messages, everything else to
+      chat-completions. The conservative shape is recorded; a deployment must
+      set `api` and `base_url` explicitly. Prompt caching is per-route too:
+      openclaw injects Anthropic ephemeral markers only on the Anthropic path
+      (extensions/github-copilot/stream.ts:90).
+
+  # ---- Vendor-native, OpenAI Responses wire --------------------------------
+
+  meta:
+    api: openai-responses
+    base_url: https://api.meta.ai/v1           # openclaw extensions/meta/openclaw.plugin.json:24-25
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  # ---- Anthropic wire ------------------------------------------------------
+
+  kimi-coding:
+    api: anthropic-messages
+    base_url: https://api.kimi.com/coding/     # openclaw extensions/kimi-coding/provider-catalog.ts:8,27-31
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      `cache: none` is stated, not defaulted: openclaw actively STRIPS
+      cache_control markers on this endpoint rather than emitting them
+      (extensions/kimi-coding/stream.ts:416,434,444). Note also that this is
+      NOT the same route as the `moonshot` kind — hermes documents the split
+      (kimi-coding/__init__.py:1-8): sk-kimi-* keys reach api.kimi.com/coding
+      on the Anthropic Messages wire, legacy keys reach api.moonshot.ai/v1 on
+      the OpenAI wire. jikji's provider_defaults.yaml:2-7 aliases `kimi-coding`
+      to `moonshot`, which folds those two wires into one; dorang does not.
+
+  moonshot-cn:
+    api: openai-chat
+    base_url: https://api.moonshot.cn/v1       # hermes plugins/model-providers/kimi-coding/__init__.py:98-118
+    cache: openai_cache_key
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      The mainland sibling of `moonshot`. Cache scheme carried over from
+      `moonshot` (DESIGN §4.3), not separately attested.
+
+  synthetic:
+    api: anthropic-messages
+    base_url: https://api.synthetic.new/anthropic
+    # openclaw extensions/synthetic/models.ts:4, provider-catalog.ts:12
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  vercel-ai-gateway:
+    api: anthropic-messages
+    base_url: https://ai-gateway.vercel.sh
+    # openclaw extensions/vercel-ai-gateway/models.ts:14, provider-catalog.ts:47,55
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      No models listed. Its four static rows are entangled with its own
+      fallbacks — VERCEL_AI_GATEWAY_DEFAULT_CONTEXT_WINDOW 200000 /
+      _MAX_TOKENS 128000 (models.ts:16-17) equal the declared values for two of
+      the four, so those two record nothing. Probe list.
+
+  anthropic-vertex:
+    api: anthropic-messages
+    base_url: https://aiplatform.googleapis.com
+    # openclaw extensions/anthropic-vertex/provider-catalog.ts:206-209,213-214
+    # (regional form is https://{region}-aiplatform.googleapis.com)
+    cache: anthropic_cache_control
+    # extensions/anthropic-vertex/stream-runtime.ts:223 re-applies and budgets
+    # cache_control markers on the cache boundary.
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Claude on Vertex, distinct from the `vertex` kind, which is Gemini on the
+      same host. ANTHROPIC_VERTEX_DEFAULT_CONTEXT_WINDOW 1000000
+      (provider-catalog.ts:20) is applied to every model in openclaw's catalog
+      rather than to any one of them, so no window is declared here.
+
+  # ---- Self-hosted / local -------------------------------------------------
+
+  lmstudio:
+    api: openai-chat
+    base_url: http://localhost:1234            # openclaw extensions/lmstudio/src/defaults.ts:2
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      The cited base URL has no /v1 suffix; LM Studio's OpenAI-compatible
+      surface lives under /v1, so a deployment sets the joined path itself.
+      Under Docker the source uses http://host.docker.internal:1234
+      (defaults.ts:4).
+
+  sglang:
+    api: openai-chat
+    base_url: http://127.0.0.1:30000/v1        # openclaw extensions/sglang/defaults.ts:2
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+
+  litellm:
+    api: openai-chat
+    base_url: http://localhost:4000            # openclaw extensions/litellm/onboard.ts:8
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      A proxy in front of anything. LITELLM_DEFAULT_CONTEXT_WINDOW 1000000 /
+      _MAX_TOKENS 128000 (onboard.ts:11-12) describe its bundled placeholder
+      model, not any real backend, so nothing numeric was taken.
+
+  llamacpp:
+    api: openai-chat
+    cache: none
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      No base URL: it is per build. jikji's provider_defaults.yaml:114-116
+      gives this kind a 13312-token window, which is one server's `-c` flag
+      rather than a property of llama.cpp, so it is not carried here.
 
   # ---- Test adapter --------------------------------------------------------
 

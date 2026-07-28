@@ -425,6 +425,7 @@ kinds:
   minimax:          { api: anthropic-messages, cache: anthropic_cache_control }
   mistral:          { api: openai-chat,        cache: openai_cache_key }
   xai:              { api: openai-chat,        cache: openai_cache_key,        reasoning: reasoning_effort }
+                    # ^ probed 2026-07-28: this host serves BOTH shapes — see note below
   google:           { api: gemini,             cache: google_cached_contents }
   ollama:           { api: openai-chat,        cache: ollama_keep_alive }
   openrouter:       { api: openai-chat,        cache: openrouter_cache }
@@ -435,6 +436,23 @@ kinds:
   bedrock | vertex | azure: { … }
   echo:             { api: echo }              # deterministic, tests only
 ```
+
+> **A "contradiction" that turned out to be a choice.** Two independent third-party catalogs
+> declare the xAI host as a Responses-shaped API where this design declares it chat-shaped.
+> Rather than adjudicate, it was probed directly, unauthenticated, for the cost of two
+> requests: `/v1/chat/completions` rejects an empty body with *"Messages cannot be empty"* and
+> `/v1/responses` rejects it with *"missing field `input`"*. **Both routes are served.**
+> Neither source was wrong, and the disagreement was really an unstated assumption that a host
+> speaks one shape.
+>
+> The lesson generalizes: an `api` shape is a property of the **deployment**, not the provider,
+> and must be settable per deployment. It also cost nothing to establish — an unauthenticated
+> probe distinguishes "route absent" from "route present, request malformed" without spending
+> a token, and should be the first move whenever catalogs disagree about a wire shape.
+>
+> Noted in passing: the two routes on that single host return *different error envelopes* —
+> one bare, one with a stringified `code`. Error normalization (§10.1) cannot assume
+> consistency even within one provider.
 
 Model-name prefix rules supply context window and max output when a name matches a known
 family, so a new model of a known family works without configuration.

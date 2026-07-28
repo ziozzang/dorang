@@ -265,3 +265,92 @@ models:
       Inherited from the token-plan roster anchor (qwen3.8-max-preview), not
       observed on this model. openclaw states 1,000,000 for the same model;
       the difference is 1.6% and the smaller value is the safe one.
+
+  # =========================================================================
+  # Z.AI general API — https://api.z.ai/api/paas/v4
+  #
+  # A DIFFERENT ROUTE from the `glm` kind, which is the coding plan at
+  # .../api/coding/paas/v4. Same vendor, same model names, different limits —
+  # which is exactly why these numbers are here and not in the embedded
+  # catalog: filing them under `glm` would be the "same model name, same
+  # limit" mistake DESIGN §4.3 warns about.
+  #
+  # The kind is declared BELOW, in this file. Nothing in the embedded data
+  # knows about `zai-paas`; an overlay may introduce a provider kind, and a
+  # model may name a kind that only an overlay declares.
+  #
+  # The name is `zai-paas` rather than `zai` because the embedded data already
+  # uses `zai` as an alias for `glm` (DESIGN §4.3). If you would rather `zai`
+  # meant this route in your deployment, repoint the alias — see the
+  # kind_aliases block at the bottom of this file.
+  #
+  # Source: openclaw extensions/zai/openclaw.plugin.json, `modelCatalog`
+  # provider `zai`, baseUrl at :33, api at :34. Line numbers below are each
+  # model's own "id". No fallback constant governs any of these rows.
+  #
+  # CONTRADICTION worth knowing before you use glm-5.2 anywhere. hermes states
+  # 1,048,576 for glm-5.2 —
+  #   hermes-agent/agent/model_metadata.py:299 (the value)
+  #   hermes-agent/agent/model_metadata.py:293-295 (the justification):
+  #     "GLM-5.2 ships with a 1M context window (verified empirically:
+  #      needle-in-a-haystack retrieval at 789K prompt tokens succeeded with
+  #      zero errors on api.z.ai/api/coding/paas/v4)"
+  # — and the endpoint it names is the CODING PLAN, where five files say
+  # 200000. That is a first-hand measurement against the exact route dorang's
+  # `glm` kind addresses, contradicting the operator's own configuration for
+  # the same route by 5x.
+  #
+  # It is still not adopted, for two reasons. The value lives in hermes'
+  # DEFAULT_CONTEXT_LENGTHS, a substring-matched table its own comment at
+  # :208-210 calls "thin fallback defaults" that fire only when every live
+  # source misses — so the code path it sits on is the one that runs when
+  # nobody looked, whatever the comment above it says. And DESIGN §4.3 is
+  # explicit that the larger of two disagreeing values may be adopted only
+  # from a probe, never from a citation. It is at the top of the probe list.
+  #
+  # 1000000 here is openclaw's figure for the GENERAL route, which is a
+  # different endpoint and not in tension with either of the above.
+  # =========================================================================
+
+  - { kind: zai-paas, model: "glm-5.2",       context_window: 1000000, max_output_tokens: 131072 }  # :37
+  - { kind: zai-paas, model: "glm-5.1",       context_window: 202800,  max_output_tokens: 131100 }  # :51
+  - { kind: zai-paas, model: "glm-5",         context_window: 202800,  max_output_tokens: 131100 }  # :65
+  - { kind: zai-paas, model: "glm-5-turbo",   context_window: 202800,  max_output_tokens: 131100 }  # :79
+  - { kind: zai-paas, model: "glm-5v-turbo",  context_window: 202800,  max_output_tokens: 131100 }  # :93
+  - { kind: zai-paas, model: "glm-4.7",       context_window: 204800,  max_output_tokens: 131072 }  # :107
+  - { kind: zai-paas, model: "glm-4.7-flash", context_window: 200000,  max_output_tokens: 131072 }  # :121
+  - { kind: zai-paas, model: "glm-4.7-flashx", context_window: 200000, max_output_tokens: 128000 }  # :135
+  - { kind: zai-paas, model: "glm-4.6",       context_window: 204800,  max_output_tokens: 131072 }  # :149
+  - { kind: zai-paas, model: "glm-4.6v",      context_window: 128000,  max_output_tokens: 32768 }   # :163
+  - { kind: zai-paas, model: "glm-4.5",       context_window: 131072,  max_output_tokens: 98304 }   # :177
+  - { kind: zai-paas, model: "glm-4.5-air",   context_window: 131072,  max_output_tokens: 98304 }   # :191
+  - { kind: zai-paas, model: "glm-4.5-flash", context_window: 131072,  max_output_tokens: 98304 }   # :205
+  - { kind: zai-paas, model: "glm-4.5v",      context_window: 64000,   max_output_tokens: 16384 }   # :219
+
+# An overlay may declare provider kinds, not only patch them. This one is
+# absent from the embedded data entirely, and the model entries above name it.
+# Order does not matter: kinds are resolved before models are attached.
+kinds:
+
+  zai-paas:
+    api: openai-chat
+    base_url: https://api.z.ai/api/paas/v4   # openclaw extensions/zai/openclaw.plugin.json:33-34
+    cache: openai_cache_key
+    reasoning: thinking_flag
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    note: >-
+      Z.AI's general API, as distinct from the coding plan the `glm` kind
+      addresses. `reasoning:` here is a SHAPE HINT for the adapter, not a
+      capability claim about any model — openclaw itself gives glm-5.2 a
+      different level set from every other GLM on this route
+      (extensions/zai/provider-policy-api.ts:8-33), which is REVIEW C5 in one
+      file.
+
+# Aliases are a plain map, so a later layer may repoint one. The embedded data
+# sends `zai` to `glm` (the coding plan). Uncomment to make `zai` mean the
+# general API in this deployment instead:
+#
+# kind_aliases:
+#   zai: zai-paas

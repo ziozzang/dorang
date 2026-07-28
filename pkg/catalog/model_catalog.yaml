@@ -20,10 +20,16 @@
 # that claims a capability without one, and refuses `unknown` carrying a date.
 # Catalog.UnverifiedModels lists everything still unprobed.
 #
-# The model lists below were fetched from the live endpoints on 2026-07-28.
-# Reasoning capability was NOT probed in that pass, so exactly one entry claims
-# a concrete capability: qwen3.8-max-preview, whose effort scale is in use in an
-# operator configuration today.
+# The model lists in the FIRST HALF of this file were fetched from the live
+# endpoints on 2026-07-28 and carry that date. Reasoning capability was NOT
+# probed in that pass, so exactly one entry claims a concrete capability:
+# qwen3.8-max-preview, whose effort scale is in use in an operator
+# configuration today.
+#
+# The SECOND HALF was absorbed from third-party catalogs (openclaw,
+# hermes-agent) and carries NO date, deliberately. Read the banner above it
+# before using any number from it. `verified:` means dorang's operator checked;
+# reading somebody else's repository is not checking.
 #
 # `context_window` and `max_output_tokens` are in tokens; 0 or absent means
 # undeclared, and callers must treat that like unknown rather than as a bound.
@@ -157,3 +163,460 @@ models:
   - { kind: jina, model: "jina-embeddings-v5-text-nano",  verified: 2026-07-28, category: embedding }
   - { kind: jina, model: "jina-embeddings-v5-text-small", verified: 2026-07-28, category: embedding }
   - { kind: jina, model: "jina-reranker-v3",              verified: 2026-07-28, category: rerank }
+
+  # =========================================================================
+  # ABSORBED 2026-07-28 from openclaw and hermes-agent. Read this before
+  # trusting any number below it.
+  # =========================================================================
+  #
+  # Everything from here down was read out of another repository. NOT ONE of
+  # these entries carries `verified:`, and that is the point: `verified:` means
+  # dorang's operator confirmed the entry against the provider, and reading
+  # somebody else's catalog is not that. Every entry below is on the probe
+  # list by construction.
+  #
+  # Each provider block cites the file it came from; each entry cites the line
+  # of its own `"id"` in that file. openclaw's `openclaw.plugin.json`
+  # `modelCatalog.providers.<id>` blocks are per-route: the block's `baseUrl`
+  # is the endpoint, and each model row states its own contextWindow and
+  # maxTokens. That route-scoping is why they are usable at all — a limit
+  # belongs to a deployment, not to a set of weights.
+  #
+  # What was thrown away, and why
+  # -----------------------------
+  # 1. Any value byte-identical to that extension's own fallback constant.
+  #    A fallback records that nobody looked. This removed every github-copilot
+  #    row except gpt-5.5 (128000/8192 = DEFAULT_CONTEXT_WINDOW/DEFAULT_MAX_TOKENS,
+  #    extensions/github-copilot/models.ts:29-30), eleven venice context
+  #    windows (128000 = VENICE_DEFAULT_CONTEXT_WINDOW, extensions/venice/models.ts:31),
+  #    one baseten window, and all of openclaw's ollama-cloud rows.
+  # 2. Any `maxTokens` equal to that row's own `contextWindow`. It is not an
+  #    output ceiling, it is the absence of one, and over-declaring output is
+  #    the unsafe direction (DESIGN §4.3). This removed the max output of every
+  #    moonshot, deepinfra and baseten row, among others.
+  # 3. Any value for a model on a DIFFERENT route than the one it is filed
+  #    under. openclaw's `zai` provider describes https://api.z.ai/api/paas/v4;
+  #    dorang's `glm` kind is the coding plan at .../api/coding/paas/v4. Same
+  #    vendor, same model names, different limits — those numbers are in
+  #    model_catalog.overlay.example.yaml under a kind the overlay declares,
+  #    not here.
+  # 4. Every reasoning capability, without exception. Sources state reasoning
+  #    shapes per model in abundance, and they contradict each other and
+  #    themselves across routes. `unknown` stands (DESIGN §10.2, REVIEW C5).
+  # 5. Every price. openclaw's manifests carry a full `cost` block per model.
+  #    None of it is here: a fabricated price flows straight into routing
+  #    decisions and invoices, and "openclaw said so in July" is not a price.
+
+  # -------------------------------------------------------------------------
+  # https://api.anthropic.com  (openclaw provider anthropic)
+  # extensions/anthropic/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: anthropic, model: "claude-fable-5", context_window: 1000000, max_output_tokens: 128000 }   # :32
+  - { kind: anthropic, model: "claude-sonnet-5", context_window: 1000000, max_output_tokens: 128000 }   # :21
+  - { kind: anthropic, model: "claude-mythos-5", context_window: 1000000, max_output_tokens: 128000 }   # :128
+  - { kind: anthropic, model: "claude-opus-4-8", context_window: 1000000, max_output_tokens: 128000 }   # :43
+  - { kind: anthropic, model: "claude-opus-4-7", context_window: 1000000, max_output_tokens: 128000 }   # :54
+  - { kind: anthropic, model: "claude-haiku-4-5", context_window: 200000, max_output_tokens: 64000 }   # :168
+  - { kind: anthropic, model: "claude-haiku-4-5-20251001", context_window: 200000, max_output_tokens: 64000 }   # :179
+  - { kind: anthropic, model: "claude-sonnet-4-6", context_window: 1000000, max_output_tokens: 64000 }   # :65
+  - { kind: anthropic, model: "claude-opus-4-6", context_window: 1000000, max_output_tokens: 128000 }   # :76
+
+  # -------------------------------------------------------------------------
+  # https://api.openai.com/v1  (openclaw provider openai)
+  # extensions/openai/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: openai-responses, model: "gpt-5.3-chat-latest", context_window: 128000, max_output_tokens: 16384 }   # :44
+  - { kind: openai-responses, model: "gpt-5.3-codex", context_window: 400000, max_output_tokens: 128000 }   # :53
+  - { kind: openai-responses, model: "gpt-5.4", context_window: 272000, max_output_tokens: 128000 }   # :62
+  - { kind: openai-responses, model: "gpt-5.4-mini", context_window: 400000, max_output_tokens: 128000 }   # :74
+  - { kind: openai-responses, model: "gpt-5.4-nano", context_window: 400000, max_output_tokens: 128000 }   # :86
+  - { kind: openai-responses, model: "gpt-5.4-pro", context_window: 1050000, max_output_tokens: 128000 }   # :98
+  - { kind: openai-responses, model: "gpt-5.6", context_window: 1050000, max_output_tokens: 128000 }   # :110
+  - { kind: openai-responses, model: "gpt-5.6-sol", context_window: 1050000, max_output_tokens: 128000 }   # :126
+  - { kind: openai-responses, model: "gpt-5.6-terra", context_window: 1050000, max_output_tokens: 128000 }   # :142
+  - { kind: openai-responses, model: "gpt-5.6-luna", context_window: 1050000, max_output_tokens: 128000 }   # :158
+  - { kind: openai-responses, model: "gpt-5.5", context_window: 1050000, max_output_tokens: 128000 }   # :174
+  - { kind: openai-responses, model: "o1", context_window: 200000, max_output_tokens: 100000 }   # :187
+  - { kind: openai-responses, model: "o1-pro", context_window: 200000, max_output_tokens: 100000 }   # :196
+  - { kind: openai-responses, model: "o3", context_window: 200000, max_output_tokens: 100000 }   # :205
+  - { kind: openai-responses, model: "o3-deep-research", context_window: 200000, max_output_tokens: 100000 }   # :214
+  - { kind: openai-responses, model: "o3-mini", context_window: 200000, max_output_tokens: 100000 }   # :223
+  - { kind: openai-responses, model: "o3-pro", context_window: 200000, max_output_tokens: 100000 }   # :232
+  - { kind: openai-responses, model: "o4-mini", context_window: 200000, max_output_tokens: 100000 }   # :241
+  - { kind: openai-responses, model: "o4-mini-deep-research", context_window: 200000, max_output_tokens: 100000 }   # :250
+  - { kind: openai-responses, model: "gpt-5.5-pro", context_window: 1050000, max_output_tokens: 128000 }   # :259
+
+  # -------------------------------------------------------------------------
+  # https://api.deepseek.com  (openclaw provider deepseek)
+  # extensions/deepseek/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: deepseek, model: "deepseek-v4-flash", context_window: 1000000, max_output_tokens: 384000 }   # :33
+  - { kind: deepseek, model: "deepseek-v4-pro", context_window: 1000000, max_output_tokens: 384000 }   # :52
+  - { kind: deepseek, model: "deepseek-chat", context_window: 1000000, max_output_tokens: 384000 }   # :71
+  - { kind: deepseek, model: "deepseek-reasoner", context_window: 1000000, max_output_tokens: 384000 }   # :88
+
+  # -------------------------------------------------------------------------
+  # https://api.moonshot.ai/v1  (openclaw provider moonshot)
+  # extensions/moonshot/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: moonshot, model: "kimi-k2.6", context_window: 262144 }   # :54
+  - { kind: moonshot, model: "kimi-k3", context_window: 1048576 }   # :67
+  - { kind: moonshot, model: "kimi-k2.7-code", context_window: 262144 }   # :94
+  - { kind: moonshot, model: "kimi-k2.7-code-highspeed", context_window: 262144 }   # :108
+  - { kind: moonshot, model: "kimi-k2.5", context_window: 262144 }   # :122
+
+  # -------------------------------------------------------------------------
+  # https://api.mistral.ai/v1  (openclaw provider mistral)
+  # extensions/mistral/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: mistral, model: "codestral-latest", context_window: 256000, max_output_tokens: 4096 }   # :29
+  - { kind: mistral, model: "devstral-medium-latest", context_window: 262144, max_output_tokens: 32768 }   # :42
+  - { kind: mistral, model: "magistral-small", context_window: 128000, max_output_tokens: 40000 }   # :55
+  - { kind: mistral, model: "mistral-large-latest", context_window: 262144, max_output_tokens: 16384 }   # :69
+  - { kind: mistral, model: "mistral-medium-2508", context_window: 262144, max_output_tokens: 8192 }   # :82
+  - { kind: mistral, model: "mistral-medium-3-5", context_window: 262144, max_output_tokens: 8192 }   # :95
+  - { kind: mistral, model: "mistral-small-latest", context_window: 262144, max_output_tokens: 16384 }   # :109
+  - { kind: mistral, model: "mistral-small-2603", context_window: 262144, max_output_tokens: 16384 }   # :123
+  - { kind: mistral, model: "pixtral-large-latest", context_window: 128000, max_output_tokens: 32768 }   # :137
+
+  # -------------------------------------------------------------------------
+  # https://api.cohere.ai/compatibility/v1  (openclaw provider cohere)
+  # extensions/cohere/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: cohere, model: "command-a-plus-05-2026", context_window: 128000, max_output_tokens: 64000 }   # :17
+  - { kind: cohere, model: "command-a-03-2025", context_window: 256000, max_output_tokens: 8000 }   # :49
+  - { kind: cohere, model: "command-a-reasoning-08-2025", context_window: 256000, max_output_tokens: 32000 }   # :67
+  - { kind: cohere, model: "command-a-vision-07-2025", context_window: 128000, max_output_tokens: 8000 }   # :99
+  - { kind: cohere, model: "north-mini-code-1-0", context_window: 256000, max_output_tokens: 64000 }   # :119
+
+  # -------------------------------------------------------------------------
+  # https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1  (openclaw provider qwen-token-plan)
+  # extensions/qwen/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: qwen, model: "qwen3.7-plus", context_window: 1000000, max_output_tokens: 65536 }   # :105
+  - { kind: qwen, model: "qwen3.6-plus", context_window: 1000000, max_output_tokens: 65536 }   # :114
+  - { kind: qwen, model: "qwen3.6-flash", context_window: 1000000, max_output_tokens: 65536 }   # :123
+  - { kind: qwen, model: "deepseek-v4-pro", context_window: 1000000, max_output_tokens: 393216 }   # :132
+  - { kind: qwen, model: "deepseek-v4-flash", context_window: 1000000, max_output_tokens: 393216 }   # :141
+  - { kind: qwen, model: "deepseek-v3.2", context_window: 131072, max_output_tokens: 65536 }   # :150
+  - { kind: qwen, model: "kimi-k2.7-code", context_window: 262144, max_output_tokens: 98304 }   # :159
+  - { kind: qwen, model: "kimi-k2.6", context_window: 262144, max_output_tokens: 98304 }   # :168
+  - { kind: qwen, model: "kimi-k2.5", context_window: 262144, max_output_tokens: 98304 }   # :177
+  - { kind: qwen, model: "glm-5.2", context_window: 1000000, max_output_tokens: 131072 }   # :186
+  - { kind: qwen, model: "glm-5.1", context_window: 202752, max_output_tokens: 131072 }   # :195
+  - { kind: qwen, model: "glm-5", context_window: 202752, max_output_tokens: 16384 }   # :204
+  - { kind: qwen, model: "MiniMax-M2.5", context_window: 196608, max_output_tokens: 32768 }   # :213
+
+  # -------------------------------------------------------------------------
+  # https://api.groq.com/openai/v1  (openclaw provider groq)
+  # extensions/groq/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: groq, model: "groq/compound", context_window: 131072, max_output_tokens: 8192 }   # :53
+  - { kind: groq, model: "groq/compound-mini", context_window: 131072, max_output_tokens: 8192 }   # :67
+  - { kind: groq, model: "llama-3.1-8b-instant", context_window: 131072 }   # :81
+  - { kind: groq, model: "llama-3.3-70b-versatile", context_window: 131072, max_output_tokens: 32768 }   # :95
+  - { kind: groq, model: "meta-llama/llama-4-scout-17b-16e-instruct", context_window: 131072, max_output_tokens: 8192 }   # :109
+  - { kind: groq, model: "openai/gpt-oss-120b", context_window: 131072, max_output_tokens: 65536 }   # :126
+  - { kind: groq, model: "openai/gpt-oss-20b", context_window: 131072, max_output_tokens: 65536 }   # :140
+  - { kind: groq, model: "openai/gpt-oss-safeguard-20b", context_window: 131072, max_output_tokens: 65536 }   # :154
+  - { kind: groq, model: "qwen/qwen3-32b", context_window: 131072, max_output_tokens: 40960 }   # :168
+
+  # -------------------------------------------------------------------------
+  # https://api.cerebras.ai/v1  (openclaw provider cerebras)
+  # extensions/cerebras/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: cerebras, model: "zai-glm-4.7", context_window: 128000, max_output_tokens: 8192 }   # :28
+  - { kind: cerebras, model: "gpt-oss-120b", context_window: 128000, max_output_tokens: 8192 }   # :42
+
+  # -------------------------------------------------------------------------
+  # https://api.together.xyz/v1  (openclaw provider together)
+  # extensions/together/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: together, model: "moonshotai/Kimi-K2.6", context_window: 262144, max_output_tokens: 32768 }   # :49
+  - { kind: together, model: "meta-llama/Llama-3.3-70B-Instruct-Turbo", context_window: 131072, max_output_tokens: 8192 }   # :63
+  - { kind: together, model: "deepseek-ai/DeepSeek-V4-Pro", context_window: 512000, max_output_tokens: 8192 }   # :76
+  - { kind: together, model: "Qwen/Qwen2.5-7B-Instruct-Turbo", context_window: 32768, max_output_tokens: 8192 }   # :90
+  - { kind: together, model: "zai-org/GLM-5.1", context_window: 202752, max_output_tokens: 8192 }   # :103
+
+  # -------------------------------------------------------------------------
+  # https://api.fireworks.ai/inference/v1  (openclaw provider fireworks)
+  # extensions/fireworks/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: fireworks, model: "accounts/fireworks/models/kimi-k2p6", context_window: 262144 }   # :39
+  - { kind: fireworks, model: "accounts/fireworks/routers/kimi-k2p6-turbo", context_window: 256000 }   # :53
+
+  # -------------------------------------------------------------------------
+  # https://api.novita.ai/openai/v1  (openclaw provider novita)
+  # extensions/novita/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: novita, model: "moonshotai/kimi-k2.5", context_window: 262144, max_output_tokens: 65536 }   # :76
+  - { kind: novita, model: "minimax/minimax-m2.7", context_window: 1000000, max_output_tokens: 65536 }   # :90
+  - { kind: novita, model: "zai-org/glm-5", context_window: 202752, max_output_tokens: 65536 }   # :104
+  - { kind: novita, model: "deepseek/deepseek-v3-0324", context_window: 163840, max_output_tokens: 65536 }   # :118
+  - { kind: novita, model: "deepseek/deepseek-r1-0528", context_window: 163840, max_output_tokens: 65536 }   # :132
+  - { kind: novita, model: "qwen/qwen3-235b-a22b-fp8", context_window: 262144, max_output_tokens: 65536 }   # :146
+
+  # -------------------------------------------------------------------------
+  # https://integrate.api.nvidia.com/v1  (openclaw provider nvidia)
+  # extensions/nvidia/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: nvidia, model: "nvidia/nemotron-3-ultra-550b-a55b", context_window: 1048576, max_output_tokens: 8192 }   # :30
+  - { kind: nvidia, model: "nvidia/nemotron-3-super-120b-a12b", context_window: 1000000, max_output_tokens: 8192 }   # :46
+  - { kind: nvidia, model: "z-ai/glm-5.2", context_window: 202752, max_output_tokens: 8192 }   # :62
+  - { kind: nvidia, model: "moonshotai/kimi-k2.6", context_window: 262144, max_output_tokens: 8192 }   # :78
+  - { kind: nvidia, model: "minimaxai/minimax-m3", context_window: 196608, max_output_tokens: 8192 }   # :94
+  - { kind: nvidia, model: "deepseek-ai/deepseek-v4-pro", context_window: 262144, max_output_tokens: 16384 }   # :110
+  - { kind: nvidia, model: "qwen/qwen3.5-397b-a17b", context_window: 262144, max_output_tokens: 16384 }   # :126
+  - { kind: nvidia, model: "moonshotai/kimi-k2.5", context_window: 262144, max_output_tokens: 8192 }   # :142
+  - { kind: nvidia, model: "z-ai/glm-5.1", context_window: 202752, max_output_tokens: 8192 }   # :161
+  - { kind: nvidia, model: "minimaxai/minimax-m2.5", context_window: 196608, max_output_tokens: 8192 }   # :180
+  - { kind: nvidia, model: "z-ai/glm5", context_window: 202752, max_output_tokens: 8192 }   # :199
+  - { kind: nvidia, model: "minimaxai/minimax-m2.7", context_window: 196608, max_output_tokens: 8192 }   # :218
+
+  # -------------------------------------------------------------------------
+  # https://api.deepinfra.com/v1/openai  (openclaw provider deepinfra)
+  # extensions/deepinfra/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: deepinfra, model: "deepseek-ai/DeepSeek-V4-Flash", context_window: 1048576 }   # :38
+  - { kind: deepinfra, model: "deepseek-ai/DeepSeek-V3.2", context_window: 163840 }   # :55
+  - { kind: deepinfra, model: "zai-org/GLM-5.1", context_window: 202752 }   # :72
+  - { kind: deepinfra, model: "stepfun-ai/Step-3.5-Flash", context_window: 262144 }   # :89
+  - { kind: deepinfra, model: "MiniMaxAI/MiniMax-M2.5", context_window: 196608 }   # :106
+  - { kind: deepinfra, model: "moonshotai/Kimi-K2.5", context_window: 262144 }   # :123
+  - { kind: deepinfra, model: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B", context_window: 262144 }   # :140
+  - { kind: deepinfra, model: "meta-llama/Llama-3.3-70B-Instruct-Turbo", context_window: 131072 }   # :157
+
+  # -------------------------------------------------------------------------
+  # https://inference.baseten.co/v1  (openclaw provider baseten)
+  # extensions/baseten/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: baseten, model: "deepseek-ai/DeepSeek-V4-Pro", context_window: 262000 }   # :27
+  - { kind: baseten, model: "zai-org/GLM-4.7", context_window: 200000 }   # :41
+  - { kind: baseten, model: "zai-org/GLM-5", context_window: 202000 }   # :55
+  - { kind: baseten, model: "zai-org/GLM-5.1", context_window: 202000 }   # :69
+  - { kind: baseten, model: "zai-org/GLM-5.2", context_window: 202000 }   # :83
+  - { kind: baseten, model: "thinkingmachines/inkling", context_window: 1048000, max_output_tokens: 32000 }   # :97
+  - { kind: baseten, model: "moonshotai/Kimi-K2.5", context_window: 262000 }   # :111
+  - { kind: baseten, model: "moonshotai/Kimi-K2.6", context_window: 262000 }   # :125
+  - { kind: baseten, model: "moonshotai/Kimi-K2.7-Code", context_window: 262000 }   # :139
+  - { kind: baseten, model: "nvidia/Nemotron-120B-A12B", context_window: 202000 }   # :153
+  - { kind: baseten, model: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B", context_window: 202000 }   # :167
+  - { kind: baseten, model: "openai/gpt-oss-120b", max_output_tokens: 128000 }   # :181
+
+  # -------------------------------------------------------------------------
+  # https://llm.chutes.ai/v1  (openclaw provider chutes)
+  # extensions/chutes/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: chutes, model: "deepseek-ai/DeepSeek-V3.2-TEE", context_window: 131072, max_output_tokens: 65536 }   # :69
+  - { kind: chutes, model: "moonshotai/Kimi-K2.5-TEE", context_window: 262144, max_output_tokens: 65535 }   # :83
+  - { kind: chutes, model: "zai-org/GLM-5-TEE", context_window: 202752, max_output_tokens: 65535 }   # :97
+  - { kind: chutes, model: "MiniMaxAI/MiniMax-M2.5-TEE", context_window: 196608, max_output_tokens: 65536 }   # :111
+  - { kind: chutes, model: "Qwen/Qwen3.5-397B-A17B-TEE", context_window: 262144, max_output_tokens: 65536 }   # :125
+
+  # -------------------------------------------------------------------------
+  # https://api.gmi-serving.com/v1  (openclaw provider gmi)
+  # extensions/gmi/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: gmi, model: "zai-org/GLM-5.1-FP8", context_window: 202752, max_output_tokens: 65536 }   # :78
+  - { kind: gmi, model: "deepseek-ai/DeepSeek-V3.2", context_window: 163840, max_output_tokens: 65536 }   # :92
+  - { kind: gmi, model: "moonshotai/Kimi-K2.5", context_window: 262144, max_output_tokens: 65536 }   # :106
+  - { kind: gmi, model: "google/gemini-3.1-flash-lite", context_window: 1048576, max_output_tokens: 65536 }   # :120
+  - { kind: gmi, model: "anthropic/claude-sonnet-4.6", context_window: 200000, max_output_tokens: 64000 }   # :134
+  - { kind: gmi, model: "openai/gpt-5.4", context_window: 400000, max_output_tokens: 128000 }   # :148
+
+  # -------------------------------------------------------------------------
+  # https://api.kilo.ai/api/gateway/  (openclaw provider kilocode)
+  # extensions/kilocode/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: kilocode, model: "kilo-auto/balanced", context_window: 1000000, max_output_tokens: 65536 }   # :57
+
+  # -------------------------------------------------------------------------
+  # https://api.featherless.ai/v1  (openclaw provider featherless)
+  # extensions/featherless/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: featherless, model: "Qwen/Qwen3-32B", context_window: 32768, max_output_tokens: 4096 }   # :49
+
+  # -------------------------------------------------------------------------
+  # https://api.longcat.chat/openai  (openclaw provider longcat)
+  # extensions/longcat/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: longcat, model: "LongCat-2.0", context_window: 1048576, max_output_tokens: 131072 }   # :24
+
+  # -------------------------------------------------------------------------
+  # https://api.meta.ai/v1  (openclaw provider meta)
+  # extensions/meta/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: meta, model: "muse-spark-1.1", context_window: 1048576, max_output_tokens: 131072 }   # :28
+
+  # -------------------------------------------------------------------------
+  # https://opencode.ai/zen/v1  (openclaw provider opencode)
+  # extensions/opencode/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: opencode, model: "claude-opus-4-8", context_window: 200000, max_output_tokens: 65536 }   # :34
+  - { kind: opencode, model: "gpt-5.5", context_window: 400000, max_output_tokens: 128000 }   # :59
+  - { kind: opencode, model: "gemini-3.1-pro", context_window: 1048576, max_output_tokens: 65536 }   # :105
+  - { kind: opencode, model: "minimax-m2.7", context_window: 204800, max_output_tokens: 131072 }   # :151
+
+  # -------------------------------------------------------------------------
+  # https://opencode.ai/zen/go/v1  (openclaw provider opencode-go)
+  # extensions/opencode-go/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: opencode-go, model: "deepseek-v4-pro", context_window: 1000000, max_output_tokens: 384000 }   # :30
+  - { kind: opencode-go, model: "deepseek-v4-flash", context_window: 1000000, max_output_tokens: 384000 }   # :57
+
+  # -------------------------------------------------------------------------
+  # https://api.stepfun.ai/v1  (openclaw provider stepfun)
+  # extensions/stepfun/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: stepfun, model: "step-3.7-flash", context_window: 262144 }   # :29
+  - { kind: stepfun, model: "step-3.5-flash", context_window: 262144, max_output_tokens: 65536 }   # :69
+
+  # -------------------------------------------------------------------------
+  # https://api.stepfun.ai/step_plan/v1  (openclaw provider stepfun-plan)
+  # extensions/stepfun/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: stepfun-plan, model: "step-3.7-flash", context_window: 262144 }   # :29
+  - { kind: stepfun-plan, model: "step-3.5-flash", context_window: 262144, max_output_tokens: 65536 }   # :69
+  - { kind: stepfun-plan, model: "step-3.5-flash-2603", context_window: 262144, max_output_tokens: 65536 }   # :143
+
+  # -------------------------------------------------------------------------
+  # https://api.xiaomimimo.com/v1  (openclaw provider xiaomi)
+  # extensions/xiaomi/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: xiaomi, model: "mimo-v2.5", context_window: 1048576, max_output_tokens: 131072 }   # :29
+  - { kind: xiaomi, model: "mimo-v2.5-pro", context_window: 1048576, max_output_tokens: 131072 }   # :43
+
+  # -------------------------------------------------------------------------
+  # https://token-plan-sgp.xiaomimimo.com/v1  (openclaw provider xiaomi-token-plan)
+  # extensions/xiaomi/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: xiaomi-token-plan, model: "mimo-v2.5-pro", context_window: 1048576, max_output_tokens: 131072 }   # :43
+  - { kind: xiaomi-token-plan, model: "mimo-v2.5", context_window: 1048576, max_output_tokens: 131072 }   # :29
+
+  # -------------------------------------------------------------------------
+  # https://ark.ap-southeast.bytepluses.com/api/v3  (openclaw provider byteplus)
+  # extensions/byteplus/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: byteplus, model: "seed-1-8-251228", context_window: 256000, max_output_tokens: 4096 }   # :27
+  - { kind: byteplus, model: "kimi-k2-5-260127", context_window: 256000, max_output_tokens: 32768 }   # :40
+  - { kind: byteplus, model: "glm-4-7-251222", context_window: 200000, max_output_tokens: 4096 }   # :54
+
+  # -------------------------------------------------------------------------
+  # https://ark.ap-southeast.bytepluses.com/api/coding/v3  (openclaw provider byteplus-plan)
+  # extensions/byteplus/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: byteplus-plan, model: "ark-code-latest", context_window: 256000, max_output_tokens: 4096 }   # :73
+  - { kind: byteplus-plan, model: "glm-4.7", context_window: 200000, max_output_tokens: 4096 }   # :86
+  - { kind: byteplus-plan, model: "kimi-k2.5", context_window: 256000, max_output_tokens: 32768 }   # :99
+
+  # -------------------------------------------------------------------------
+  # https://ark.cn-beijing.volces.com/api/v3  (openclaw provider volcengine)
+  # extensions/volcengine/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: volcengine, model: "doubao-seed-code-preview-251028", context_window: 256000, max_output_tokens: 4096 }   # :45
+  - { kind: volcengine, model: "doubao-seed-1-8-251228", context_window: 256000, max_output_tokens: 4096 }   # :58
+  - { kind: volcengine, model: "kimi-k2-5-260127", context_window: 256000, max_output_tokens: 4096 }   # :71
+  - { kind: volcengine, model: "glm-4-7-251222", context_window: 200000, max_output_tokens: 4096 }   # :84
+  - { kind: volcengine, model: "deepseek-v3-2-251201", context_window: 128000, max_output_tokens: 4096 }   # :97
+
+  # -------------------------------------------------------------------------
+  # https://ark.cn-beijing.volces.com/api/coding/v3  (openclaw provider volcengine-plan)
+  # extensions/volcengine/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: volcengine-plan, model: "ark-code-latest", context_window: 256000, max_output_tokens: 4096 }   # :116
+  - { kind: volcengine-plan, model: "doubao-seed-code", context_window: 256000, max_output_tokens: 4096 }   # :129
+
+  # -------------------------------------------------------------------------
+  # https://qianfan.baidubce.com/v2  (openclaw provider qianfan)
+  # extensions/qianfan/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: qianfan, model: "deepseek-v3.2", context_window: 98304, max_output_tokens: 32768 }   # :25
+  - { kind: qianfan, model: "ernie-5.0-thinking-preview", context_window: 119000, max_output_tokens: 64000 }   # :39
+
+  # -------------------------------------------------------------------------
+  # https://tokenhub.tencentmaas.com/v1  (openclaw provider tencent-tokenhub)
+  # extensions/tencent/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: tencent-tokenhub, model: "hy3-preview", context_window: 256000, max_output_tokens: 64000 }   # :16
+  - { kind: tencent-tokenhub, model: "hy3", context_window: 256000, max_output_tokens: 64000 }   # :58
+
+  # -------------------------------------------------------------------------
+  # https://api.lkeap.cloud.tencent.com/plan/v3  (openclaw provider tencent-tokenplan)
+  # extensions/tencent/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: tencent-tokenplan, model: "hy3", context_window: 256000, max_output_tokens: 64000 }   # :58
+
+  # -------------------------------------------------------------------------
+  # https://api.venice.ai/api/v1  (openclaw provider venice)
+  # extensions/venice/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: venice, model: "hermes-3-llama-3.1-405b", max_output_tokens: 16384 }   # :70
+  - { kind: venice, model: "qwen3-235b-a22b-thinking-2507", max_output_tokens: 16384 }   # :82
+  - { kind: venice, model: "qwen3-235b-a22b-instruct-2507", max_output_tokens: 16384 }   # :93
+  - { kind: venice, model: "qwen3-coder-480b-a35b-instruct-turbo", context_window: 256000, max_output_tokens: 65536 }   # :104
+  - { kind: venice, model: "qwen3-5-35b-a3b", context_window: 256000, max_output_tokens: 65536 }   # :115
+  - { kind: venice, model: "qwen3-next-80b", context_window: 256000, max_output_tokens: 16384 }   # :126
+  - { kind: venice, model: "qwen3-vl-235b-a22b", context_window: 256000, max_output_tokens: 16384 }   # :137
+  - { kind: venice, model: "deepseek-v3.2", context_window: 160000, max_output_tokens: 32768 }   # :148
+  - { kind: venice, model: "google-gemma-3-27b-it", context_window: 198000, max_output_tokens: 16384 }   # :160
+  - { kind: venice, model: "openai-gpt-oss-120b", max_output_tokens: 16384 }   # :171
+  - { kind: venice, model: "nvidia-nemotron-3-nano-30b-a3b", max_output_tokens: 16384 }   # :182
+  - { kind: venice, model: "olafangensan-glm-4.7-flash-heretic", max_output_tokens: 24000 }   # :193
+  - { kind: venice, model: "zai-org-glm-4.6", context_window: 198000, max_output_tokens: 16384 }   # :204
+  - { kind: venice, model: "zai-org-glm-4.7", context_window: 198000, max_output_tokens: 16384 }   # :215
+  - { kind: venice, model: "zai-org-glm-4.7-flash", max_output_tokens: 16384 }   # :226
+  - { kind: venice, model: "zai-org-glm-5", context_window: 198000, max_output_tokens: 32000 }   # :237
+  - { kind: venice, model: "kimi-k2-5", context_window: 256000, max_output_tokens: 65536 }   # :248
+  - { kind: venice, model: "minimax-m25", context_window: 198000, max_output_tokens: 32768 }   # :259
+  - { kind: venice, model: "claude-opus-4-6", context_window: 1000000, max_output_tokens: 128000 }   # :270
+  - { kind: venice, model: "claude-sonnet-4-6", context_window: 1000000, max_output_tokens: 64000 }   # :281
+  - { kind: venice, model: "openai-gpt-52", context_window: 256000, max_output_tokens: 65536 }   # :292
+  - { kind: venice, model: "openai-gpt-52-codex", context_window: 256000, max_output_tokens: 65536 }   # :303
+  - { kind: venice, model: "openai-gpt-53-codex", context_window: 400000, max_output_tokens: 128000 }   # :314
+  - { kind: venice, model: "openai-gpt-54", context_window: 1000000, max_output_tokens: 131072 }   # :325
+  - { kind: venice, model: "openai-gpt-4o-2024-11-20", max_output_tokens: 16384 }   # :336
+  - { kind: venice, model: "openai-gpt-4o-mini-2024-07-18", max_output_tokens: 16384 }   # :347
+  - { kind: venice, model: "gemini-3-1-pro-preview", context_window: 1000000, max_output_tokens: 32768 }   # :358
+  - { kind: venice, model: "gemini-3-flash-preview", context_window: 256000, max_output_tokens: 65536 }   # :369
+
+  # -------------------------------------------------------------------------
+  # https://api.individual.githubcopilot.com  (openclaw provider github-copilot)
+  # extensions/github-copilot/openclaw.plugin.json
+  # -------------------------------------------------------------------------
+  - { kind: github-copilot, model: "gpt-5.5", context_window: 400000, max_output_tokens: 128000 }   # :106
+
+  # -------------------------------------------------------------------------
+  # https://api.arcee.ai/api/v1  (openclaw provider arcee)
+  # extensions/arcee/models.ts — three hand-written rows, no fallback constant
+  # in the file, so nothing here is a default in disguise.
+  # -------------------------------------------------------------------------
+  - { kind: arcee, model: "trinity-mini",           context_window: 131072, max_output_tokens: 80000 }   # :13,17,18
+  - { kind: arcee, model: "trinity-large-preview",  context_window: 131072, max_output_tokens: 16384 }   # :27,31,32
+  - { kind: arcee, model: "trinity-large-thinking", context_window: 262144, max_output_tokens: 80000 }   # :41,45,46
+
+  # -------------------------------------------------------------------------
+  # https://api.synthetic.new/anthropic  (openclaw provider synthetic)
+  # extensions/synthetic/models.ts — seven rows, each with its own numbers and
+  # no shared default. Model ids carry the `hf:` prefix the provider uses; it
+  # is part of the name, not a namespace to be split off (REVIEW C3).
+  # -------------------------------------------------------------------------
+  - { kind: synthetic, model: "hf:moonshotai/Kimi-K2.7-Code",                        context_window: 262144, max_output_tokens: 8192 }    # :24,28,29
+  - { kind: synthetic, model: "hf:nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",   context_window: 262144, max_output_tokens: 8192 }    # :32,36,37
+  - { kind: synthetic, model: "hf:openai/gpt-oss-120b",                              context_window: 131072, max_output_tokens: 8192 }    # :40,44,45
+  - { kind: synthetic, model: "hf:Qwen/Qwen3.6-27B",                                 context_window: 262144, max_output_tokens: 81920 }   # :48,52,53
+  - { kind: synthetic, model: "hf:zai-org/GLM-4.7-Flash",                            context_window: 196608, max_output_tokens: 131072 }  # :56,60,61
+  - { kind: synthetic, model: "hf:zai-org/GLM-5.2",                                  context_window: 524288, max_output_tokens: 131072 }  # :64,68,69
+
+  # -------------------------------------------------------------------------
+  # https://api.kimi.com/coding/  (openclaw provider kimi-coding)
+  # extensions/kimi-coding/provider-catalog.ts
+  #
+  # ONE entry, out of four the source lists. The other three take
+  # KIMI_CODING_DEFAULT_CONTEXT_WINDOW (262144) and every one of the four takes
+  # KIMI_CODING_DEFAULT_MAX_TOKENS (32768), both at :15-16 — the provider-wide
+  # default, so none of that is evidence. `k3[1m]` is the exception the code
+  # writes explicitly: `contextWindow: id === "k3" ? DEFAULT : 1_048_576` at
+  # :66. The brackets are part of the wire id and are not normalized away;
+  # the source says so at :12-13.
+  # -------------------------------------------------------------------------
+  - { kind: kimi-coding, model: "k3[1m]", context_window: 1048576 }   # :51-52,66

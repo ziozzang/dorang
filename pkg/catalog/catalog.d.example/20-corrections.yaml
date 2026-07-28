@@ -1,0 +1,55 @@
+# What a later file in the directory can do to an earlier one.
+#
+# Two modes, and the difference matters:
+#
+#   merge   (the default, everywhere) — field by field. State only the keys
+#           you are changing; everything else is inherited. This can change a
+#           value but can never remove one, because "absent" and "unchanged"
+#           are the same input.
+#
+#   replace — discard everything inherited for this entry first, so the entry
+#           becomes exactly what this file states. This is the ONLY way to
+#           take a wrong value back out.
+#
+# Declare the mode per entry with `merge:`, or once at the top of a document
+# to set the default for every entry in it.
+
+version: 1
+
+models:
+  # MERGE (default): correct one field, keep the rest. max_output_tokens 32000
+  # from 10-acme.yaml survives; only the window changes. Explain reports
+  # context_window from this file and max_output_tokens from the other.
+  - kind: acme
+    model: "acme-lodestar-2"
+    context_window: 190000
+
+  # REPLACE: the entry is rebuilt from nothing. 10-acme.yaml declared both a
+  # window and a max output for this model; after this, the ENTRY states a
+  # window and no max output.
+  #
+  # Note what that means, because it is easy to get wrong: removal is removal
+  # from this layer, not from the answer. The `acme-lodestar-` prefix rule is
+  # a lower layer and is still there, so the resolved max output falls back to
+  # the family default of 16000 rather than becoming undeclared. Explain will
+  # show max_output_tokens coming from 10-acme.yaml at layer=prefix. To take
+  # it out of the answer entirely, replace the prefix rule too.
+  #
+  # Writing `max_output_tokens: null` above would not have removed anything —
+  # an explicit null reads as "not stated", the same as leaving the key out.
+  # Removal is a decision, so it has its own keyword.
+  - kind: acme
+    model: "acme-lodestar-2:turbo"
+    merge: replace
+    context_window: 190000
+    note: >-
+      Model-level max output deliberately removed: the 32000 in 10-acme.yaml
+      was copied from the non-turbo model and never observed here. The family
+      default still applies.
+
+kinds:
+  # Kinds take the same two modes. Merge is almost always what you want; a
+  # replaced kind must restate `api`, because api is required and replace
+  # discarded it.
+  acme:
+    note: Corrected by 20-corrections.yaml; the rest of the kind is inherited.

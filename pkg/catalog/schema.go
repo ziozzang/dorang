@@ -16,60 +16,168 @@ import (
 // time instead of hanging a lookup.
 const maxAliasHops = 8
 
+// field is one optional scalar of a document, carrying whether it was stated
+// and which layer stated it.
+//
+// The pointer-to-scalar this replaces could distinguish "absent" from "set to
+// the zero value", which is what makes field-level overlay merging possible,
+// but it could not say *who* set it. Provenance has to be per field, because
+// merging is per field: an entry's context window and its max output routinely
+// come from different files.
+type field[T any] struct {
+	set    bool
+	val    T
+	origin fieldSource
+}
+
+// UnmarshalYAML records the value and marks the field stated. An explicit YAML
+// null is treated as absent, the same as omitting the key: removing an
+// inherited value is `merge: replace`, and having two spellings for it would
+// make the file harder to read, not easier.
+func (f *field[T]) UnmarshalYAML(n *yaml.Node) error {
+	if n.Tag == "!!null" {
+		return nil
+	}
+	var v T
+	if err := n.Decode(&v); err != nil {
+		return err
+	}
+	f.set, f.val = true, v
+	return nil
+}
+
+// get returns the value, or T's zero value when the field was never stated.
+func (f field[T]) get() T { return f.val }
+
+// or returns the value, or def when the field was never stated.
+func (f field[T]) or(def T) T {
+	if f.set {
+		return f.val
+	}
+	return def
+}
+
+// ptr returns a copy of the value, or nil when the field was never stated. It
+// is how a boolean survives into the lookup layers: a model must be able to
+// switch a kind default off, not only on.
+func (f field[T]) ptr() *T {
+	if !f.set {
+		return nil
+	}
+	v := f.val
+	return &v
+}
+
+// mergeField overlays one field, recording from as the winning layer. An
+// unstated source field leaves the destination — and its provenance — alone.
+func mergeField[T any](dst *field[T], src field[T], from fieldSource) {
+	if !src.set {
+		return
+	}
+	dst.set = true
+	dst.val = src.val
+	dst.origin = from
+}
+
+// mergeMode controls how one document's entry combines with what earlier
+// documents contributed for the same entry.
+type mergeMode string
+
+const (
+	// mergeInherit is "not stated": take the document's default.
+	mergeInherit mergeMode = ""
+
+	// mergeMerge overlays field by field. It is the default, everywhere, and
+	// it is why an overlay can correct one key without restating an entry.
+	mergeMerge mergeMode = "merge"
+
+	// mergeReplace discards every inherited field first, so the entry is
+	// exactly what this document states. It is the only way to REMOVE an
+	// inherited value rather than change it — a wrong context window on an
+	// embedded entry cannot be merged away, because "absent" and "unchanged"
+	// are the same input under merge.
+	mergeReplace mergeMode = "replace"
+)
+
+func parseMerge(p *string) (mergeMode, bool) {
+	if p == nil {
+		return mergeInherit, true
+	}
+	switch m := mergeMode(*p); m {
+	case mergeMerge, mergeReplace:
+		return m, true
+	}
+	return mergeInherit, false
+}
+
 // fileDoc is the on-disk shape of both embedded files and of any operator
 // overlay. One schema for all of them: an operator overlay can carry kinds,
-// prefix rules and models in a single file.
+// prefix rules and models in a single file, which is what lets a deployment
+// keep one file per provider.
 type fileDoc struct {
-	Version     *int                `yaml:"version"`
+	Version *int `yaml:"version"`
+
+	// Merge sets the default merge mode for every entry in this document.
+	// A file that fully describes its providers says `merge: replace` once at
+	// the top instead of on every entry.
+	Merge *string `yaml:"merge"`
+
 	KindAliases map[string]string   `yaml:"kind_aliases"`
 	Kinds       map[string]*kindDoc `yaml:"kinds"`
 	PrefixRules []*prefixDoc        `yaml:"prefix_rules"`
 	Models      []*modelDoc         `yaml:"models"`
 }
 
-// Pointer fields distinguish "absent" from "set to the zero value", which is
-// what makes field-level overlay merging possible.
 type kindDoc struct {
-	API               *string `yaml:"api"`
-	Cache             *string `yaml:"cache"`
-	Reasoning         *string `yaml:"reasoning"`
-	Category          *string `yaml:"category"`
-	ContextWindow     *int    `yaml:"context_window"`
-	MaxOutputTokens   *int    `yaml:"max_output_tokens"`
-	SupportsTools     *bool   `yaml:"supports_tools"`
-	SupportsStreaming *bool   `yaml:"supports_streaming"`
-	Metrics           *string `yaml:"metrics"`
-	Priority          *string `yaml:"priority"`
-	Verified          *string `yaml:"verified"`
-	Note              *string `yaml:"note"`
+	Merge             *string       `yaml:"merge"`
+	API               field[string] `yaml:"api"`
+	BaseURL           field[string] `yaml:"base_url"`
+	Cache             field[string] `yaml:"cache"`
+	Reasoning         field[string] `yaml:"reasoning"`
+	Category          field[string] `yaml:"category"`
+	ContextWindow     field[int]    `yaml:"context_window"`
+	MaxOutputTokens   field[int]    `yaml:"max_output_tokens"`
+	SupportsTools     field[bool]   `yaml:"supports_tools"`
+	SupportsStreaming field[bool]   `yaml:"supports_streaming"`
+	Metrics           field[string] `yaml:"metrics"`
+	Priority          field[string] `yaml:"priority"`
+	Verified          field[string] `yaml:"verified"`
+	Note              field[string] `yaml:"note"`
 }
 
 // prefixDoc has no reasoning field, and that is deliberate. A prefix rule
 // generalizes across every present and future member of a name family; letting
 // it carry a reasoning capability would reintroduce REVIEW C5 by construction.
 type prefixDoc struct {
-	Kind              string  `yaml:"kind"`
-	Prefix            string  `yaml:"prefix"`
-	Category          *string `yaml:"category"`
-	ContextWindow     *int    `yaml:"context_window"`
-	MaxOutputTokens   *int    `yaml:"max_output_tokens"`
-	SupportsTools     *bool   `yaml:"supports_tools"`
-	SupportsStreaming *bool   `yaml:"supports_streaming"`
-	Note              *string `yaml:"note"`
+	Kind              string        `yaml:"kind"`
+	Prefix            string        `yaml:"prefix"`
+	Merge             *string       `yaml:"merge"`
+	Category          field[string] `yaml:"category"`
+	ContextWindow     field[int]    `yaml:"context_window"`
+	MaxOutputTokens   field[int]    `yaml:"max_output_tokens"`
+	SupportsTools     field[bool]   `yaml:"supports_tools"`
+	SupportsStreaming field[bool]   `yaml:"supports_streaming"`
+	Note              field[string] `yaml:"note"`
 }
 
 type modelDoc struct {
 	Kind              string        `yaml:"kind"`
 	Model             string        `yaml:"model"`
-	Category          *string       `yaml:"category"`
-	ContextWindow     *int          `yaml:"context_window"`
-	MaxOutputTokens   *int          `yaml:"max_output_tokens"`
-	SupportsTools     *bool         `yaml:"supports_tools"`
-	SupportsStreaming *bool         `yaml:"supports_streaming"`
+	Merge             *string       `yaml:"merge"`
+	Category          field[string] `yaml:"category"`
+	ContextWindow     field[int]    `yaml:"context_window"`
+	MaxOutputTokens   field[int]    `yaml:"max_output_tokens"`
+	SupportsTools     field[bool]   `yaml:"supports_tools"`
+	SupportsStreaming field[bool]   `yaml:"supports_streaming"`
 	Reasoning         *reasoningDoc `yaml:"reasoning"`
 	Pricing           *pricingDoc   `yaml:"pricing"`
-	Verified          *string       `yaml:"verified"`
-	Note              *string       `yaml:"note"`
+	Verified          field[string] `yaml:"verified"`
+	Note              field[string] `yaml:"note"`
+
+	// Provenance for the two blocks that merge whole rather than field-wise.
+	// Unexported, so they are neither read from nor accepted in YAML.
+	reasoningFrom fieldSource
+	pricingFrom   fieldSource
 }
 
 type reasoningDoc struct {
@@ -91,10 +199,16 @@ type pricingDoc struct {
 	Note               string  `yaml:"note"`
 }
 
-// source pairs raw bytes with a name used in error messages.
+// source pairs raw bytes with the name and origin used in error messages and
+// in provenance.
 type source struct {
-	name string
-	data []byte
+	name   string
+	origin OriginKind
+	data   []byte
+}
+
+func (s source) from() fieldSource {
+	return fieldSource{kind: s.origin, source: s.name}
 }
 
 // decode parses every YAML document in one source. Unknown fields are an
@@ -120,14 +234,15 @@ func decode(src source) ([]*fileDoc, error) {
 
 // builder accumulates merged documents before they are frozen into a Catalog.
 type builder struct {
-	aliases   map[string]string
-	kinds     map[string]*kindDoc
-	kindOrder []string
-	rules     map[ruleKey]*prefixDoc
-	ruleOrder []ruleKey
-	models    map[ModelRef]*modelDoc
-	modelRefs []ModelRef
-	errs      []error
+	aliases      map[string]string
+	aliasOrigins map[string]fieldSource
+	kinds        map[string]*kindDoc
+	kindOrder    []string
+	rules        map[ruleKey]*prefixDoc
+	ruleOrder    []ruleKey
+	models       map[ModelRef]*modelDoc
+	modelRefs    []ModelRef
+	errs         []error
 }
 
 type ruleKey struct {
@@ -137,10 +252,11 @@ type ruleKey struct {
 
 func newBuilder() *builder {
 	return &builder{
-		aliases: map[string]string{},
-		kinds:   map[string]*kindDoc{},
-		rules:   map[ruleKey]*prefixDoc{},
-		models:  map[ModelRef]*modelDoc{},
+		aliases:      map[string]string{},
+		aliasOrigins: map[string]fieldSource{},
+		kinds:        map[string]*kindDoc{},
+		rules:        map[ruleKey]*prefixDoc{},
+		models:       map[ModelRef]*modelDoc{},
 	}
 }
 
@@ -148,149 +264,155 @@ func (b *builder) errf(format string, args ...any) {
 	b.errs = append(b.errs, fmt.Errorf(format, args...))
 }
 
-// add folds one document into the builder. Later documents win field by field,
-// so an overlay may change a single key without restating an entry.
-func (b *builder) add(src string, doc *fileDoc) {
+// add folds one document into the builder. Later documents win field by field
+// under the default merge mode, so an overlay may change a single key without
+// restating an entry; `merge: replace` drops the inherited fields first.
+//
+// Every entry kind here is additive: a document may introduce a provider kind,
+// an alias, a prefix rule or a model that no earlier document mentioned. The
+// embedded data is a starting point, not a closed world.
+func (b *builder) add(src source, doc *fileDoc) {
+	name := src.name
+	from := src.from()
+
 	if doc.Version != nil && *doc.Version != 1 {
-		b.errf("%s: unsupported version %d, want 1", src, *doc.Version)
+		b.errf("%s: unsupported version %d, want 1", name, *doc.Version)
+	}
+
+	docMode, ok := parseMerge(doc.Merge)
+	if !ok {
+		b.errf("%s: merge must be %q or %q, got %q", name, mergeMerge, mergeReplace, *doc.Merge)
+	}
+	if docMode == mergeInherit {
+		docMode = mergeMerge
+	}
+
+	// entryMode resolves an entry's own merge key against the document default.
+	entryMode := func(p *string, where string) mergeMode {
+		m, ok := parseMerge(p)
+		if !ok {
+			b.errf("%s: %s: merge must be %q or %q, got %q", name, where, mergeMerge, mergeReplace, *p)
+			return docMode
+		}
+		if m == mergeInherit {
+			return docMode
+		}
+		return m
 	}
 
 	for alias, target := range doc.KindAliases {
 		if alias == "" || target == "" {
-			b.errf("%s: kind_aliases has an empty alias or target", src)
+			b.errf("%s: kind_aliases has an empty alias or target", name)
 			continue
 		}
 		b.aliases[alias] = target
+		b.aliasOrigins[alias] = from
 	}
 
-	for name, in := range doc.Kinds {
-		if name == "" {
-			b.errf("%s: kinds has an empty name", src)
+	for kindName, in := range doc.Kinds {
+		if kindName == "" {
+			b.errf("%s: kinds has an empty name", name)
 			continue
 		}
 		if in == nil {
 			in = &kindDoc{}
 		}
-		cur, ok := b.kinds[name]
+		mode := entryMode(in.Merge, fmt.Sprintf("kinds[%q]", kindName))
+		cur, ok := b.kinds[kindName]
 		if !ok {
 			cur = &kindDoc{}
-			b.kinds[name] = cur
-			b.kindOrder = append(b.kindOrder, name)
+			b.kinds[kindName] = cur
+			b.kindOrder = append(b.kindOrder, kindName)
+		} else if mode == mergeReplace {
+			cur = &kindDoc{}
+			b.kinds[kindName] = cur
 		}
-		mergeKind(cur, in)
+		mergeKind(cur, in, from)
 	}
 
 	for _, in := range doc.PrefixRules {
 		if in == nil || in.Prefix == "" {
-			b.errf("%s: prefix_rules entry has an empty prefix", src)
+			b.errf("%s: prefix_rules entry has an empty prefix", name)
 			continue
 		}
+		mode := entryMode(in.Merge, fmt.Sprintf("prefix_rules[%q]", in.Prefix))
 		key := ruleKey{kind: in.Kind, prefix: in.Prefix}
 		cur, ok := b.rules[key]
 		if !ok {
 			cur = &prefixDoc{Kind: in.Kind, Prefix: in.Prefix}
 			b.rules[key] = cur
 			b.ruleOrder = append(b.ruleOrder, key)
+		} else if mode == mergeReplace {
+			cur = &prefixDoc{Kind: in.Kind, Prefix: in.Prefix}
+			b.rules[key] = cur
 		}
-		mergePrefix(cur, in)
+		mergePrefix(cur, in, from)
 	}
 
 	for _, in := range doc.Models {
 		if in == nil || in.Kind == "" || in.Model == "" {
-			b.errf("%s: models entry needs both kind and model", src)
+			b.errf("%s: models entry needs both kind and model", name)
 			continue
 		}
+		mode := entryMode(in.Merge, fmt.Sprintf("models[kind=%s model=%s]", in.Kind, in.Model))
 		ref := ModelRef{Kind: in.Kind, Model: in.Model}
 		cur, ok := b.models[ref]
 		if !ok {
 			cur = &modelDoc{Kind: in.Kind, Model: in.Model}
 			b.models[ref] = cur
 			b.modelRefs = append(b.modelRefs, ref)
+		} else if mode == mergeReplace {
+			cur = &modelDoc{Kind: in.Kind, Model: in.Model}
+			b.models[ref] = cur
 		}
-		mergeModel(cur, in)
+		mergeModel(cur, in, from)
 	}
 }
 
-func mergeKind(dst, src *kindDoc) {
-	setStr(&dst.API, src.API)
-	setStr(&dst.Cache, src.Cache)
-	setStr(&dst.Reasoning, src.Reasoning)
-	setStr(&dst.Category, src.Category)
-	setInt(&dst.ContextWindow, src.ContextWindow)
-	setInt(&dst.MaxOutputTokens, src.MaxOutputTokens)
-	setBool(&dst.SupportsTools, src.SupportsTools)
-	setBool(&dst.SupportsStreaming, src.SupportsStreaming)
-	setStr(&dst.Metrics, src.Metrics)
-	setStr(&dst.Priority, src.Priority)
-	setStr(&dst.Verified, src.Verified)
-	setStr(&dst.Note, src.Note)
+func mergeKind(dst, src *kindDoc, from fieldSource) {
+	mergeField(&dst.API, src.API, from)
+	mergeField(&dst.BaseURL, src.BaseURL, from)
+	mergeField(&dst.Cache, src.Cache, from)
+	mergeField(&dst.Reasoning, src.Reasoning, from)
+	mergeField(&dst.Category, src.Category, from)
+	mergeField(&dst.ContextWindow, src.ContextWindow, from)
+	mergeField(&dst.MaxOutputTokens, src.MaxOutputTokens, from)
+	mergeField(&dst.SupportsTools, src.SupportsTools, from)
+	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
+	mergeField(&dst.Metrics, src.Metrics, from)
+	mergeField(&dst.Priority, src.Priority, from)
+	mergeField(&dst.Verified, src.Verified, from)
+	mergeField(&dst.Note, src.Note, from)
 }
 
-func mergePrefix(dst, src *prefixDoc) {
-	setStr(&dst.Category, src.Category)
-	setInt(&dst.ContextWindow, src.ContextWindow)
-	setInt(&dst.MaxOutputTokens, src.MaxOutputTokens)
-	setBool(&dst.SupportsTools, src.SupportsTools)
-	setBool(&dst.SupportsStreaming, src.SupportsStreaming)
-	setStr(&dst.Note, src.Note)
+func mergePrefix(dst, src *prefixDoc, from fieldSource) {
+	mergeField(&dst.Category, src.Category, from)
+	mergeField(&dst.ContextWindow, src.ContextWindow, from)
+	mergeField(&dst.MaxOutputTokens, src.MaxOutputTokens, from)
+	mergeField(&dst.SupportsTools, src.SupportsTools, from)
+	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
+	mergeField(&dst.Note, src.Note, from)
 }
 
-func mergeModel(dst, src *modelDoc) {
-	setStr(&dst.Category, src.Category)
-	setInt(&dst.ContextWindow, src.ContextWindow)
-	setInt(&dst.MaxOutputTokens, src.MaxOutputTokens)
-	setBool(&dst.SupportsTools, src.SupportsTools)
-	setBool(&dst.SupportsStreaming, src.SupportsStreaming)
-	setStr(&dst.Verified, src.Verified)
-	setStr(&dst.Note, src.Note)
+func mergeModel(dst, src *modelDoc, from fieldSource) {
+	mergeField(&dst.Category, src.Category, from)
+	mergeField(&dst.ContextWindow, src.ContextWindow, from)
+	mergeField(&dst.MaxOutputTokens, src.MaxOutputTokens, from)
+	mergeField(&dst.SupportsTools, src.SupportsTools, from)
+	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
+	mergeField(&dst.Verified, src.Verified, from)
+	mergeField(&dst.Note, src.Note, from)
 	// Reasoning and pricing are replaced whole. Capability, levels and the
 	// verification date are one claim; merging them field by field could
 	// leave a capability standing next to a date that never covered it.
 	if src.Reasoning != nil {
 		dst.Reasoning = src.Reasoning
+		dst.reasoningFrom = from
 	}
 	if src.Pricing != nil {
 		dst.Pricing = src.Pricing
+		dst.pricingFrom = from
 	}
-}
-
-func setStr(dst **string, src *string) {
-	if src != nil {
-		v := *src
-		*dst = &v
-	}
-}
-
-func setInt(dst **int, src *int) {
-	if src != nil {
-		v := *src
-		*dst = &v
-	}
-}
-
-func setBool(dst **bool, src *bool) {
-	if src != nil {
-		v := *src
-		*dst = &v
-	}
-}
-
-func str(p *string) string {
-	if p == nil {
-		return ""
-	}
-	return *p
-}
-
-func intv(p *int) int {
-	if p == nil {
-		return 0
-	}
-	return *p
-}
-
-func boolv(p *bool) bool {
-	return p != nil && *p
 }
 
 // build validates the accumulated documents and freezes them into a Catalog.
@@ -298,19 +420,22 @@ func boolv(p *bool) bool {
 // file rather than one per attempt.
 func (b *builder) build() (*Catalog, error) {
 	c := &Catalog{
-		kinds:   make(map[string]KindDefaults, len(b.kinds)),
-		aliases: make(map[string]string, len(b.aliases)),
-		models:  make(map[ModelRef]modelEntry, len(b.models)),
+		kinds:        make(map[string]KindDefaults, len(b.kinds)),
+		kindOrigins:  make(map[string]map[string]fieldSource, len(b.kinds)),
+		aliases:      make(map[string]string, len(b.aliases)),
+		aliasOrigins: make(map[string]fieldSource, len(b.aliases)),
+		models:       make(map[ModelRef]modelEntry, len(b.models)),
 	}
 
 	slices.Sort(b.kindOrder)
 	for _, name := range b.kindOrder {
-		kd, err := resolveKind(name, b.kinds[name])
+		kd, origins, err := resolveKind(name, b.kinds[name])
 		if err != nil {
 			b.errs = append(b.errs, err)
 			continue
 		}
 		c.kinds[name] = kd
+		c.kindOrigins[name] = origins
 		c.kindOrder = append(c.kindOrder, name)
 	}
 
@@ -325,6 +450,7 @@ func (b *builder) build() (*Catalog, error) {
 			continue
 		}
 		c.aliases[alias] = target
+		c.aliasOrigins[alias] = b.aliasOrigins[alias]
 	}
 
 	for _, key := range b.ruleOrder {
@@ -335,7 +461,7 @@ func (b *builder) build() (*Catalog, error) {
 				continue
 			}
 		}
-		cat := Category(str(in.Category))
+		cat := Category(in.Category.get())
 		if cat != "" && !validCategories[cat] {
 			b.errf("prefix_rules[%q]: unknown category %q", in.Prefix, cat)
 			continue
@@ -344,11 +470,19 @@ func (b *builder) build() (*Catalog, error) {
 			kind:              c.canonical(in.Kind),
 			prefix:            in.Prefix,
 			category:          cat,
-			contextWindow:     intv(in.ContextWindow),
-			maxOutputTokens:   intv(in.MaxOutputTokens),
-			supportsTools:     in.SupportsTools,
-			supportsStreaming: in.SupportsStreaming,
-			note:              str(in.Note),
+			contextWindow:     in.ContextWindow.get(),
+			maxOutputTokens:   in.MaxOutputTokens.get(),
+			supportsTools:     in.SupportsTools.ptr(),
+			supportsStreaming: in.SupportsStreaming.ptr(),
+			note:              in.Note.get(),
+			origins: map[string]fieldSource{
+				FieldCategory:          in.Category.origin,
+				FieldContextWindow:     in.ContextWindow.origin,
+				FieldMaxOutputTokens:   in.MaxOutputTokens.origin,
+				FieldSupportsTools:     in.SupportsTools.origin,
+				FieldSupportsStreaming: in.SupportsStreaming.origin,
+				FieldNote:              in.Note.origin,
+			},
 		})
 	}
 	// Longest prefix wins; a kind-scoped rule breaks a length tie against a
@@ -412,68 +546,93 @@ func (b *builder) resolveAlias(alias string, kinds map[string]KindDefaults) (str
 	return "", fmt.Errorf("kind_aliases[%q]: chain longer than %d hops, probably a cycle", alias, maxAliasHops)
 }
 
-func resolveKind(name string, in *kindDoc) (KindDefaults, error) {
+// packageDefault marks a value this package supplied because no file did. It
+// is distinguishable from a file that states the same value on purpose: an
+// operator reading Explain must be able to tell "dorang assumed chat" from
+// "my file says chat".
+var packageDefault = fieldSource{kind: OriginDefault}
+
+func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource, error) {
 	var errs []error
 
-	api := API(str(in.API))
+	api := API(in.API.get())
 	if api == "" {
 		errs = append(errs, fmt.Errorf("kinds[%q]: api is required", name))
 	} else if !validAPIs[api] {
 		errs = append(errs, fmt.Errorf("kinds[%q]: unknown api %q", name, api))
 	}
 
-	cache := CacheScheme(str(in.Cache))
+	cacheOrigin := in.Cache.origin
+	cache := CacheScheme(in.Cache.get())
 	if cache == "" {
-		cache = CacheNone
+		cache, cacheOrigin = CacheNone, packageDefault
 	}
 	if !validCaches[cache] {
 		errs = append(errs, fmt.Errorf("kinds[%q]: unknown cache scheme %q", name, cache))
 	}
 
-	hint := ReasoningCapability(str(in.Reasoning))
+	hintOrigin := in.Reasoning.origin
+	hint := ReasoningCapability(in.Reasoning.get())
 	if hint == "" {
-		hint = ReasoningUnknown
+		hint, hintOrigin = ReasoningUnknown, packageDefault
 	}
 	if !validReasoning[hint] {
 		errs = append(errs, fmt.Errorf("kinds[%q]: unknown reasoning shape %q", name, hint))
 	}
 
-	cat := Category(str(in.Category))
+	catOrigin := in.Category.origin
+	cat := Category(in.Category.get())
 	if cat == "" {
-		cat = CategoryChat
+		cat, catOrigin = CategoryChat, packageDefault
 	}
 	if !validCategories[cat] {
 		errs = append(errs, fmt.Errorf("kinds[%q]: unknown category %q", name, cat))
 	}
 
-	if err := checkDate(str(in.Verified)); err != nil {
+	if err := checkDate(in.Verified.get()); err != nil {
 		errs = append(errs, fmt.Errorf("kinds[%q]: verified: %w", name, err))
 	}
-	if v := intv(in.ContextWindow); v < 0 {
+	if v := in.ContextWindow.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("kinds[%q]: context_window is negative", name))
 	}
-	if v := intv(in.MaxOutputTokens); v < 0 {
+	if v := in.MaxOutputTokens.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("kinds[%q]: max_output_tokens is negative", name))
 	}
 
 	if len(errs) > 0 {
-		return KindDefaults{}, errors.Join(errs...)
+		return KindDefaults{}, nil, errors.Join(errs...)
+	}
+	origins := map[string]fieldSource{
+		FieldAPI:               in.API.origin,
+		FieldBaseURL:           in.BaseURL.origin,
+		FieldCache:             cacheOrigin,
+		FieldReasoningHint:     hintOrigin,
+		FieldCategory:          catOrigin,
+		FieldContextWindow:     in.ContextWindow.origin,
+		FieldMaxOutputTokens:   in.MaxOutputTokens.origin,
+		FieldSupportsTools:     in.SupportsTools.origin,
+		FieldSupportsStreaming: in.SupportsStreaming.origin,
+		FieldMetrics:           in.Metrics.origin,
+		FieldPriority:          in.Priority.origin,
+		FieldVerified:          in.Verified.origin,
+		FieldNote:              in.Note.origin,
 	}
 	return KindDefaults{
 		Name:              name,
 		API:               api,
+		BaseURL:           in.BaseURL.get(),
 		Cache:             cache,
 		ReasoningHint:     hint,
 		Category:          cat,
-		ContextWindow:     intv(in.ContextWindow),
-		MaxOutputTokens:   intv(in.MaxOutputTokens),
-		SupportsTools:     boolv(in.SupportsTools),
-		SupportsStreaming: boolv(in.SupportsStreaming),
-		Metrics:           str(in.Metrics),
-		Priority:          str(in.Priority),
-		Verified:          str(in.Verified),
-		Note:              str(in.Note),
-	}, nil
+		ContextWindow:     in.ContextWindow.get(),
+		MaxOutputTokens:   in.MaxOutputTokens.get(),
+		SupportsTools:     in.SupportsTools.get(),
+		SupportsStreaming: in.SupportsStreaming.get(),
+		Metrics:           in.Metrics.get(),
+		Priority:          in.Priority.get(),
+		Verified:          in.Verified.get(),
+		Note:              in.Note.get(),
+	}, origins, nil
 }
 
 // resolveModel turns one model document into the top lookup layer. Booleans
@@ -483,17 +642,17 @@ func resolveModel(ref ModelRef, in *modelDoc) (modelEntry, error) {
 	var errs []error
 	where := fmt.Sprintf("models[kind=%s model=%s]", ref.Kind, ref.Model)
 
-	cat := Category(str(in.Category))
+	cat := Category(in.Category.get())
 	if cat != "" && !validCategories[cat] {
 		errs = append(errs, fmt.Errorf("%s: unknown category %q", where, cat))
 	}
-	if err := checkDate(str(in.Verified)); err != nil {
+	if err := checkDate(in.Verified.get()); err != nil {
 		errs = append(errs, fmt.Errorf("%s: verified: %w", where, err))
 	}
-	if v := intv(in.ContextWindow); v < 0 {
+	if v := in.ContextWindow.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("%s: context_window is negative", where))
 	}
-	if v := intv(in.MaxOutputTokens); v < 0 {
+	if v := in.MaxOutputTokens.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("%s: max_output_tokens is negative", where))
 	}
 
@@ -512,14 +671,25 @@ func resolveModel(ref ModelRef, in *modelDoc) (modelEntry, error) {
 	return modelEntry{
 		ref:               ref,
 		category:          cat,
-		contextWindow:     intv(in.ContextWindow),
-		maxOutputTokens:   intv(in.MaxOutputTokens),
-		supportsTools:     in.SupportsTools,
-		supportsStreaming: in.SupportsStreaming,
+		contextWindow:     in.ContextWindow.get(),
+		maxOutputTokens:   in.MaxOutputTokens.get(),
+		supportsTools:     in.SupportsTools.ptr(),
+		supportsStreaming: in.SupportsStreaming.ptr(),
 		reasoning:         reasoning,
 		pricing:           pricing,
-		verified:          str(in.Verified),
-		note:              str(in.Note),
+		verified:          in.Verified.get(),
+		note:              in.Note.get(),
+		origins: map[string]fieldSource{
+			FieldCategory:          in.Category.origin,
+			FieldContextWindow:     in.ContextWindow.origin,
+			FieldMaxOutputTokens:   in.MaxOutputTokens.origin,
+			FieldSupportsTools:     in.SupportsTools.origin,
+			FieldSupportsStreaming: in.SupportsStreaming.origin,
+			FieldReasoning:         in.reasoningFrom,
+			FieldPricing:           in.pricingFrom,
+			FieldVerified:          in.Verified.origin,
+			FieldNote:              in.Note.origin,
+		},
 	}, nil
 }
 
