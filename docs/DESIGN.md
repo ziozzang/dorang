@@ -1231,6 +1231,31 @@ upstream (modulo the alias rewrite of §7.2) and the numbers are available from 
 
 See §7.5. A client hint is clamped to the principal's permitted range.
 
+### 10.5a dorang does not compact — a decided non-goal
+
+dorang knows a deployment's real context window (VLLM.md §1.1) and the caller often does not,
+which makes "compact on the caller's behalf" a tempting feature. **It is a non-goal.**
+
+Compaction means rewriting someone's conversation: dropping turns, eliding tool results, or
+substituting a summary. A gateway doing that silently changes what the model was asked, and
+the caller has no way to see it in the response. The failure is not a wrong answer the caller
+can spot — it is a plausible answer to a question they did not ask. An agent loop that
+compacts its own history knows what it discarded and can compensate; a gateway does not and
+cannot.
+
+So the context window is used for **routing and refusal**, never for rewriting:
+
+| Situation | dorang does |
+|---|---|
+| Request fits the target's window | dispatch |
+| Does not fit, a same-class deployment with a larger window exists | route there (§7.6 `context_window`) |
+| Does not fit anywhere in the class | **fail with a clear error naming the real limit** |
+| Caller invokes a vendor's own compaction API | **pass it through** (§10.6), do not interpret it |
+
+Failing is the correct outcome in the third row. The caller learns the real limit — which is
+information they did not have and cannot get elsewhere — and decides for themselves what to
+drop. That is a better outcome than a silently shortened conversation.
+
 ### 10.6 Generic passthrough engine
 
 Provider-native routes are opened by configuration, not by writing an adapter each time.
