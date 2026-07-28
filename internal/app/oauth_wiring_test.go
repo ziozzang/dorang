@@ -49,6 +49,14 @@ const chatOK = `{"id":"x","object":"chat.completion","model":"m1-upstream",` +
 
 const chatReq = `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
 
+// fixtureAccountID is the vendor account identifier the store carries. It is an
+// identifier, not a secret — which is exactly why it is the one thing besides
+// the token that has to reach the wire.
+const fixtureAccountID = "fixture-account-4f2a"
+
+// fixtureAccountHeader is where a provider that wants the account id expects it.
+const fixtureAccountHeader = "X-Fixture-Account-Id"
+
 // writeTokenStore writes a generic-format store into the test's own temporary
 // directory.
 //
@@ -62,6 +70,7 @@ func writeTokenStore(t *testing.T, access, refresh string, expires time.Time) st
 	doc := map[string]any{
 		"access_token":  access,
 		"refresh_token": refresh,
+		"account_id":    fixtureAccountID,
 		// A key dorang does not own, so that a write-back that drops it fails.
 		"vendor_note": "written by a fixture",
 	}
@@ -135,13 +144,14 @@ credentials:
     oauth:
       source: file
       path: %q
+      account_header: %s
       refresh_margin: 1m
       poll_interval: 5s%s
 models:
   - name: m1
     deployments:
       - {provider: p1, upstream_model: m1-upstream, credentials: [oauth-1]}
-`, upstream, store, refresh)
+`, upstream, store, fixtureAccountHeader, refresh)
 }
 
 // TestAnOAuthCredentialAuthorizesAnUpstreamRequest is the definition of done:
@@ -149,10 +159,11 @@ models:
 // request. The assertion is the header the upstream received.
 func TestAnOAuthCredentialAuthorizesAnUpstreamRequest(t *testing.T) {
 	var mu sync.Mutex
-	var gotAuth string
+	var gotAuth, gotAccount string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		gotAuth = r.Header.Get("Authorization")
+		gotAccount = r.Header.Get(fixtureAccountHeader)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, chatOK)
@@ -176,6 +187,14 @@ func TestAnOAuthCredentialAuthorizesAnUpstreamRequest(t *testing.T) {
 	if want := "Bearer " + staleAccess; gotAuth != want {
 		t.Fatalf("the upstream received Authorization %q, want %q: the OAuth credential "+
 			"never reached the request", gotAuth, want)
+	}
+	// account_header is the setting the configuration guard cannot vouch for: it
+	// checks that a field's NAME is mentioned outside internal/config, and a
+	// field that is copied into a struct nobody forwards is mentioned too. The
+	// only thing that settles it is the header the upstream received.
+	if gotAccount != fixtureAccountID {
+		t.Fatalf("the upstream received %s: %q, want %q: account_header loads, validates "+
+			"and reaches no request", fixtureAccountHeader, gotAccount, fixtureAccountID)
 	}
 }
 
