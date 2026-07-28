@@ -50,7 +50,8 @@ the ratio, not a preference.
 
 | # | Contract | Why it bites |
 |---|---|---|
-| 2.1 | **Absent fields are omitted, never emitted as `null`.** | The reference serializer excludes unset and none. A Go struct without `omitempty` emits `"logprobs":null,"system_fingerprint":null` and diverges from every existing client's expectation. This is the single easiest way to fail compatibility while passing your own tests. |
+| 2.1 | **Absent fields are omitted, never emitted as `null`.** | ⚠️ Corrected framing: this is **not** merely avoiding a Go mistake. Real OpenAI *does* emit `"logprobs":null` and `"finish_reason":null` on chunks; the reference proxy omits them. The two disagree, and dorang follows **the reference proxy**, because that is what the clients in front of us were built against. Choosing the other way is a one-line option, but it must be a choice, not an accident. |
+| 2.1a | **The serializer itself is normative.** | A "byte-for-byte" claim is meaningless without saying which serializer. Compact separators (no space after `:` or `,`), raw UTF-8 rather than `\uXXXX` escaping, and **Go's HTML escaping disabled** — left on, Go turns `&&` into `&&`, which no other server does. |
 | 2.2 | A plain text chunk is exactly `{id, object, created, model, choices:[{index, delta:{role?,content?}, finish_reason?}]}` — nothing more. | Extra keys are a divergence. |
 | 2.3 | `object` is always `"chat.completion.chunk"`. | |
 | 2.4 | `id` and `created` are **pinned across every chunk** of one stream. | Regenerating `created` per chunk breaks clients that use it as a stream identity. |
@@ -72,7 +73,8 @@ the ratio, not a preference.
 |---|---|
 | 4.1 | Backend-native values are normalized through a mapping table covering at least: `end_turn`, `stop_sequence`, `max_tokens`, `tool_use`, `refusal`, `COMPLETE`, `ERROR`, `ERROR_TOXIC`, `eos_token`, `eos`, `STOP`, `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `IMAGE_SAFETY`, `network_error`, `sensitive`, `guardrail_intervened`. |
 | 4.2 | An unmapped value becomes `"stop"` **and logs a warning**. It is never passed through raw. |
-| 4.3 | The original value is preserved out-of-band (`provider_specific_fields.native_finish_reason`) so nothing is actually lost. |
+| 4.2a | ⚠️ **Error-shaped native reasons map to `"stop"`, and that is lossy in a way worth stating.** `ERROR`, `network_error` and friends have no OpenAI equivalent, so the client is told a failed turn ended normally — the same harm 6.4 flags for a filtered turn reported as a normal one. dorang keeps the wire mapping for compatibility and **must** surface the truth out of band: `x-dorang-native-stop-reason` on the response, and the native value in the ledger. A caller that wants to distinguish them has a way; a caller that does not is unaffected. |
+| 4.3 | The original value is preserved out-of-band on the **choice** object, adjacent to `finish_reason`, in both streaming and non-streaming form. Note this is the one documented exception to 2.2's "nothing more" — which is scoped to *plain text* chunks. |
 | 4.4 | ⚠️ **A terminal chunk is synthesized when the backend never sent one**, defaulting to `"stop"` — **and upgraded to `"tool_calls"` if any tool call was seen in the stream.** A gateway that merely forwards will emit `"stop"` on a tool-call turn and break every agentic client. This is the highest-value single line in this document. |
 
 ## 5. Tool-call streaming
@@ -81,7 +83,8 @@ the ratio, not a preference.
 |---|---|
 | 5.1 | `delta.tool_calls[].index` is **required**, non-optional. `id`, `type`, `function` are optional. |
 | 5.2 | Inbound assistant messages have `index` **stripped** from `tool_calls` before forwarding, so a client echoing a full assistant message is not rejected. |
-| 5.3 | Tool names are limited to 64 characters on the OpenAI side. Truncation must be recorded in a mapping and **round-tripped**, or the model's tool call cannot be matched back. |
+| 5.3 | Tool names are limited to 64 characters on the OpenAI side. Truncation must be recorded in a mapping and **round-tripped**, or the model's tool call cannot be matched back. **Plain truncation is not sufficient**: qualified tool names routinely share a long common prefix, so cutting at 64 collides and two different tools become one. The shortened form is `prefix + "_" + 8 hex of a hash of the full name`, with the mapping authoritative for restoring it. |
+| 5.5 | ⚠️ **`max_tokens` and `max_completion_tokens` are not interchangeable, and picking wrong breaks a T0 path.** Several widely deployed OpenAI-compatible servers accept only the former; current reasoning models on the vendor surface reject it in favour of the latter. There is no value that works everywhere, so the field is **per-deployment configuration**, defaulting to `max_tokens` for the compatible-server majority. See DESIGN §10.7, where this is one of the three named cross-protocol traps. |
 | 5.4 | Cross-protocol tool-use ids must be normalized consistently in both directions. |
 
 ## 6. `/v1/messages` — the highest-risk surface

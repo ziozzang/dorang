@@ -1568,8 +1568,8 @@ formatted string construction. Full-body buffering beyond the replay budget.
 
 ```
 cmd/dorang · cmd/dorangctl
-internal/{server,frontend,backend,canonical,router,capacity,quota,pricing,
-          meter,store,auth,admin,batch,cluster,config,luaext,passthrough}
+internal/{server,canonical,wire/<family>,router,capacity,prefix,health,quota,
+          pricing,meter,store,auth,admin,batch,cluster,config,luaext,passthrough}
 pkg/catalog          provider defaults, model catalog, base pricing
 ui/                  embedded admin SPA
 deploy/              compose for tests, Dockerfile, examples
