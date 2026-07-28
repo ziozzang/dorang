@@ -1580,7 +1580,15 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 | Added TTFT, streaming | p99 < 1 ms |
 | Idle RSS, notebook profile | < 100 MB |
 | 1000 concurrent streams | < 300 MB **including** the replay budget (§15.4) |
-| Metering on vs off | < 5%, in steady state and at a full buffer |
+| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.074%** of the 200 µs warm-local p50 |
+
+> **"5%" needed a denominator.** An earlier draft said only "metering on vs off < 5%", which never
+> said 5% *of what*. Measured against a no-op meter the ratio is **7.6×** — but the no-op returns after
+> one branch, so dividing by it measures nothing about a real request. The requirement is 5% of the
+> **gateway-overhead budget**, so added-nanoseconds-against-that-budget is the figure that answers it.
+> Both numbers are reported, and the gate asserts steady state **and** a full buffer — at which point
+> metering is *cheaper* (110 ns), because a failed ring push skips the payload copy while the numeric
+> path does identical work. That asymmetry is the two-queue split (§12.1) behaving as designed.
 
 ### 15.2 Techniques
 
