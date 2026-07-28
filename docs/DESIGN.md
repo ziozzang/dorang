@@ -1599,7 +1599,17 @@ Every removal is reported.
 | `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form |
 | `retry-after` | on 429 |
 
-**Header set is bounded.** Only the identification and cost headers are always attached.
+**Header set is bounded — but standard HTTP headers are not telemetry and are never gated.**
+`Retry-After` and the `x-ratelimit-*` set are always attached. An earlier draft listed them
+among the extension headers, which taken literally means a `429` carries no `Retry-After`
+unless the caller asked for detail — and every SDK's backoff silently stops working. The rule
+is: a header the client **acts on** is unconditional; a header the client **reads** may be
+gated.
+
+Of dorang's own headers, only the identification and cost set is always attached:
+`x-dorang-request-id`, `-model`, `-upstream-model`, `-deployment`, `-cost-usd`, and
+`-replayable` when false — the last because it changes retry semantics a caller may be relying
+on, which makes it an act-on header by the same rule.
 The rest are emitted when `x-dorang-detail: full` is requested, or when
 `observability.always_full_headers` is set. Revision 1 attached roughly thirty headers to
 every response, which risks intermediary header-size limits and adds bytes ahead of the
@@ -1718,8 +1728,25 @@ passthrough:
    counts and bytes. Metering failure never fails the request.
 6. WebSocket upgrades are relayed frame-for-frame by the same engine.
 
-**Security boundary**: unmapped prefixes are not served — this is not an open proxy. Joined
-paths are normalized and traversal is rejected. Provider credentials never reach the client.
+**Security boundary** — four rules, and the last two were missing from an earlier draft:
+
+1. Unmapped prefixes are not served. This is not an open proxy.
+2. Joined paths are normalized and traversal is rejected.
+3. **Redirects are never followed.** A `30x` from an upstream makes an ordinary HTTP client
+   re-issue the request — **with the provider credential attached** — to a host the *upstream*
+   chose. That turns any compromised or misconfigured backend into a credential-exfiltration
+   primitive, and it needs no attacker access to dorang at all. The response is returned to the
+   caller as-is; dorang does not chase it. A test fails if an attacker-nominated host is ever
+   reached.
+4. **Credentials are stripped in both directions.** "Never reach the client" was stated only
+   for the request path. A backend that echoes back the key it was given would have that
+   relayed straight through, so authorization headers are removed from the **response** too.
+
+Step 3's "relay without parsing" and step 5's "price the usage" cannot both hold
+unconditionally — pricing requires parsing. The reconciliation is a **bounded** tee: JSON
+content types only, a hard byte ceiling, and streamed responses never touched. An unbounded
+read here would reintroduce exactly the full-body buffering §15.5 prohibits, so the bound is
+part of the contract rather than an implementation detail.
 
 ### 10.7 Metadata equivalence across protocol families
 
@@ -2242,4 +2269,5 @@ fixes the neutral representation. M9 and M12 are independent of the core through
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
 | W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **open** — inherent to no-partial-holding; needs a soft-reservation protocol. Not a deadlock and not an overtaking problem, so aging does not close it. Measurable: a waiter that never wins while both its axes stay saturated |
+| W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
 | W9 | **Quota and budget state is in-memory only** (§9.6) | **open** — a restart resets the windows. Safe for concurrency, wrong for accounting: a monthly budget silently starts over. Must be persisted through the lease mechanism before clustering, since a lease that does not outlive its node is not a lease |
