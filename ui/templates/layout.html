@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>{{.Title}} — dorang</title>
+<link rel="stylesheet" href="{{.Base}}/assets/style.css">
+<!-- Loaded without defer on purpose: it stamps the stored theme on <html>
+     before the first paint, so an operator on the dark theme does not get a
+     white flash on every navigation. Everything else it does waits for
+     DOMContentLoaded. -->
+<script src="{{.Base}}/assets/app.js"></script>
+</head>
+<body>
+
+<header class="top">
+  <span class="brand">dorang<small>admin</small></span>
+  {{if .Nav}}
+  <nav class="screens">
+    <a href="{{.Base}}/keys"   {{if eq .Screen "keys"}}aria-current="page"{{end}}>keys</a>
+    <a href="{{.Base}}/models" {{if eq .Screen "models"}}aria-current="page"{{end}}>models &amp; deployments</a>
+    <a href="{{.Base}}/usage"  {{if eq .Screen "usage"}}aria-current="page"{{end}}>usage &amp; cost</a>
+  </nav>
+  {{end}}
+  <span class="spacer"></span>
+  <button type="button" id="theme-toggle">theme</button>
+  {{if .Session}}
+  <form method="POST" action="{{.Base}}/logout"><button type="submit">sign out</button></form>
+  {{end}}
+</header>
+
+<main>
+{{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
+{{if .Notice}}<div class="banner">{{.Notice}}</div>{{end}}
+{{template "content" .}}
+</main>
+
+<footer class="foot">
+  Read-only operator view. Rendered {{rfc3339 .Generated}}.
+  Every figure comes from the same engine the API and the CLI use, so there is one answer rather than three (DESIGN §8.4).
+</footer>
+
+</body>
+</html>

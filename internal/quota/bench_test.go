@@ -69,6 +69,30 @@ func BenchmarkMeterQueryLongWindow(b *testing.B) {
 	}
 }
 
+// BenchmarkMeterUrgency is the ranking path: it runs once per candidate per
+// request, so it holds the meter's lock for a handful of divisions and a hash
+// over two short ids, and allocates nothing.
+func BenchmarkMeterUrgency(b *testing.B) {
+	m, err := NewMeter(MeterConfig{Rules: []Rule{
+		{Window: Weekly, Metric: MetricTokensTotal, Limit: 1 << 40, Resets: true},
+		{Window: Rolling(5 * time.Hour), Metric: MetricCostUSD, Limit: NanoUSD(1e6)},
+		{Window: Daily, Metric: MetricRequests, Limit: 1 << 30, Resets: true},
+	}, Now: func() time.Time { return base }})
+	if err != nil {
+		b.Fatal(err)
+	}
+	m.Record(base, Usage{TokensInput: 1 << 20, Requests: 1, CostNanoUSD: NanoUSD(1)})
+	in := UrgencyInput{Subject: "cred-bench", NodeID: "node-bench", Occupancy: 0.25}
+	now := base.Add(time.Hour)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if m.Urgency(now, in) <= 0 {
+			b.Fatal("no urgency")
+		}
+	}
+}
+
 func BenchmarkBudgetReserveSettle(b *testing.B) {
 	bg, err := NewBudget(BudgetConfig{
 		Period: Monthly, DefaultLimit: 1 << 60, Now: func() time.Time { return base },

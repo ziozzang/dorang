@@ -286,6 +286,27 @@ func (w Window) PeriodEnd(now time.Time) time.Time {
 	return start.Add(w.dur)
 }
 
+// periodBounds returns both ends of the period containing now, computing the
+// start only once.
+//
+// It exists for the ranking path (DESIGN §7.5a(c)), which needs the pair on
+// every candidate of every request: PeriodEnd recomputes PeriodStart, and the
+// calendar arithmetic is the expensive half. Daily and weekly ends are a fixed
+// offset because every boundary here is UTC, where a day is always 24 hours;
+// only a month has a variable length.
+func (w Window) periodBounds(now time.Time) (start, end time.Time) {
+	start = w.PeriodStart(now)
+	switch w.kind {
+	case KindDaily:
+		return start, start.Add(24 * time.Hour)
+	case KindWeekly:
+		return start, start.Add(7 * 24 * time.Hour)
+	case KindMonthly:
+		return start, start.AddDate(0, 1, 0)
+	}
+	return start, start.Add(w.dur)
+}
+
 // buckets is how many one-minute buckets a rolling window needs.
 func (w Window) buckets() int {
 	if w.kind != KindRolling {

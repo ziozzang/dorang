@@ -1,0 +1,17 @@
+{{define "content"}}
+<div class="login panel">
+  <h1>Sign in</h1>
+  <p class="lede">
+    Present the master credential or an admin-role key. It is exchanged for a session cookie
+    scoped to this UI, which authorizes reading these three screens and nothing else — the
+    administration API does not accept the cookie.
+  </p>
+  <form method="POST" action="{{.Base}}/login">
+    <input type="hidden" name="next" value="{{.Next}}">
+    <label class="field">credential
+      <input type="password" name="key" autocomplete="current-password" autofocus required>
+    </label>
+    <button type="submit">sign in</button>
+  </form>
+</div>
+{{end}}

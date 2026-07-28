@@ -1,0 +1,8 @@
+{{define "content"}}
+<div class="panel">
+  <h1>{{.Heading}}</h1>
+  <p class="lede">{{.Body}}</p>
+  {{if .Code}}<p class="lede">Code: <code>{{.Code}}</code></p>{{end}}
+  {{if .Nav}}<p><a href="{{.Base}}/keys">back to keys</a></p>{{end}}
+</div>
+{{end}}

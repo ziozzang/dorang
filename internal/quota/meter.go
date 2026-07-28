@@ -55,10 +55,22 @@ type Rule struct {
 	Metric    Metric
 	Limit     int64
 	OnExhaust OnExhaust
+	// Resets declares that the unused remainder of the window is discarded when
+	// it rolls over, which is what makes the allowance use-it-or-lose-it and
+	// gives it an urgency (DESIGN §7.5a(c), [Meter.Urgency]).
+	//
+	// It is declared, never inferred. A resetting subscription window and a
+	// rolling prepaid balance produce identical numbers, and treating the
+	// second as the first spends money early to buy nothing.
+	Resets bool
 }
 
 // String renders the rule the way configuration writes it.
 func (r Rule) String() string {
+	if r.Resets {
+		return fmt.Sprintf("{window: %s, metric: %s, limit: %d, on_exhaust: %s, resets: true}",
+			r.Window, r.Metric, r.Limit, r.OnExhaust)
+	}
 	return fmt.Sprintf("{window: %s, metric: %s, limit: %d, on_exhaust: %s}",
 		r.Window, r.Metric, r.Limit, r.OnExhaust)
 }

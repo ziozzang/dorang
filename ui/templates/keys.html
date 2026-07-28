@@ -1,0 +1,62 @@
+{{define "content"}}
+<h1>Keys</h1>
+<p class="lede">
+  Issued credentials and the authorization fields that travel with them. There is no column
+  here that could be turned back into a secret: dorang stores a non-reversible display label
+  rather than the trailing characters of the key (DESIGN §2.4).
+</p>
+
+<form class="controls" onsubmit="return false">
+  <label class="field">filter
+    <input type="search" id="filter" placeholder="label, id, user, team, tag" autocomplete="off">
+  </label>
+  <label class="field">auto-refresh
+    <select id="refresh">
+      <option value="0">off</option>
+      <option value="30">30s</option>
+      <option value="60">60s</option>
+      <option value="300">5m</option>
+    </select>
+  </label>
+  <span class="field" id="filter-count">{{len .Keys}} rows</span>
+</form>
+
+<div class="panel scroll">
+<table data-filterable>
+<thead>
+<tr>
+  <th>label</th><th>alias</th><th>id</th><th>user</th><th>team</th>
+  <th>models</th><th>tags</th><th class="num">spend</th><th class="num">budget</th>
+  <th>state</th><th>expires</th><th>created</th>
+</tr>
+</thead>
+<tbody>
+{{range .Keys}}
+<tr>
+  <td class="mono">{{.KeyLabel}}</td>
+  <td>{{or .KeyAlias "—"}}</td>
+  <td class="mono">{{.ID}}</td>
+  <td class="mono">{{or .UserID "—"}}</td>
+  <td class="mono">{{or .TeamID "—"}}</td>
+  <td class="wrap">{{if .Models}}{{range .Models}}<span class="tag">{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</td>
+  <td class="wrap">{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</td>
+  <td class="num">{{money .SpendNano}}</td>
+  <td class="num">{{if .MaxBudgetNano}}{{money (deref .MaxBudgetNano)}}{{else}}<span class="unavailable">none</span>{{end}}</td>
+  <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else if .Expired}}<span class="state-warn">expired</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
+  <td>{{stamp .ExpiresAt}}</td>
+  <td>{{stamp .CreatedAt}}</td>
+</tr>
+{{else}}
+<tr><td colspan="12" class="unavailable">No keys.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<p class="lede">
+  Creating, rotating and revoking keys is done over the API — <code>POST {{.APIBase}}/key/generate</code>
+  and friends. This screen is deliberately read-only: it authenticates with a cookie, and a
+  cookie-authenticated mutating surface is a cross-site request forgery surface. The generated
+  secret is returned exactly once, by that call, and is never recoverable afterwards.
+</p>
+{{end}}

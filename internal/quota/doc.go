@@ -42,6 +42,34 @@
 // [StaticProber] is a shipped test double; real provider clients live with
 // their providers, not here.
 //
+// # Expiring quota is a ranking input
+//
+// A window that resets is use-it-or-lose-it, and routing that ignores that
+// wastes the cheapest capacity there is — invisibly, because nothing fails and
+// only the bill moves. [Meter.Urgency] scores it (DESIGN §7.5a(c)):
+//
+//	urgency = unused_fraction ÷ remaining_fraction_of_window
+//
+// Three properties keep the optimization from doing harm:
+//
+//   - Only quota that actually expires has any. Rule.Resets is declared, never
+//     inferred: a rolling balance and a resetting subscription window look the
+//     same from their numbers, and spending the first early buys nothing.
+//   - It is damped by the subject's current occupancy, so that a credential
+//     which is filling up stops attracting the fleet before its concurrency
+//     limit becomes everyone's bottleneck. Occupancy is an input; this package
+//     does not import internal/capacity.
+//   - It is jittered deterministically, keyed by (node, subject). The node
+//     alone would not do: a factor that scaled every candidate a node ranks by
+//     the same amount cannot change that node's ordering, so it would be
+//     arithmetic with no effect on the stampede it is meant to break.
+//
+// Every degenerate case — a quota that does not reset, a fully consumed
+// allowance, a zero-length window, a window whose reset instant the provider
+// never reported — scores zero. An unknown must not be able to attract traffic.
+//
+// [Ranker] is the Urgency(subject) form routing consumes.
+//
 // # Accuracy across nodes
 //
 // Quota uses the same accuracy vocabulary as capacity (DESIGN §5.6, §6.3):

@@ -1,0 +1,134 @@
+{{define "content"}}
+<h1>Usage &amp; cost</h1>
+<p class="lede">
+  Every figure below is for the bounded window shown. There is no "all time" option, because
+  an unbounded ledger query is refused rather than answered slowly (DESIGN §9.3).
+</p>
+
+<form class="controls" method="GET" action="{{.Base}}/usage">
+  <label class="field">from
+    <input type="date" name="start_date" value="{{date .Range.Start}}" required>
+  </label>
+  <label class="field">to
+    <input type="date" name="end_date" value="{{date .Range.End}}" required>
+  </label>
+  <button type="submit">apply</button>
+  <label class="field">auto-refresh
+    <select id="refresh">
+      <option value="0">off</option>
+      <option value="60">60s</option>
+      <option value="300">5m</option>
+    </select>
+  </label>
+</form>
+
+<div class="tiles">
+  <div class="tile"><div class="label">requests</div><div class="value">{{num .Totals.Requests}}</div></div>
+  <div class="tile"><div class="label">errors</div><div class="value">{{num .Totals.Errors}}</div></div>
+  <div class="tile"><div class="label">tokens</div><div class="value">{{num .Totals.TotalTokens}}</div></div>
+
+  <!-- Side by side, and paired visually, because §8.5 exists precisely so that a
+       subscription's value is visible. Billed cost alone reads as zero on a flat
+       plan, which is correct for billing and useless for every other question. -->
+  <div class="tile paired">
+    <div class="label">cost (billed)</div>
+    <div class="value">{{money .Totals.CostNano}}</div>
+    <div class="note">marginal + amortized subscription + adjustments</div>
+  </div>
+  <div class="tile paired">
+    <div class="label">notional (list rate)</div>
+    <div class="value">
+      {{if .NotionalAvailable}}{{money .Totals.NotionalNano}}{{else}}<span class="unavailable">unavailable</span>{{end}}
+    </div>
+    <div class="note">
+      {{if .NotionalAvailable}}an estimate — never billed, never budgeted (§8.5)
+      {{else}}no notional_rate rule matched; reported missing, never zero{{end}}
+    </div>
+  </div>
+  <div class="tile">
+    <div class="label">leverage</div>
+    <div class="value">{{leverage .Totals}}</div>
+    <div class="note">notional ÷ billed, over the whole window — not per request</div>
+  </div>
+</div>
+
+<h2>By day</h2>
+<div class="panel scroll">
+<table>
+<thead>
+<tr>
+  <th>day</th><th class="num">requests</th><th class="num">errors</th>
+  <th class="num">prompt</th><th class="num">completion</th><th class="num">cached</th>
+  <th class="num">cost</th><th class="num">notional</th>
+</tr>
+</thead>
+<tbody>
+{{range .Days}}
+<tr>
+  <td class="mono">{{date .Day}}</td>
+  <td class="num">{{num .Requests}}</td>
+  <td class="num">{{num .Errors}}</td>
+  <td class="num">{{num .PromptTokens}}</td>
+  <td class="num">{{num .CompletionTokens}}</td>
+  <td class="num">{{num .CachedTokens}}</td>
+  <td class="num">{{money .CostNano}}</td>
+  <td class="num">{{if .NotionalKnown}}{{money .NotionalNano}}{{else}}<span class="unavailable">—</span>{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="8" class="unavailable">No traffic in this window.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<h2>By model group</h2>
+<div class="panel scroll">
+<table>
+<thead>
+<tr>
+  <th>model group</th><th class="num">requests</th><th class="num">errors</th>
+  <th class="num">tokens</th><th class="num">cost</th><th class="num">notional</th>
+</tr>
+</thead>
+<tbody>
+{{range .Models}}
+<tr>
+  <td class="mono">{{or .Value "(unattributed)"}}</td>
+  <td class="num">{{num .Requests}}</td>
+  <td class="num">{{num .Errors}}</td>
+  <td class="num">{{num .TotalTokens}}</td>
+  <td class="num">{{money .CostNano}}</td>
+  <td class="num">{{if .NotionalKnown}}{{money .NotionalNano}}{{else}}<span class="unavailable">—</span>{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="6" class="unavailable">No traffic in this window.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<h2>By team</h2>
+<div class="panel scroll">
+<table>
+<thead>
+<tr>
+  <th>team</th><th class="num">requests</th><th class="num">tokens</th>
+  <th class="num">cost</th><th class="num">notional</th>
+</tr>
+</thead>
+<tbody>
+{{range .Teams}}
+<tr>
+  <td class="mono">{{or .Value "(unattributed)"}}</td>
+  <td class="num">{{num .Requests}}</td>
+  <td class="num">{{num .TotalTokens}}</td>
+  <td class="num">{{money .CostNano}}</td>
+  <td class="num">{{if .NotionalKnown}}{{money .NotionalNano}}{{else}}<span class="unavailable">—</span>{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="5" class="unavailable">No traffic in this window.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{end}}

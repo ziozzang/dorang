@@ -1,0 +1,126 @@
+{{define "content"}}
+<h1>Models &amp; deployments</h1>
+<p class="lede">
+  Every model group, the deployments behind it, and the health of the credentials those
+  deployments draw on. Model names are opaque strings and are never split on any character
+  (DESIGN §2.1), so what is shown is what a client must ask for, byte for byte.
+</p>
+
+<form class="controls" onsubmit="return false">
+  <label class="field">filter
+    <input type="search" id="filter" placeholder="group, provider, upstream model" autocomplete="off">
+  </label>
+  <label class="field">auto-refresh
+    <select id="refresh">
+      <option value="0">off</option>
+      <option value="30">30s</option>
+      <option value="60">60s</option>
+    </select>
+  </label>
+  <span class="field" id="filter-count">{{len .Deployments}} rows</span>
+</form>
+
+<h2>Deployments</h2>
+<div class="panel scroll">
+<table data-filterable>
+<thead>
+<tr>
+  <th>model group</th><th>deployment</th><th>provider</th><th>upstream model</th>
+  <th class="num">weight</th><th class="num">priority</th>
+  <th class="num">rpm</th><th class="num">tpm</th><th class="num">parallel</th>
+  <th>enabled</th>
+</tr>
+</thead>
+<tbody>
+{{range .Deployments}}
+<tr>
+  <td class="mono">{{.ModelGroup}}</td>
+  <td class="mono">{{.ID}}</td>
+  <td class="mono">{{.ProviderID}}</td>
+  <td class="mono">{{.UpstreamModel}}</td>
+  <td class="num">{{.Weight}}</td>
+  <td class="num">{{.Priority}}</td>
+  <td class="num">{{limit .RPMLimit}}</td>
+  <td class="num">{{limit .TPMLimit}}</td>
+  <td class="num">{{limit .MaxParallel}}</td>
+  <td>{{if .Enabled}}<span class="state-ok">yes</span>{{else}}<span class="state-bad">no</span>{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="10" class="unavailable">No deployments.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<h2>Aliases</h2>
+<div class="panel scroll">
+<table>
+<thead><tr><th>alias</th><th>model group</th></tr></thead>
+<tbody>
+{{range .Aliases}}
+<tr><td class="mono">{{.Alias}}</td><td class="mono">{{.ModelGroup}}</td></tr>
+{{else}}
+<tr><td colspan="2" class="unavailable">No aliases.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<h2>Credential health</h2>
+{{if .HealthAvailable}}
+<div class="panel scroll">
+<table>
+<thead>
+<tr>
+  <th>credential</th><th>provider</th><th>state</th><th class="num">consec. fails</th>
+  <th>unavailable until</th><th class="num">ttft</th><th class="num">tok/s</th><th>quota</th>
+</tr>
+</thead>
+<tbody>
+{{range .Credentials}}
+<tr>
+  <td class="mono">{{.ID}}</td>
+  <td class="mono">{{.ProviderID}}</td>
+  <td class="{{healthClass .Health}}">{{.Health}}</td>
+  <td class="num">{{.ConsecutiveFailures}}</td>
+  <td>{{stamp .UnavailableUntil}}</td>
+  <td class="num">{{ms .TTFTMS}}</td>
+  <td class="num">{{if .TokensPerSec}}{{printf "%.1f" .TokensPerSec}}{{else}}—{{end}}</td>
+  <td class="wrap">
+    {{range .Quota}}<span class="tag">{{.Window}}/{{.Metric}} {{.UsedPct}}%{{if .Stale}} (stale){{end}}</span>{{else}}<span class="unavailable">no probe</span>{{end}}
+  </td>
+</tr>
+{{else}}
+<tr><td colspan="8" class="unavailable">No credentials tracked.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{else}}
+<div class="panel"><span class="unavailable">Credential health is not wired into this process.</span></div>
+{{end}}
+
+<h2>Capacity occupancy</h2>
+{{if .CapacityAvailable}}
+<div class="panel scroll">
+<table>
+<thead><tr><th>axis</th><th>key</th><th class="num">in use</th><th class="num">limit</th><th class="num">waiting</th></tr></thead>
+<tbody>
+{{range .Capacity.Axes}}
+<tr>
+  <td>{{.Axis}}</td>
+  <td class="mono">{{.Key}}</td>
+  <td class="num">{{.InUse}}</td>
+  <td class="num">{{if .Limit}}{{.Limit}}{{else}}<span class="unavailable">∞</span>{{end}}</td>
+  <td class="num">{{.Waiting}}</td>
+</tr>
+{{else}}
+<tr><td colspan="5" class="unavailable">No axis has been touched yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{else}}
+<div class="panel"><span class="unavailable">Capacity reporting is not wired into this process.</span></div>
+{{end}}
+{{end}}

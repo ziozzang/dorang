@@ -1,0 +1,264 @@
+/* dorang admin UI.
+ *
+ * One stylesheet, no imports, no web fonts: DESIGN §11.3 requires the UI to
+ * work offline, and an @import or a font URL is an external asset wearing a
+ * stylesheet's clothes.
+ *
+ * Both themes are defined. The default follows the operating system through
+ * prefers-color-scheme; an explicit choice is stamped on <html data-theme>
+ * by app.js and must win in both directions, so each theme is written twice:
+ * once as the media default and once as an explicit override.
+ */
+
+:root {
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --border: #dcdcd6;
+  --text: #1c1c19;
+  --muted: #6b6b63;
+  --accent: #2f5d8a;
+  --accent-soft: #e8eef5;
+  --ok: #2b6b45;
+  --warn: #8a5a12;
+  --bad: #94332c;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16171a;
+    --panel: #1e2024;
+    --border: #33363d;
+    --text: #e6e6e3;
+    --muted: #9a9a94;
+    --accent: #7fb0e0;
+    --accent-soft: #232c36;
+    --ok: #7fc79c;
+    --warn: #d9ac60;
+    --bad: #e2867d;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #fbfbfa;
+  --panel: #ffffff;
+  --border: #dcdcd6;
+  --text: #1c1c19;
+  --muted: #6b6b63;
+  --accent: #2f5d8a;
+  --accent-soft: #e8eef5;
+  --ok: #2b6b45;
+  --warn: #8a5a12;
+  --bad: #94332c;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #16171a;
+  --panel: #1e2024;
+  --border: #33363d;
+  --text: #e6e6e3;
+  --muted: #9a9a94;
+  --accent: #7fb0e0;
+  --accent-soft: #232c36;
+  --ok: #7fc79c;
+  --warn: #d9ac60;
+  --bad: #e2867d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+a { color: var(--accent); }
+
+header.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header.top .brand {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin-right: 0.5rem;
+}
+
+header.top .brand small {
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 0.4rem;
+}
+
+nav.screens { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+
+nav.screens a {
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+  text-decoration: none;
+  color: var(--text);
+  border: 1px solid transparent;
+}
+
+nav.screens a:hover { background: var(--accent-soft); }
+
+nav.screens a[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: var(--border);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+header.top .spacer { flex: 1 1 auto; }
+
+main { padding: 1rem; max-width: 1400px; }
+
+h1 { font-size: 1.15rem; margin: 0 0 0.25rem; }
+h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
+p.lede { color: var(--muted); margin: 0 0 1rem; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+
+/* Totals. Cost and the notional figure sit side by side deliberately:
+ * §8.5 exists so that a subscription's value is visible, and a number that
+ * is one click away is a number nobody looks at. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.tile {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+}
+
+.tile .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.tile .value { font: 600 1.35rem/1.2 var(--mono); margin-top: 0.2rem; overflow-wrap: anywhere; }
+.tile .note { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
+.tile.paired { border-color: var(--accent); }
+
+.scroll { overflow-x: auto; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.87rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+tbody tr:hover { background: var(--accent-soft); }
+
+td.num, th.num { text-align: right; font-family: var(--mono); }
+td.mono { font-family: var(--mono); }
+td.wrap { white-space: normal; }
+
+.tag {
+  display: inline-block;
+  padding: 0 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-right: 0.2rem;
+}
+
+.state-ok   { color: var(--ok); }
+.state-warn { color: var(--warn); }
+.state-bad  { color: var(--bad); }
+
+.unavailable { color: var(--muted); font-style: italic; }
+
+form.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-end;
+  margin-bottom: 1rem;
+}
+
+label.field { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.8rem; color: var(--muted); }
+
+input, select, button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+}
+
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+
+.banner {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: var(--panel);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.banner.bad { border-left-color: var(--bad); }
+
+footer.foot {
+  color: var(--muted);
+  font-size: 0.78rem;
+  padding: 1rem;
+  border-top: 1px solid var(--border);
+  margin-top: 2rem;
+}
+
+.login {
+  max-width: 24rem;
+  margin: 4rem auto;
+}
+
+.login input[type="password"] { width: 100%; }
+.login button { width: 100%; margin-top: 0.6rem; }
+
+@media (max-width: 640px) {
+  header.top { gap: 0.5rem; }
+  main { padding: 0.6rem; }
+}
