@@ -946,6 +946,16 @@ Unknown backends receive only the header, which is harmless if ignored.
 
 `same_class` is what satisfies R6 — delegation to a *different model* of equivalent class.
 
+> ⚠️ **Opaque state pins a conversation to a protocol family — preference is not enough.**
+> Once a conversation carries family-scoped opaque state (an integrity-protected reasoning
+> block, a server-side response handle, a vendor compaction cursor), a fallback that crosses
+> families cannot succeed: the receiving family classifies the foreign state as
+> **never-retryable**, so every remaining hop burns and the caller gets the same `400` three
+> times slower. Capability routing (§10.1) must therefore treat this as a **hard pin**, not a
+> ranking input. A request whose family has no healthy deployment fails immediately and says
+> why — spending the hop budget to arrive at the identical error is worse than failing fast.
+> Evidence and the full opaque-state inventory: [EXTENSIONS.md](EXTENSIONS.md) §B.
+
 **Streaming boundary**: fallback is permitted only before the first byte reaches the client.
 After that, an error event ends the stream. Duplicated output is worse than a visible
 failure. This boundary is enforced by a test.
@@ -1325,6 +1335,17 @@ So the context window is used for **routing and refusal**, never for rewriting:
 | Does not fit, a same-class deployment with a larger window exists | route there (§7.6 `context_window`) |
 | Does not fit anywhere in the class | **fail with a clear error naming the real limit** |
 | Caller invokes a vendor's own compaction API | **pass it through** (§10.6), do not interpret it |
+
+> **Estimation must err pessimistic, and `bytes/4` does not.** That ratio undercounts CJK
+> substantially, and undercounting is precisely the optimistic direction §4.3 warns about:
+> dorang believes the request fits, dispatches it, and context-window fallback never fires.
+> The estimator must be script-aware and biased high — an over-estimate costs an unnecessary
+> route to a larger model, an under-estimate costs a hard failure the router cannot see.
+>
+> **A `200` is not proof the request fit.** Some backends silently clamp oversized input;
+> at least one truncates and returns a normal-looking length stop with no output. So overflow
+> detection cannot rely on error signatures alone, and dorang must never enable a backend's
+> own auto-truncation option — doing so disables the very detection §7.6 depends on.
 
 Failing is the correct outcome in the third row. The caller learns the real limit — which is
 information they did not have and cannot get elsewhere — and decides for themselves what to
