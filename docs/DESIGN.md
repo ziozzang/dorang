@@ -1603,9 +1603,25 @@ invoice. Two normalizations are mandatory:
 
 1. **Input tokens are reported the same way in all three directions.** One family reports
    cache reads *inside* the input count; another reports them *outside* it. dorang normalizes
-   to **exclusive** — `InputTokens` never includes cache reads or writes — and re-adds on the
-   way out for whichever family expects inclusive. Getting this wrong double-counts or
-   under-counts every cached request, which is most of them in an agentic workload.
+   to **inclusive** — `InputTokens` is the full prompt count, cache reads and writes included,
+   matching the OpenAI convention — and the encoder **subtracts** on the way out for the
+   family that expects exclusive. Getting this wrong mis-counts every cached request, which in
+   an agentic workload is most of them.
+
+   > ⚠️ **This paragraph said "exclusive" until it was corrected, and the inversion is worth
+   > recording rather than quietly fixing.** The implementation had gone inclusive — which is
+   > what `canonical.Usage` documents, what `TotalTokens() = input + output` requires, what the
+   > OpenAI adapter does in both directions, and the only reading under which COMPATIBILITY
+   > 6.7's `input_tokens = prompt − cache_read − cache_creation` type-checks at all. Following
+   > the design literally would have billed **every cached request through an OpenAI backend
+   > roughly 1.8× over**, with no error anywhere.
+   >
+   > That is precisely the failure this very section warns about two paragraphs above — "a
+   > mis-mapped cache field does not produce a visible error, it produces a wrong invoice" —
+   > and the warning was written with the direction backwards. A prose invariant about
+   > arithmetic is worth less than the arithmetic: the rule is now stated as the formula the
+   > encoder implements, and a round-trip test in each adapter asserts it, so the next
+   > inversion fails a test instead of an audit.
 2. **Reasoning tokens are billed as output.** One family breaks them out, another folds them
    in. `ReasoningTokens` is reported separately *and* is already contained in
    `OutputTokens`, so cost never adds them twice. A test asserts
