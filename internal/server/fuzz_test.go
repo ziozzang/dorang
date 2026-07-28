@@ -136,6 +136,41 @@ func FuzzNormalize(f *testing.F) {
 		if raw := *round.Error.Code; len(raw) == 0 || raw[0] != '"' {
 			t.Fatalf("code is not a JSON string: %s", enc)
 		}
+
+		// The other envelope of COMPATIBILITY §11.1, rendered by a different
+		// serializer, holds the same invariants — plus the outer discriminator
+		// that family's SDK dispatches on, whose absence is the whole defect.
+		anth := EncodeError(Normalize(status, body).ForFamily(FamilyAnthropicMessages))
+		var outer struct {
+			Type  *string `json:"type"`
+			Error *struct {
+				Message *string          `json:"message"`
+				Type    *string          `json:"type"`
+				Param   *string          `json:"param"`
+				Code    *json.RawMessage `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(anth, &outer); err != nil {
+			t.Fatalf("anthropic envelope is not valid JSON: %s (%v)", anth, err)
+		}
+		if outer.Type == nil || *outer.Type != "error" {
+			t.Fatalf("anthropic envelope has no outer discriminator: %s", anth)
+		}
+		if outer.Error == nil {
+			t.Fatalf("anthropic envelope has no error object: %s", anth)
+		}
+		if outer.Error.Message == nil || *outer.Error.Message == "" {
+			t.Fatalf("anthropic envelope has no message: %s", anth)
+		}
+		if outer.Error.Type == nil || !KnownTypes(*outer.Error.Type) {
+			t.Fatalf("anthropic envelope type is outside the canonical vocabulary: %s", anth)
+		}
+		if outer.Error.Code == nil {
+			t.Fatalf("anthropic envelope has no code: %s", anth)
+		}
+		if raw := *outer.Error.Code; len(raw) == 0 || raw[0] != '"' {
+			t.Fatalf("anthropic code is not a JSON string: %s", anth)
+		}
 	})
 }
 

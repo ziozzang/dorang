@@ -155,13 +155,29 @@ func (f Family) String() string {
 
 // Anthropic reports whether the caller is speaking the Anthropic protocol,
 // which decides the error vocabulary they get back (COMPATIBILITY §11.2's two
-// type columns).
+// type columns) AND the envelope it is delivered in (§11.1's two objects, and
+// §11.1a's two SSE framings for a mid-stream failure).
+//
+// The second half is the one that was missing. A vocabulary projected correctly
+// and then serialized into the other family's object is not half right: that
+// SDK dispatches on the outer `"type":"error"` member, so it never reaches the
+// correctly-spelled type inside.
 //
 // It is a whitelist rather than "not one of the OpenAI ones" because every
 // family that is neither — models, health, metrics, admin, passthrough, and the
 // zero value a route that never matched carries — is served an OpenAI-shaped
 // envelope today, and a new family must be classified deliberately rather than
 // inherit an answer from where it happened to be appended.
+//
+// [FamilyPassthrough] is the one entry that is a judgement rather than a fact.
+// A prefix relayed to a native Anthropic surface is being called by an Anthropic
+// SDK, and a gateway-authored refusal on it — an unauthorized model, a relay
+// failure — reaches that SDK in the OpenAI object. It stays here because
+// [PassthroughRoute] declares no protocol: the prefix, the base URL and the
+// provider id are all opaque strings, so nothing in the route table knows which
+// envelope the caller expects, and guessing from a configured provider NAME
+// would be a new contract rather than a fix. Closing it means declaring the
+// family per prefix in configuration.
 func (f Family) Anthropic() bool {
 	switch f {
 	case FamilyAnthropicMessages, FamilyAnthropicCountTokens:

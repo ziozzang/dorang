@@ -393,8 +393,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// not the stringified status NewError would otherwise default
 				// to. A 500 is the one status a client cannot infer anything
 				// from, so the code is the whole of what it learns.
-				WriteError(rw, NewError(http.StatusInternalServerError,
-					TypeAPIError, "internal error").WithCode(CodeInternalError))
+				e := NewError(http.StatusInternalServerError,
+					TypeAPIError, "internal error").WithCode(CodeInternalError)
+				// And §11.1's envelope for whichever family was being spoken.
+				// This path does not go through [Server.fail] — it is the one
+				// that runs when fail itself could not — so the projection has
+				// to be applied here too. rq.Route is nil for a panic raised
+				// before the route was resolved, which is FamilyNone and the
+				// OpenAI envelope, and is the honest answer when nobody has
+				// established what the caller was speaking.
+				if rq.Route != nil {
+					e = e.ForFamily(rq.Route.Family)
+				}
+				WriteError(rw, e)
 			}
 		}
 		s.finish(cfg, rq, rw)
@@ -555,9 +566,10 @@ func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 	// The dispatcher has already scrubbed the credential it sent from these.
 	rq.Result.NativeErrorType = e.NativeType
 	rq.Result.NativeErrorMessage = e.NativeMessage
-	// The vendor's own vocabulary, chosen by which family the caller is speaking
-	// (COMPATIBILITY §11's opening rule). This is the one place a family reaches
-	// an envelope, and every error response goes through it.
+	// The vendor's own vocabulary AND the vendor's own envelope, chosen by which
+	// family the caller is speaking (COMPATIBILITY §11's opening rule). This is
+	// the one place a family reaches an envelope, and every error response goes
+	// through it.
 	if rq.Route != nil {
 		e = e.ForFamily(rq.Route.Family)
 	}
@@ -567,10 +579,7 @@ func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 		return
 	}
 	if rw.sse {
-		buf := getBuf()
-		*buf = appendSSEError(*buf, e)
-		_, _ = rw.Write(*buf)
-		putBuf(buf)
+		writeSSEError(rw, e)
 		rw.flush()
 	}
 	rq.srv.metrics.lateErrors.Add(1)

@@ -46,8 +46,16 @@ func TestUpstreamErrorBodyNeverReachesTheClient(t *testing.T) {
 			if strings.Contains(e.Message, providerKey) {
 				t.Fatalf("the provider credential is in the client-facing message: %q", e.Message)
 			}
-			if strings.Contains(string(EncodeError(e)), providerKey) {
-				t.Fatalf("the provider credential is in the wire envelope: %s", EncodeError(e))
+			// Both of §11.1's envelopes. They are rendered by different
+			// serializers — this package's appender and internal/wire/
+			// anthropic's — so a containment property asserted on one is not
+			// inherited by the other, and a leak that exists on only one route
+			// family is still a leak.
+			for _, f := range []Family{FamilyNone, FamilyOpenAIChat, FamilyAnthropicMessages} {
+				enc := string(EncodeError(Normalize(http.StatusUnauthorized, []byte(b.body)).ForFamily(f)))
+				if strings.Contains(enc, providerKey) {
+					t.Fatalf("the provider credential is in the %v wire envelope: %s", f, enc)
+				}
 			}
 			// And the whole upstream text, not just the key, stays out.
 			if e.Message != canonicalMessage(http.StatusUnauthorized) {

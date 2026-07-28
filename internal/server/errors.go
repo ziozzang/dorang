@@ -3,8 +3,12 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
+
+	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/wire/anthropic"
 )
 
 // Error is the one error shape that leaves dorang.
@@ -91,6 +95,21 @@ type Error struct {
 	NativeCodeWasNumeric bool
 	// Shape records which upstream envelope [Normalize] recognized.
 	Shape Shape
+
+	// family is the caller's protocol family, and it decides which ENVELOPE
+	// this error is rendered in — not only which spelling of Type goes inside
+	// it. COMPATIBILITY §11.1 gives the two families different objects: the
+	// OpenAI one is `{"error":{…}}` and the Anthropic one wraps it in an outer
+	// `{"type":"error"}` discriminator that that SDK dispatches on. An
+	// Anthropic client handed the OpenAI object reads a missing key and cannot
+	// classify the failure at all.
+	//
+	// It is written only by [Error.ForFamily], which §11.2 already names as
+	// "the single path every error response takes", so the envelope and the
+	// type are chosen by the same call and cannot disagree. The zero value is
+	// [FamilyNone], whose Anthropic() is false, so an error that never met a
+	// route renders as it always did.
+	family Family
 }
 
 // Error implements the error interface.
@@ -340,6 +359,13 @@ var compat11Types = map[string]struct{}{
 // e, for chaining. It is what the response path calls, and it is the only place
 // a family reaches an envelope.
 //
+// It resolves TWO things, and for a long time it resolved only one. The type is
+// projected onto §11.2's column for f, and the family is recorded so that
+// [appendEnvelope] renders §11.1's object for f. Choosing the vocabulary and
+// then serializing it into the other family's envelope is not half right: the
+// Anthropic SDK dispatches on the outer `"type":"error"` member, so it never
+// reaches the correctly-spelled type inside.
+//
 // It is exported so that a compatibility test can assert the bytes a client of
 // each family receives for a given condition. §11.2 is a per-family contract,
 // and a test that can only see one family's column can only check half of it.
@@ -347,6 +373,7 @@ func (e *Error) ForFamily(f Family) *Error {
 	if e == nil {
 		return nil
 	}
+	e.family = f
 	if f.Anthropic() && e.AltType != "" {
 		e.Type = e.AltType
 		return e
@@ -678,10 +705,74 @@ func canonicalCode(raw json.RawMessage, status int) (code, native string, wasNum
 	}
 }
 
-// appendEnvelope writes the four-key envelope. Key order is fixed here rather
-// than inherited from a struct definition, because it is part of the golden
-// bytes.
+// appendEnvelope writes the envelope of the family the error was projected
+// onto by [Error.ForFamily].
+//
+// COMPATIBILITY §11.1 defines two objects, not one with a different `type`
+// inside it. Everything that is not the Anthropic family gets §7.1's four-key
+// object, which is the whitelist [Family.Anthropic] documents: a family that is
+// neither — models, health, metrics, admin, passthrough, and the zero value —
+// is answered in the OpenAI shape deliberately rather than by omission.
 func appendEnvelope(dst []byte, e *Error) []byte {
+	if e.family.Anthropic() {
+		return appendAnthropicEnvelope(dst, e)
+	}
+	return appendOpenAIEnvelope(dst, e)
+}
+
+// appendAnthropicEnvelope renders §11.1's Anthropic object through
+// internal/wire/anthropic, which owns that family's serializer.
+//
+// It calls that package rather than hand-rolling a second renderer here. The
+// reason is not tidiness: the two would be free to drift, and this defect —
+// one family's envelope emitted on the other family's route — is what drift
+// between two renderers of the same contract looks like. That package's
+// [anthropic.Error] carries `param` and `code` alongside the outer
+// discriminator, which is deliberate and documented there: §11.1's Anthropic
+// object omits both, §7.1 requires both, and emitting the union satisfies each
+// reader without either seeing a field it must reject.
+//
+// The crossing goes through [canonical.Error] because that is the neutral form
+// [anthropic.ErrorFrom] takes, and it is a type this package already imports.
+//
+// This costs a reflective marshal and a copy on a path the OpenAI side renders
+// by hand. That is a deliberate trade: an error response is not the steady
+// state, and DESIGN §15.5's hand-rolled-appender rule exists to keep a
+// serializer off the per-token path, not to justify a second implementation of
+// an envelope that another package already renders and golden-tests.
+func appendAnthropicEnvelope(dst []byte, e *Error) []byte {
+	b, err := anthropic.EncodeError(anthropicError(e))
+	if err != nil {
+		// Unreachable: the value is four strings and a *string, and
+		// encoding/json cannot fail on those. A body in the other family's
+		// shape is still a body a client can parse and still carries the
+		// status, which is more than nothing at all.
+		return appendOpenAIEnvelope(dst, e)
+	}
+	return append(dst, b...)
+}
+
+// anthropicError projects a dorang error onto that family's own type.
+//
+// Type and Code are passed through rather than re-derived: [Error.ForFamily]
+// has already chosen §11.2's Anthropic column, and letting anthropic.NewError
+// fill an empty type from the status would quietly re-decide a question that
+// was already answered — including for the two 429 capacity rows, whose
+// `overloaded_error` is chosen by condition and is NOT a function of the status.
+func anthropicError(e *Error) *anthropic.Error {
+	return anthropic.ErrorFrom(&canonical.Error{
+		StatusCode: e.StatusCode(),
+		Message:    e.Message,
+		Type:       e.Type,
+		Param:      e.Param,
+		Code:       e.Code,
+	})
+}
+
+// appendOpenAIEnvelope writes the four-key envelope. Key order is fixed here
+// rather than inherited from a struct definition, because it is part of the
+// golden bytes.
+func appendOpenAIEnvelope(dst []byte, e *Error) []byte {
 	dst = append(dst, `{"error":{"message":`...)
 	dst = appendJSONString(dst, e.Message)
 	dst = append(dst, `,"type":`...)
@@ -697,7 +788,10 @@ func appendEnvelope(dst []byte, e *Error) []byte {
 	return append(dst, '}', '}')
 }
 
-// EncodeError renders the envelope exactly as it goes on the wire.
+// EncodeError renders the envelope exactly as it goes on the wire, in the
+// family the error was projected onto by [Error.ForFamily]. An error that has
+// met no route renders in §7.1's object, which is what a caller outside this
+// package holding an un-projected error should see.
 func EncodeError(e *Error) []byte {
 	if e == nil {
 		e = NewError(http.StatusInternalServerError, TypeAPIError, "unknown error")
@@ -747,14 +841,51 @@ func WriteError(w http.ResponseWriter, e *Error) {
 	_, _ = w.Write(*buf)
 }
 
-// appendSSEError renders a mid-stream error as the two frames COMPATIBILITY
-// §1.3 requires: the error in band, then the terminator.
+// writeSSEError delivers a mid-stream error in the SSE conventions of the
+// family the caller is speaking.
 //
 // Once the first chunk has gone out the HTTP status is already 200 and cannot
 // change. That is exactly the boundary DESIGN §7.6 refuses to cross with a
 // fallback, and it is why this exists at all: the only channel left is the body.
-func appendSSEError(dst []byte, e *Error) []byte {
+//
+// The two families do not frame it the same way, and the difference is not
+// cosmetic. COMPATIBILITY §1.1 says a chat-completions frame carries no
+// `event:` line and §1.2 terminates the stream with `data: [DONE]`; §6.1 says
+// every frame of this other protocol carries BOTH lines and §6.2 says it has no
+// `[DONE]` at all and sends no `message_stop` after an error. A client reading
+// an Anthropic stream dispatches on the event NAME, so a data-only frame is not
+// a frame it mis-parses — it is one it silently discards, leaving a failed
+// exchange indistinguishable from a truncated one.
+//
+// Write errors are discarded here for the same reason the caller discards
+// them: the only channel left has just failed, and there is no second one.
+func writeSSEError(w io.Writer, e *Error) {
+	if e != nil && e.family.Anthropic() {
+		// The framing, the event name and the absence of a terminator all come
+		// from that package's own writer. Constructing one per failed stream
+		// costs a message id that this frame does not use; a stream that is
+		// already failing is not the place to optimize that away by copying
+		// its framing rules into this file.
+		_ = anthropic.NewStreamWriter(w, anthropic.StreamConfig{}).
+			WriteError(anthropicError(e))
+		return
+	}
+	buf := getBuf()
+	defer putBuf(buf)
+	*buf = appendOpenAISSEError(*buf, e)
+	_, _ = w.Write(*buf)
+}
+
+// appendOpenAISSEError renders a mid-stream error as the two frames
+// COMPATIBILITY §1.3 requires: the error in band, then the terminator.
+//
+// It is the chat-completions framing specifically — §1.1's data-only frame and
+// §1.2's `[DONE]` — so it renders §7.1's envelope directly rather than through
+// [appendEnvelope]. Routing this through the family switch would let an
+// Anthropic envelope out inside chat-completions framing, which is a shape
+// neither family's client can read.
+func appendOpenAISSEError(dst []byte, e *Error) []byte {
 	dst = append(dst, "data: "...)
-	dst = appendEnvelope(dst, e)
+	dst = appendOpenAIEnvelope(dst, e)
 	return append(dst, "\n\ndata: [DONE]\n\n"...)
 }

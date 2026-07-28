@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -267,10 +269,21 @@ func TestFamilyErrorWireShape(t *testing.T) {
 			want: `{"error":{"message":"request body is not a JSON object","type":"invalid_request_error","param":null,"code":"invalid_request"}}`,
 		},
 		{
+			// The SAME condition on the other family, and §11.1 gives that
+			// family a different OBJECT and not merely a different `type`
+			// inside the same one. This golden asserted the OpenAI envelope on
+			// an Anthropic route for the life of the project: the outer
+			// `"type":"error"` the SDK dispatches on was simply absent, so the
+			// correctly-spelled type inside was never reached.
+			//
+			// `param` and `code` are present because dorang emits the union of
+			// §11.1's Anthropic object and §7.1's four keys; internal/wire/
+			// anthropic's Error documents why, and every SDK in this family
+			// tolerates unknown members of the error object.
 			name: "malformed body, anthropic family",
 			path: "/v1/messages",
 			body: `["not an object"]`,
-			want: `{"error":{"message":"request body is not a JSON object","type":"invalid_request_error","param":null,"code":"invalid_request"}}`,
+			want: `{"type":"error","error":{"type":"invalid_request_error","message":"request body is not a JSON object","param":null,"code":"invalid_request"}}`,
 		},
 	}
 	for _, c := range cases {
@@ -284,6 +297,412 @@ func TestFamilyErrorWireShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// wireEnvelope is what a client decodes: BOTH of COMPATIBILITY §11.1's objects
+// at once, so a test can ask which one arrived rather than assume.
+//
+// The outer Type is the whole point. §11.1 says of it: "The outer
+// `"type":"error"` is load-bearing: the Anthropic SDK dispatches on it." A
+// decoder that only knows the OpenAI object cannot tell the two apart — it
+// reads the inner keys and reports success — which is how an envelope with the
+// discriminator missing survived every existing test.
+type wireEnvelope struct {
+	Type  string `json:"type"`
+	Error struct {
+		Type    string  `json:"type"`
+		Message string  `json:"message"`
+		Param   *string `json:"param"`
+		Code    string  `json:"code"`
+	} `json:"error"`
+}
+
+func decodeWire(t *testing.T, body []byte) wireEnvelope {
+	t.Helper()
+	var e wireEnvelope
+	if err := json.Unmarshal(body, &e); err != nil {
+		t.Fatalf("body is not an error envelope: %v\n%s", err, body)
+	}
+	return e
+}
+
+// assertDispatchable checks the envelope a client of family f receives.
+//
+// "Dispatchable" is not a figure of speech: the Anthropic SDK selects its error
+// class from the OUTER type, so its absence is not a cosmetic difference. The
+// converse is checked too — the OpenAI object must not grow one — because §7.1
+// fixes that object at four keys and a client diffing dorang's bytes against
+// the reference would see an extra member on every error it ever receives.
+func assertDispatchable(t *testing.T, f Family, condition string, e wireEnvelope) {
+	t.Helper()
+	switch {
+	case f.Anthropic() && e.Type != "error":
+		t.Errorf("§11.1 %q on %v: outer discriminator is %q, want \"error\" — "+
+			"this family's SDK dispatches on it and cannot classify the failure without it",
+			condition, f, e.Type)
+	case !f.Anthropic() && e.Type != "":
+		t.Errorf("§11.1 %q on %v: the OpenAI object grew an outer type %q",
+			condition, f, e.Type)
+	}
+	if e.Error.Message == "" {
+		t.Errorf("§7.1 %q on %v: message is empty on the wire", condition, f)
+	}
+}
+
+// compat11Row is one row of COMPATIBILITY §11.2, as a test case: the condition,
+// the status, the two type columns, and the code both columns share.
+type compat11Row struct {
+	name      string
+	condition string
+	err       func() *Error
+	status    int
+	openai    string
+	anthropic string
+	code      string
+	param     *string
+}
+
+// compat11Rows is §11.2's table, every row of it, built the way each condition's
+// raiser builds it.
+//
+// The two capacity rows set [Error.AltType] because their Anthropic spelling is
+// chosen by CONDITION rather than by status — a 429 is `rate_limit_error` to
+// both families when it is an actual rate limit — and that is what their raisers
+// in internal/router do.
+func compat11Rows() []compat11Row {
+	raise := func(status int, code string) func() *Error {
+		return func() *Error { return NewError(status, "", "m").WithCode(code) }
+	}
+	raiseAlt := func(status int, code, alt string) func() *Error {
+		return func() *Error {
+			e := NewError(status, "", "m").WithCode(code)
+			e.AltType = alt
+			return e
+		}
+	}
+	raiseParam := func(status int, code, param string) func() *Error {
+		return func() *Error { return NewError(status, "", "m").WithCode(code).WithParam(param) }
+	}
+	model, messages := "model", "messages"
+	return []compat11Row{
+		{"malformed body", "Malformed request body", raise(400, CodeInvalidRequest),
+			400, TypeInvalidRequest, TypeInvalidRequest, CodeInvalidRequest, nil},
+		{"unknown parameter", "Unknown or disallowed parameter", raise(400, "invalid_parameter"),
+			400, TypeInvalidRequest, TypeInvalidRequest, "invalid_parameter", nil},
+		{"downgrade refused", "Structural downgrade refused", raise(400, "unsupported_construct"),
+			400, TypeInvalidRequest, TypeInvalidRequest, "unsupported_construct", nil},
+		{"context window", "Context window exceeded", raiseParam(400, "context_length_exceeded", messages),
+			400, TypeInvalidRequest, TypeInvalidRequest, "context_length_exceeded", &messages},
+		{"budget exhausted", "Budget exhausted", raise(400, "budget_exceeded"),
+			400, TypeInvalidRequest, TypeInvalidRequest, "budget_exceeded", nil},
+		{"missing credential", "Missing or malformed credential", raise(401, "invalid_api_key"),
+			401, TypeAuthentication, TypeAuthentication, "invalid_api_key", nil},
+		{"revoked credential", "Expired or revoked credential", raise(401, "invalid_api_key"),
+			401, TypeAuthentication, TypeAuthentication, "invalid_api_key", nil},
+		{"model not allowed", "Model not in the key's allow-list", raise(403, "model_not_allowed"),
+			403, TypePermission, TypePermission, "model_not_allowed", nil},
+		{"route not allowed", "Route not permitted for this key", raise(403, "route_not_allowed"),
+			403, TypePermission, TypePermission, "route_not_allowed", nil},
+		{"key blocked", "Key blocked", raise(403, "key_blocked"),
+			403, TypePermission, TypePermission, "key_blocked", nil},
+		{"unknown model", "Unknown model", raiseParam(404, CodeModelNotFound, model),
+			404, TypeInvalidRequest, TypeNotFound, CodeModelNotFound, &model},
+		{"unknown resource", "Unknown resource", raise(404, "not_found"),
+			404, TypeInvalidRequest, TypeNotFound, "not_found", nil},
+		{"body too large", "Body over the size cap", raise(413, CodeRequestTooLarge),
+			413, TypeInvalidRequest, TypeRequestTooLarge, CodeRequestTooLarge, nil},
+		{"rate limit", "Rate limit (RPM/TPM)", raise(429, "rate_limit_exceeded"),
+			429, TypeRateLimit, TypeRateLimit, "rate_limit_exceeded", nil},
+		{"quota exhausted", "Provider quota exhausted", raise(429, "insufficient_quota"),
+			429, TypeRateLimit, TypeRateLimit, "insufficient_quota", nil},
+		{"no healthy deployment", "No healthy deployment",
+			raiseAlt(429, "no_healthy_deployment", TypeOverloaded),
+			429, TypeRateLimit, TypeOverloaded, "no_healthy_deployment", nil},
+		{"capacity wait", "Capacity wait timed out",
+			raiseAlt(429, "capacity_unavailable", TypeOverloaded),
+			429, TypeRateLimit, TypeOverloaded, "capacity_unavailable", nil},
+		{"gateway fault", "Gateway fault", raise(500, CodeInternalError),
+			500, TypeAPIError, TypeAPIError, CodeInternalError, nil},
+		{"route unimplemented", "Route declared but unimplemented", raise(501, CodeRouteNotImplemented),
+			501, TypeAPIError, TypeAPIError, CodeRouteNotImplemented, nil},
+		{
+			// §11.2's 502 row, whose code column is "the upstream's own string
+			// code when it sent one". It is built through [Normalize] rather
+			// than by hand so that the pass-through internal/backend's own
+			// tests assert is pinned on BOTH families: an Anthropic envelope
+			// that dropped `code` would silently discard it.
+			name:      "upstream 5xx",
+			condition: "Upstream 5xx after fallback",
+			err: func() *Error {
+				return Normalize(502, []byte(`{"error":{"message":"gone","code":"model_retired"}}`))
+			},
+			status: 502, openai: TypeAPIError, anthropic: TypeAPIError, code: "model_retired",
+		},
+		{"upstream timeout", "Upstream timeout", raise(504, CodeTimeout),
+			504, TypeAPIError, TypeAPIError, CodeTimeout, nil},
+	}
+}
+
+// TestCompat11EnvelopeIsDispatchableOnBothFamilies is the test that would have
+// caught it.
+//
+// Every §11.2 condition, rendered through the response path a client actually
+// receives — [WriteError], the one [Server.fail] calls — and decoded from the
+// bytes. For the whole life of the project every one of these produced the
+// OpenAI object on an Anthropic route, so the outer discriminator that family's
+// SDK dispatches on was absent on every error dorang has ever returned to a
+// `/v1/messages` caller.
+//
+// It is deliberately the same table internal/app/compat11_test.go drives
+// end-to-end, so the two families are pinned side by side and a row cannot be
+// fixed on one and left on the other.
+func TestCompat11EnvelopeIsDispatchableOnBothFamilies(t *testing.T) {
+	families := []struct {
+		name   string
+		family Family
+	}{
+		{"openai", FamilyOpenAIChat},
+		{"anthropic", FamilyAnthropicMessages},
+		// The other Anthropic-shaped route. §11.1 is about the protocol the
+		// caller speaks, not about one path.
+		{"anthropic count_tokens", FamilyAnthropicCountTokens},
+	}
+	for _, c := range compat11Rows() {
+		t.Run(c.name, func(t *testing.T) {
+			for _, f := range families {
+				want := c.openai
+				if f.family.Anthropic() {
+					want = c.anthropic
+				}
+				w := httptest.NewRecorder()
+				WriteError(w, c.err().ForFamily(f.family))
+
+				if w.Code != c.status {
+					t.Errorf("§11.2 %q on %s: status %d, want %d",
+						c.condition, f.name, w.Code, c.status)
+				}
+				e := decodeWire(t, w.Body.Bytes())
+				assertDispatchable(t, f.family, c.condition, e)
+				if e.Error.Type != want {
+					t.Errorf("§11.2 %q on %s: type %q, want %q",
+						c.condition, f.name, e.Error.Type, want)
+				}
+				if e.Error.Code != c.code {
+					t.Errorf("§11.2 %q on %s: code %q, want %q",
+						c.condition, f.name, e.Error.Code, c.code)
+				}
+				switch {
+				case c.param == nil && e.Error.Param != nil:
+					t.Errorf("§11.1 %q on %s: param %q, want null",
+						c.condition, f.name, *e.Error.Param)
+				case c.param != nil && e.Error.Param == nil:
+					t.Errorf("§11.1 %q on %s: param null, want %q",
+						c.condition, f.name, *c.param)
+				case c.param != nil && *e.Error.Param != *c.param:
+					t.Errorf("§11.1 %q on %s: param %q, want %q",
+						c.condition, f.name, *e.Error.Param, *c.param)
+				}
+			}
+		})
+	}
+}
+
+// TestCompat11EnvelopeOverHTTP drives the conditions this package raises
+// through a real request on both families, so the assertion covers the wiring
+// and not only the renderer.
+//
+// [WriteError] rendering the right object proves nothing if [Server.fail] never
+// tells it which family is asking — which is exactly how the defect survived: a
+// correct renderer sat in internal/wire/anthropic with no caller anywhere in
+// the tree.
+func TestCompat11EnvelopeOverHTTP(t *testing.T) {
+	cases := []struct {
+		name      string
+		condition string
+		opts      func(*Options)
+		body      string
+		status    int
+		openai    string
+		anthropic string
+		code      string
+		auth      bool
+	}{
+		{
+			name: "malformed body", condition: "Malformed request body",
+			body: `["not an object"]`, status: 400, auth: true,
+			openai: TypeInvalidRequest, anthropic: TypeInvalidRequest, code: CodeInvalidRequest,
+		},
+		{
+			name: "missing credential", condition: "Missing or malformed credential",
+			body: `{"model":"model-x"}`, status: 401, auth: false,
+			openai: TypeAuthentication, anthropic: TypeAuthentication, code: "no_credential",
+		},
+		{
+			name: "body over the cap", condition: "Body over the size cap",
+			opts:   func(o *Options) { o.MaxBodyBytes = 8 },
+			body:   `{"model":"model-x","messages":[{"role":"user","content":"a long body"}]}`,
+			status: 413, auth: true,
+			openai: TypeInvalidRequest, anthropic: TypeRequestTooLarge, code: CodeRequestTooLarge,
+		},
+		{
+			name: "gateway fault", condition: "Gateway fault",
+			opts: func(o *Options) {
+				o.Logf = func(string, ...any) {}
+				o.Dispatcher = DispatchFunc(func(context.Context, *Request, http.ResponseWriter) error {
+					panic("the handler exploded")
+				})
+			},
+			body: `{"model":"model-x"}`, status: 500, auth: true,
+			openai: TypeAPIError, anthropic: TypeAPIError, code: CodeInternalError,
+		},
+		{
+			// The upstream's own string code, through the real normalizer, on
+			// both families.
+			name: "upstream 5xx", condition: "Upstream 5xx after fallback",
+			opts: func(o *Options) {
+				o.Logf = func(string, ...any) {}
+				o.Dispatcher = DispatchFunc(func(context.Context, *Request, http.ResponseWriter) error {
+					return Normalize(502, []byte(`{"error":{"message":"gone","code":"model_retired"}}`))
+				})
+			},
+			body: `{"model":"model-x"}`, status: 502, auth: true,
+			openai: TypeAPIError, anthropic: TypeAPIError, code: "model_retired",
+		},
+		{
+			name: "upstream timeout", condition: "Upstream timeout",
+			opts: func(o *Options) {
+				o.Dispatcher = DispatchFunc(func(context.Context, *Request, http.ResponseWriter) error {
+					return NewError(http.StatusGatewayTimeout, TypeTimeout, "m").WithCode(CodeTimeout)
+				})
+			},
+			body: `{"model":"model-x"}`, status: 504, auth: true,
+			openai: TypeAPIError, anthropic: TypeAPIError, code: CodeTimeout,
+		},
+	}
+	routes := []struct {
+		name   string
+		path   string
+		family Family
+	}{
+		{"openai", "/v1/chat/completions", FamilyOpenAIChat},
+		{"anthropic", "/v1/messages", FamilyAnthropicMessages},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newTestServer(t, c.opts)
+			for _, rt := range routes {
+				want := c.openai
+				if rt.family.Anthropic() {
+					want = c.anthropic
+				}
+				r := post(rt.path, c.body)
+				if !c.auth {
+					r.Header.Del(HeaderAuthorization)
+				}
+				w := do(s, r)
+				if w.Code != c.status {
+					t.Fatalf("§11.2 %q on %s: status %d, want %d\n%s",
+						c.condition, rt.name, w.Code, c.status, w.Body.String())
+				}
+				e := decodeWire(t, w.Body.Bytes())
+				assertDispatchable(t, rt.family, c.condition, e)
+				if e.Error.Type != want {
+					t.Errorf("§11.2 %q on %s: type %q, want %q",
+						c.condition, rt.name, e.Error.Type, want)
+				}
+				if e.Error.Code != c.code {
+					t.Errorf("§11.2 %q on %s: code %q, want %q",
+						c.condition, rt.name, e.Error.Code, c.code)
+				}
+			}
+		})
+	}
+}
+
+// TestMidStreamErrorUsesTheFamilysFraming is the half a status code cannot
+// reach: once the first frame is out the response is a 200 and the only channel
+// left is the body.
+//
+// The two families frame that channel differently and the difference decides
+// whether the client sees the error at all. COMPATIBILITY §1.1 and §1.3 give
+// chat completions a data-only frame followed by `data: [DONE]`; §6.1 and §6.2
+// give this other protocol `event: error` with BOTH lines, no `[DONE]`, and no
+// `message_stop` after it. An Anthropic client dispatches on the event NAME, so
+// a data-only frame is not misread — it is discarded, and a failed stream
+// becomes indistinguishable from a truncated one.
+func TestMidStreamErrorUsesTheFamilysFraming(t *testing.T) {
+	s := newTestServer(t, func(o *Options) {
+		o.Dispatcher = DispatchFunc(func(_ context.Context, rq *Request, w http.ResponseWriter) error {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: message_start\ndata: {\"x\":1}\n\n")
+			return NewError(http.StatusBadGateway, TypeAPIError, "upstream died").
+				WithCode("upstream_gone")
+		})
+	})
+
+	t.Run("openai", func(t *testing.T) {
+		w := do(s, post("/v1/chat/completions", `{"model":"model-x","stream":true}`))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 — the status went out with the first frame", w.Code)
+		}
+		body := w.Body.String()
+		want := "data: {\"error\":{\"message\":\"upstream died\",\"type\":\"api_error\"," +
+			"\"param\":null,\"code\":\"upstream_gone\"}}\n\ndata: [DONE]\n\n"
+		if !strings.HasSuffix(body, want) {
+			t.Errorf("§1.3 frames\n got %q\nwant a suffix of %q", body, want)
+		}
+	})
+
+	t.Run("anthropic", func(t *testing.T) {
+		w := do(s, post("/v1/messages", `{"model":"model-x","stream":true}`))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d, want 200 — the status went out with the first frame", w.Code)
+		}
+		body := w.Body.String()
+		want := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\"," +
+			"\"message\":\"upstream died\",\"param\":null,\"code\":\"upstream_gone\"}}\n\n"
+		if !strings.HasSuffix(body, want) {
+			t.Errorf("§6.1 frames\n got %q\nwant a suffix of %q", body, want)
+		}
+		// §6.2: this protocol has no [DONE]. Emitting one leaves a conforming
+		// parser with a frame it cannot name.
+		if strings.Contains(body, "[DONE]") {
+			t.Errorf("§6.2: the chat-completions terminator is in an Anthropic stream: %q", body)
+		}
+		// And the frame a client dispatches on is decodable as this family's
+		// envelope, which is the assertion the framing exists to make possible.
+		name, data, ok := lastSSEFrame(body)
+		if !ok {
+			t.Fatalf("no SSE frame in %q", body)
+		}
+		if name != "error" {
+			t.Errorf("§6.2: last frame is event %q, want \"error\"", name)
+		}
+		e := decodeWire(t, []byte(data))
+		assertDispatchable(t, FamilyAnthropicMessages, "mid-stream failure", e)
+		if e.Error.Code != "upstream_gone" {
+			t.Errorf("code %q, want upstream_gone", e.Error.Code)
+		}
+	})
+}
+
+// lastSSEFrame returns the event name and data of the final frame in an SSE
+// body. It parses rather than string-matches, because the claim under test is
+// that a conforming parser can route the frame.
+func lastSSEFrame(body string) (name, data string, ok bool) {
+	frames := strings.Split(strings.TrimSuffix(body, "\n\n"), "\n\n")
+	if len(frames) == 0 {
+		return "", "", false
+	}
+	for _, line := range strings.Split(frames[len(frames)-1], "\n") {
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data = strings.TrimPrefix(line, "data: ")
+		}
+	}
+	return name, data, data != ""
 }
 
 // TestUnknownModelOnTheModelsRoute is §11.1's own worked example, byte for byte.

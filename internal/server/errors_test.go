@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +45,27 @@ func TestErrorEnvelopeGolden(t *testing.T) {
 			name: "control characters and quotes are escaped",
 			err:  NewError(http.StatusBadRequest, TypeInvalidRequest, "line\nbreak \"quoted\" \x01"),
 			want: `{"error":{"message":"line\nbreak \"quoted\" \u0001","type":"invalid_request_error","param":null,"code":"400"}}`,
+		},
+		{
+			// The Anthropic family's object, §11.1: the outer discriminator is
+			// present and §7.1's four keys are inside it — the union that
+			// section describes.
+			name: "anthropic family carries the outer discriminator",
+			err: NewError(http.StatusNotFound, TypeNotFound, "no such model").
+				WithParam("model").WithCode(CodeModelNotFound).
+				ForFamily(FamilyAnthropicMessages),
+			want: `{"type":"error","error":{"type":"not_found_error","message":"no such model","param":"model","code":"model_not_found"}}`,
+		},
+		{
+			// §2.1a's serializer rules hold on BOTH objects. This one is
+			// rendered by encoding/json rather than by the appenders above, so
+			// the property is asserted again rather than inherited: a plain
+			// json.Marshal there emits &amp;&amp; and &lt;b&gt;, which no
+			// other server does.
+			name: "anthropic family: HTML escaping is off and UTF-8 stays raw",
+			err: NewError(http.StatusBadRequest, TypeInvalidRequest, `a && b, <b>c</b> 모델 🚀`).
+				ForFamily(FamilyAnthropicMessages),
+			want: `{"type":"error","error":{"type":"invalid_request_error","message":"a && b, <b>c</b> 모델 🚀","param":null,"code":"400"}}`,
 		},
 	}
 	for _, c := range cases {
@@ -298,9 +320,16 @@ func TestWriteErrorSetsRetryAfterAndNativeType(t *testing.T) {
 // TestSSEErrorFraming is COMPATIBILITY §1.3: a mid-stream error is delivered in
 // band, followed by the terminator. There is no other channel — the status went
 // out with the first frame and is already 200.
+//
+// This is the CHAT-COMPLETIONS framing, and it is asserted through the writer
+// the response path actually calls rather than through the appender, so that a
+// family switch put in the wrong place shows up here.
 func TestSSEErrorFraming(t *testing.T) {
-	e := NewError(http.StatusBadGateway, TypeAPIError, "upstream died")
-	got := string(appendSSEError(nil, e))
+	e := NewError(http.StatusBadGateway, TypeAPIError, "upstream died").
+		ForFamily(FamilyOpenAIChat)
+	var b strings.Builder
+	writeSSEError(&b, e)
+	got := b.String()
 	want := "data: {\"error\":{\"message\":\"upstream died\",\"type\":\"api_error\",\"param\":null,\"code\":\"502\"}}\n\ndata: [DONE]\n\n"
 	if got != want {
 		t.Errorf("frames\n got %q\nwant %q", got, want)
