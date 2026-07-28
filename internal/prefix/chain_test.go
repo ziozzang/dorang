@@ -26,7 +26,7 @@ func TestOrderSensitivity(t *testing.T) {
 		return b.Bytes()
 	}
 
-	base := Compute("g", mk("alpha", "beta", "gamma"), seg)
+	base := Compute("t", "g", mk("alpha", "beta", "gamma"), seg)
 
 	cases := []struct {
 		name string
@@ -42,7 +42,7 @@ func TestOrderSensitivity(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			other := Compute("g", tc.body, seg)
+			other := Compute("t", "g", tc.body, seg)
 			// A permutation must not reproduce the full chain.
 			if len(other) == len(base) && digestsEqual(base, other) {
 				t.Fatalf("%s produced an identical chain; order is not being enforced", tc.name)
@@ -85,7 +85,7 @@ func TestPermutationsNeverCollide(t *testing.T) {
 			for _, i := range cur {
 				body = append(body, blocks[i]...)
 			}
-			ds := Compute("g", body, seg)
+			ds := Compute("t", "g", body, seg)
 			final := ds[len(ds)-1]
 			if prev, dup := seen[final]; dup {
 				t.Fatalf("permutation %v collided with %v", cur, prev)
@@ -107,8 +107,8 @@ func TestPermutationsNeverCollide(t *testing.T) {
 // Length is folded into each step precisely so two different splits of the same
 // bytes cannot hash alike.
 func TestLengthDisambiguatesBoundaries(t *testing.T) {
-	a := Compute("g", []byte("aabb"), 2) // segments "aa","bb"
-	b := Compute("g", []byte("aabb"), 4) // segment  "aabb"
+	a := Compute("t", "g", []byte("aabb"), 2) // segments "aa","bb"
+	b := Compute("t", "g", []byte("aabb"), 4) // segment  "aabb"
 	if a[len(a)-1] == b[len(b)-1] {
 		t.Fatal("different segmentations of the same bytes produced the same digest")
 	}
@@ -116,8 +116,8 @@ func TestLengthDisambiguatesBoundaries(t *testing.T) {
 
 func TestGroupIsolation(t *testing.T) {
 	body := bytes.Repeat([]byte("x"), 100)
-	a := Compute("group-a", body, 32)
-	b := Compute("group-b", body, 32)
+	a := Compute("t", "group-a", body, 32)
+	b := Compute("t", "group-b", body, 32)
 	for i := range a {
 		if a[i] == b[i] {
 			t.Fatalf("identical bytes in different groups shared digest at depth %d", i)
@@ -130,8 +130,8 @@ func TestGroupIsolation(t *testing.T) {
 func TestSharedPrefixMatchesToDivergence(t *testing.T) {
 	const seg = 16
 	shared := bytes.Repeat([]byte("s"), seg*3)
-	a := Compute("g", append(append([]byte{}, shared...), bytes.Repeat([]byte("a"), seg*4)...), seg)
-	b := Compute("g", append(append([]byte{}, shared...), bytes.Repeat([]byte("b"), seg*4)...), seg)
+	a := Compute("t", "g", append(append([]byte{}, shared...), bytes.Repeat([]byte("a"), seg*4)...), seg)
+	b := Compute("t", "g", append(append([]byte{}, shared...), bytes.Repeat([]byte("b"), seg*4)...), seg)
 
 	matched := 0
 	for i := 0; i < len(a) && i < len(b); i++ {
@@ -153,7 +153,7 @@ func TestSharedPrefixMatchesToDivergence(t *testing.T) {
 // fixed-size chunking would put ~4000 entries in the table for a 16 MiB body.
 func TestDepthIsLogarithmic(t *testing.T) {
 	for _, size := range []int{4 << 10, 1 << 20, 16 << 20} {
-		ds := Compute("g", make([]byte, size), DefaultBaseSegment)
+		ds := Compute("t", "g", make([]byte, size), DefaultBaseSegment)
 		linear := size / DefaultBaseSegment
 		if len(ds) > 24 {
 			t.Fatalf("size %d produced %d digests, above the depth guard", size, len(ds))
@@ -171,10 +171,10 @@ func TestStreamingMatchesWholeBuffer(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	body := make([]byte, 300000)
 	rng.Read(body)
-	want := Compute("g", body, DefaultBaseSegment)
+	want := Compute("t", "g", body, DefaultBaseSegment)
 
 	for _, chunk := range []int{1, 7, 4095, 4096, 4097, 65536} {
-		c := NewChain("g", DefaultBaseSegment)
+		c := NewChain("t", "g", DefaultBaseSegment)
 		for off := 0; off < len(body); off += chunk {
 			end := off + chunk
 			if end > len(body) {
@@ -194,7 +194,7 @@ func TestStreamingMatchesWholeBuffer(t *testing.T) {
 // A short conversation still gets a digest — those benefit most from landing on
 // a warm backend, so producing nothing would defeat the feature.
 func TestShortBodyStillProducesDigest(t *testing.T) {
-	ds := Compute("g", []byte("hi"), DefaultBaseSegment)
+	ds := Compute("t", "g", []byte("hi"), DefaultBaseSegment)
 	if len(ds) != 1 {
 		t.Fatalf("want 1 digest for a short body, got %d", len(ds))
 	}
@@ -204,13 +204,13 @@ func TestShortBodyStillProducesDigest(t *testing.T) {
 }
 
 func TestEmptyBodyProducesNoDigest(t *testing.T) {
-	if ds := Compute("g", nil, DefaultBaseSegment); len(ds) != 0 {
+	if ds := Compute("t", "g", nil, DefaultBaseSegment); len(ds) != 0 {
 		t.Fatalf("want 0 digests for an empty body, got %d", len(ds))
 	}
 }
 
 func TestSealIsIdempotent(t *testing.T) {
-	c := NewChain("g", 16)
+	c := NewChain("t", "g", 16)
 	_, _ = c.Write(bytes.Repeat([]byte("z"), 100))
 	first := append([]Digest{}, c.Seal()...)
 	second := c.Seal()
@@ -225,7 +225,7 @@ func TestSealIsIdempotent(t *testing.T) {
 }
 
 func TestDepthGuard(t *testing.T) {
-	c := NewChain("g", 1)
+	c := NewChain("t", "g", 1)
 	_, _ = c.Write(bytes.Repeat([]byte("q"), 1<<20))
 	if got := len(c.Seal()); got > MaxDepth {
 		t.Fatalf("depth %d exceeded the guard of %d", got, MaxDepth)
@@ -252,7 +252,7 @@ func BenchmarkChain(b *testing.B) {
 			b.SetBytes(int64(size))
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_ = Compute("group", body, DefaultBaseSegment)
+				_ = Compute("t", "group", body, DefaultBaseSegment)
 			}
 		})
 	}

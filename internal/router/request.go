@@ -85,6 +85,17 @@ type Request struct {
 	// Session identifies the conversation for session stickiness. Empty means
 	// no pin is created and none is consulted.
 	Session string
+	// PrincipalMax is this caller's own concurrency ceiling, from the key,
+	// user or team column max_parallel_requests — the most restrictive of the
+	// three. Zero means the subject declares none and only the deployment's
+	// static capacity.principals table applies.
+	//
+	// It travels on the request rather than living in internal/capacity's
+	// configuration because it is a per-credential value that arrives with the
+	// credential, and the broker's table is static YAML loaded at startup. The
+	// column existed, was imported, was administered, and reached no enforcement
+	// at all until it was carried here.
+	PrincipalMax int
 
 	// Required is what this request actually uses (§10.1). Its structural bits
 	// are a filter: a deployment that cannot express them is removed before

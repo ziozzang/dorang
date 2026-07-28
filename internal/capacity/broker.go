@@ -157,6 +157,15 @@ type Request struct {
 	ProviderGroup string
 	// PrincipalID is the api key, user or team id. Empty skips the axis.
 	PrincipalID string
+	// PrincipalMax is a ceiling carried by the principal itself, from the
+	// credential's own max_parallel_requests rather than from this broker's
+	// static table. Zero means the subject declares none.
+	//
+	// The two are combined by taking the smaller, which is DESIGN §11.2's "the
+	// most restrictive wins" applied to concurrency. A per-key ceiling must be
+	// able to tighten a deployment-wide default without being able to raise it,
+	// or a caller who can set their own column can also set their own limit.
+	PrincipalMax int
 	// Candidates are the credentials that may serve this request. An empty
 	// slice is legal and reserves only the non-credential axes.
 	Candidates []Candidate
@@ -379,7 +388,7 @@ func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 		out = append(out, axisNeed{globalKey(), b.global})
 	}
 	if req.PrincipalID != "" {
-		if l := b.principalLimit(req.PrincipalID); l > 0 {
+		if l := mostRestrictive(b.principalLimit(req.PrincipalID), req.PrincipalMax); l > 0 {
 			out = append(out, axisNeed{principalKey(req.PrincipalID), l})
 		}
 	}
@@ -423,6 +432,22 @@ func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 		}
 	}
 	return out
+}
+
+// mostRestrictive combines two ceilings where zero means "no ceiling". It is
+// the smaller of the two whenever both are set, so a per-credential limit can
+// tighten a deployment-wide one and never loosen it.
+func mostRestrictive(a, b int) int {
+	switch {
+	case a <= 0:
+		return b
+	case b <= 0:
+		return a
+	case b < a:
+		return b
+	default:
+		return a
+	}
 }
 
 func (b *Broker) principalLimit(id string) int {

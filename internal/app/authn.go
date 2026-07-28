@@ -98,8 +98,9 @@ func recordFromAPIKey(k *store.APIKey) (auth.Record, error) {
 // interface, and internal/auth's is a struct with a KeyID FIELD. A method and a
 // field cannot share a name, so the struct is wrapped rather than embedded.
 type authAdapter struct {
-	a   *auth.Authenticator
-	now func() time.Time
+	a     *auth.Authenticator
+	now   func() time.Time
+	rates *rateMeter
 }
 
 // AuthenticateHeader implements server.Authenticator.
@@ -108,13 +109,20 @@ func (ad *authAdapter) AuthenticateHeader(ctx context.Context, h http.Header) (s
 	if err != nil {
 		return nil, authError(err)
 	}
-	return &principal{p: p, now: ad.now}, nil
+	return &principal{p: p, now: ad.now, rates: ad.rates}, nil
 }
 
 // principal is the server's view of an authenticated caller.
+//
+// One is built per request, which is what lets counted below be a plain field:
+// it records that THIS request has already been counted against the rate
+// meters, so a handler that authorizes fifty batch rows does not count fifty
+// requests.
 type principal struct {
-	p   *auth.Principal
-	now func() time.Time
+	p       *auth.Principal
+	now     func() time.Time
+	rates   *rateMeter
+	counted bool
 }
 
 // KeyID implements server.Principal.
@@ -127,12 +135,69 @@ func (p *principal) UserID() string { return p.p.UserID }
 func (p *principal) TeamID() string { return p.p.TeamID }
 
 // Authorize implements server.Principal.
+//
+// The observed rates come from the meter rather than being left at zero, which
+// is the whole of DESIGN §11.2's rate half. Reading before recording is
+// deliberate: the ceiling is "requests already counted this minute", so the
+// request being authorized is not one of them, and a limit of 1 admits one
+// request rather than none.
 func (p *principal) Authorize(a server.Access) error {
-	err := p.p.Authorize(auth.Access{Now: p.now(), Model: a.Model, Route: a.Route})
+	err := p.p.Authorize(auth.Access{
+		Now: p.now(), Model: a.Model, Route: a.Route, Rates: p.rates,
+	})
 	if err != nil {
 		return authError(err)
 	}
+	if !p.counted {
+		p.counted = true
+		p.rates.record(p.p, 1, 0)
+	}
 	return nil
+}
+
+// recordTokens adds a finished request's token count to the rate meters. It is
+// called once, at settlement, because that is when the number exists.
+func (p *principal) recordTokens(n int64) {
+	if p == nil || n <= 0 {
+		return
+	}
+	p.rates.record(p.p, 0, n)
+}
+
+// MaxParallel implements the ceiling the dispatcher reads for
+// capacity.Request.PrincipalMax. The most restrictive of key, user and team
+// wins, matching every other limit on this type.
+func (p *principal) MaxParallel() int {
+	if p == nil || p.p == nil || p.p.Master {
+		return 0
+	}
+	return auth.MostRestrictiveParallel(&p.p.Key, p.p.User, p.p.Team)
+}
+
+// ModelsRestricted implements server.ModelRestricted.
+//
+// It answers "is there a list at all", which is what a route that could not
+// determine the model has to know before it decides whether that is fine or
+// fatal. A key with no allow-list anywhere is unrestricted and a passthrough
+// body dorang cannot parse costs it nothing.
+func (p *principal) ModelsRestricted() bool {
+	if p == nil || p.p == nil || p.p.Master {
+		return false
+	}
+	for _, l := range []*auth.Limits{&p.p.Key, p.p.User, p.p.Team} {
+		if l == nil {
+			continue
+		}
+		for _, m := range l.Models {
+			if m == "*" {
+				continue
+			}
+			if m != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // AllowsModel implements server.Principal.

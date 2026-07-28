@@ -23,6 +23,13 @@ type UploadRequest struct {
 	Content io.Reader
 	// ExpiresAfter, when set, marks the file for expiry that far in the future.
 	ExpiresAfter time.Duration
+	// Authorize refuses a row naming a model the uploading credential may not
+	// use. It is REQUIRED for PurposeBatch: an input file is a list of model
+	// calls, and accepting one without checking who may make them is how a key
+	// restricted to one model came to dispatch any model in the catalog.
+	//
+	// A nil authorizer on a batch upload is an error, not a permissive default.
+	Authorize ModelAuthorizer
 }
 
 // UploadFile stores a file, validating it when its purpose says what it is
@@ -40,6 +47,14 @@ func (s *Service) UploadFile(ctx context.Context, req UploadRequest) (*File, err
 	}
 	if req.Content == nil {
 		return nil, fmt.Errorf("%w: file content is required", ErrInvalidRequest)
+	}
+	// Refused before a byte is written. A batch input file is a list of paid
+	// model calls, and this is the one moment the uploader's own allow-list is
+	// in hand — the rows are dispatched later, asynchronously, by a process
+	// that may not be this one.
+	if req.Purpose == PurposeBatch && req.Authorize == nil {
+		return nil, fmt.Errorf("%w: a batch input file cannot be accepted without a model "+
+			"authorizer for the uploading credential", ErrInvalidRequest)
 	}
 
 	id := newID("file-")
@@ -61,7 +76,7 @@ func (s *Service) UploadFile(ctx context.Context, req UploadRequest) (*File, err
 	}
 
 	if req.Purpose == PurposeBatch {
-		if err := s.validateStored(ctx, id); err != nil {
+		if err := s.validateStored(ctx, id, req.Authorize); err != nil {
 			_ = s.cfg.Blobs.Remove(ctx, id)
 			return nil, err
 		}
@@ -92,13 +107,15 @@ func (s *Service) UploadFile(ctx context.Context, req UploadRequest) (*File, err
 // validateStored runs the JSONL rules over content already in blob storage. No
 // endpoint is enforced: at upload time the file does not yet belong to a batch,
 // so a row may name any batch-capable endpoint.
-func (s *Service) validateStored(ctx context.Context, ref string) error {
+func (s *Service) validateStored(ctx context.Context, ref string, authorize ModelAuthorizer) error {
 	rd, err := s.cfg.Blobs.Open(ctx, ref)
 	if err != nil {
 		return err
 	}
 	defer rd.Close()
-	ve, err := validateInput(rd, s.validateConfig(""), nil)
+	vc := s.validateConfig("")
+	vc.authorize = authorize
+	ve, err := validateInput(rd, vc, nil)
 	if err != nil {
 		return err
 	}

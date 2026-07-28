@@ -349,6 +349,7 @@ func TestAppSuppliedRouteOverridesTheBuiltIn(t *testing.T) {
 		o.Routes = []Route{{
 			Pattern: "/v1/responses", Methods: MethodPOST,
 			Name: "responses_override", NeedsBody: true,
+			ModelAuth: ModelAuthGate,
 			Handler: func(w http.ResponseWriter, rq *Request) error {
 				_, err := w.Write([]byte(`{"override":true}`))
 				return err

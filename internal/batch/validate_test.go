@@ -102,7 +102,7 @@ func TestUploadRejectsEachInvalidClass(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, nil)
 			_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-				Filename: "in.jsonl", Purpose: PurposeBatch, Content: strings.NewReader(tc.content),
+				Filename: "in.jsonl", Purpose: PurposeBatch, Content: strings.NewReader(tc.content), Authorize: allowAllModels,
 			})
 			ve := asValidation(t, err)
 			if ve.Len() != 1 {
@@ -139,7 +139,7 @@ func TestDuplicateCustomIDRejected(t *testing.T) {
 	}, "\n") + "\n"
 
 	_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-		Filename: "dup.jsonl", Purpose: PurposeBatch, Content: strings.NewReader(content),
+		Filename: "dup.jsonl", Purpose: PurposeBatch, Content: strings.NewReader(content), Authorize: allowAllModels,
 	})
 	ve := asValidation(t, err)
 	if ve.Len() != 1 {
@@ -172,7 +172,7 @@ func TestValidationReportsEveryBadLine(t *testing.T) {
 	}, "\n") + "\n"
 
 	_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-		Purpose: PurposeBatch, Content: strings.NewReader(content),
+		Purpose: PurposeBatch, Content: strings.NewReader(content), Authorize: allowAllModels,
 	})
 	ve := asValidation(t, err)
 	if ve.Len() != 3 {
@@ -193,7 +193,7 @@ func TestValidationCeilings(t *testing.T) {
 		content := jsonlRow("req-1", "m1", "/v1/chat/completions", "short") + "\n" +
 			jsonlRow("req-2", "m1", "/v1/chat/completions", strings.Repeat("x", 500)) + "\n"
 		_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-			Purpose: PurposeBatch, Content: strings.NewReader(content),
+			Purpose: PurposeBatch, Content: strings.NewReader(content), Authorize: allowAllModels,
 		})
 		ve := asValidation(t, err)
 		if ve.Errs[0].Code != CodeLineTooLarge || ve.Errs[0].Line != 2 {
@@ -207,7 +207,7 @@ func TestValidationCeilings(t *testing.T) {
 	t.Run("too many rows", func(t *testing.T) {
 		h := newHarness(t, func(c *Config) { c.MaxRows = 2 })
 		_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-			Purpose: PurposeBatch, Content: strings.NewReader(jsonlFile(3, "m1")),
+			Purpose: PurposeBatch, Content: strings.NewReader(jsonlFile(3, "m1")), Authorize: allowAllModels,
 		})
 		ve := asValidation(t, err)
 		if ve.Errs[0].Code != CodeTooManyRequests {
@@ -221,7 +221,7 @@ func TestValidationCeilings(t *testing.T) {
 	t.Run("file too large", func(t *testing.T) {
 		h := newHarness(t, func(c *Config) { c.MaxFileBytes = 100 })
 		_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-			Purpose: PurposeBatch, Content: strings.NewReader(jsonlFile(10, "m1")),
+			Purpose: PurposeBatch, Content: strings.NewReader(jsonlFile(10, "m1")), Authorize: allowAllModels,
 		})
 		ve := asValidation(t, err)
 		if ve.Errs[0].Code != CodeFileTooLarge {
@@ -238,7 +238,7 @@ func TestValidationCeilings(t *testing.T) {
 		h := newHarness(t, func(c *Config) { c.MaxCustomIDChars = 8 })
 		content := jsonlRow(strings.Repeat("i", 9), "m1", "/v1/chat/completions", "hi") + "\n"
 		_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-			Purpose: PurposeBatch, Content: strings.NewReader(content),
+			Purpose: PurposeBatch, Content: strings.NewReader(content), Authorize: allowAllModels,
 		})
 		ve := asValidation(t, err)
 		if ve.Errs[0].Code != CodeCustomIDTooLong {

@@ -435,11 +435,12 @@ func (g *Gateway) Do(ctx context.Context, c Call) (*Reply, error) {
 	// margin is deliberately on the high side of the usual rule of thumb.
 	rr.InputTokens = int64(len(c.Body)/3 + 16)
 	if c.Prefix {
-		// The chain is seeded with the model group so two groups can never
-		// share an entry (DESIGN §7.4b). The group is what the alias resolves
-		// to, not the name the client typed.
+		// The chain is seeded with the tenant and then the model group, so
+		// neither two groups nor two tenants can share an entry (DESIGN §7.4b
+		// as amended). The group is what the alias resolves to, not the name
+		// the client typed.
 		group, _ := g.Router.Resolve(req.Model)
-		rr.Digests = prefix.Compute(group, c.Body, 0)
+		rr.Digests = prefix.Compute(c.Tenant, group, c.Body, 0)
 	}
 
 	reply := &Reply{Header: http.Header{}}

@@ -161,6 +161,59 @@ func (f Family) Inference() bool {
 // written yet and an in-band SSE error if a stream has already started.
 type Handler func(w http.ResponseWriter, rq *Request) error
 
+// ModelAuth declares how a route satisfies the per-key model allow-list.
+//
+// It exists because "the check is written" and "the check is reached" turned
+// out to be different facts three separate times: the gate consults the
+// allow-list only when it managed to scan a model out of the body, so a route
+// whose body has no top-level model (batch create) or whose body is never
+// parsed at all (passthrough) sailed past a restriction the operator had set.
+// The bypass was silent in both cases because a skipped check and a passed
+// check look identical from the outside.
+//
+// Making the field required removes the silence. [ModelAuthUnset] is the zero
+// value and [newRouteTable] refuses to compile a route that still carries it,
+// so a new route cannot reach the mux until somebody has answered the question
+// — and answering it wrong is at least a visible answer in the route table
+// rather than an omission nobody can grep for.
+type ModelAuth uint8
+
+// The model-authorization modes.
+const (
+	// ModelAuthUnset is the zero value. A route carrying it is refused at
+	// registration: the mode is a decision, and the zero value is the absence
+	// of one.
+	ModelAuthUnset ModelAuth = iota
+	// ModelAuthGate means the server's gate enforces the allow-list from the
+	// model it scanned out of the body. Only valid together with NeedsBody:
+	// without a body there is nothing to scan and the gate would silently
+	// enforce nothing, which is the defect this type exists to prevent.
+	ModelAuthGate
+	// ModelAuthHandler means the handler names every model it is about to
+	// dispatch to [Request.AuthorizeModel]. Routes that carry many models in
+	// one request (a batch input file) or that never parse their body
+	// (passthrough) use this.
+	ModelAuthHandler
+	// ModelAuthNone means the route cannot reach a paid model call at all:
+	// health, metrics, the model listing, and the batch/file management
+	// endpoints that only read records back.
+	ModelAuthNone
+)
+
+// String names the mode.
+func (m ModelAuth) String() string {
+	switch m {
+	case ModelAuthGate:
+		return "gate"
+	case ModelAuthHandler:
+		return "handler"
+	case ModelAuthNone:
+		return "none"
+	default:
+		return "unset"
+	}
+}
+
 // Route is one registered pattern.
 //
 // Patterns are '/'-separated. A segment may be a literal, a parameter
@@ -195,6 +248,9 @@ type Route struct {
 	// so the allow-list is checked against the name that will actually be
 	// dispatched.
 	ModelParam string
+	// ModelAuth declares how this route satisfies the model allow-list. It has
+	// no default: [ModelAuthUnset] is refused at registration.
+	ModelAuth ModelAuth
 	// Handler serves the route.
 	Handler Handler
 
@@ -219,6 +275,11 @@ const (
 
 // ErrBadPattern is returned by the table builder for a malformed pattern.
 var ErrBadPattern = errors.New("server: malformed route pattern")
+
+// ErrModelAuthUnset is returned by the table builder for a route that did not
+// declare a [ModelAuth] mode, or that declared [ModelAuthGate] without a body
+// for the gate to read the model out of.
+var ErrModelAuthUnset = errors.New("server: route does not declare a ModelAuth mode")
 
 // compile turns a pattern into segments.
 func compile(pattern string) ([]segment, error) {
@@ -358,6 +419,21 @@ func overrideByPattern(routes []*Route) []*Route {
 func newRouteTable(routes []*Route) (*routeTable, error) {
 	t := &routeTable{exact: make(map[string]*Route, len(routes))}
 	for _, rt := range routes {
+		// The allow-list decision is checked before the pattern, because a
+		// route that forgot it is a security defect and a route with a bad
+		// pattern is a typo.
+		//
+		// ModelAuthGate without NeedsBody is refused rather than tolerated: the
+		// gate enforces the allow-list from the model it scanned out of the
+		// body, and with no body it scans nothing, compares "" against the
+		// list, and skips the check — which is exactly how passthrough came to
+		// dispatch unrestricted models while looking authorized.
+		switch {
+		case rt.ModelAuth == ModelAuthUnset:
+			return nil, ErrModelAuthUnset
+		case rt.ModelAuth == ModelAuthGate && !rt.NeedsBody:
+			return nil, ErrModelAuthUnset
+		}
 		segs, err := compile(rt.Pattern)
 		if err != nil {
 			return nil, err

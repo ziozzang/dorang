@@ -73,12 +73,31 @@ type Chain struct {
 	sealed  bool
 }
 
-// NewChain starts a chain seeded with the model group. Seeding with the group
-// means two groups can never share an entry, so a match always implies the
-// candidate set is the same one.
+// NewChain starts a chain seeded with the tenant and then the model group:
+//
+//	h₀ = H(tenant ‖ 0x00 ‖ group)
+//
+// Seeding with the group means two groups can never share an entry, so a match
+// always implies the candidate set is the same one. Seeding with the TENANT
+// first means two tenants can never share one either, and that is a
+// confidentiality property rather than a routing one.
+//
+// DESIGN §7.4b specified h₀ = H(group_id) alone, and on a shared gateway that
+// is not enough. A prefix table keyed on the group is a byte-exact oracle over
+// other tenants' prompt prefixes: a caller sends candidate bytes, reads
+// prefix_hit:depth=N off its own routing header, and learns that somebody else
+// recently sent exactly those bytes on that model. It is also a poisoning
+// primitive, because prefix affinity outranks cost in the default strategy
+// chain, so planting an entry steers another tenant's next request onto a
+// deployment of the planter's choosing. §7.4a already required the tenant to
+// lead its key; the two need the same rule.
+//
+// The 0x00 separator is what stops "ab" ‖ "c" and "a" ‖ "bc" seeding alike —
+// neither component may contain a NUL, and a tenant id is derived from stored
+// ids rather than from anything a caller writes.
 //
 // baseSegment of zero uses DefaultBaseSegment.
-func NewChain(group string, baseSegment int) *Chain {
+func NewChain(tenant, group string, baseSegment int) *Chain {
 	if baseSegment <= 0 {
 		baseSegment = DefaultBaseSegment
 	}
@@ -88,7 +107,11 @@ func NewChain(group string, baseSegment int) *Chain {
 		seg:     sha256.New(),
 		digests: make([]Digest, 0, 8),
 	}
-	c.state = sha256.Sum256([]byte(group))
+	h := sha256.New()
+	h.Write([]byte(tenant))
+	h.Write([]byte{0})
+	h.Write([]byte(group))
+	h.Sum(c.state[:0])
 	c.seg.Write(c.state[:])
 	return c
 }
@@ -166,8 +189,8 @@ func (c *Chain) Digests() []Digest { return c.digests }
 func (c *Chain) Depth() int { return c.depth }
 
 // Compute is the whole-buffer convenience form of the streaming API above.
-func Compute(group string, body []byte, baseSegment int) []Digest {
-	c := NewChain(group, baseSegment)
+func Compute(tenant, group string, body []byte, baseSegment int) []Digest {
+	c := NewChain(tenant, group, baseSegment)
 	_, _ = c.Write(body)
 	return c.Seal()
 }

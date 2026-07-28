@@ -43,7 +43,12 @@ const (
 	CodeInvalidBody      = "invalid_body"
 	CodeMissingModel     = "missing_model"
 	CodeModelNotFound    = "model_not_found"
-	CodeReadFailed       = "read_failed"
+	// CodeModelNotAllowed is a row naming a model the owning credential's
+	// allow-list refuses. It is distinct from CodeModelNotFound on purpose: one
+	// says the deployment does not serve it, the other says this caller may not
+	// ask for it, and collapsing them would tell a caller which models exist.
+	CodeModelNotAllowed = "model_not_allowed"
+	CodeReadFailed      = "read_failed"
 )
 
 // ValidationError is one problem with one line of an input file.
