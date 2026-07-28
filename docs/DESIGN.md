@@ -2673,6 +2673,32 @@ lives. The round-trip test through the assembled stack — real router, real cap
 pricing, real metering, asserting the ledger row and the reserved axis — is the only thing
 that does.
 
+**This is not a pair of anecdotes. It is the dominant defect class in this codebase**, and a
+security review counted nine instances independently. Extracting the backend layer added four
+more, all of the same shape — a value computed, stored, documented, and never read:
+
+| Configured and never applied | Consequence |
+|---|---|
+| `providers[].timeout` | **no upstream attempt had a deadline** |
+| `providers[].retry` | defaulted, validated, never read |
+| an upstream `429`'s `Retry-After` | reached the cooldown but never the client, so §11.4's mandatory header could not fire |
+| `Decision.PriorityTier` | §7.5's `service_tier` fold has been dead in production |
+
+#### The harness that hid the bug
+
+The last row deserves its own note. `PriorityTier` is computed by the router and dropped on the
+way out — and the scenario harness **splices it back in itself**. So the scenario suite passes,
+green, while the production path has never sent the field.
+
+That is the mirror image of the lesson above: a package test can prove a check works while
+nothing calls it, and an integration harness can supply the very value the real path fails to.
+Both produce a passing suite over a broken system.
+
+The rule that follows: **a test harness may substitute a dependency, but never a value the
+system under test is responsible for producing.** Where a harness fills something in, that is
+itself the assertion worth writing — and if it cannot be written as an assertion, the harness
+is compensating for a gap rather than exercising a path.
+
 Consequence for the milestone gates in §17: a package is not done when its tests pass. It is
 done when something end to end exercises it and asserts an observable outside it.
 

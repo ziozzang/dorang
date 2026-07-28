@@ -3,7 +3,8 @@ package openai
 import (
 	"encoding/json"
 	"errors"
-	"sort"
+
+	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 
 // Object values.
@@ -602,87 +603,18 @@ type ModelList struct {
 // Shared JSON helpers
 // ---------------------------------------------------------------------------
 
-func knownKeys(names ...string) map[string]struct{} {
-	m := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		m[n] = struct{}{}
-	}
-	return m
-}
+func knownKeys(names ...string) map[string]struct{} { return wirejson.KnownKeys(names...) }
 
 // splitExtra returns the members of a JSON object that are not in known.
 func splitExtra(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, err
-	}
-	for k := range raw {
-		if _, ok := known[k]; ok {
-			delete(raw, k)
-		}
-	}
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	return raw, nil
+	return wirejson.SplitExtra(b, known)
 }
 
 // marshalWithExtra marshals v and splices extra's members into the resulting
 // object. Keys are sorted so the bytes are deterministic, which the golden
 // tests require.
 func marshalWithExtra(v any, extra map[string]json.RawMessage, known map[string]struct{}) ([]byte, error) {
-	b, err := Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	if len(extra) == 0 {
-		return b, nil
-	}
-	keys := make([]string, 0, len(extra))
-	for k := range extra {
-		if _, clash := known[k]; clash {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	if len(keys) == 0 {
-		return b, nil
-	}
-	sort.Strings(keys)
-	if len(b) < 2 || b[len(b)-1] != '}' {
-		return nil, errors.New("openai: cannot splice extra fields into a non-object")
-	}
-	out := make([]byte, 0, len(b)+64*len(keys))
-	out = append(out, b[:len(b)-1]...)
-	empty := len(b) == 2 // "{}"
-	for i, k := range keys {
-		if i > 0 || !empty {
-			out = append(out, ',')
-		}
-		// json.Marshal, not strconv.Quote: Go string quoting escapes control
-		// bytes as \xNN, which is not valid JSON.
-		kb, err := Marshal(k)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, kb...)
-		out = append(out, ':')
-		out = append(out, extra[k]...)
-	}
-	out = append(out, '}')
-	return out, nil
+	return wirejson.MarshalWithExtra(v, extra, known)
 }
 
-func trimSpace(b []byte) []byte {
-	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\n' || b[0] == '\r') {
-		b = b[1:]
-	}
-	for len(b) > 0 {
-		c := b[len(b)-1]
-		if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
-			break
-		}
-		b = b[:len(b)-1]
-	}
-	return b
-}
+func trimSpace(b []byte) []byte { return wirejson.TrimSpace(b) }
