@@ -32,6 +32,17 @@ const (
 	// CauseAuth is a 401/403 on the credential. It has no chain, and the
 	// credential is marked exhausted.
 	CauseAuth
+	// CauseBadRequest is a 4xx that names no other class: the REQUEST was
+	// refused, and the deployment that refused it answered correctly and
+	// promptly. It has no chain — a malformed body is malformed on every
+	// backend, so a hop only spends the caller's money to reach the identical
+	// refusal — and it is the one failure that counts for NOTHING against
+	// availability; see [countsAgainstAvailability].
+	//
+	// It is not a configuration key. §4.2's fallbacks.on table is the set of
+	// conditions an operator can route around, and this is the one condition
+	// that must never be routed around, so [ParseCause] refuses it.
+	CauseBadRequest
 
 	numCauses
 )
@@ -39,7 +50,13 @@ const (
 var causeNames = [numCauses]string{
 	"none", "rate_limit", "quota_exhausted", "context_window",
 	"content_policy", "upstream_5xx", "timeout", "budget_exceeded", "auth",
+	"bad_request",
 }
+
+// configurable reports whether a cause may appear as a fallbacks.on key. The two
+// that may not are the zero value and [CauseBadRequest]: neither names a
+// condition an operator chooses a chain for.
+func (c Cause) configurable() bool { return c != CauseNone && c != CauseBadRequest }
 
 // String returns the configuration spelling of the cause, matching the keys of
 // fallbacks.on in DESIGN §4.2.
@@ -53,7 +70,7 @@ func (c Cause) String() string {
 // ParseCause decodes a configured fallback cause.
 func ParseCause(s string) (Cause, bool) {
 	for i, n := range causeNames {
-		if n == s && Cause(i) != CauseNone {
+		if n == s && Cause(i).configurable() {
 			return Cause(i), true
 		}
 	}
@@ -63,9 +80,15 @@ func ParseCause(s string) (Cause, bool) {
 // Chainable reports whether this cause may fall back at all. It is a property
 // of the cause, not of configuration: DESIGN §7.6 gives budget_exceeded and
 // auth an empty chain, and internal/config refuses a configuration that tries
-// to give them one.
+// to give them one. bad_request joins them for the same kind of reason — the
+// next deployment refuses the same body — and it is not a configuration key at
+// all, so no configuration can override this.
 func (c Cause) Chainable() bool {
-	return c != CauseBudgetExceeded && c != CauseAuth && c != CauseNone
+	switch c {
+	case CauseNone, CauseBudgetExceeded, CauseAuth, CauseBadRequest:
+		return false
+	}
+	return true
 }
 
 // Target is where a fallback chain looks next (DESIGN §7.6).

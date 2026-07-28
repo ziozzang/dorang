@@ -277,7 +277,7 @@ func TestNextSSEData(t *testing.T) {
 
 	var got []string
 	for {
-		p, err := nextSSEData(br, &buf)
+		p, err := nextSSEData(br, &buf, maxStreamFrame)
 		if err == io.EOF {
 			break
 		}

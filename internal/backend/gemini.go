@@ -614,7 +614,7 @@ func (s *geminiSource) next() ([]canonical.StreamEvent, error) {
 		if s.done {
 			return nil, io.EOF
 		}
-		payload, err := nextSSEData(s.br, &s.data)
+		payload, err := nextSSEData(s.br, &s.data, maxStreamFrame)
 		if err != nil {
 			s.done = true
 			return nil, err

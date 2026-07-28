@@ -1,0 +1,275 @@
+# dorang — LiteLLM parity configuration (front-proxy mode)
+#
+# WHAT THIS IS
+#   The 39-model surface of the live LiteLLM instance, reproduced on dorang,
+#   with the LiteLLM instance itself as the single upstream. This is the
+#   configuration the differential harness runs, and it is deliberately a
+#   front proxy rather than a cutover: with one upstream behind both gateways,
+#   every difference the harness reports is attributable to the gateway and
+#   not to a different backend answering. `dorang-direct.yaml.tmpl` is the
+#   cutover shape.
+#
+# WHY IT IS A TEMPLATE
+#   dorang expands environment variables in secret fields ONLY (key_env /
+#   key_file). `providers[].base_url` is a literal string with no expansion,
+#   so the upstream host cannot be referenced by variable in the file itself.
+#   Render it before use:
+#
+#     set -a; . ~/env; set +a
+#     envsubst < dorang.yaml.tmpl > "$RUNDIR/dorang.yaml"
+#
+#   Only ${LITELLM_OPENAI_BASE_URL} is substituted. The API key is NOT
+#   substituted: it stays a `key_env:` reference and is read from the process
+#   environment at load. See REPORT.md gap G1.
+#
+# STATE
+#   Every state path is written with a leading `~` and relocated by
+#   $DORANG_STATE_DIR, so nothing here names a home directory.
+
+version: 1
+
+server:
+  listen: ":4100"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  # LiteLLM's own default is 6000s (COMPATIBILITY §8); dorang's schema default
+  # is 600s, so it is set explicitly rather than inherited.
+  request_timeout: 6000s
+  shutdown_grace: 30s
+
+storage:
+  driver: sqlite
+  sqlite:
+    path: ~/.dorang/dorang.db
+
+providers:
+  - name: litellm
+    kind: openai
+    base_url: ${LITELLM_OPENAI_BASE_URL}
+    timeout: 6000s
+    # LiteLLM's documented default is num_retries: 2.
+    retry: {max_attempts: 2, backoff: exponential, base: 500ms}
+    # The upstream is itself a gateway in front of hosted caches; nothing here
+    # holds KV blocks for us, so prefix affinity buys nothing and a long TTL
+    # would pin conversations for no reason.
+    prefix_ttl: 5m
+
+credentials:
+  - id: litellm-1
+    provider: litellm
+    key_env: LITELLM_OPENAI_API_KEY
+
+# ---------------------------------------------------------------------------
+# The 39 ids, forwarded verbatim.
+#
+# `upstream_model` is byte-identical to `name` for every entry, including the
+# three LiteLLM-side aliases (local, public, public-free) and the two prefixed
+# namespaces (nim:, zai:). A model name is opaque to dorang: nothing splits it
+# on ':' or '.', so `zai:glm-5-turbo` and `mistral-large-3:675b` are names, not
+# structures (CONFIG §10.1).
+#
+# The three aliases are declared as MODELS here, not under `aliases:`, because
+# resolving them dorang-side needs to know their targets and the LiteLLM key
+# available is not permitted GET /model/info (403). See REPORT.md gap G2.
+# ---------------------------------------------------------------------------
+models:
+
+  # ---- chat ----
+  - name: "deepseek-v3.2"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "deepseek-v3.2", credentials: [litellm-1]}
+  - name: "deepseek-v4-flash"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "deepseek-v4-flash", credentials: [litellm-1]}
+  - name: "deepseek-v4-pro"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "deepseek-v4-pro", credentials: [litellm-1]}
+  - name: "gemini-3-flash-preview"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "gemini-3-flash-preview", credentials: [litellm-1]}
+  - name: "gemma4:31b"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "gemma4:31b", credentials: [litellm-1]}
+  - name: "glm-4.7"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "glm-4.7", credentials: [litellm-1]}
+  - name: "glm-5"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "glm-5", credentials: [litellm-1]}
+  - name: "glm-5.1"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "glm-5.1", credentials: [litellm-1]}
+  - name: "gpt-oss:120b"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "gpt-oss:120b", credentials: [litellm-1]}
+  - name: "gpt-oss:20b"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "gpt-oss:20b", credentials: [litellm-1]}
+  - name: "kimi-k2.5"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "kimi-k2.5", credentials: [litellm-1]}
+  - name: "kimi-k2.6"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "kimi-k2.6", credentials: [litellm-1]}
+  - name: "local"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "local", credentials: [litellm-1]}
+  - name: "minimax-m2.7"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "minimax-m2.7", credentials: [litellm-1]}
+  - name: "minimax-m3"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "minimax-m3", credentials: [litellm-1]}
+  - name: "mistral-large-3:675b"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "mistral-large-3:675b", credentials: [litellm-1]}
+  - name: "nim:deepseek-v4-flash"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "nim:deepseek-v4-flash", credentials: [litellm-1]}
+  - name: "nim:deepseek-v4-pro"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "nim:deepseek-v4-pro", credentials: [litellm-1]}
+  - name: "nim:minimax-m2.7"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "nim:minimax-m2.7", credentials: [litellm-1]}
+  - name: "nim:step-3.5-flash"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "nim:step-3.5-flash", credentials: [litellm-1]}
+  - name: "public"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "public", credentials: [litellm-1]}
+  - name: "public-free"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "public-free", credentials: [litellm-1]}
+  - name: "qwen3-coder-next"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "qwen3-coder-next", credentials: [litellm-1]}
+  - name: "qwen3.5:397b"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "qwen3.5:397b", credentials: [litellm-1]}
+  - name: "zai:glm-4.5"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "zai:glm-4.5", credentials: [litellm-1]}
+  - name: "zai:glm-5"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "zai:glm-5", credentials: [litellm-1]}
+  - name: "zai:glm-5-turbo"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "zai:glm-5-turbo", credentials: [litellm-1]}
+  - name: "zai:glm-5.1"
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "zai:glm-5.1", credentials: [litellm-1]}
+
+  # ---- embeddings ----
+  - name: "embeddinggemma-300m"
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "embeddinggemma-300m", credentials: [litellm-1]}
+  - name: "jina-embeddings-v5-text-nano"
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "jina-embeddings-v5-text-nano", credentials: [litellm-1]}
+  - name: "jina-embeddings-v5-text-small"
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "jina-embeddings-v5-text-small", credentials: [litellm-1]}
+  - name: "llama-nemotron-embed-vl-1b-v2"
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "llama-nemotron-embed-vl-1b-v2", credentials: [litellm-1]}
+  - name: "pplx-embed-v1-0.6b"
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "pplx-embed-v1-0.6b", credentials: [litellm-1]}
+
+  # ---- rerank ----
+  - name: "jina-reranker-v3"
+    class: rerank
+    deployments:
+      - {provider: litellm, upstream_model: "jina-reranker-v3", credentials: [litellm-1]}
+
+  # ---- audio transcription ----
+  - name: "gpt-4o-transcribe"
+    class: transcription
+    deployments:
+      - {provider: litellm, upstream_model: "gpt-4o-transcribe", credentials: [litellm-1]}
+  - name: "whisper-1"
+    class: transcription
+    deployments:
+      - {provider: litellm, upstream_model: "whisper-1", credentials: [litellm-1]}
+
+  # ---- audio speech ----
+  - name: "tts-1"
+    class: speech
+    deployments:
+      - {provider: litellm, upstream_model: "tts-1", credentials: [litellm-1]}
+  - name: "tts-1-hd"
+    class: speech
+    deployments:
+      - {provider: litellm, upstream_model: "tts-1-hd", credentials: [litellm-1]}
+
+  # ---- image generation ----
+  - name: "gpt-image-1.5"
+    class: image
+    deployments:
+      - {provider: litellm, upstream_model: "gpt-image-1.5", credentials: [litellm-1]}
+
+classes:
+  chat: ["deepseek-v3.2", "deepseek-v4-flash", "deepseek-v4-pro", "gemini-3-flash-preview", "gemma4:31b", "glm-4.7", "glm-5", "glm-5.1", "gpt-oss:120b", "gpt-oss:20b", "kimi-k2.5", "kimi-k2.6", "local", "minimax-m2.7", "minimax-m3", "mistral-large-3:675b", "nim:deepseek-v4-flash", "nim:deepseek-v4-pro", "nim:minimax-m2.7", "nim:step-3.5-flash", "public", "public-free", "qwen3-coder-next", "qwen3.5:397b", "zai:glm-4.5", "zai:glm-5", "zai:glm-5-turbo", "zai:glm-5.1"]
+  embedding: ["embeddinggemma-300m", "jina-embeddings-v5-text-nano", "jina-embeddings-v5-text-small", "llama-nemotron-embed-vl-1b-v2", "pplx-embed-v1-0.6b"]
+  rerank: ["jina-reranker-v3"]
+  transcription: ["gpt-4o-transcribe", "whisper-1"]
+  speech: ["tts-1", "tts-1-hd"]
+  image: ["gpt-image-1.5"]
+
+fallbacks:
+  # Every model here is a distinct LiteLLM route and the classes above are
+  # capability groupings, not interchangeable pools: falling a chat request
+  # from glm-5 over to whisper-1's class-mate would be worse than the error.
+  # So class fallback is disabled and only the schema-mandated empty chains
+  # remain. LiteLLM's own fallbacks are configured per model_name upstream and
+  # are not visible from a client key (REPORT.md gap G4).
+  on:
+    rate_limit:      []
+    quota_exhausted: []
+    context_window:  []
+    content_policy:  []
+    upstream_5xx:    []
+    timeout:         []
+    budget_exceeded: []
+    auth:            []
+  max_hops: 0
+  budget_ms: 120000
+
+observability:
+  prometheus: true
+

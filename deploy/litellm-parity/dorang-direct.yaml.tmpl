@@ -1,0 +1,214 @@
+# dorang — LiteLLM cutover skeleton (direct upstreams)
+#
+# ============================== READ THIS FIRST ==============================
+# THIS FILE IS NOT VALIDATED AGAINST THE LIVE SURFACE AND MUST NOT BE DEPLOYED
+# AS-IS. It loads (`dorang --check` passes) and it demonstrates the dorang
+# idioms a LiteLLM operator needs, but every `upstream_model` in it is an
+# INFERENCE from a model id, not an observation.
+#
+# The reason is recorded rather than worked around: deriving what actually sits
+# behind each of the 39 LiteLLM routes needs `GET /model/info`, and the client
+# key in ~/env is answered **403** there ("Virtual key is not allowed to call
+# this route. Only allowed to call routes: ['llm_api_routes']"). So the true
+# provider, upstream model id, api_base and per-deployment fallback of each
+# route are not observable from outside LiteLLM. What is below is what ~/env
+# plus the model ids can justify, and nothing more. See REPORT.md gap G3.
+#
+# `dorang.yaml.tmpl` — the front-proxy configuration — is the artifact the
+# parity harness actually runs. This one is the shape of the cutover after an
+# operator with LiteLLM admin access fills in the unattributed half.
+#
+# WHAT IS ATTRIBUTED, AND ON WHAT EVIDENCE
+#
+#   zai:glm-4.5 / zai:glm-5 / zai:glm-5-turbo / zai:glm-5.1
+#       Z_AI_API_KEY + Z_AI_OPENAI_BASE_URL exist in ~/env, and the `zai:`
+#       prefix is the operator's own namespace label. Upstream ids assumed to
+#       be the prefix stripped.
+#   public / public-free
+#       OpenRouter. Not a guess: LiteLLM's own 401 for `public-free` names
+#       `OpenrouterException` in the message. OPENROUTER_API_KEY is in ~/env.
+#       The upstream model ids are NOT derivable and are left as TODO.
+#   gemma4:31b, gpt-oss:20b, gpt-oss:120b, qwen3.5:397b, mistral-large-3:675b
+#       Ollama `name:tag` form, and ~/env carries OLLAMA_API_KEY and
+#       OLLAMA_API_KEY_2 — two accounts, which is why they are configured as a
+#       credential pool below.
+#   jina-embeddings-v5-text-nano / -small, jina-reranker-v3
+#       JINA_API_KEY is in ~/env and the ids carry the vendor's own naming.
+#   qwen3-coder-next
+#       QWEN_TOKEN_PLAN_BASE_URL + QWEN_TOKEN_PLAN_KEY.
+#
+# WHAT IS NOT ATTRIBUTED (19 of 39) — no credential in ~/env identifies them:
+#   deepseek-v3.2, deepseek-v4-flash, deepseek-v4-pro,
+#   nim:deepseek-v4-flash, nim:deepseek-v4-pro, nim:minimax-m2.7,
+#   nim:step-3.5-flash, minimax-m2.7, minimax-m3, kimi-k2.5, kimi-k2.6,
+#   glm-4.7, glm-5, glm-5.1, gemini-3-flash-preview, local,
+#   embeddinggemma-300m, llama-nemotron-embed-vl-1b-v2, pplx-embed-v1-0.6b,
+#   tts-1, tts-1-hd, whisper-1, gpt-4o-transcribe, gpt-image-1.5
+#   They are absent from this file rather than guessed at.
+#
+# RENDER
+#   set -a; . ~/env; set +a
+#   envsubst '${Z_AI_OPENAI_BASE_URL} ${QWEN_TOKEN_PLAN_BASE_URL}' \
+#     < dorang-direct.yaml.tmpl > "$RUNDIR/dorang.yaml"
+#
+#   Only base URLs are substituted, and only the two that live in ~/env rather
+#   than being public constants. Every key stays a `key_env:` reference.
+# =============================================================================
+
+version: 1
+
+server:
+  listen: ":4100"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  request_timeout: 6000s
+  shutdown_grace: 30s
+
+storage:
+  driver: sqlite
+  sqlite:
+    path: ~/.dorang/dorang.db
+
+providers:
+  # z.ai. `kind: zai` resolves through the catalog's kind_aliases to `glm`,
+  # which selects the GLM wire adapter, its prompt-cache scheme and its
+  # thinking-flag reasoning shape in one word.
+  - name: zai
+    kind: zai
+    base_url: ${Z_AI_OPENAI_BASE_URL}
+    timeout: 600s
+    prefix_ttl: 5m
+
+  # Ollama Cloud. The base URL is the catalog's own declared default for this
+  # kind (https://ollama.com/v1) and is left unset here on purpose, so the
+  # value tracks the catalog rather than being pinned in two places.
+  - name: ollama-cloud
+    kind: ollama-cloud
+    timeout: 600s
+    max_concurrency: 8
+    # A hosted engine's prefix cache has no clock; blocks live until the
+    # backend evicts them under memory pressure.
+    prefix_ttl: until_evicted
+
+  # OpenRouter. Also a catalog default (https://openrouter.ai/api/v1).
+  - name: openrouter
+    kind: openrouter
+    timeout: 600s
+
+  # Jina. The `jina` kind declares NO default base URL in the catalog, so this
+  # one must be written out; it is a public constant, not a value from ~/env.
+  - name: jina
+    kind: jina
+    base_url: https://api.jina.ai
+    timeout: 120s
+
+  - name: qwen-plan
+    kind: qwen
+    base_url: ${QWEN_TOKEN_PLAN_BASE_URL}
+    timeout: 600s
+
+credentials:
+  - {id: zai-1, provider: zai, key_env: Z_AI_API_KEY}
+  # Two Ollama accounts. LiteLLM expresses this as two `model_list` entries per
+  # model with different api_keys and lets the router pick; dorang makes the
+  # account a first-class object, so a per-account ceiling is written once and
+  # applies across every model that account serves.
+  - {id: ollama-1, provider: ollama-cloud, key_env: OLLAMA_API_KEY, capacity_group: ollama-acct-1}
+  - {id: ollama-2, provider: ollama-cloud, key_env: OLLAMA_API_KEY_2, capacity_group: ollama-acct-2}
+  - {id: openrouter-1, provider: openrouter, key_env: OPENROUTER_API_KEY}
+  - {id: jina-1, provider: jina, key_env: JINA_API_KEY}
+  - {id: qwen-1, provider: qwen-plan, key_env: QWEN_TOKEN_PLAN_KEY}
+
+capacity:
+  credential_groups:
+    ollama-acct-1: {max_concurrency: 4}
+    ollama-acct-2: {max_concurrency: 4}
+  principals:
+    default: {max_concurrent: 32, max_queue_wait: 30s}
+  global: {max_concurrency: 256}
+  interactive_reserve: 0.3
+
+key_rotation:
+  strategy: least_used
+  providers:
+    ollama-cloud:
+      stickiness:
+        on_capacity: spill     # stateless chat: another account is not a wrong choice
+      keys:
+        - {id: ollama-1, key_env: OLLAMA_API_KEY,   max_concurrency: 4, capacity_group: ollama-acct-1}
+        - {id: ollama-2, key_env: OLLAMA_API_KEY_2, max_concurrency: 4, capacity_group: ollama-acct-2}
+
+models:
+  # ---- z.ai ----
+  # The client-facing name keeps the operator's `zai:` namespace; the upstream
+  # id is assumed to be the same name with the prefix removed. A model name is
+  # opaque to dorang, so this is an explicit mapping and not a parse.
+  - name: "zai:glm-4.5"
+    deployments: [{provider: zai, upstream_model: "glm-4.5", credentials: [zai-1]}]
+  - name: "zai:glm-5"
+    deployments: [{provider: zai, upstream_model: "glm-5", credentials: [zai-1]}]
+  - name: "zai:glm-5-turbo"
+    deployments: [{provider: zai, upstream_model: "glm-5-turbo", credentials: [zai-1]}]
+  - name: "zai:glm-5.1"
+    deployments: [{provider: zai, upstream_model: "glm-5.1", credentials: [zai-1]}]
+
+  # ---- Ollama Cloud. Both accounts serve every model; the pool is ordered by
+  # `key_rotation.strategy` and bounded per account by the capacity groups.
+  - name: "gemma4:31b"
+    deployments:
+      - {provider: ollama-cloud, upstream_model: "gemma4:31b", credentials: [ollama-1, ollama-2]}
+  - name: "gpt-oss:20b"
+    deployments:
+      - {provider: ollama-cloud, upstream_model: "gpt-oss:20b", credentials: [ollama-1, ollama-2]}
+  - name: "gpt-oss:120b"
+    deployments:
+      - {provider: ollama-cloud, upstream_model: "gpt-oss:120b", credentials: [ollama-1, ollama-2]}
+  - name: "qwen3.5:397b"
+    deployments:
+      - {provider: ollama-cloud, upstream_model: "qwen3.5:397b", credentials: [ollama-1, ollama-2]}
+  - name: "mistral-large-3:675b"
+    deployments:
+      - {provider: ollama-cloud, upstream_model: "mistral-large-3:675b", credentials: [ollama-1, ollama-2]}
+
+  # ---- OpenRouter. The upstream ids behind these two LiteLLM aliases are not
+  # observable from a client key; `TODO-` marks them so a lint of this file
+  # against a real deployment fails loudly rather than routing somewhere wrong.
+  - name: "public"
+    deployments:
+      - {provider: openrouter, upstream_model: "TODO-openrouter-id-for-public", credentials: [openrouter-1]}
+  - name: "public-free"
+    deployments:
+      - {provider: openrouter, upstream_model: "TODO-openrouter-id-for-public-free", credentials: [openrouter-1]}
+
+  # ---- Jina ----
+  - name: "jina-embeddings-v5-text-nano"
+    deployments:
+      - {provider: jina, upstream_model: "jina-embeddings-v5-text-nano", credentials: [jina-1]}
+  - name: "jina-embeddings-v5-text-small"
+    deployments:
+      - {provider: jina, upstream_model: "jina-embeddings-v5-text-small", credentials: [jina-1]}
+  - name: "jina-reranker-v3"
+    deployments:
+      - {provider: jina, upstream_model: "jina-reranker-v3", credentials: [jina-1]}
+
+  # ---- Qwen plan ----
+  - name: "qwen3-coder-next"
+    deployments:
+      - {provider: qwen-plan, upstream_model: "qwen3-coder-next", credentials: [qwen-1]}
+
+fallbacks:
+  on:
+    rate_limit:      []
+    quota_exhausted: []
+    context_window:  []
+    content_policy:  []
+    upstream_5xx:    []
+    timeout:         []
+    budget_exceeded: []
+    auth:            []
+  max_hops: 0
+  budget_ms: 120000
+
+observability:
+  prometheus: true

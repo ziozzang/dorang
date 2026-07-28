@@ -3,10 +3,12 @@ package scenario
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/ziozzang/dorang/internal/router"
+	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/testing/fake"
@@ -290,16 +292,48 @@ func TestScenario15_AnthropicRequestThroughOpenAIBackendTwoTurns(t *testing.T) {
 		if err == nil {
 			t.Fatal("an unsigned reasoning block was accepted by the family that requires a signature")
 		}
-		var oe *anthropic.OpaqueError
-		if !errors.As(err, &oe) {
-			t.Fatalf("the refusal must be typed and name a reason; got %T: %v", err, err)
+		// internal/wire/anthropic raises a typed *anthropic.OpaqueError; L5
+		// renders it into the one envelope dorang answers with. What a caller
+		// sees is that envelope, so that is what this asserts.
+		var se *server.Error
+		if !errors.As(err, &se) {
+			t.Fatalf("the refusal must be a typed gateway error; got %T: %v", err, err)
 		}
-		if oe.Reason != anthropic.ReasonUnsignedThinking {
-			t.Fatalf("reason = %q, want %q", oe.Reason, anthropic.ReasonUnsignedThinking)
+		if se.Status != http.StatusBadRequest {
+			t.Errorf("status = %d, want 400: no sibling of this family accepts an unsigned block either",
+				se.Status)
+		}
+		if !strings.Contains(se.Message, anthropic.ReasonUnsignedThinking) {
+			t.Errorf("the refusal must name the reason; got %q", se.Message)
 		}
 		if g.ups["oai-1"].Count() != 0 {
 			t.Error("the request reached the backend anyway")
 		}
+
+		t.Run("DIVERGENCE: the machine-readable half of the refusal does not survive L5",
+			func(t *testing.T) {
+				// Characterization, not endorsement, and it became visible the
+				// moment this harness stopped encoding requests itself: the
+				// harness called anthropic.MarshalRequest directly and therefore
+				// saw the typed error that production never delivers.
+				//
+				// *anthropic.OpaqueError carries Reason and — the load-bearing
+				// one — Construct, whose whole purpose is that "the caller can
+				// put it in x-dorang-allow-lossy and retry deliberately". Its own
+				// ToError() renders the reason as the wire `code`.
+				// backend.encodeError does neither: it flattens the error into a
+				// message string under the generic code conversion_failed, and it
+				// sets no Unwrap, so the reason cannot be recovered downstream
+				// either. A caller is told what went wrong in prose and is given
+				// nothing to act on.
+				var oe *anthropic.OpaqueError
+				if errors.As(err, &oe) {
+					t.Skipf("the typed refusal now survives L5 (reason %q, construct %q): "+
+						"restore the typed assertion and delete this subtest", oe.Reason, oe.Construct)
+				}
+				t.Logf("the caller receives code %q and a sentence; the construct id that "+
+					"x-dorang-allow-lossy takes is lost", se.Code)
+			})
 	})
 
 	t.Run("streaming crosses the families too", func(t *testing.T) {

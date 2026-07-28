@@ -46,6 +46,19 @@ import (
 func TestEveryConfiguredFieldIsReadSomewhere(t *testing.T) {
 	idents := identifiersOutsideConfig(t)
 
+	// Canaries: unexported identifiers that exist nowhere but internal/config.
+	// If the scan sees one, it is reading a copy of this package — a nested
+	// checkout, a vendored tree, a stale build directory — and every answer it
+	// gives is worthless in the direction that matters, because every field
+	// looks consumed. Without this the guard fails open and still passes.
+	for _, canary := range []string{"defaultLogLevel", "defaultCheckpoints", "defaultRedisURLEnv"} {
+		if idents[canary] {
+			t.Fatalf("the scan found %q, which exists only inside internal/config: "+
+				"it is walking a copy of this package, so every field would look "+
+				"consumed and this guard would pass while detecting nothing", canary)
+		}
+	}
+
 	var walk func(rt reflect.Type, path string, seen map[reflect.Type]bool)
 	var missing, fixed []string
 	walk = func(rt reflect.Type, path string, seen map[reflect.Type]bool) {
@@ -219,12 +232,28 @@ func identifiersOutsideConfig(t *testing.T) identSet {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", "testdata", "node_modules":
+			case ".git", "testdata", "node_modules", ".claude":
 				return fs.SkipDir
 			}
+			// A nested checkout is a second copy of this repository, and every
+			// field is "read" inside it — by internal/config itself. Walking one
+			// does not weaken this guard, it disables it: the ledger direction
+			// reports every entry as wired, and the direction that matters more
+			// reports every new setting as consumed, silently. Found the hard
+			// way, from an agent's worktree under .claude/, which turned the
+			// whole check into a no-op that still passed.
+			//
+			// Keyed on go.mod rather than on the directory name, so any nested
+			// module is excluded however it got there.
+			if path != root {
+				if _, err := os.Stat(filepath.Join(path, "go.mod")); err == nil {
+					return fs.SkipDir
+				}
+			}
 			// This package is the one place a configured field is guaranteed to
-			// be mentioned, so it cannot count as a consumer of itself.
-			if path == filepath.Join(root, "internal", "config") {
+			// be mentioned, so it cannot count as a consumer of itself. Matched
+			// at any depth for the same reason as above.
+			if filepath.Base(filepath.Dir(path)) == "internal" && d.Name() == "config" {
 				return fs.SkipDir
 			}
 			return nil

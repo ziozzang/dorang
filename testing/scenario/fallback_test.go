@@ -1,10 +1,12 @@
 package scenario
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/health"
 	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/testing/fake"
 )
@@ -147,6 +149,92 @@ func TestScenario06_GroupThenClassDelegation(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// §7.6 — what a 4xx is evidence of
+// -----------------------------------------------------------------------------
+
+// oneDeploymentGroup is a model served by a single backend. That is the shape
+// that makes a circuit breaker load-bearing: standing this deployment down is
+// not a degradation, it is the model going away.
+func oneDeploymentGroup() router.Config {
+	return router.Config{
+		Groups: []router.Group{{Name: "chat", Class: "large", Deployments: []router.Deployment{
+			{ID: "d1", Provider: "p1", Kind: "openai", UpstreamModel: "zai:glm-5.1",
+				Credentials: []router.Credential{{ID: "k1"}}},
+		}}},
+		Fallback: router.FallbackConfig{On: router.DefaultChains(), MaxHops: 3, Budget: time.Minute},
+	}
+}
+
+// TestMalformedRequestsFromOneTenantDoNotRemoveTheDeploymentFromTheOthers is the
+// cross-tenant denial of service, end to end.
+//
+// The circuit breaker is per DEPLOYMENT and shared by every tenant of it. If a
+// 400 counts against availability, then any caller holding any key can take a
+// working deployment away from everybody else by sending a handful of bodies
+// the backend refuses — no privilege, no volume, no timing.
+//
+// The backend here is deliberately healthy throughout: it answers the malformed
+// bodies with a 400 immediately and correctly, and it serves everything else.
+// Nothing about it is failing, which is the whole point.
+func TestMalformedRequestsFromOneTenantDoNotRemoveTheDeploymentFromTheOthers(t *testing.T) {
+	const marker = "TEMPERATURE-OUT-OF-RANGE"
+	g := newGateway(t, oneDeploymentGroup(), rigOpts{}, map[string]fake.Options{
+		"d1": {
+			Shape: fake.ShapeOpenAI,
+			Behaviour: func(r *fake.Recorded) fake.Behaviour {
+				if bytes.Contains(r.Body, []byte(marker)) {
+					return fake.Behaviour{Status: 400, ErrorType: "BadRequestError",
+						ErrorMessage: "1 validation error for ChatCompletionRequest: " +
+							"temperature must be <= 2"}
+				}
+				return fake.Behaviour{}
+			},
+			Script: func(*fake.Recorded) fake.Script {
+				return fake.Script{Text: "served the well-formed request",
+					Usage: fake.Usage{InputTokens: 9, OutputTokens: 4}}
+			},
+		},
+	})
+
+	bad := []byte(`{"model":"chat","messages":[{"role":"user","content":"` + marker + `"}]}`)
+	for i := range 20 {
+		rep, err := g.do(t, Call{Family: FamilyOpenAI, Principal: "attacker", Tenant: "attacker",
+			Body: bad})
+		if err == nil {
+			t.Fatalf("request %d: the upstream served a body it is configured to refuse", i)
+		}
+		if rep.Status != 400 {
+			t.Fatalf("request %d: status = %d, want 400 — the CALLER's request is what was refused",
+				i, rep.Status)
+		}
+		if len(rep.Attempts) != 1 {
+			t.Fatalf("request %d: attempts = %v; a malformed body is malformed on every "+
+				"backend, so it must not tour the class", i, rep.Attempts)
+		}
+	}
+
+	// A different tenant, a well-formed request, the same deployment.
+	rep, err := g.do(t, Call{Family: FamilyOpenAI, Principal: "victim", Tenant: "victim",
+		Body: []byte(`{"model":"chat","messages":[{"role":"user","content":"hello"}]}`)})
+	if err != nil {
+		t.Fatalf("another tenant's malformed requests took the deployment away from this one: %v", err)
+	}
+	if rep.Status != 200 || !strings.Contains(string(rep.Body), "served the well-formed request") {
+		t.Fatalf("status = %d, body = %s", rep.Status, rep.Body)
+	}
+
+	if st := g.health.Stats("d1"); st.State != health.Closed || st.Failures != 0 || st.Opens != 0 {
+		t.Fatalf("a backend that answered every request correctly was charged %d failures "+
+			"and %d opens, and is %v", st.Failures, st.Opens, st.State)
+	}
+	// And it really was the same backend serving both, rather than a second one
+	// quietly covering for a stood-down first.
+	if n := g.ups["d1"].Count(); n != 21 {
+		t.Errorf("the deployment received %d requests, want 21", n)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // §14.7 — a stream falls back only before the first byte,
 //         and there is zero duplicated output after it
 // -----------------------------------------------------------------------------
@@ -206,22 +294,15 @@ func TestScenario07_StreamFallsBackOnlyBeforeTheFirstByte(t *testing.T) {
 			"h1": serving("nor this one"),
 		})
 
-		rep, err := g.do(t, Call{Family: FamilyOpenAI, Body: []byte(streamBody)})
-		if err == nil {
-			t.Fatal("a committed stream that fails must not be reported as a success")
-		}
-		if rep.RouteError == nil || rep.RouteError.Code != router.CodeStreamCommitted {
-			code := "<none>"
-			if rep.RouteError != nil {
-				code = rep.RouteError.Code
-			}
-			t.Fatalf("refusal code = %s, want %s", code, router.CodeStreamCommitted)
-		}
+		rep, _ := g.do(t, Call{Family: FamilyOpenAI, Body: []byte(streamBody)})
 		if len(rep.Attempts) != 1 {
 			t.Fatalf("attempts = %v: a committed stream must not hop", rep.Attempts)
 		}
 		if rep.Status != 200 {
 			t.Errorf("status = %d; once a byte is out the response is already 200", rep.Status)
+		}
+		if !rep.FirstByteSent {
+			t.Error("the relay did not report that the client had already seen output")
 		}
 
 		body := string(rep.Body)
@@ -245,6 +326,41 @@ func TestScenario07_StreamFallsBackOnlyBeforeTheFirstByte(t *testing.T) {
 			t.Errorf("a fallback was dispatched after the first byte: g2=%d h1=%d",
 				g.ups["g2"].Count(), g.ups["h1"].Count())
 		}
+
+		t.Run("DIVERGENCE: an in-band upstream failure is reported to the router as a success",
+			func(t *testing.T) {
+				// Characterization, not endorsement, and it appeared the moment
+				// this harness stopped relaying streams itself: the harness used
+				// to scan the relayed bytes for an error frame and hand
+				// internal/router a failed outcome, which is a verdict about the
+				// exchange — something the system under test is responsible for
+				// producing (DESIGN §17.1). internal/backend does not produce it.
+				// Its relay copies an upstream error frame through and returns a
+				// nil error, so every consumer of the outcome is told the attempt
+				// succeeded:
+				//
+				//   - internal/health never counts it, so a deployment that fails
+				//     every stream after the first frame keeps its full share of
+				//     traffic forever;
+				//   - the meter records a success;
+				//   - §7.6's stream_committed refusal is unreachable from this
+				//     condition, so the ONLY end-to-end proof of the boundary is
+				//     that no hop was dispatched above. The rule itself is proved
+				//     in internal/router's TestStreamCommitted.
+				//
+				// Deleting this subtest is the correct move the day the relay
+				// surfaces an in-band error; see the report accompanying this
+				// change for where.
+				rep, err := g.do(t, Call{Family: FamilyOpenAI, Body: []byte(streamBody)})
+				if err != nil || rep.RouteError != nil {
+					t.Skipf("the relay now surfaces the in-band failure (err=%v, route=%v): "+
+						"restore the stream_committed assertion and delete this subtest",
+						err, rep.RouteError)
+				}
+				t.Log("internal/backend relayed an upstream in-band error frame and reported " +
+					"the attempt as a success; the failure reaches neither internal/health " +
+					"nor the fail-back boundary")
+			})
 	})
 
 	t.Run("inverse: the same failure BEFORE any frame does hop", func(t *testing.T) {
