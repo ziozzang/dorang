@@ -519,8 +519,47 @@ Revision 2:
   indefinitely overtaken by single-axis waiters.
 
 Completion gate: a saturation benchmark at 0 / 100 / 1000 waiters against limits of
-1 / 7 / 32, asserting bounded wakeups per release, FIFO fairness within an axis, and no
-starvation of multi-axis waiters.
+1 / 7 / 32, asserting bounded wakeups per release and FIFO fairness within an axis.
+**Measured: exactly 1.00 wakeups per grant at every scale** — a broadcast would be O(waiters)
+per release.
+
+#### Six corrections found while implementing this
+
+The implementation surfaced problems the design text did not answer. Recorded because each
+one is a place a plausible reading produces broken behavior.
+
+1. **A waiter must enqueue on the blocking axis of *every* candidate it tried, not one.**
+   The text said "the axis that blocked it", singular. With `spill`, if the preferred
+   candidate blocks on one key and a later candidate's key frees, a single-queue waiter is
+   never woken. Queue on all of them (capped), and remove from all on grant or cancel.
+
+2. **"Wake as many waiters as slots freed" under-specifies a failed probe.** A waiter that
+   fails to acquire consumes no slot, so a literal reading leaves freed slots idle behind it.
+   Probe up to `freed + slack` with a hard cap — still O(1) per release.
+
+3. **Strict FIFO and the interactive reserve conflict.** Batch and interactive waiters share
+   a queue but have different effective ceilings, so a blocked batch waiter at the head
+   head-of-line blocks exactly the interactive traffic §11.1 exists to protect. A re-blocked
+   head waiter is parked for the remainder of the pass, keeping its sequence number, so the
+   next-oldest gets a turn.
+
+4. **The reserve must not round a slot away.** `floor(10 × (1 − 0.3))` evaluates to **6**, not
+   7, in binary floating point, so the reserve silently exceeds what was configured. An
+   epsilon is required. And `floor(1 × 0.7) = 0` makes an axis unsatisfiable rather than
+   merely contended — that returns an error immediately instead of blocking forever.
+
+5. ⚠️ **Aging prevents overtaking, not starvation. This is an open hole.** §5.3 forbids
+   holding one slot while queuing for another, which is what makes deadlock structurally
+   impossible. The cost is that a waiter needing axes A and B can ping-pong indefinitely
+   while both stay saturated: it is always at the head of both queues, yet never finds both
+   free at the same instant. Aging does not fix this, because the waiter is never overtaken —
+   it simply never wins. Closing it needs a **soft reservation**: when the oldest waiter on A
+   is blocked on B, bar new grants on A until it is served, accepting a small throughput loss
+   for a liveness guarantee. That protocol is not yet designed; see §18 W8.
+
+6. **Check order.** §5.3 and §5.7 stated different orders. §5.7's is authoritative because it
+   has a stated rationale. Under one lock the outcome is identical; only the reported
+   blocking axis differs, which matters for diagnostics rather than correctness.
 
 ### 5.5 TPM belongs to the logical request **[R1-8]**
 
@@ -1452,3 +1491,4 @@ fixes the neutral representation. M9 and M12 are independent of the core through
 | W5 | Cross-protocol conversion loss | **open** — enumerated in headers; may need per-pair fidelity tests beyond golden |
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
+| W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **open** — inherent to no-partial-holding; needs a soft-reservation protocol. Not a deadlock and not an overtaking problem, so aging does not close it. Measurable: a waiter that never wins while both its axes stay saturated |
