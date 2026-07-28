@@ -38,6 +38,58 @@ type Service struct {
 
 	sweepStop chan struct{}
 	sweepDone chan struct{}
+
+	// Observability. DESIGN §12.3 asks for queue depth and rows in flight, and
+	// the store cannot answer either: a row that has been sent upstream and not
+	// yet settled has no persisted state that distinguishes it from one that
+	// has not started, and "how many batches are waiting for a dispatch slot"
+	// is a fact about this process rather than about the batch.
+	rowsStarted  atomic.Int64
+	rowsFinished atomic.Int64
+	rowsInFlight atomic.Int64
+}
+
+// Stats is a point-in-time view of the scheduler, for metrics and tests.
+type Stats struct {
+	// Active is batches with a run in this process, whether dispatching or
+	// still waiting for a slot.
+	Active int
+	// DispatchSlots is max_active_batches and SlotsFree is what is left of it.
+	DispatchSlots int
+	SlotsFree     int
+	// Queued is runs blocked on the dispatch semaphore, in arrival order.
+	Queued int
+	// RowsInFlight is rows sent upstream and not yet settled.
+	RowsInFlight int64
+	// RowsStarted and RowsFinished are cumulative.
+	RowsStarted  int64
+	RowsFinished int64
+	// Closed reports that the service has stopped accepting work.
+	Closed bool
+}
+
+// Stats reports the scheduler's live state.
+//
+// It takes s.mu, which is the same mutex a batch record's read-modify-write
+// takes — but never the row execution path, which is explicitly documented as
+// not touching it. So a scrape can contend with a batch being created or
+// cancelled, and never with a row being run.
+func (s *Service) Stats() Stats {
+	s.mu.Lock()
+	active, closed := len(s.runs), s.closed
+	s.mu.Unlock()
+
+	free, queued, slots := s.slots.stats()
+	return Stats{
+		Active:        active,
+		DispatchSlots: slots,
+		SlotsFree:     free,
+		Queued:        queued,
+		RowsInFlight:  s.rowsInFlight.Load(),
+		RowsStarted:   s.rowsStarted.Load(),
+		RowsFinished:  s.rowsFinished.Load(),
+		Closed:        closed,
+	}
 }
 
 // New builds a service. It does not read the store; call [Service.Recover] to
@@ -288,13 +340,23 @@ type fifoSem struct {
 	free   int
 	q      []chan struct{}
 	closed bool
+	slots  int
 }
 
 func newFIFOSem(n int) *fifoSem {
 	if n < 1 {
 		n = 1
 	}
-	return &fifoSem{free: n}
+	return &fifoSem{free: n, slots: n}
+}
+
+// stats reports the semaphore's occupancy. The critical section is three field
+// reads, and the only other writers are slot acquisition and release, neither
+// of which happens per row.
+func (f *fifoSem) stats() (free, queued, slots int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.free, len(f.q), f.slots
 }
 
 // acquire waits for a slot, for ctx to end, or for stop to be closed.

@@ -36,6 +36,15 @@ func (s *Server) baseRoutes() []*Route {
 			Handler: s.handleModels,
 		}
 	}
+	modelRetrieve := func(pattern string) *Route {
+		return &Route{
+			Pattern: pattern,
+			Methods: MethodGET | MethodHEAD,
+			Name:    "models_retrieve",
+			Family:  FamilyModels,
+			Handler: s.handleModelRetrieve,
+		}
+	}
 	health := func(pattern, name string, kind healthKind) *Route {
 		return &Route{
 			Pattern: pattern,
@@ -47,7 +56,29 @@ func (s *Server) baseRoutes() []*Route {
 		}
 	}
 
-	return []*Route{
+	// multipart is the same route with the body declared as form data. The
+	// server parses it in the gate so the allow-list check sees the model
+	// (COMPATIBILITY 2.0 applied to a non-JSON body).
+	multipart := func(pattern, name string, family Family) *Route {
+		rt := inference(pattern, name, family)
+		rt.Multipart = true
+		return rt
+	}
+	// deployment is one of the model-in-the-path aliases. The pattern's {model}
+	// segment carries the deployment name, and the server resolves it before
+	// authorization.
+	deployment := func(pattern, name string, family Family) *Route {
+		rt := inference(pattern, name, family)
+		rt.ModelParam = "model"
+		return rt
+	}
+	deploymentMultipart := func(pattern, name string, family Family) *Route {
+		rt := deployment(pattern, name, family)
+		rt.Multipart = true
+		return rt
+	}
+
+	routes := []*Route{
 		inference("/v1/chat/completions", "chat_completions", FamilyOpenAIChat),
 		inference("/chat/completions", "chat_completions", FamilyOpenAIChat),
 		inference("/v1/embeddings", "embeddings", FamilyOpenAIEmbeddings),
@@ -55,8 +86,44 @@ func (s *Server) baseRoutes() []*Route {
 		inference("/v1/messages", "messages", FamilyAnthropicMessages),
 		inference("/v1/messages/count_tokens", "messages_count_tokens", FamilyAnthropicCountTokens),
 
+		// T1 — the legacy text-completions surface. Two spellings, for the same
+		// reason chat completions has two: a client configured with a base URL
+		// ending in /v1 and one configured without it both exist.
+		inference("/v1/completions", "completions", FamilyOpenAICompletions),
+		inference("/completions", "completions", FamilyOpenAICompletions),
+
+		// T1 — rerank. Three spellings are deployed and all three are served;
+		// /v2/rerank is not a different protocol, it is the same one under the
+		// path the vendor's own SDK uses.
+		inference("/v1/rerank", "rerank", FamilyOpenAIRerank),
+		inference("/rerank", "rerank", FamilyOpenAIRerank),
+		inference("/v2/rerank", "rerank", FamilyOpenAIRerank),
+
+		// T1 — moderations.
+		inference("/v1/moderations", "moderations", FamilyOpenAIModerations),
+		inference("/moderations", "moderations", FamilyOpenAIModerations),
+
+		// T1 — audio. Speech takes JSON and answers bytes; the other two take
+		// multipart.
+		inference("/v1/audio/speech", "audio_speech", FamilyOpenAISpeech),
+		multipart("/v1/audio/transcriptions", "audio_transcriptions", FamilyOpenAITranscription),
+		multipart("/v1/audio/translations", "audio_translations", FamilyOpenAITranslation),
+
+		// T1 — images. Generation takes JSON; edits and variations take
+		// multipart because they carry an image and possibly a mask.
+		inference("/v1/images/generations", "images_generations", FamilyOpenAIImageGeneration),
+		multipart("/v1/images/edits", "images_edits", FamilyOpenAIImageEdit),
+		multipart("/v1/images/variations", "images_variations", FamilyOpenAIImageVariation),
+
+		// T1 — the Responses API. The sub-resources are stateful and are
+		// mounted by internal/app, which owns responses_store; this is the
+		// inference half.
+		inference("/v1/responses", "responses", FamilyOpenAIResponses),
+
 		models("/v1/models"),
 		models("/models"),
+		modelRetrieve("/v1/models/{id}"),
+		modelRetrieve("/models/{id}"),
 
 		// "liveliness" is not a typo and not a synonym dorang chose. The
 		// widely-deployed proxy this surface has to interoperate with spells it
@@ -77,6 +144,34 @@ func (s *Server) baseRoutes() []*Route {
 			Handler: s.handleMetrics,
 		},
 	}
+
+	// The deployment-in-the-path aliases.
+	//
+	// COMPATIBILITY §7.5 is why these can be registered at all: the table is
+	// specificity-ordered, so /openai/deployments/{model}/chat/completions
+	// matches before a configured /openai/{rest...} passthrough prefix. A naive
+	// prefix router swallows every one of them into the catch-all and the
+	// symptom is an Azure-shaped client silently reaching a vendor passthrough.
+	for _, base := range []string{"/engines/{model}", "/openai/deployments/{model}"} {
+		routes = append(routes,
+			deployment(base+"/chat/completions", "chat_completions", FamilyOpenAIChat),
+			deployment(base+"/completions", "completions", FamilyOpenAICompletions),
+			deployment(base+"/embeddings", "embeddings", FamilyOpenAIEmbeddings),
+		)
+	}
+	// Azure serves the audio and image surfaces under the same deployment
+	// prefix; /engines does not, and inventing routes there would answer 200 on
+	// a path no client sends.
+	const azure = "/openai/deployments/{model}"
+	routes = append(routes,
+		deployment(azure+"/audio/speech", "audio_speech", FamilyOpenAISpeech),
+		deploymentMultipart(azure+"/audio/transcriptions", "audio_transcriptions", FamilyOpenAITranscription),
+		deploymentMultipart(azure+"/audio/translations", "audio_translations", FamilyOpenAITranslation),
+		deployment(azure+"/images/generations", "images_generations", FamilyOpenAIImageGeneration),
+		deploymentMultipart(azure+"/images/edits", "images_edits", FamilyOpenAIImageEdit),
+		deployment(azure+"/responses", "responses", FamilyOpenAIResponses),
+	)
+	return routes
 }
 
 // handleInference is every route that ends in an upstream model call. The
@@ -219,6 +314,51 @@ func (s *Server) handleModels(w http.ResponseWriter, rq *Request) error {
 	return nil
 }
 
+// handleModelRetrieve serves GET /v1/models/{id}.
+//
+// It is filtered by the calling key's allow-list exactly as the list endpoint
+// is (COMPATIBILITY §7.4), and the filter is the whole point: a client that
+// cannot see a model in the list must not be able to confirm it exists by
+// asking for it directly. A disallowed model is therefore answered 404
+// `model_not_found` rather than 403 — the two would otherwise differ, and the
+// difference is an enumeration oracle over another key's catalogue.
+func (s *Server) handleModelRetrieve(w http.ResponseWriter, rq *Request) error {
+	cfg := rq.srv.snap.Load()
+	if cfg.models == nil {
+		return NewError(http.StatusNotImplemented, TypeNotImplemented,
+			"no model catalog is configured for this deployment").
+			WithCode("catalog_not_configured")
+	}
+	// The id is one path segment and is compared whole: a model name is opaque
+	// and nothing splits it on ':' or '/' (DESIGN §2.1).
+	id := rq.Param("id")
+	models := cfg.models.Models()
+	var found *Model
+	for i := range models {
+		if models[i].ID == id {
+			found = &models[i]
+			break
+		}
+	}
+	if found == nil || (rq.Principal != nil && !rq.Principal.AllowsModel(id)) {
+		return NewError(http.StatusNotFound, TypeInvalidRequest,
+			"no such model").WithCode("model_not_found").WithParam("model")
+	}
+
+	buf := getBuf()
+	defer putBuf(buf)
+	*buf = appendModel(*buf, found)
+
+	h := w.Header()
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", strconv.Itoa(len(*buf)))
+	w.WriteHeader(http.StatusOK)
+	if rq.Method != http.MethodHead {
+		_, _ = w.Write(*buf)
+	}
+	return nil
+}
+
 // appendModelList renders the list body.
 func appendModelList(dst []byte, models []Model, p Principal) []byte {
 	dst = append(dst, `{"object":"list","data":[`...)
@@ -232,17 +372,24 @@ func appendModelList(dst []byte, models []Model, p Principal) []byte {
 			dst = append(dst, ',')
 		}
 		first = false
-		dst = append(dst, `{"id":`...)
-		dst = appendJSONString(dst, m.ID)
-		dst = append(dst, `,"object":"model","created":`...)
-		dst = appendInt(dst, ModelsCreated)
-		dst = append(dst, `,"owned_by":`...)
-		owner := m.OwnedBy
-		if owner == "" {
-			owner = DefaultOwnedBy
-		}
-		dst = appendJSONString(dst, owner)
-		dst = append(dst, '}')
+		dst = appendModel(dst, m)
 	}
 	return append(dst, ']', '}')
+}
+
+// appendModel renders one model object. The list endpoint and the retrieve
+// endpoint share it so the two cannot drift; a client that reads `created` from
+// one and caches on it must see the same constant from the other.
+func appendModel(dst []byte, m *Model) []byte {
+	dst = append(dst, `{"id":`...)
+	dst = appendJSONString(dst, m.ID)
+	dst = append(dst, `,"object":"model","created":`...)
+	dst = appendInt(dst, ModelsCreated)
+	dst = append(dst, `,"owned_by":`...)
+	owner := m.OwnedBy
+	if owner == "" {
+		owner = DefaultOwnedBy
+	}
+	dst = appendJSONString(dst, owner)
+	return append(dst, '}')
 }

@@ -212,6 +212,19 @@ type Observer interface {
 	Metrics(dst []byte) []byte
 }
 
+// MetricsSource renders the whole Prometheus scrape.
+//
+// It is one method wide for the same reason [Observer] is: internal/metrics
+// pulls from every subsystem in the process, and a compile-time edge from the
+// HTTP surface to that assembly would put the router, the store and the cluster
+// ledger behind every test of this package. The concrete wiring happens once,
+// in internal/app.
+type MetricsSource interface {
+	// Metrics appends the exposition body to dst and returns it. It must not
+	// block and must not perform I/O: it is answering a request.
+	Metrics(dst []byte) []byte
+}
+
 // Observation is one captured request and the response the client actually
 // received.
 //
@@ -306,9 +319,18 @@ type Result struct {
 	Deployment    string
 	UpstreamModel string
 
-	Attempt      int
+	Attempt int
+	// FallbackFrom is the cause that sent this request down a fallback chain,
+	// spelled "fallback:<cause>". It is a reason, not a place, and it is what
+	// X-Dorang-Fallback-From has always carried.
 	FallbackFrom string
-	RouteReason  string
+	// FallbackFromDeployment is the deployment the request left. It is a
+	// separate field because DESIGN §12.3's fallback counter is keyed by
+	// {from, to, reason} and the first of those is a deployment id: a counter
+	// with an empty `from` cannot answer "which backend is shedding traffic",
+	// which is the only question it is asked.
+	FallbackFromDeployment string
+	RouteReason            string
 
 	QueueNS   int64
 	TTFTNS    int64
@@ -323,6 +345,15 @@ type Result struct {
 	// Priced marks the cost fields as meaningful. An unpriced request must not
 	// claim to have cost zero.
 	Priced bool
+	// NotionalPriced marks NotionalNanoUSD as meaningful, and it is a separate
+	// flag from Priced because the two rules are separate: a request can be
+	// billed exactly and still have no list-rate equivalent, which is the
+	// normal case on a subscription that nobody has written a notional_rate
+	// rule for. DESIGN §8.5 rule 5 requires that case to be reported as missing
+	// and to increment a counter — "silently returning zero would make a
+	// subscription look infinitely efficient", and without this flag zero is
+	// exactly what a reader of NotionalNanoUSD sees.
+	NotionalPriced bool
 
 	// QuotaUsedPct is the credential's quota-window consumption, keyed by
 	// window name ("minute", "day", …). Nil when no probe reported.

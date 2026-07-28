@@ -87,10 +87,10 @@ func TestUnimplementedIsNeverASilent404(t *testing.T) {
 	cases := []struct {
 		path, code string
 	}{
-		{"/v1/responses", "route_not_implemented"},
-		{"/v1/audio/speech", "route_not_implemented"},
+		{"/v1/responses/resp_1/cancel", "route_not_implemented"},
+		{"/v1/ocr", "route_not_implemented"},
 		{"/key/generate", "route_not_implemented"},
-		{"/v1/models/gpt-4o", "route_not_implemented"},
+		{"/v1/vector_stores", "route_not_implemented"},
 		{"/definitely/not/a/route", "route_unknown"},
 	}
 	for _, c := range cases {

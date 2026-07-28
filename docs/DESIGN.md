@@ -2387,6 +2387,30 @@ Requests, duration, TTFT, tokens, cost, capacity in-flight and wait time per axi
 credential health, provider quota percentage, budget consumption ratio, prefix hit ratio,
 fallbacks by reason, metering drops, and spool depth.
 
+> **Three of the labels above were not sourceable as written, and the reason is worth
+> recording rather than quietly dropping them.**
+>
+> - **Capacity wait time per axis.** The broker grants across every axis atomically and never
+>   records which one blocked, so the label has no value to carry. Wait time is emitted
+>   globally, and the HELP text says why — a label that is always the same value is worse than
+>   no label, because it implies a breakdown exists.
+> - **Prefix hit ratio per model.** The prefix table is keyed by content digest and is never
+>   told the model — deliberately, since §7.4b seeds the chain with the group id and needs
+>   nothing else. The per-model figure is counted at the request observation point instead;
+>   the table's own exact global figures are separate metrics.
+> - **`credential_health`.** dorang's circuit breaker is per **deployment**, not per
+>   credential — §12.3 named a thing that does not exist. Deployment health is now its own
+>   metric, and credential health means only what OAuth refresh reports about a credential.
+>
+> **A metric dorang cannot compute is absent, never zero** — the rule VLLM.md §3.3 exists to
+> teach, where a load endpoint returns an attractive zero forever when unconfigured. Absent
+> metrics here include time-to-first-token before any sample, prefix ratios with prefix off,
+> budget ratio with no ceiling, and a rolling quota window with no reported reset instant.
+>
+> Naming is validated rather than reviewed: a `_ratio` must be in [0,1], a `_percent` in
+> [0,100], a `_total` must be a counter, and a histogram must name its unit. That check
+> immediately caught a `_total` declared as a gauge in shipped code.
+
 ### 12.4 Backend metrics
 
 A provider may declare a metrics endpoint to scrape. Queue depth and cache utilization then

@@ -69,15 +69,102 @@ func (m *metrics) observe(status int, d time.Duration, in, out int64) {
 	m.buckets[i].Add(1)
 }
 
+// Stats is a point-in-time view of the HTTP surface's own counters.
+//
+// It exists so that the complete DESIGN §12.3 surface can be assembled outside
+// this package without moving these counters out of it or exporting the fields
+// they live in. internal/metrics renders them; this package keeps owning them.
+type Stats struct {
+	// Requests is every request the surface finished, health probes and the
+	// metrics scrape included.
+	Requests uint64
+	// ByClass counts responses by status class; index 0 is unused.
+	ByClass [6]uint64
+
+	BytesIn  uint64
+	BytesOut uint64
+	// DurationSumNS is the summed gateway duration. The distribution is
+	// rendered by internal/metrics, which keeps it per model.
+	DurationSumNS uint64
+
+	Unimplemented uint64
+	AuthFailures  uint64
+	LateErrors    uint64
+	Panics        uint64
+	MeterPanics   uint64
+
+	Passthrough   uint64
+	WSUpgrades    uint64
+	ReplayRefused uint64
+	BodyTooLarge  uint64
+
+	Observed       uint64
+	ObserverPanics uint64
+
+	InFlight    int64
+	ReplayBytes int64
+	// ReplayLimit is the process-wide replay budget of DESIGN §15.4.
+	ReplayLimit int64
+	Ready       bool
+	Uptime      time.Duration
+}
+
+// Stats returns the surface's counters. It takes no lock: every field is an
+// atomic, which is what lets a metrics scrape read them while the configuration
+// mutex is held (TestSnapshotReadTakesNoLock is the same property from the
+// other side).
+func (s *Server) Stats() Stats {
+	m := &s.metrics
+	return Stats{
+		Requests: m.requests.Load(),
+		ByClass: [6]uint64{
+			0, m.byClass[1].Load(), m.byClass[2].Load(), m.byClass[3].Load(),
+			m.byClass[4].Load(), m.byClass[5].Load(),
+		},
+		BytesIn:        m.bytesIn.Load(),
+		BytesOut:       m.bytesOut.Load(),
+		DurationSumNS:  m.durationSumNS.Load(),
+		Unimplemented:  m.unimplemented.Load(),
+		AuthFailures:   m.authFailures.Load(),
+		LateErrors:     m.lateErrors.Load(),
+		Panics:         m.panics.Load(),
+		MeterPanics:    m.meterPanics.Load(),
+		Passthrough:    m.passthrough.Load(),
+		WSUpgrades:     m.wsUpgrades.Load(),
+		ReplayRefused:  m.replayRefused.Load(),
+		BodyTooLarge:   m.bodyTooLarge.Load(),
+		Observed:       m.observed.Load(),
+		ObserverPanics: m.observerPanics.Load(),
+		InFlight:       s.inflight.Load(),
+		ReplayBytes:    s.replay.Used(),
+		ReplayLimit:    s.replay.Limit(),
+		Ready:          s.Ready(),
+		Uptime:         time.Since(s.started),
+	}
+}
+
 // handleMetrics serves the Prometheus text exposition format.
 //
 // Hand-rolled, because a metrics endpoint is not worth a dependency and because
 // DESIGN §0.2 requires the notebook profile to have zero required dependencies.
+//
+// When [Options.Metrics] is configured, the whole body comes from there instead.
+// It is a replacement rather than an addition on purpose: internal/metrics
+// renders `dorang_requests_total` with the labels DESIGN §12.3 specifies, and
+// emitting the unlabelled family below alongside it would put two `# TYPE`
+// lines for one name on the page, which makes Prometheus reject the entire
+// scrape. The built-in block stays as the zero-configuration default so that a
+// server assembled without a registry still has a usable endpoint.
 func (s *Server) handleMetrics(w http.ResponseWriter, rq *Request) error {
 	m := &s.metrics
 	buf := getBuf()
 	defer putBuf(buf)
 	b := *buf
+
+	if src := rq.srv.snap.Load().metrics; src != nil {
+		b = src.Metrics(b)
+		return writeExposition(w, rq, buf, b)
+	}
 
 	b = counter(b, "dorang_requests_total",
 		"Requests served by the HTTP surface.", m.requests.Load())
@@ -162,6 +249,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, rq *Request) error {
 		b = o.Metrics(b)
 	}
 
+	return writeExposition(w, rq, buf, b)
+}
+
+// writeExposition answers the scrape.
+func writeExposition(w http.ResponseWriter, rq *Request, buf *[]byte, b []byte) error {
 	*buf = b
 	h := w.Header()
 	h.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

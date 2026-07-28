@@ -418,6 +418,13 @@ type rowOutcome struct {
 // an unreadable input file, a store that will not record results. Everything
 // else is a row outcome, because partial failure is the normal case.
 func (s *Service) runRow(ctx context.Context, r *run, rec *BatchRecord, row *RowRecord, rd io.ReadSeeker, buf *[]byte, st *dispatchState) error {
+	s.rowsStarted.Add(1)
+	s.rowsInFlight.Add(1)
+	defer func() {
+		s.rowsInFlight.Add(-1)
+		s.rowsFinished.Add(1)
+	}()
+
 	line, err := readRow(rd, row, buf)
 	if err != nil {
 		return fmt.Errorf("batch %s row %d (%s): %w", rec.ID, row.Seq, row.CustomID, err)

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/canonical"
 )
 
 // Request is dorang's view of one in-flight request.
@@ -55,6 +57,11 @@ type Request struct {
 
 	// Body is the capped request body, nil for routes that do not read one.
 	Body *Body
+	// Form is the parsed multipart body, non-nil only on a route that declares
+	// Multipart. It is parsed in the gate rather than in the handler, because
+	// the model on those routes is a form field and the allow-list check has to
+	// see it (COMPATIBILITY 2.0, DESIGN §18 W10).
+	Form *canonical.Form
 
 	// Result is the dispatcher's report. Fill it before writing.
 	Result Result
@@ -123,6 +130,7 @@ func (rq *Request) reset() {
 	rq.Start = time.Time{}
 	rq.Body = nil
 	rq.body = Body{}
+	rq.Form = nil
 	rq.Result.reset()
 	rq.ctx = nil
 	rq.rw = responseWriter{}
@@ -242,6 +250,15 @@ func (b *replayBudget) release(n int64) {
 
 // Used is the currently reserved byte count.
 func (b *replayBudget) Used() int64 { return b.used.Load() }
+
+// Limit is the configured process-wide budget of DESIGN §15.4. Zero or less
+// means retention is disabled, which is not the same fact as a full budget.
+func (b *replayBudget) Limit() int64 {
+	if b == nil {
+		return 0
+	}
+	return b.limit
+}
 
 // read fills b from r under both caps.
 //

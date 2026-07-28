@@ -85,6 +85,10 @@ func allowHeader(m Method) string {
 type Family uint8
 
 // The route families.
+//
+// New members are appended, never inserted: the value is written into the
+// ledger's family column, so renumbering an existing one silently relabels
+// every historical row.
 const (
 	FamilyNone Family = iota
 	FamilyOpenAIChat
@@ -95,30 +99,61 @@ const (
 	FamilyHealth
 	FamilyMetrics
 	FamilyPassthrough
+
+	// The T1 inference surface (COMPATIBILITY §0, DESIGN §2.1).
+	FamilyOpenAICompletions
+	FamilyOpenAIResponses
+	FamilyOpenAIModerations
+	FamilyOpenAIRerank
+	FamilyOpenAISpeech
+	FamilyOpenAITranscription
+	FamilyOpenAITranslation
+	FamilyOpenAIImageGeneration
+	FamilyOpenAIImageEdit
+	FamilyOpenAIImageVariation
 )
+
+// familyNames is the fixed-cardinality label set. It is a table rather than a
+// switch so that adding a family without naming it fails to compile the
+// exhaustive test rather than silently metering as "none".
+var familyNames = [...]string{
+	FamilyNone:                  "none",
+	FamilyOpenAIChat:            "openai-chat",
+	FamilyOpenAIEmbeddings:      "openai-embeddings",
+	FamilyAnthropicMessages:     "anthropic-messages",
+	FamilyAnthropicCountTokens:  "anthropic-count-tokens",
+	FamilyModels:                "models",
+	FamilyHealth:                "health",
+	FamilyMetrics:               "metrics",
+	FamilyPassthrough:           "passthrough",
+	FamilyOpenAICompletions:     "openai-completions",
+	FamilyOpenAIResponses:       "openai-responses",
+	FamilyOpenAIModerations:     "openai-moderations",
+	FamilyOpenAIRerank:          "rerank",
+	FamilyOpenAISpeech:          "openai-audio-speech",
+	FamilyOpenAITranscription:   "openai-audio-transcription",
+	FamilyOpenAITranslation:     "openai-audio-translation",
+	FamilyOpenAIImageGeneration: "openai-image-generation",
+	FamilyOpenAIImageEdit:       "openai-image-edit",
+	FamilyOpenAIImageVariation:  "openai-image-variation",
+}
 
 // String names the family.
 func (f Family) String() string {
-	switch f {
-	case FamilyOpenAIChat:
-		return "openai-chat"
-	case FamilyOpenAIEmbeddings:
-		return "openai-embeddings"
-	case FamilyAnthropicMessages:
-		return "anthropic-messages"
-	case FamilyAnthropicCountTokens:
-		return "anthropic-count-tokens"
-	case FamilyModels:
-		return "models"
-	case FamilyHealth:
-		return "health"
-	case FamilyMetrics:
-		return "metrics"
-	case FamilyPassthrough:
-		return "passthrough"
-	default:
-		return "none"
+	if int(f) < len(familyNames) && familyNames[f] != "" {
+		return familyNames[f]
 	}
+	return "none"
+}
+
+// Inference reports whether a family ends in an upstream model call, which is
+// what decides whether a request is priced and metered as one.
+func (f Family) Inference() bool {
+	switch f {
+	case FamilyNone, FamilyModels, FamilyHealth, FamilyMetrics, FamilyPassthrough:
+		return false
+	}
+	return true
 }
 
 // Handler serves one matched request. Returning a non-nil error hands the
@@ -147,6 +182,19 @@ type Route struct {
 	// NeedsBody makes the server read and cap the request body before the
 	// handler runs. Passthrough sets it false: it streams.
 	NeedsBody bool
+	// Multipart declares that the body is multipart/form-data rather than
+	// JSON. The server parses it into [Request.Form] and reads the model from
+	// the `model` FIELD, so the authorization gate sees the same model the
+	// adapter will — the multipart equivalent of the strict-JSON rule
+	// (COMPATIBILITY 2.0, DESIGN §18 W10).
+	Multipart bool
+	// ModelParam names the path parameter that carries the model, for the
+	// deployment-in-the-path aliases (`/engines/{model}/…`,
+	// `/openai/deployments/{model}/…`). When set, the path wins over the body:
+	// that is what those clients mean, and it is resolved BEFORE authorization
+	// so the allow-list is checked against the name that will actually be
+	// dispatched.
+	ModelParam string
 	// Handler serves the route.
 	Handler Handler
 
@@ -275,6 +323,29 @@ func (rt *Route) match(path string, params *[maxParams]Param) (int, bool) {
 type routeTable struct {
 	exact map[string]*Route
 	pats  []*Route
+}
+
+// overrideByPattern keeps the LAST route registered on each pattern, preserving
+// registration order otherwise.
+//
+// Order is preserved rather than rebuilt because newRouteTable sorts patterned
+// routes by specificity with a stable sort, and a reordering here would change
+// which of two equally-specific patterns is scanned first for no stated reason.
+func overrideByPattern(routes []*Route) []*Route {
+	last := make(map[string]int, len(routes))
+	for i, rt := range routes {
+		last[rt.Pattern] = i
+	}
+	if len(last) == len(routes) {
+		return routes
+	}
+	out := routes[:0]
+	for i, rt := range routes {
+		if last[rt.Pattern] == i {
+			out = append(out, rt)
+		}
+	}
+	return out
 }
 
 // newRouteTable compiles and orders a route set.

@@ -61,6 +61,17 @@ type Options struct {
 	// request path reads one nil pointer and skips the whole mechanism.
 	Observer Observer
 
+	// Metrics renders GET /metrics when it is set, replacing the built-in
+	// block (DESIGN §12.3). internal/metrics assembles the full surface by
+	// pulling from every subsystem, including this one through [Server.Stats];
+	// this package neither knows nor imports it.
+	//
+	// It replaces rather than extends because the two would otherwise both
+	// emit `dorang_requests_total` — the built-in one unlabelled, §12.3's with
+	// five labels — and a second `# TYPE` line for one name makes Prometheus
+	// reject the whole scrape.
+	Metrics MetricsSource
+
 	// CaptureHeadBytes and CaptureTailBytes bound what a sampled response
 	// retains for comparison; 0 uses [DefaultCaptureHeadBytes] and
 	// [DefaultCaptureTailBytes]. They are here rather than in the observer
@@ -117,6 +128,7 @@ type snapshot struct {
 	models     ModelLister
 	meter      Meter
 	observer   Observer
+	metrics    MetricsSource
 
 	captureHead int
 	captureTail int
@@ -181,6 +193,7 @@ func (s *Server) Reload(opts Options) error {
 		models:         opts.Models,
 		meter:          opts.Meter,
 		observer:       opts.Observer,
+		metrics:        opts.Metrics,
 		captureHead:    opts.CaptureHeadBytes,
 		captureTail:    opts.CaptureTailBytes,
 		maxBody:        opts.MaxBodyBytes,
@@ -228,6 +241,16 @@ func (s *Server) Reload(opts Options) error {
 		r := opts.Routes[i]
 		routes = append(routes, &r)
 	}
+	// A caller-supplied route REPLACES a built-in one on the same pattern.
+	//
+	// The built-in table declares the whole T0+T1 surface, including routes
+	// whose stateful half lives in internal/app (the Responses sub-resources,
+	// batches, files). Without this rule the app's real handler would be
+	// registered behind the built-in one and silently never reached — the same
+	// class of bug COMPATIBILITY §7.5 is about, one layer up. Within a single
+	// set a duplicate is still a configuration error, which newRouteTable
+	// enforces for exact patterns.
+	routes = overrideByPattern(routes)
 	table, err := newRouteTable(routes)
 	if err != nil {
 		return err
@@ -399,12 +422,37 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 			s.metrics.replayRefused.Add(1)
 		}
 		if b := rq.body.Bytes(); len(b) > 0 {
-			model, stream, ok := peekRequest(b)
-			if !ok {
-				return NewError(http.StatusBadRequest, TypeInvalidRequest,
-					"request body is not a JSON object").WithCode("invalid_body")
+			if rt.Multipart {
+				form, e := parseMultipart(rq.HTTP, b)
+				if e != nil {
+					return e
+				}
+				rq.Form = form
+				// An exact field lookup, matching the strict JSON rule: the gate
+				// and the adapter must resolve the same model from the same
+				// bytes (COMPATIBILITY 2.0).
+				rq.Model = form.Get("model")
+				rq.Stream, _ = form.Bool("stream")
+			} else {
+				model, stream, ok := peekRequest(b)
+				if !ok {
+					return NewError(http.StatusBadRequest, TypeInvalidRequest,
+						"request body is not a JSON object").WithCode("invalid_body")
+				}
+				rq.Model, rq.Stream = model, stream
 			}
-			rq.Model, rq.Stream = model, stream
+		}
+	}
+
+	// The deployment-in-the-path aliases name the model in the URL, and there
+	// the path is authoritative: an Azure-shaped client sends the deployment
+	// there and often nothing in the body. This runs BEFORE the allow-list
+	// check below, so the key is authorized against the name that will actually
+	// be dispatched — resolving it in the handler instead would authorize a
+	// request as having no model and dispatch it as having one, which is W10.
+	if rt.ModelParam != "" {
+		if m := rq.Param(rt.ModelParam); m != "" {
+			rq.Model = m
 		}
 	}
 
@@ -489,10 +537,14 @@ func (s *Server) unimplemented(rw *responseWriter, rq *Request) error {
 // plannedRoutePrefixes are the administrative and protocol families DESIGN §2.1
 // and §2.3 declare but this milestone has not built. A path under one of them
 // is "not implemented yet" rather than "does not exist".
+// A path here that is ALSO a registered route never reaches this function; the
+// overlap is deliberate, because a route can be registered by one build and not
+// another (internal/app mounts the batch, files and Responses sub-resources
+// only when their subsystems exist) and the honest answer for the build without
+// them is "declared, not built" rather than "no such path".
 var plannedRoutePrefixes = []string{
-	"/v1/completions", "/v1/responses", "/v1/rerank", "/v2/rerank",
-	"/v1/audio/", "/v1/images/", "/v1/moderations", "/v1/ocr",
-	"/v1/files", "/v1/batches", "/v1/models/",
+	"/v1/responses", "/v1/ocr", "/v1/files", "/v1/batches",
+	"/v1/audio/", "/v1/images/", "/v1/vector_stores", "/v1/assistants",
 	"/key/", "/user/", "/team/", "/model/", "/model_group/", "/budget/",
 	"/spend/", "/global/spend/", "/health/history",
 }

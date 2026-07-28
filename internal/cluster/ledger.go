@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,6 +252,20 @@ type ledgerBlock struct {
 	// bound rather than an estimate.
 	expiresUS atomic.Int64
 
+	// limitSeen and counterAtDraw exist only to be read by an observer, and
+	// they are atomics for one reason: mu below is held across a store round
+	// trip, and a metrics scrape that waited behind one would be unavailable at
+	// exactly the moment the store is the thing going wrong. Both are written
+	// where the fields they mirror are written, under mu, and read without it.
+	//
+	// counterAtDraw is the durable counter immediately after this node's last
+	// draw. Subtracting `remaining` from it estimates what has been spent
+	// against the counter fleet-wide, on the assumption that every other node
+	// has spent what it drew -- an upper bound, which is the safe direction for
+	// a budget gauge to be wrong in.
+	limitSeen     atomic.Int64
+	counterAtDraw atomic.Int64
+
 	// mu guards the slow path: drawing, renewing, checkpointing and closing.
 	// The hot path never takes it.
 	mu    sync.Mutex
@@ -312,6 +327,29 @@ type Hold struct {
 	done  atomic.Bool
 }
 
+// Consumed estimates what has been spent against this hold's counter, and the
+// ceiling it is measured against.
+//
+// It is the same upper-bound arithmetic [Ledger.Stats] reports — the durable
+// counter at this node's last draw, less what the node has not yet spent — but
+// for one counter and without the lock, so it is two atomic loads and no
+// allocation. That matters because the caller is the request path: DESIGN
+// §11.5's budget_80pct threshold is crossed while serving a request, and
+// discovering it must not cost a store read.
+//
+// Both figures are zero for a hold taken against no limit.
+func (h *Hold) Consumed() (spent, limit int64) {
+	if h == nil || h.block == nil {
+		return 0, 0
+	}
+	rem := h.block.remaining.Load()
+	spent = h.block.counterAtDraw.Load() - rem
+	if spent < 0 {
+		spent = 0
+	}
+	return spent, h.block.limitSeen.Load()
+}
+
 // Reserve takes amount units against limit.
 //
 // limit is passed in rather than read from the store because the hot path
@@ -337,6 +375,12 @@ func (l *Ledger) Reserve(ctx context.Context, key CounterKey, limit, amount int6
 	b, err := l.blockFor(key)
 	if err != nil {
 		return nil, err
+	}
+	// The ceiling is a per-call argument, so the block never learns it except
+	// here. Stored only when it changes, so the steady state is one atomic load
+	// rather than a store.
+	if b.limitSeen.Load() != limit {
+		b.limitSeen.Store(limit)
 	}
 	if amount == 0 {
 		return &Hold{Key: key, Amount: 0, block: b}, nil
@@ -495,11 +539,12 @@ func (l *Ledger) drawAndTake(ctx context.Context, b *ledgerBlock, limit, amount 
 	key := b.key
 
 	var (
-		grant int64
-		reset bool
+		grant   int64
+		reset   bool
+		counter int64
 	)
 	err := l.c.withTx(ctx, func(ctx context.Context, t tx) error {
-		grant, reset = 0, false
+		grant, reset, counter = 0, false, 0
 		if err := t.lock(ctx, "ledger/"+key.String()); err != nil {
 			return err
 		}
@@ -531,6 +576,7 @@ func (l *Ledger) drawAndTake(ctx context.Context, b *ledgerBlock, limit, amount 
 		if err != nil {
 			return err
 		}
+		counter = value
 		want := maxInt64(need, l.block)
 		grant = want
 		if limit > 0 {
@@ -584,8 +630,56 @@ func (l *Ledger) drawAndTake(ctx context.Context, b *ledgerBlock, limit, amount 
 	// held + grant - amount is non-negative: grant is at least amount - held.
 	b.remaining.Add(held + grant - amount)
 	b.expiresUS.Store(expUS)
+	b.counterAtDraw.Store(counter + grant)
 	l.draws.Add(1)
 	return nil
+}
+
+// LedgerStat is one live block, as this node knows it.
+//
+// Everything here is this node's view. The durable counter is read only when a
+// block is drawn, so Committed is exact at that instant and drifts by whatever
+// other nodes spend afterwards; the drift is bounded by the same block size
+// DESIGN §5.6 publishes as the overshoot. Reading the true figure needs a store
+// round trip, which is not something a scrape may do.
+type LedgerStat struct {
+	Key CounterKey
+	// Limit is the ceiling last reserved against, 0 when none was given.
+	Limit int64
+	// Committed estimates what has been spent against the counter fleet-wide.
+	Committed int64
+	// Remaining is what this node still holds unspent from its lease.
+	Remaining int64
+	// ExpiresAt is when this node's lease lapses. Zero means it holds none.
+	ExpiresAt time.Time
+}
+
+// Stats reports every live block without touching the store.
+//
+// It takes only the read lock the hot path takes -- two read locks never
+// conflict -- and the per-block mutex, which is held across a store round trip,
+// is deliberately not taken. DESIGN §12.3's budget gauge is worth nothing if
+// reading it blocks behind the write it is meant to warn about.
+func (l *Ledger) Stats() []LedgerStat {
+	l.mu.RLock()
+	out := make([]LedgerStat, 0, len(l.blocks))
+	for _, b := range l.blocks {
+		rem := b.remaining.Load()
+		st := LedgerStat{
+			Key:       b.key,
+			Limit:     b.limitSeen.Load(),
+			Committed: maxInt64(b.counterAtDraw.Load()-rem, 0),
+			Remaining: maxInt64(rem, 0),
+		}
+		if us := b.expiresUS.Load(); us > 0 {
+			st.ExpiresAt = time.UnixMicro(us).UTC()
+		}
+		out = append(out, st)
+	}
+	l.mu.RUnlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Key.String() < out[j].Key.String() })
+	return out
 }
 
 // Maintain renews the leases that are approaching expiry and checkpoints the
