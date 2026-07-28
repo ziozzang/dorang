@@ -1,0 +1,27 @@
+# Build output
+/bin/
+/dist/
+dorang
+dorangctl
+*.test
+*.out
+coverage.*
+
+# Local dev
+.env
+*.local.yaml
+/data/
+/tmp/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Agent scratch
+.claude/
+.jikji/
+
+# Local-only working notes (deployment specifics, not for publication)
+docs/internal/

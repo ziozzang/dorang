@@ -1,0 +1,47 @@
+dorang
+Copyright (c) 2026 Jioh L. Jung
+
+This product includes software developed as dorang by Jioh L. Jung and the
+dorang contributors (https://github.com/ziozzang/dorang).
+
+dorang is licensed under the Apache License, Version 2.0. The complete license
+text is in LICENSE.
+
+ATTRIBUTION REQUIREMENT
+----------------------
+Distributions of this work or of derivative works must preserve this NOTICE
+attribution in one of the forms permitted by section 4(d) of the Apache License,
+Version 2.0. In particular, the distribution must continue to identify dorang
+(https://github.com/ziozzang/dorang) as the origin of this work.
+
+This uses the standard Apache 2.0 NOTICE mechanism and does not modify, add to,
+or subtract from the Apache 2.0 license text itself.
+
+ORIGIN OF DESIGN
+----------------
+dorang is an independent Go implementation. It was informed by the following
+works. No source code was copied from any of them; mechanisms were re-implemented
+from analysis of their published behavior and interfaces.
+
+  Jikji — https://github.com/jikji-labs/jikji
+    Copyright (c) 2025-2026 Jioh L. Jung
+    Provider-backbone concepts: multi-axis capacity brokering, credential pool
+    rotation, sticky routing, provider-reported usage-limit normalization,
+    provider-kind defaults and model-prefix capability inference.
+    Used by the same copyright holder; contributed to dorang under Apache-2.0.
+
+  OpenClaw — https://github.com/openclaw/openclaw — MIT License
+    Copyright (c) 2026 OpenClaw Foundation
+    Provider-catalog / plugin-manifest structure.
+
+  Hermes Agent — https://github.com/nousresearch/hermes-agent — MIT License
+    Copyright (c) 2025 Nous Research
+    Provider-profile concept for mapping a neutral reasoning configuration onto
+    provider-specific wire representations.
+
+Interoperability with the LiteLLM proxy configuration format and with the
+OpenAI, Anthropic, and vLLM HTTP APIs is implemented from their public wire
+formats for compatibility purposes.
+
+Third-party Go modules retain their respective copyright and license notices;
+see the generated dependency attribution material in release artifacts.
