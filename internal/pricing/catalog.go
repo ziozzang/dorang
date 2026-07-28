@@ -666,6 +666,17 @@ func compileAdjustment(raw *rawRule, r *rule) error {
 	if op == AdjMultiply && d.neg {
 		return errors.New("a multiply adjustment may not use a negative factor")
 	}
+	// A negative percent is a discount and a negative add is a credit; both are real
+	// things and both stay legal. What is bounded is how far one may reach: a discount
+	// deeper than 100% is not a discount, it is a payout expressed as one, and the
+	// operator who wrote -150 meant -15 far more often than they meant "pay the caller
+	// half the bill again". The size of an `add` credit cannot be bounded here — it is an
+	// absolute amount and the request it applies to is not known until it arrives — so
+	// that one is bounded at the total instead, which is where [Cost.Floored] clamps.
+	if op == AdjPercent && d.neg && d.exceedsHundred() {
+		return fmt.Errorf("amount %q: a percent discount may not exceed -100%% "+
+			"(it would make the request cost less than nothing)", d.text)
+	}
 	return nil
 }
 

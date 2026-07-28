@@ -39,6 +39,12 @@ type Meter struct {
 	numMu   sync.Mutex
 	pending []Bucket
 	scratch map[bucketKey]int
+	// carryDir is where the numeric carry-over is kept durably, empty when no
+	// spool directory is configured. carryOnDisk records whether a file is
+	// currently there, so a healthy meter pays no syscall per flush. Both are
+	// guarded by numMu.
+	carryDir    string
+	carryOnDisk bool
 
 	drainMu  sync.Mutex
 	drainBuf []Trace
@@ -121,9 +127,27 @@ func New(cfg Config) *Meter {
 			m.setDegraded(ReasonSpoolError)
 		} else {
 			m.sp = sp
+			m.carryDir = cfg.SpoolDir
 		}
 	} else {
 		m.sp = newMemSpool(cfg.SpoolMaxBytes)
+	}
+
+	// Rollups a previous process could not ship are replayed into the
+	// carry-over before anything new is counted, so they merge with this
+	// process's first flush rather than arriving as a second row for the same
+	// hour. It is the numeric path's half of the restart guarantee the trace
+	// spool already made.
+	if m.carryDir != "" {
+		kept, err := readCarry(m.carryDir)
+		switch {
+		case err != nil:
+			m.setDegraded(ReasonSpoolError)
+		case len(kept) > 0:
+			m.pending = kept
+			m.carryOnDisk = true
+			m.st.pendingBuckets.Store(int64(len(kept)))
+		}
 	}
 
 	if cfg.FlushInterval > 0 {
@@ -318,6 +342,11 @@ func (m *Meter) Flush(ctx context.Context) error {
 func (m *Meter) flushNumeric(ctx context.Context) error {
 	m.numMu.Lock()
 	defer m.numMu.Unlock()
+	// Whatever this flush decides, the carry-over on disk matches the
+	// carry-over in memory by the time the lock is released. That is what makes
+	// the promise "nothing on this path is droppable" survive the process:
+	// counters the sink refused are on disk, not merely in a slice.
+	defer m.persistPendingLocked()
 
 	seed := m.pending
 	m.pending = nil
@@ -496,9 +525,15 @@ func (m *Meter) Stats() Stats {
 }
 
 // Close stops the background loops and makes a bounded final attempt to flush.
-// Whatever the sink does, the ring is always drained onto the spool and the
-// spool is always closed cleanly, so a clean shutdown loses nothing even when
-// the store is unreachable: the next process start replays it.
+//
+// Whatever the sink does, both paths land on disk: the ring is drained onto the
+// trace spool, the counters the sink would not take are written to the numeric
+// carry-over file, and the spool is closed cleanly. A clean shutdown against an
+// unreachable store therefore loses no counter and no spooled trace — the next
+// process start replays both (see carry.go and openDiskSpool).
+//
+// The one thing that forfeits this is running with no Config.SpoolDir, which
+// forfeits the trace spool in the same way and for the same reason.
 func (m *Meter) Close() error {
 	if m == nil || m.off {
 		return nil

@@ -1,6 +1,8 @@
 package prefix
 
 import (
+	"cmp"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,9 +28,17 @@ const shardCount = 64
 type shard struct {
 	mu      sync.RWMutex
 	entries map[Digest]entry
-	// clock hand for eviction: a plain sweep is enough here because entries are
-	// tiny, uniform, and cheap to recreate — a miss costs one routing decision.
-	victims []Digest
+	// victims is the eviction scratch, reused across sweeps so that dropping
+	// the coldest entries of a shard allocates nothing after the first time.
+	// Eviction is approximate by design — entries are tiny, uniform, and cheap
+	// to recreate, since a miss costs one routing decision.
+	victims []victim
+}
+
+// victim is one candidate for eviction: a key and the instant it was last used.
+type victim struct {
+	d    Digest
+	last int64
 }
 
 // Table maps prefix digests to the deployment that served them.
@@ -203,6 +213,14 @@ func (t *Table) Record(digests []Digest, target uint32) {
 // evict drops the coldest entries until the table is back under budget. It is
 // approximate by design — running per shard avoids a global lock, and a
 // slightly stale eviction order costs at most a few extra cache misses.
+//
+// It reaches the target in ONE call. That is not an optimization, it is the
+// contract: [Table.Record] runs it whenever the table is over budget, so a pass
+// that frees less than the deficit is re-run by the very next Record, under the
+// shard lock that Lookup waits on, on the routing hot path. The earlier version
+// freed one entry per shard — 64 entries — whatever the deficit was, so a table
+// 5,000 entries over budget ran the whole scan 78 times per insert until it
+// caught up, and never did while traffic continued.
 func (t *Table) evict() {
 	target := t.maxBytes - t.maxBytes/8 // reclaim to 87.5% so this is not per-insert
 	now := t.now().UnixNano()
@@ -227,28 +245,60 @@ func (t *Table) evict() {
 		}
 	}
 
-	// Pass two: still over budget, so drop the coldest by last use.
+	// Pass two: still over budget, so drop the coldest by last use. The number
+	// of entries the deficit calls for is computed once and taken from the
+	// shards in equal shares; a shard that cannot meet its share leaves the
+	// remainder to the ones after it, and a final top-up sweep covers the case
+	// where those ran out too. Both loops are bounded by shardCount, so the
+	// cost of a sweep is bounded whatever the deficit is.
+	need := int((t.curBytes.Load() - target + entryBytes - 1) / entryBytes)
 	for i := range t.shards {
-		if t.curBytes.Load() <= target {
+		if need <= 0 {
 			return
 		}
-		sh := &t.shards[i]
-		sh.mu.Lock()
-		oldest := int64(1)<<62 - 1
-		var victim Digest
-		var have bool
-		for d, e := range sh.entries {
-			if e.lastSeen < oldest {
-				oldest, victim, have = e.lastSeen, d, true
-			}
-		}
-		if have {
-			delete(sh.entries, victim)
-			t.curBytes.Add(-entryBytes)
-			t.evicted.Add(1)
-		}
-		sh.mu.Unlock()
+		share := (need + shardCount - i - 1) / (shardCount - i)
+		need -= t.evictColdest(&t.shards[i], share)
 	}
+	for i := range t.shards {
+		if need <= 0 {
+			return
+		}
+		need -= t.evictColdest(&t.shards[i], need)
+	}
+}
+
+// evictColdest drops the k least recently used entries of one shard and reports
+// how many it dropped, which is fewer than k only when the shard held fewer.
+func (t *Table) evictColdest(sh *shard, k int) int {
+	if k <= 0 {
+		return 0
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	n := len(sh.entries)
+	if n == 0 {
+		return 0
+	}
+	if k >= n {
+		clear(sh.entries)
+		t.curBytes.Add(-int64(n) * entryBytes)
+		t.evicted.Add(uint64(n))
+		return n
+	}
+
+	vs := sh.victims[:0]
+	for d, e := range sh.entries {
+		vs = append(vs, victim{d: d, last: e.lastSeen})
+	}
+	sh.victims = vs
+	slices.SortFunc(vs, func(a, b victim) int { return cmp.Compare(a.last, b.last) })
+	for _, v := range vs[:k] {
+		delete(sh.entries, v.d)
+	}
+	t.curBytes.Add(-int64(k) * entryBytes)
+	t.evicted.Add(uint64(k))
+	return k
 }
 
 // Stats reports observability counters.

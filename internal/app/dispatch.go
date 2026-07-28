@@ -785,6 +785,17 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		d.logf("app: pricing %s/%s: %v", dec.Provider, dec.UpstreamModel, err)
 		return
 	}
+	if cost.Floored {
+		// The catalog's adjustments came to more than the request they applied
+		// to. pricing floors the total at zero, because the ledger row and the
+		// quota counter below both read it as an amount SPENT and a negative one
+		// would hand back budget and quota nobody paid for. A clamp that nobody
+		// is told about is a catalog error that never gets fixed, so it is
+		// logged for the same reason an unpriced model is.
+		d.logf("app: adjustment rules on %s/%s exceed the request's cost; the total "+
+			"was clamped to zero (a credit may zero a request out, not pay the caller)",
+			dec.Provider, dec.UpstreamModel)
+	}
 	if cost.Missing {
 		// §8.3: an unpriced model warns rather than costing zero in silence.
 		d.logf("app: no marginal price rule matched %s/%s; the request is unpriced",

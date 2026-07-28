@@ -217,6 +217,13 @@ func (d decimal) atto() (u128, bool) {
 	return u64To128(d.units).mul(pow10[attoScale-int(d.scale)])
 }
 
+// exceedsHundred reports whether the magnitude of d is greater than 100, ignoring its
+// sign. It is the "more than the whole" test a percentage has to pass.
+func (d decimal) exceedsHundred() bool {
+	hi, lo := bits.Mul64(100, pow10[d.scale])
+	return hi != 0 || d.units > lo
+}
+
 // scaled returns units * 10^(want-scale), used to express a decimal at a coarser fixed
 // scale (for example micro-seconds). It fails if the decimal is finer than want.
 func (d decimal) scaled(want uint8) (uint64, bool) {

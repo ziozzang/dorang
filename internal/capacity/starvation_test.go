@@ -765,3 +765,239 @@ func TestBatchWaitersNeverSoftReserve(t *testing.T) {
 	}
 	releaseAll(held[1:])
 }
+
+// ---------------------------------------------------------------------------
+// W8, the spill case: the claim candidate is not always the one that can serve
+// ---------------------------------------------------------------------------
+
+// TestSpillWaiterIsServedWhenItsPreferredCandidateIsPinned.
+//
+// Soft reservations were taken over attempt-order candidate zero and nothing
+// else. Under OnCapacity == Wait that is the only candidate there is; under
+// Spill it need not be the one the waiter is ever served through. Pin one axis
+// of candidate zero — a long-lived reservation on its credential group, which
+// is an ordinary steady state, not a pathology — and the claim prefix freezes
+// short of it forever. The waiter then has no protection at all on the
+// candidate it could actually use, so it ping-pongs between that candidate's
+// two saturated axes exactly as it did before W8 was closed, while the units it
+// did claim on candidate zero stay idle for the whole wait.
+//
+// Measured before the fix: unserved after 78 releases against a documented
+// bound of five, with a unit of the plan-a route axis idle throughout.
+func TestSpillWaiterIsServedWhenItsPreferredCandidateIsPinned(t *testing.T) {
+	// The bound the protocol promises once the waiter is oldest is
+	// SoftReserveAfter to arm, then at most SoftReserveAfter non-growing probes
+	// before the claim candidate rotates, then at most m = 2 releases of the
+	// candidate it rotated to: 4 + 4 + 2 = 10 at the shipped default. This runs
+	// at the default deliberately and leaves headroom, so that a slower but
+	// still bounded route is not called a failure.
+	const maxReleases = 20
+
+	for _, tc := range []struct {
+		name       string
+		mode       SoftReservationMode
+		wantServed bool
+	}{
+		{"soft-reservations-on", SoftReservationsOn, true},
+		{"soft-reservations-off", SoftReservationsOff, false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			releases, served, idle := runSpillStarvationSchedule(t, tc.mode, maxReleases)
+			switch {
+			case tc.wantServed && !served:
+				t.Fatalf("spill waiter starved: still queued after %d releases, with the "+
+					"claim prefix frozen behind its preferred candidate's pinned axis "+
+					"(DESIGN §5.4 correction 5, W8); a unit of that candidate's route "+
+					"axis was still being held idle for it: %v", releases, idle)
+			case !tc.wantServed && served:
+				t.Fatalf("the spill waiter was served after %d releases with the guard "+
+					"off. Either the schedule stopped being adversarial or starvation is "+
+					"now closed by some other mechanism; if the latter, delete this "+
+					"branch rather than weakening it.", releases)
+			case tc.wantServed:
+				if releases > maxReleases {
+					t.Fatalf("spill waiter served after %d releases, want <= %d",
+						releases, maxReleases)
+				}
+				if idle {
+					t.Error("a unit of the preferred candidate's route axis was still " +
+						"held idle when the waiter was served through the other candidate")
+				}
+				t.Logf("spill waiter served after %d releases", releases)
+			default:
+				t.Logf("starvation reproduced: not served after %d releases", releases)
+			}
+		})
+	}
+}
+
+// runSpillStarvationSchedule drives the same adversarial schedule as
+// runStarvationSchedule, one candidate along.
+//
+// The victim prefers a candidate whose credential group is pinned for the whole
+// run, and may spill to a second candidate on another provider whose two axes
+// are held saturated by single-axis streams the test schedules itself. It
+// reports the releases spent, whether the victim was served, and whether the
+// preferred candidate's spare route unit was still being idled at that moment.
+func runSpillStarvationSchedule(t *testing.T, mode SoftReservationMode, maxReleases int) (int, bool, bool) {
+	t.Helper()
+
+	b := newBroker(t, Config{
+		// plan-a's route has room for the pin and one more, so the victim can
+		// claim a unit there — which is the capacity that then sits idle.
+		Routes:           map[string]int{"plan-a": 2},
+		CredentialGroups: map[string]int{"acct-1": 1},
+		Models:           []ModelLimit{{Provider: "cloud-a", Model: "mx:cloud", Max: 1}},
+		SoftReservations: mode,
+	})
+
+	victim := Request{
+		Provider:   "plan-a",
+		Model:      "mx",
+		OnCapacity: Spill,
+		Candidates: []Candidate{
+			{ID: "acct-1", CapacityGroup: "acct-1"},
+			{ID: "acct-2", Provider: "cloud-a", UpstreamModel: "mx:cloud", MaxConcurrent: 1},
+		},
+	}
+
+	// The preferred candidate's credential group is held for the whole test and
+	// never released: one long-running request on the account. That is all it
+	// takes to pin the claim prefix.
+	pin := mustAcquire(t, b, Request{
+		Provider:   "plan-a",
+		Candidates: []Candidate{{ID: "acct-1", CapacityGroup: "acct-1"}},
+	})
+	defer pin.Release()
+
+	sa := &axisStream{
+		name: "cloud model",
+		req:  Request{Provider: "cloud-a", Model: "mx:cloud"},
+		key:  modelAxisKey("cloud-a", "mx:cloud"),
+		out:  make(chan *Reservation, 64),
+	}
+	sb := &axisStream{
+		name: "cloud key",
+		req:  Request{Provider: "cloud-a", Candidates: []Candidate{{ID: "acct-2", MaxConcurrent: 1}}},
+		key:  credAxisKey("cloud-a", "acct-2"),
+		out:  make(chan *Reservation, 64),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sa.held = append(sa.held, mustAcquire(t, b, sa.req))
+	sb.held = append(sb.held, mustAcquire(t, b, sb.req))
+
+	wOut := make(chan result, 1)
+	launch(b, ctx, victim, wOut)
+	waiting := 1
+	waitQueued(t, b, waiting)
+
+	var spawned sync.WaitGroup
+	spawn := func(s *axisStream) {
+		spawned.Add(1)
+		go func() {
+			defer spawned.Done()
+			res, err := b.Acquire(ctx, s.req)
+			if err == nil {
+				s.out <- res
+			}
+		}()
+		s.queued++
+		waiting++
+		waitQueued(t, b, waiting)
+	}
+
+	releases := 0
+	var won *result
+
+	releaseOne := func(s *axisStream) {
+		if won != nil || len(s.held) == 0 {
+			return
+		}
+		r := s.held[len(s.held)-1]
+		s.held = s.held[:len(s.held)-1]
+		r.Release()
+		releases++
+
+		if b.softReservedOn(s.key) {
+			return
+		}
+		select {
+		case res := <-s.out:
+			s.held = append(s.held, res)
+			s.queued--
+			waiting--
+		case g := <-wOut:
+			won = &g
+			waiting--
+		case <-time.After(5 * time.Second):
+			t.Fatalf("release on the %s axis was neither granted nor set aside", s.name)
+		}
+	}
+
+	for round := 0; round < maxReleases && won == nil; round++ {
+		for _, s := range []*axisStream{sa, sb} {
+			if won != nil {
+				break
+			}
+			if s.queued == 0 {
+				spawn(s)
+			}
+			releaseOne(s)
+		}
+	}
+
+	if won == nil {
+		select {
+		case g := <-wOut:
+			won = &g
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	served := won != nil
+	idle := b.softReservedOn(routeKey("plan-a"))
+	if served {
+		if won.err != nil {
+			t.Fatalf("spill waiter failed: %v", won.err)
+		}
+		if got := won.res.CredentialID(); got != "acct-2" {
+			t.Fatalf("served through %q; the preferred candidate is pinned, so the only "+
+				"way through is the spill candidate acct-2", got)
+		}
+		won.res.Release()
+	}
+
+	cancel()
+	releaseAll(sa.held)
+	releaseAll(sb.held)
+	spawned.Wait()
+	for _, s := range []*axisStream{sa, sb} {
+		for {
+			select {
+			case res := <-s.out:
+				res.Release()
+				continue
+			default:
+			}
+			break
+		}
+	}
+	if !served {
+		if r := <-wOut; r.err == nil {
+			r.res.Release()
+		}
+	}
+
+	waitFor(t, func() bool { return b.Snapshot().Waiting == 0 }, "waiters to drain")
+	if got := b.totalClaims(); got != 0 {
+		t.Fatalf("%d soft reservations left behind: idled capacity leaked", got)
+	}
+	if got := b.totalQueueNodes(); got != 0 {
+		t.Fatalf("queue nodes = %d after drain, want 0", got)
+	}
+	return releases, served, idle
+}

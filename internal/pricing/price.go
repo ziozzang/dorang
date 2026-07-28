@@ -113,6 +113,11 @@ func (c *Catalog) Explain(req Request) Explanation {
 		ex.Notes = append(ex.Notes,
 			"the subscription share is imputed for accounting; routing compares MarginalNano only")
 	}
+	if cost.Floored {
+		ex.Notes = append(ex.Notes,
+			"the adjustments exceeded the cost they applied to: the total was clamped to zero, "+
+				"because a credit may zero a request out but may not pay the caller")
+	}
 	if cost.NotionalMissing {
 		ex.Notes = append(ex.Notes,
 			"no notional_rate rule matched: the list-rate estimate is unavailable, not zero")
@@ -234,6 +239,22 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 	// TotalNano is the sum of the three billing classes. nNano is not a term and there is
 	// no branch in which it becomes one (§8.5).
 	cost.TotalNano = total
+	if total < 0 {
+		// A credit may zero a request out; it may not pay the caller. Every consumer of
+		// this number treats it as an amount SPENT — the ledger row, the budget hold, the
+		// quota counter — and a negative one does not merely mis-bill, it manufactures
+		// quota and budget out of a catalog edit. The guard lives here, in the one place
+		// all three entry points (Price, Settle, Explain) pass through, rather than at the
+		// call sites: two of the three call sites checked, one did not, and that is
+		// precisely the failure this shape removes.
+		//
+		// The adjustment absorbs the difference so that TotalNano == MarginalNano +
+		// SubscriptionNano + AdjustmentNano stays exact, which is what reconciliation
+		// depends on. What was clamped is reported rather than hidden.
+		cost.AdjustmentNano = aNano - total
+		cost.TotalNano = 0
+		cost.Floored = true
+	}
 	cost.NotionalNano = nNano
 	if ex != nil {
 		ex.Notional = NotionalDetail{
@@ -492,6 +513,17 @@ func (c *Catalog) subscriptionShare(r *rule, marginal amt, at time.Time, mutate 
 	}
 
 	if mutate {
+		// A settlement whose instant falls in a period that has already closed —
+		// a backfill, a replayed row, a clock that stepped back — is priced
+		// against its own period, but it must not become the state of the
+		// subscription. Storing it would move periodStart backwards, and the
+		// next request in the OPEN period would then find a period that does not
+		// match its own, read a to-date of zero, and take the whole plan cost
+		// again: one late row would reset the accumulator every other row in the
+		// period is divided by.
+		if cur := st.snap.Load(); cur != nil && cur.periodStart.After(start) {
+			return attoAmt(share), nil
+		}
 		sum, ok := toDate.add(marginal.m)
 		if !ok {
 			return amt{}, ErrOverflow

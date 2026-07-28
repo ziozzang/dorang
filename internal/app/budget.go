@@ -271,6 +271,32 @@ func usdString(nano int64) string {
 	return strconv.FormatFloat(quota.USD(nano), 'f', 6, 64)
 }
 
+// quoter is the non-mutating half of *pricing.Catalog: it can quote a price and
+// nothing else.
+//
+// It exists because the pre-flight estimate below priced its upper bound with
+// Settle, whose own documentation says "call it at most once per request, from
+// the accounting path; routing must call Price". A comment did not prevent that,
+// so the estimate now holds a type through which the mutating call is not
+// reachable at all. Settling twice is not a double charge — the second settle
+// wins the ledger row — but it advances the subscription period accumulator
+// twice, once at max_tokens, which is the denominator every later request's
+// amortized share is divided by.
+type quoter interface {
+	Price(pricing.Request) (pricing.Cost, error)
+}
+
+// quoteOnly is the estimating view of this state's catalog, or nil when nothing
+// is priced. Returning the interface rather than the catalog is the whole point:
+// the estimate cannot settle by accident, and a future edit that needs to would
+// have to change this signature and say so.
+func (st *dispatchState) quoteOnly() quoter {
+	if st == nil || st.pricing == nil {
+		return nil
+	}
+	return st.pricing
+}
+
 // estimate is DESIGN §6.4's deliberately pessimistic upper bound: exact input
 // tokens priced, plus output priced at max_tokens.
 //
@@ -279,15 +305,22 @@ func usdString(nano int64) string {
 // request that names no max_tokens is priced at the deployment's catalogued
 // ceiling rather than at zero, because zero would make an unbounded generation
 // free to reserve.
+//
+// It quotes; it does not settle. The two differ in more than a name: Settle
+// consumes the carried sub-nano remainder and adds the request's marginal cost
+// to the subscription accumulator, and doing that from a pre-flight estimate
+// priced at max_tokens inflates the accumulator by the ratio of the ceiling to
+// the real generation before the request has produced a single token.
 func (g *budgetGate) estimate(st *dispatchState, c *call, dec *router.Decision) int64 {
-	if st == nil || st.pricing == nil {
+	price := st.quoteOnly()
+	if price == nil {
 		return 0
 	}
 	out := maxOutputTokens(c.creq)
 	if out <= 0 && st.catalog != nil {
 		out = int64(st.catalog.Model(dec.Kind, dec.UpstreamModel).MaxOutputTokens)
 	}
-	cost, err := st.pricing.Settle(pricing.Request{
+	cost, err := price.Price(pricing.Request{
 		Provider:     dec.Provider,
 		Model:        dec.UpstreamModel,
 		Credential:   dec.Credential,
@@ -297,13 +330,17 @@ func (g *budgetGate) estimate(st *dispatchState, c *call, dec *router.Decision) 
 		Requests:     1,
 		At:           g.now(),
 	})
-	if err != nil || cost.Missing || cost.TotalNano < 0 {
+	if err != nil || cost.Missing {
 		// An unpriced model reserves nothing. It is already reported as
 		// unpriced at settlement (§8.3), and refusing traffic on a price the
 		// deployment never configured would be a worse answer than counting it
 		// at zero.
 		return 0
 	}
+	// TotalNano cannot be negative — pricing floors it (see [pricing.Cost]) —
+	// so there is nothing left to check here. The check that used to stand in
+	// this line guarded one of the three call sites and let the other two
+	// through, which is why the guard moved to where the number is made.
 	return cost.TotalNano
 }
 

@@ -97,14 +97,41 @@
 // waiters that were never in trouble, at roughly four times the measured cost.
 // The threshold shifts the liveness bound below by a constant and nothing else.
 //
-// On a probe that fails, the waiter walks the axes of its claim candidate — the
-// first candidate in attempt order, which under OnCapacity == Wait is the only
-// one it will ever use — in axis order, and claims each in turn until it reaches
-// one it cannot claim. An axis cannot be claimed when it is full, when someone
-// else already claims it, or when an older waiter is queued on it (which keeps
-// claims consistent with FIFO and aging). The walk stops at the first such axis:
-// claims are always a *prefix* in axis order, never a scattered subset. That
-// prefix rule is what rules out deadlock, below.
+// On a probe that fails, the waiter walks the axes of its claim candidate in
+// axis order and claims each in turn until it reaches one it cannot claim. An
+// axis cannot be claimed when it is full, when someone else already claims it,
+// or when an older waiter is queued on it (which keeps claims consistent with
+// FIFO and aging). The walk stops at the first such axis: claims are always a
+// *prefix* in axis order, never a scattered subset. That prefix rule is what
+// rules out deadlock, below.
+//
+// # Soft reservations: which candidate they are taken over
+//
+// The claim candidate is one candidate, never a union. Under OnCapacity == Wait
+// it is candidate zero for the waiter's whole life, because that is the only
+// candidate it will ever use.
+//
+// Under Spill it starts there and MOVES, because candidate zero is not
+// necessarily the candidate the waiter can be served through. Pin one axis of
+// candidate zero — a long-running reservation on its credential group is
+// enough, and is an ordinary steady state — and the claim prefix freezes short
+// of that axis and can never complete, so the guarantee never arrives. Worse
+// than not arriving: the units the prefix did claim stay idle for the whole
+// wait, and the candidate that does have capacity coming free gets no
+// protection at all, which is the pre-W8 ping-pong with a parked unit beside
+// it.
+//
+// So when the claim candidate stops growing — SoftReserveAfter consecutive
+// probes that claim nothing new — the claim set moves to the candidate whose
+// axis triggered the current probe, which is by construction a candidate with
+// capacity coming free. The move gives the whole old prefix back first, which
+// re-offers those units to their queues, so the idling ends at the same instant.
+//
+// The hysteresis is load-bearing. Rotating on the first probe that grew nothing
+// would be worse than never rotating: two candidates whose axes free alternately
+// would each destroy the other's progress on every release, and neither prefix
+// would ever complete. A probe that grows the prefix resets the counter, so a
+// candidate that is making progress is never abandoned.
 //
 // A claim is released when the waiter that holds it leaves the wait state, by
 // any route: granted (the commit consumes the claims on the axes it commits,
@@ -129,6 +156,13 @@
 // *same* order for every waiter, because it is a property of the axis, not of
 // the request. Claims are taken in that order and only as a prefix.
 //
+// Rotating the claim candidate does not weaken this, because it releases every
+// claim before it switches: at every instant, the set a waiter holds is a prefix
+// of ONE candidate's axes. A waiter holding the tail of one candidate's prefix
+// while reaching for the head of another's would be outside the argument
+// entirely — its held axes would no longer all precede its target — which is why
+// the rotation is not an incremental merge.
+//
 // Suppose a cycle W1 -> W2 -> ... -> Wn -> W1, where Wi -> Wj means Wi is
 // blocked from claiming an axis Xi that Wj claims. Wj holds Xi and its own next
 // target is Xj, and because Wj took its claims as a prefix in axis order, every
@@ -143,14 +177,37 @@
 // # Soft reservations: the liveness guarantee
 //
 // Once a waiter is the oldest live waiter it is at the head of every queue it
-// sits in, so every release on the axis blocking it probes it first. Let its
-// claim candidate need m axes (m <= 7). On each such probe it either commits, or
-// its claim prefix grows strictly: the axis that blocked it has just been freed
-// and it is the head, so that axis is now claimable, and everything before it in
-// axis order already passed the check and is therefore claimable too. The prefix
-// never shrinks. So the waiter is served within at most
-// Config.SoftReserveAfter + m releases of its blocking axes — eleven, at the
-// default, against a hole that was previously unbounded.
+// sits in, so every release on an axis blocking it probes it first. Let its
+// claim candidate need m axes (m <= 7), and let a is Config.SoftReserveAfter.
+//
+// On a probe caused by a release of the axis blocking its CLAIM CANDIDATE, the
+// waiter either commits or its claim prefix grows strictly: that axis has just
+// been freed and it is the head, so it is now claimable, and everything before
+// it in axis order already passed the check and is therefore claimable too. The
+// prefix never shrinks while the claim candidate stands. So m such releases
+// complete the prefix and the next probe commits unconditionally.
+//
+//	OnCapacity == Wait:  a + m releases of its blocking axis.
+//	                     4 + 7 = 11 at the default, worst case;
+//	                     4 + 2 = 6 for a two-axis waiter, which is what
+//	                     TestTwoAxisWaiterServedUnderSustainedSaturation
+//	                     measures.
+//
+// Under Spill the releases can come from an axis of a candidate the waiter is
+// not claiming over, and those grow nothing. After a of them the claim candidate
+// rotates onto the candidate whose axis is actually freeing, and the argument
+// above then applies to that candidate:
+//
+//	OnCapacity == Spill: a + k x (a + m) releases of its blocking axes, for k
+//	                     candidates. 4 + 4 + 2 = 10 measured for the
+//	                     two-candidate, two-axis shape of
+//	                     TestSpillWaiterIsServedWhenItsPreferredCandidateIsPinned,
+//	                     which is the shape that starves without the rotation.
+//
+// Both numbers are what the two tests observe at the shipped default, not
+// estimates: each drives an adversarial schedule in which the axes are never
+// observably free, counts the releases, and fails if the waiter takes more than
+// the stated headroom — or, with the guard off, if it is served at all.
 //
 // Reaching "oldest" is what aging already provides: sequence numbers are
 // assigned at arrival and never renewed, so the set of waiters older than a

@@ -51,6 +51,25 @@ type waiter struct {
 	// to be given anyway. See Config.SoftReserveAfter.
 	bounces int32
 
+	// claimIdx is the attempt-order index of the candidate this waiter takes its
+	// soft reservations over. It is zero for the whole life of an OnCapacity ==
+	// Wait waiter, which has exactly one candidate; a Spill waiter moves it when
+	// the candidate it is claiming over stops making progress, because a claim
+	// prefix frozen behind a pinned axis of candidate zero protects nothing and
+	// idles a unit for as long as it stands.
+	//
+	// Moving it releases every claim first, so the claims a waiter holds are
+	// always a prefix, in axis order, of ONE candidate's axes. That is the
+	// property the deadlock argument in doc.go rests on.
+	claimIdx int
+	// stall counts consecutive armed probes on which the claim prefix grew by
+	// nothing. It is the "this candidate is not the one" signal, and it carries
+	// hysteresis for a reason: a single non-growing probe means only that the
+	// release came from another candidate's axis, and rotating on that would let
+	// two candidates whose axes free alternately destroy each other's progress
+	// forever. See extendClaimsLocked.
+	stall int32
+
 	// at holds this waiter's position in every queue it currently sits in. A
 	// Spill waiter may block on a different axis per candidate and must be
 	// woken by whichever of them frees first.

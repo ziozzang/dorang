@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1260,5 +1262,125 @@ func TestRecordStaysZeroAllocAcrossFlushes(t *testing.T) {
 		if n := testing.AllocsPerRun(500, func() { m.Record(ev) }); n != 0 {
 			t.Errorf("round %d after a flush: Record allocates %v times per call, want 0", round, n)
 		}
+	}
+}
+
+// TestCountersSurviveCloseWithADeadSink is DESIGN 12.1's whole reason for
+// splitting the two paths: the trace payload may be dropped, the counters may
+// not. The trace path made good on that with a durable spool; the numeric path
+// carried its refused rollups in a slice, so a shutdown against an unreachable
+// store lost 100% of them — the case the promise exists for.
+//
+// The sink is dead for the entire life of the first meter, including its final
+// flush. What is asserted is not that a code path ran but that the counters are
+// still there afterwards: a second meter over the same directory replays them
+// and a working sink receives every request that was recorded.
+func TestCountersSurviveCloseWithADeadSink(t *testing.T) {
+	dir := t.TempDir()
+	const requests = 250
+
+	dead := NewMemSink()
+	dead.SetErrors(errors.New("store is down"), errors.New("store is down"))
+	cfg := manualConfig(dead)
+	cfg.SpoolDir = dir
+	m := New(cfg)
+
+	for i := 0; i < requests; i++ {
+		m.Record(sampleEvent(i))
+	}
+	// Close makes the final attempt; the sink refuses it, as it has all along.
+	_ = m.Close()
+	if got := dead.Totals().Requests; got != 0 {
+		t.Fatalf("the dead sink accepted %d requests; it was supposed to refuse everything", got)
+	}
+
+	// A new process over the same spool directory, with a store that answers.
+	up := NewMemSink()
+	cfg2 := manualConfig(up)
+	cfg2.SpoolDir = dir
+	m2 := New(cfg2)
+	defer m2.Close()
+
+	if st := m2.Stats(); st.PendingBuckets == 0 {
+		t.Fatal("nothing was replayed: every counter recorded before the shutdown is gone")
+	}
+	if err := m2.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	tot := up.Totals()
+	if tot.Requests != requests {
+		t.Fatalf("requests recovered = %d, want %d", tot.Requests, requests)
+	}
+	if want := int64(requests) * sampleEvent(0).CostNano; tot.CostNano != want {
+		t.Errorf("cost recovered = %d, want %d", tot.CostNano, want)
+	}
+	if want := int64(requests) * sampleEvent(0).Tokens.Total(); tot.Tokens.Total() != want {
+		t.Errorf("tokens recovered = %d, want %d", tot.Tokens.Total(), want)
+	}
+	if st := m2.Stats(); st.PendingBuckets != 0 {
+		t.Errorf("PendingBuckets = %d after a successful flush, want 0", st.PendingBuckets)
+	}
+
+	// A third start must find nothing left owed: the file is removed once the
+	// counters have actually landed, or every restart re-reports them.
+	m3 := New(cfg2)
+	defer m3.Close()
+	if st := m3.Stats(); st.PendingBuckets != 0 {
+		t.Errorf("PendingBuckets = %d on a start after a clean flush, want 0", st.PendingBuckets)
+	}
+}
+
+// The carry-over survives the round trip exactly, dimension by dimension. A
+// bucket that comes back with the right request count and the wrong hour, or
+// the wrong status class, is a silently wrong rollup row.
+func TestCarryOverRoundTripsEveryField(t *testing.T) {
+	dir := t.TempDir()
+	want := []Bucket{{
+		Key: Key{APIKeyID: "key-1", TeamID: "team-a", ModelGroup: "gpt", Provider: "openai",
+			CredentialID: "cred-1", Endpoint: "/v1/chat/completions", StatusClass: Status5xx},
+		HourStart:  time.Unix(1700000000-1700000000%3600, 0).UTC(),
+		Requests:   7,
+		Errors:     3,
+		Tokens:     Tokens{Input: 11, Output: 22, CacheRead: 33, CacheWrite: 44, Reasoning: 55},
+		CostNano:   987654321,
+		LatencySum: 9 * time.Second,
+		TTFTSum:    3 * time.Second,
+		TTFTCount:  5,
+	}, {
+		Key:       Key{APIKeyID: OverflowSentinel},
+		HourStart: time.Unix(1700003600, 0).UTC(),
+		Requests:  1,
+	}}
+	if err := writeCarry(dir, want); err != nil {
+		t.Fatalf("writeCarry: %v", err)
+	}
+	got, err := readCarry(dir)
+	if err != nil {
+		t.Fatalf("readCarry: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("read %d buckets, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("bucket %d round-tripped as %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	// A truncated tail yields everything before it rather than nothing.
+	path := filepath.Join(dir, carryName)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if err := os.WriteFile(path, raw[:len(raw)-3], 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	got, err = readCarry(dir)
+	if err != nil {
+		t.Fatalf("readCarry after truncation: %v", err)
+	}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("a torn tail lost the intact records before it: got %+v", got)
 	}
 }

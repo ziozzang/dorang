@@ -370,7 +370,14 @@ type Cost struct {
 	SubscriptionNano int64
 	// AdjustmentNano is the net effect of all adjustment rules; negative for a discount.
 	AdjustmentNano int64
-	// TotalNano is MarginalNano + SubscriptionNano + AdjustmentNano, exactly.
+	// TotalNano is MarginalNano + SubscriptionNano + AdjustmentNano, exactly, and it is
+	// never negative.
+	//
+	// The floor is a property of this type, not a rule each caller is asked to remember.
+	// TotalNano is what the ledger row, the budget hold and the quota counter all read as
+	// "what this request spent", and a negative one does not merely mis-bill: it gives
+	// budget and quota back. An adjustment large enough to invert the sum is clamped to
+	// zero and Floored says so; see [Cost.Floored].
 	//
 	// NotionalNano is deliberately not a term here. It is not omitted by convention that
 	// a later edit could forget: the sum is formed from the three billing classes and
@@ -389,6 +396,14 @@ type Cost struct {
 	// caller is expected to increment a counter and warn (§8.3): silent zero-cost
 	// accounting is the failure mode this package exists to avoid.
 	Missing bool
+
+	// Floored reports that the adjustments summed to less than the cost they applied to,
+	// so the total was clamped to zero and AdjustmentNano reduced to match. A credit that
+	// exceeds the request it credits is a catalog error — the credit outlives the request
+	// it was written for, and the balance it would carry has nowhere to live in a
+	// per-request price — so the caller is expected to count it and warn rather than to
+	// read a zero as an ordinary free request.
+	Floored bool
 
 	// NotionalMissing reports that no notional_rate rule matched, so NotionalNano is
 	// unavailable rather than zero (§8.5). It is a separate flag from Missing because the

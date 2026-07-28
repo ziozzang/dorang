@@ -998,6 +998,16 @@ func (b *Broker) Acquire(ctx context.Context, req Request) (*Reservation, error)
 // in that queue — not the number of requests blocked overall, since one waiter
 // on a Spill request sits in several queues at once. That is the right unit: the
 // ceiling exists to bound what one saturated axis makes the process hold.
+//
+// It is checked on ADMISSION only. A waiter that is re-enqueued onto a newly
+// blocking axis (serveLocked) is not re-tested, and may therefore push that
+// axis one over its ceiling. That is deliberate: `max_queue` bounds how many
+// callers may START waiting on an axis, and turning an already-admitted waiter
+// away because the axis it moved to is busy would fail a request that has
+// already waited — the one caller with the strongest claim to be served — while
+// freeing nothing, since it was occupying a queue slot elsewhere a moment
+// earlier. The process-wide bound is unaffected: waiters are only ever created
+// by an admission that passed this test.
 func (b *Broker) queueFullLocked(blocking []*bucket) *bucket {
 	if !b.bounded {
 		return nil

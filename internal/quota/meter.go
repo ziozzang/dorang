@@ -214,16 +214,28 @@ func (m *Meter) Cumulative(metric Metric) int64 {
 }
 
 // Record adds one request's measured usage.
+//
+// A negative value is ignored rather than subtracted. Consumption is the only
+// thing a meter measures: every metric it carries — cost, tokens, requests — is
+// a quantity a request USED, and none of them can be un-used. Subtracting one
+// would not merely mis-count, it would MANUFACTURE allowance, handing back
+// window capacity that no reset granted, and it would do so on the one path
+// that decides whether a credential may keep serving.
+//
+// Nothing upstream can produce one today ([pricing.Cost.TotalNano] is floored at
+// zero, and token counts and request counts are measured), so this costs one
+// comparison that already existed and defends the invariant at the place that
+// depends on it rather than at each caller that might one day feed it.
 func (m *Meter) Record(now time.Time, u Usage) {
 	for i := range numMetrics {
-		if v := u.Value(Metric(i)); v != 0 {
+		if v := u.Value(Metric(i)); v > 0 {
 			m.cum[i].Add(v)
 		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i, r := range m.rules {
-		if v := u.Value(r.Metric); v != 0 {
+		if v := u.Value(r.Metric); v > 0 {
 			m.counters[i].add(now, v)
 		}
 	}

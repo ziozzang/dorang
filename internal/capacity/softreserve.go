@@ -77,10 +77,13 @@ func (m SoftReservationMode) enabled() bool { return m != SoftReservationsOff }
 // agree to within a quarter of a point), and that is the number to quote.
 //
 // The threshold costs only a constant on the liveness bound: an oldest waiter
-// is served within SoftReserveAfter + (axes it needs) releases of its blocking
-// axes, so 4 + 7 = 11 in the worst case rather than 7. Lower it on a system
-// whose axes release slowly, where eleven releases is a long time; raise it on
-// one that is throughput-bound and whose multi-axis traffic is rare.
+// under OnCapacity == Wait is served within SoftReserveAfter + (axes it needs)
+// releases of its blocking axis, so 4 + 7 = 11 in the worst case rather than 7.
+// It enters the Spill bound twice, once for arming and once for the hysteresis
+// on rotating the claim candidate — SoftReserveAfter + k x (SoftReserveAfter +
+// axes) for k candidates; see doc.go. Lower it on a system whose axes release
+// slowly, where eleven releases is a long time; raise it on one that is
+// throughput-bound and whose multi-axis traffic is rare.
 const DefaultSoftReserveAfter = 4
 
 // claimableLocked reports whether w may take a soft reservation on the bucket
@@ -119,10 +122,35 @@ func (b *Broker) claimableLocked(bk *bucket, n axisNeed, w *waiter) bool {
 // reports whether it claimed the bucket `on`, which is the bucket whose release
 // triggered the probe.
 //
-// Claims are taken over the axes of the claim candidate — attempt-order
-// candidate zero, the only candidate an OnCapacity == Wait request will ever
-// use — in axis order, stopping at the first axis that cannot be claimed. The
+// Claims are taken over the axes of ONE candidate — w.claimIdx, in attempt
+// order — in axis order, stopping at the first axis that cannot be claimed. The
 // prefix discipline is what makes the wait-for graph acyclic; see doc.go.
+//
+// # Why the claim candidate moves
+//
+// It used to be candidate zero, always. That is right for OnCapacity == Wait,
+// where candidate zero is the only candidate the waiter will ever use, and it
+// is wrong for Spill, where the waiter may be served through any of them. If an
+// axis of candidate zero is pinned — held by a long-lived reservation, or
+// claimed by an older waiter — the prefix freezes short of it and can never
+// complete, so the guarantee it exists to provide never arrives. Meanwhile the
+// units already claimed stay idle for the whole wait, and the candidate the
+// waiter could actually be served through gets no protection at all: it is
+// exactly the pre-W8 ping-pong, one candidate along, with a unit of capacity
+// parked next to it.
+//
+// So when the current claim candidate stops growing, the claim set moves to the
+// candidate whose axis triggered this probe — the one that demonstrably has
+// capacity coming free. Rotation gives the old prefix back first (which
+// re-offers those units, so the idling ends immediately), then claims afresh,
+// so at every instant the claims held are a prefix of one candidate.
+//
+// The move waits for SoftReserveAfter consecutive probes that grew nothing.
+// Rotating on the first one would be worse than not rotating at all: with two
+// candidates whose axes free alternately, every release would drop the progress
+// the previous one made, and neither prefix would ever complete. A probe that
+// grows the prefix resets the counter, so a candidate that is making progress
+// is never abandoned.
 //
 // It must be called with w already removed from every queue, so that w's own
 // queue membership cannot make its axes look contested to itself.
@@ -134,7 +162,10 @@ func (b *Broker) extendClaimsLocked(w *waiter, on *bucket) bool {
 	if !b.soft || w.bounces < int32(b.softAfter) || (w.req.Batch && b.reserve > 0) {
 		return false
 	}
-	c, ok := claimCandidate(&w.req)
+	if w.stall >= int32(b.softAfter) && candidateCount(&w.req) > 1 {
+		b.rotateClaimLocked(w, on)
+	}
+	c, ok := claimCandidate(w)
 	if !ok {
 		return false
 	}
@@ -142,7 +173,7 @@ func (b *Broker) extendClaimsLocked(w *waiter, on *bucket) bool {
 	var needBuf [numAxes]axisNeed
 	needs := b.needs(&w.req, c, needBuf[:0])
 
-	claimedOn := false
+	claimedOn, placed := false, 0
 	for _, n := range needs {
 		bk := b.buckets[n.key]
 		if bk != nil && bk.claimant == w {
@@ -159,21 +190,70 @@ func (b *Broker) extendClaimsLocked(w *waiter, on *bucket) bool {
 		bk.inUse++ // the unit is occupied from everyone else's point of view
 		w.claimed = true
 		b.softPlaced++
+		placed++
 		if bk == on {
 			claimedOn = true
 		}
 	}
+	if placed > 0 {
+		w.stall = 0
+	} else {
+		w.stall++
+	}
 	return claimedOn
 }
 
-// claimCandidate is the candidate a waiter takes its soft reservations over:
-// attempt-order candidate zero, which under OnCapacity == Wait is the only
-// candidate it will ever use. It is a pure function of the request, which is
-// immutable once a waiter exists, so the claim set can be recomputed instead of
-// stored.
-func claimCandidate(req *Request) (*Candidate, bool) {
-	c := candidateAt(req, 0)
-	if c == nil && len(req.Candidates) > 0 {
+// rotateClaimLocked moves w's claim set onto the candidate that needs `on`, the
+// axis whose release triggered this probe.
+//
+// Giving the old claims back BEFORE the switch is not tidiness: it is what keeps
+// "the claims a waiter holds are a prefix of one candidate's axes, in axis
+// order" true at every instant, and that statement is the whole of the deadlock
+// argument. A waiter holding the tail of one candidate's prefix while taking the
+// head of another's could sit in a cycle that the total axis order no longer
+// forbids.
+func (b *Broker) rotateClaimLocked(w *waiter, on *bucket) {
+	if on == nil {
+		return
+	}
+	idx, ok := b.candidateNeeding(w, on)
+	if !ok || idx == w.claimIdx {
+		return
+	}
+	b.releaseClaimsLocked(w) // reads the OLD w.claimIdx; must precede the switch
+	w.claimIdx = idx
+	w.stall = 0
+}
+
+// candidateNeeding reports the first candidate, in attempt order, whose axes
+// include the bucket bk. A waiter is only ever queued on an axis some candidate
+// of its needs, so the probe that triggered a rotation always has one.
+func (b *Broker) candidateNeeding(w *waiter, bk *bucket) (int, bool) {
+	var needBuf [numAxes]axisNeed
+	n := candidateCount(&w.req)
+	for i := 0; i < n; i++ {
+		c := candidateAt(&w.req, i)
+		if c == nil && len(w.req.Candidates) > 0 {
+			break
+		}
+		for _, nd := range b.needs(&w.req, c, needBuf[:0]) {
+			if b.buckets[nd.key] == bk {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// claimCandidate is the candidate a waiter currently takes its soft
+// reservations over. Under OnCapacity == Wait it is candidate zero for the
+// waiter's whole life, because that is the only candidate it will ever use.
+//
+// It is derived from the request and one small index rather than stored as a
+// set, so the claim set can be recomputed on the rare path that gives it back.
+func claimCandidate(w *waiter) (*Candidate, bool) {
+	c := candidateAt(&w.req, w.claimIdx)
+	if c == nil && len(w.req.Candidates) > 0 {
 		return nil, false
 	}
 	return c, true
@@ -194,7 +274,7 @@ func (b *Broker) releaseClaimsLocked(w *waiter) {
 		return
 	}
 	w.claimed = false
-	c, ok := claimCandidate(&w.req)
+	c, ok := claimCandidate(w)
 	if !ok {
 		return
 	}

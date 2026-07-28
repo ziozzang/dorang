@@ -37,6 +37,15 @@ const (
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
+
+	// The numeric carry-over file uses the same framing under its own magic and
+	// its own version, so a rollup record can never be mistaken for a trace
+	// record and a field-list change to either one does not invalidate the
+	// other. An unrecognised header is discarded exactly as a segment's is.
+	carryMagic     = "DRRU"
+	carryVersion   = 1
+	carryHeaderLen = 8
+	bucketCodecVer = 1
 )
 
 var (
@@ -65,6 +74,102 @@ func checkSpoolHeader(b []byte) error {
 		return errBadHeader
 	}
 	return nil
+}
+
+func appendCarryHeader(dst []byte) []byte {
+	dst = append(dst, carryMagic...)
+	dst = binary.LittleEndian.AppendUint16(dst, carryVersion)
+	return binary.LittleEndian.AppendUint16(dst, 0)
+}
+
+func checkCarryHeader(b []byte) error {
+	if len(b) < carryHeaderLen || string(b[:4]) != carryMagic {
+		return errBadHeader
+	}
+	if binary.LittleEndian.Uint16(b[4:]) != carryVersion {
+		return errBadHeader
+	}
+	return nil
+}
+
+// appendBucket encodes one merged rollup row. Like appendTrace it reads
+// positionally, so a change to the field list is a change to carryVersion.
+func appendBucket(dst []byte, b *Bucket) []byte {
+	dst = append(dst, bucketCodecVer)
+	dst = appendStr(dst, b.APIKeyID)
+	dst = appendStr(dst, b.TeamID)
+	dst = appendStr(dst, b.ModelGroup)
+	dst = appendStr(dst, b.Provider)
+	dst = appendStr(dst, b.CredentialID)
+	dst = appendStr(dst, b.Endpoint)
+	dst = binary.AppendVarint(dst, int64(b.StatusClass))
+	dst = binary.AppendVarint(dst, b.HourStart.Unix())
+
+	dst = binary.AppendVarint(dst, b.Requests)
+	dst = binary.AppendVarint(dst, b.Errors)
+	dst = binary.AppendVarint(dst, b.Tokens.Input)
+	dst = binary.AppendVarint(dst, b.Tokens.Output)
+	dst = binary.AppendVarint(dst, b.Tokens.CacheRead)
+	dst = binary.AppendVarint(dst, b.Tokens.CacheWrite)
+	dst = binary.AppendVarint(dst, b.Tokens.Reasoning)
+	dst = binary.AppendVarint(dst, b.CostNano)
+	dst = binary.AppendVarint(dst, int64(b.LatencySum))
+	dst = binary.AppendVarint(dst, int64(b.TTFTSum))
+	return binary.AppendVarint(dst, b.TTFTCount)
+}
+
+func decodeBucket(p []byte) (Bucket, error) {
+	var b Bucket
+	if len(p) == 0 || p[0] != bucketCodecVer {
+		return b, errCorrupt
+	}
+	p = p[1:]
+
+	var err error
+	str := func(dstp *string) bool {
+		var s string
+		s, p, err = takeStr(p)
+		if err != nil {
+			return false
+		}
+		*dstp = s
+		return true
+	}
+	num := func() int64 {
+		if err != nil {
+			return 0
+		}
+		var v int64
+		v, p, err = takeInt(p)
+		return v
+	}
+
+	if !str(&b.APIKeyID) || !str(&b.TeamID) || !str(&b.ModelGroup) ||
+		!str(&b.Provider) || !str(&b.CredentialID) || !str(&b.Endpoint) {
+		return Bucket{}, errCorrupt
+	}
+	sc := num()
+	if sc < 0 || sc >= int64(numStatusClasses) {
+		return Bucket{}, errCorrupt
+	}
+	b.StatusClass = StatusClass(sc)
+	b.HourStart = time.Unix(num(), 0).UTC()
+
+	b.Requests = num()
+	b.Errors = num()
+	b.Tokens.Input = num()
+	b.Tokens.Output = num()
+	b.Tokens.CacheRead = num()
+	b.Tokens.CacheWrite = num()
+	b.Tokens.Reasoning = num()
+	b.CostNano = num()
+	b.LatencySum = time.Duration(num())
+	b.TTFTSum = time.Duration(num())
+	b.TTFTCount = num()
+	if err != nil {
+		return Bucket{}, errCorrupt
+	}
+	return b, nil
 }
 
 func appendStr(dst []byte, s string) []byte {
