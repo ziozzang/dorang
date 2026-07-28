@@ -400,9 +400,20 @@ func TestAnOperatorLoopExitsWhenItsDeadlinePasses(t *testing.T) {
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("the request waited %v for a hook with a 50 ms ceiling", elapsed)
 	}
-	if st := e.Stats(); st.Timeouts != 0 || st.Skipped != 1 {
-		t.Fatalf("stats = %+v, want one skipped invocation and no abandonment: the loop is "+
-			"interruptible, so it ended itself", st)
+	// Skipped is the deterministic half and stays strict: every error out of
+	// watch goes through Engine.skip, so the invocation is counted as skipped
+	// whether it ended itself or was booked as abandoned.
+	//
+	// Timeouts is the half that was a coin toss, and it is not asserted here.
+	// Ending itself and being *recorded* as having ended itself are different
+	// events: the second needs the goroutine to be scheduled inside
+	// [abandonGrace], 5 ms, of the deadline, which on a loaded machine it is
+	// not — measured, 2 failures in 100 runs under sixteen-way load. What the
+	// test is for survives intact below, where the claim is that the goroutine
+	// stops: a loop that ignored its cancellation never leaves that drain.
+	if st := e.Stats(); st.Skipped != 1 {
+		t.Fatalf("stats = %+v, want one skipped invocation: a hook stopped at its ceiling "+
+			"is a hook whose decision was not used", st)
 	}
 
 	// The goroutine is never killed. What must be true is that it notices: a

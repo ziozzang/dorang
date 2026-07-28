@@ -274,7 +274,25 @@ func TestATokenIsRefreshedAheadOfExpiryAndTheNextRequestCarriesIt(t *testing.T) 
 	if !ok {
 		t.Fatal("the credential is not registered")
 	}
-	waitFor(t, "the background loop to renew the token", func() bool { return c.Refreshes() >= 1 })
+	// Wait for the store, not for the counter. auth's refreshOnce adopts the
+	// successor, increments Refreshes, and only THEN writes the vendor's file —
+	// deliberately, because a token that is already valid upstream must be used
+	// even if the file cannot be written. So Refreshes() >= 1 says the token was
+	// adopted, not that the file this test reads below has been rewritten, and
+	// under load the read lands in between. The file is the artifact asserted
+	// on, so the file is what is waited for; reaching the successor there
+	// implies the refresh it came from.
+	waitFor(t, "the renewed token to reach the vendor's store", func() bool {
+		raw, err := os.ReadFile(store)
+		if err != nil {
+			return false
+		}
+		var m map[string]any
+		return json.Unmarshal(raw, &m) == nil && m["access_token"] == freshAccess
+	})
+	if c.Refreshes() < 1 {
+		t.Fatalf("the store holds the successor but no refresh was counted: %d", c.Refreshes())
+	}
 	if n := tokenCalls(); n != 1 {
 		t.Fatalf("the token endpoint was called %d times, want exactly 1", n)
 	}

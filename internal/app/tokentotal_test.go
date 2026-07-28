@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -165,11 +166,9 @@ func (noopEnforcer) Release(context.Context, string) error      { return nil }
 // Test files are not scanned. A test may deliberately spell the wrong sum out in order to
 // name it — cmd/dorang's `equivDoubleCounted` and this file's `ttSumOfAll` both do.
 func TestNoSecondTokenTotalRuleIsWrittenAnywhere(t *testing.T) {
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
-	}
+	root := moduleRootForScan(t)
 	fset := token.NewFileSet()
+	var err error
 	var findings []string
 
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -296,4 +295,41 @@ func hasAnyFold(name string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// moduleRootForScan finds this module's root by walking up to the go.mod that
+// declares it, rather than assuming the working directory.
+//
+// `filepath.Abs("../..")` is right under `go test`, which runs in the package
+// directory, and wrong for a binary built with `go test -c` and run anywhere
+// else: it then walks whatever happens to sit two levels up. Run from the
+// repository root it scanned an entire home directory — every unrelated
+// checkout on the machine — for over ten minutes, and a scanner that reads
+// files outside its own module can report findings that are not this project's
+// and, worse, reads things it has no business reading.
+//
+// Verifying the module path matters as much as finding a go.mod: a nested or
+// vendored module would otherwise satisfy the search. internal/config's
+// consumed_test.go learned the same lesson from a git worktree checked out
+// inside the repository, which silently turned its guard into a no-op.
+func moduleRootForScan(t *testing.T) string {
+	t.Helper()
+	const want = "module github.com/ziozzang/dorang\n"
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err == nil && strings.HasPrefix(string(b), want) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("no go.mod declaring %q above %s", strings.TrimSpace(want), dir)
+	return ""
 }

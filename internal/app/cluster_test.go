@@ -345,10 +345,17 @@ func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 	// The reclaim is attributed, not blind: the peer's row is what the leader
 	// walked to find the lease, so it must still have been there when the
 	// reclaim ran. Pruning happens on a much longer grace (§13).
-	if got := a.Node.JobStats()["lease-reclaim"].Runs; got == 0 {
-		t.Error("the lease was reclaimed but the lease-reclaim job never ran, " +
-			"so something else returned it")
-	}
+	//
+	// Waited for rather than read once, because the counter trails the work.
+	// jobState.run calls the job body and increments Runs only after it
+	// returns, so between the ledger write this test has already observed and
+	// the statistic that describes it there is a window where the reclaim has
+	// happened and nothing has counted it — and under load the read lands
+	// there. The claim is unchanged: if the count never arrives, the budget
+	// came back some other way.
+	waitForNode(t, "the lease-reclaim job to be counted as having run "+
+		"(the lease was reclaimed, so if this never arrives something else returned it)",
+		func() bool { return a.Node.JobStats()["lease-reclaim"].Runs > 0 })
 }
 
 // TestSingleNodeJoinsNothing holds DESIGN §0.2's promise against the layer most

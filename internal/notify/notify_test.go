@@ -384,13 +384,25 @@ func TestLuaDriverWithoutATransportSaysSo(t *testing.T) {
 		}
 	})
 	n.Notify(Notification{Event: EventInvite, Subject: Subject{ID: "u"}})
-	waitFor(t, "the drop to be counted", func() bool { return n.Stats().Dropped == 1 })
+	// The ErrNoTransport branch counts the drop and logs the warning on the next
+	// statement, so Dropped == 1 does not mean the line the assertion below
+	// reads exists yet — one preemption in that window and `logged` is empty.
+	// The warning is what is asserted on, so the warning is what is waited for;
+	// it cannot appear without the drop that precedes it.
+	waitFor(t, "the operator to be told", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(logged) > 0
+	})
+	if got := n.Stats().Dropped; got != 1 {
+		t.Errorf("a missing transport is exactly one drop: dropped = %d", got)
+	}
 	if got := n.Stats().Failed; got != 0 {
 		t.Errorf("a missing transport is a configuration error, not a retryable failure: failed = %d", got)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(logged) == 0 || !strings.Contains(strings.Join(logged, " "), "on_email") {
+	if !strings.Contains(strings.Join(logged, " "), "on_email") {
 		t.Errorf("the operator must be told: %v", logged)
 	}
 }
@@ -539,7 +551,15 @@ func TestSMTPDriverDelivers(t *testing.T) {
 		Subject: Subject{Kind: "credential", ID: "acct-1"},
 		Fields:  []Field{{"provider", "plan-a"}, {"state", "open"}},
 	})
-	waitFor(t, "the message to arrive", func() bool { return len(srv.messages()) == 1 })
+	// Both, because neither implies the other. The fake server appends the
+	// message from its own session goroutine while the worker is still inside
+	// Deliver, and the worker counts the delivery only once Deliver has
+	// returned — so waiting on the message and then reading Delivered catches
+	// the worker mid-window and reads 0, and waiting on Delivered alone would
+	// be a claim about the server's goroutine that nothing here establishes.
+	waitFor(t, "the message to arrive and be counted", func() bool {
+		return len(srv.messages()) == 1 && n.Stats().Delivered == 1
+	})
 
 	msg := srv.messages()[0]
 	for _, want := range []string{

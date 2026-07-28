@@ -473,9 +473,31 @@ func TestABurstCannotTurnTheMaskOff(t *testing.T) {
 	}
 	yaml := strings.Replace(filterYAML(t, url), pluginPath(t), plugin, 1)
 	a := newFilterApp(t, yaml, &logs, func(c *config.Config) {
-		// The shipped default wall clock, scaled down so the burst is a burst
-		// rather than a benchmark. The instruction budget is the real one.
-		c.Extensions.Lua.Limits.Timeout = config.Duration(50 * time.Millisecond)
+		// The wall clock is what the burst has to overrun, so it has to be
+		// finite — but it also bounds the two ORDINARY requests below, which the
+		// test needs to SUCCEED, and those are what a scaled-down value breaks.
+		//
+		// The ordinary request masks about forty bytes; its hook work is
+		// microseconds. What it has to survive is not its own cost but the
+		// scheduler's: the invocation runs on its own goroutine, and on a
+		// machine running the rest of this suite under -race that goroutine can
+		// sit runnable for a long time. The ceiling is spent before the hook
+		// executes an instruction, and a fail-closed filter turns that into a
+		// 422. At 50 ms this failed 58% of the time under eight-way load and 35%
+		// of the time in the full package; at 200 ms, 8%; at 500 ms, 9% at
+		// sixteen-way. Both the pre-burst and the post-burst request are hit,
+		// so this is not cold-start alone — the burst discards the VM pool it
+		// drained, and the request after it pays the same price the first did.
+		//
+		// So the ceiling is set two orders of magnitude above the work it has to
+		// admit rather than just above it. That does not weaken the burst by
+		// one invocation: 48 concurrent 200 KB segments against `.-.-.-@` are
+		// unaffordable at any ceiling a test can wait for, and the measurement
+		// says so — the burst still abandoned between 2 and 24 invocations at
+		// every value from 50 ms to 2 s. The assertion after the burst checks
+		// that rather than trusting it, so a ceiling that ever does become
+		// affordable fails this test loudly instead of passing it vacuously.
+		c.Extensions.Lua.Limits.Timeout = config.Duration(2 * time.Second)
 	})
 	secret := issueKey(t, a, nil)
 
@@ -516,6 +538,17 @@ func TestABurstCannotTurnTheMaskOff(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	// The burst was a burst. Without this the test still passes when the
+	// segments are affordable — nothing overruns, nothing is refused, the trip
+	// is never approached and the mask was never at risk — which is a green
+	// result for a scenario that did not happen. The ceiling above is chosen for
+	// margin, and this is what stops that margin from quietly emptying the test.
+	if st := a.Hooks.Stats(); st.Timeouts == 0 && st.Refused == 0 {
+		t.Fatalf("the burst overran nothing: %+v. The segments are affordable at this "+
+			"wall clock, so the filter was never under the pressure that switched "+
+			"the mask off, and what follows proves nothing", st)
+	}
 
 	// After: the same request that worked before must still work, and must
 	// still be masked. A filter that answers "no" for the life of the process is

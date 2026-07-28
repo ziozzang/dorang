@@ -231,9 +231,16 @@ func TestBrokenReferenceNeverFailsAClientRequest(t *testing.T) {
 			if got := meter.n.Load(); got != 5 {
 				t.Fatalf("5 requests produced %d ledger rows", got)
 			}
-			waitFor(t, 5*time.Second, "the reference calls to resolve", func() bool {
+			// Sent is incremented as soon as the reference call returns, which
+			// is before the result is classified — so waiting on it would let
+			// the Clean check below run against comparisons that had not been
+			// decided yet, and read zero because nothing had been counted at
+			// all. The classification counters are the ones that say the
+			// verdict exists: a broken reference lands in ReferenceErrors, a
+			// reference that answers with rubbish in Compared.
+			waitFor(t, 5*time.Second, "the reference calls to be classified", func() bool {
 				st := s.Stats()
-				return st.Sent >= 5
+				return st.Compared+st.ReferenceErrors >= 5
 			})
 			if st := s.Stats(); st.Clean != 0 {
 				t.Errorf("clean = %d; a broken reference is never a clean comparison", st.Clean)
@@ -276,7 +283,12 @@ func TestEndToEndComparisonFindsARealDivergence(t *testing.T) {
 		t.Fatalf("status %d", rec.Code)
 	}
 
-	waitFor(t, 5*time.Second, "the comparison", func() bool { return s.Stats().Compared > 0 })
+	// The record, not the counter. Stats().Compared is incremented in process's
+	// classification switch and the record is written after it, so the counter
+	// says a comparison HAPPENED and not that it has been REPORTED; under load
+	// the worker loses the processor in between and the read below sees nothing.
+	waitFor(t, 5*time.Second, "the comparison to be reported",
+		func() bool { return len(w.lines()) > 0 })
 	recs := w.lines()
 	if len(recs) != 1 {
 		t.Fatalf("want one report record, got %d: %+v", len(recs), recs)
@@ -353,7 +365,9 @@ func TestEndToEndStreamComparison(t *testing.T) {
 		t.Fatal("the client's stream changed under shadowing")
 	}
 
-	waitFor(t, 5*time.Second, "the comparison", func() bool { return s.Stats().Compared > 0 })
+	// The record, not the counter — see the note in the non-streaming case.
+	waitFor(t, 5*time.Second, "the comparison to be reported",
+		func() bool { return len(w.lines()) > 0 })
 	recs := w.lines()
 	if len(recs) != 1 {
 		t.Fatalf("want one record, got %d: %+v", len(recs), recs)

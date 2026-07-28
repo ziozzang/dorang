@@ -303,7 +303,16 @@ func TestBodyBufferIsReturnedToThePool(t *testing.T) {
 	budget := newReplayBudget(1 << 20)
 	payload := `{"model":"model-x","pad":"` + strings.Repeat("x", 4096) + `"}`
 
-	const iterations = 8
+	// Enough iterations for the proportion to mean something. sync.Pool makes no
+	// per-operation promise at all: a Put lands in the current P's slot and a
+	// Get on another P has to steal, so a goroutine that is preempted between
+	// the two legitimately misses its own buffer, and a GC empties the pool
+	// outright. Measured under sixteen-way load with -race, the hit rate is
+	// about 75% and it is the sample size, not the rate, that moves — over 40
+	// runs the low was 3 of 7 at eight iterations and 39 of 63 at sixty-four.
+	// Seven trials is too few to put a threshold in: the shipped one was 3, and
+	// a run that came back with 2 failed the suite for a pool that was working.
+	const iterations = 64
 	var prev *byte
 	reused := 0
 	for i := 0; i < iterations; i++ {
@@ -329,11 +338,12 @@ func TestBodyBufferIsReturnedToThePool(t *testing.T) {
 			t.Fatal("release left the body marked replayable")
 		}
 	}
-	// A garbage collection between iterations legitimately drops the pooled
-	// buffer, and under -race the per-P pool shuffles more, so the assertion is
-	// that reuse is the norm rather than that it is universal. Removing the
-	// pool entirely takes this to zero.
-	if reused < (iterations-1)/2 {
+	// The threshold sits between the two answers rather than near either. A
+	// working pool measured no lower than 62% of trials; removing the pool takes
+	// this to exactly 0, because a fresh make() never returns the address the
+	// last one had. A quarter is far from both, so the test says "pooled or
+	// not" — which is the question — instead of grading the runtime's luck.
+	if reused*4 < iterations-1 {
 		t.Errorf("the body buffer was reused %d times out of %d: it is not being pooled",
 			reused, iterations-1)
 	}

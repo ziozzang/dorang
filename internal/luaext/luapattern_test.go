@@ -91,10 +91,23 @@ func TestSearchIsChargedForItsWorkNotItsOutput(t *testing.T) {
 				if completed {
 					t.Fatal("the hook completed after its budget was exhausted")
 				}
-				// The pre-fix 256-char measurement was 4.05 s. This is not a
-				// benchmark, only a floor under "bounded": if the search were
-				// still unpriced this could not pass.
-				if elapsed > 1500*time.Millisecond {
+				// The measurement stays in the suite, as a log. It is not an
+				// assertion, because it cannot be one: once the ceiling has
+				// fired the search ran exactly its budget in steps, and how
+				// long a fixed number of steps takes is the machine's business.
+				// At 1.5 s this failed whenever the suite ran beside other
+				// copies of itself — a legitimate stopped search measured 1.63 s
+				// — and it was reporting the load, not the pricing.
+				//
+				// What the row is really for is asserted two lines above and is
+				// exact: LimitHits != 0 says the ceiling fired INSIDE the
+				// builtin, which is the whole defect. Unpriced, the 256-char
+				// search walked straight through it and took 4.05 s; the check
+				// below is only a backstop against a runaway that somehow
+				// counted a limit hit anyway, so it is set where no working
+				// build can reach it and every broken one can.
+				t.Logf("%d-char subject: stopped after %v", tc.n, elapsed)
+				if elapsed > 30*time.Second {
 					t.Fatalf("a stopped search still took %v", elapsed)
 				}
 			} else {
@@ -368,11 +381,29 @@ func TestAPricedMatchStopsWhenTheRequestDoes(t *testing.T) {
 	// ended itself, so there is no abandoned goroutine matching on after the
 	// request. Without the context it ran for 1.1 s on a core nobody was
 	// waiting for — and that is what a burst turned into a trip.
-	if st := e.Stats(); st.Timeouts != 0 {
-		t.Fatalf("stats = %+v: the match outlived its ceiling and was abandoned", st)
-	}
-	if n := e.Abandoned(HookFilterRequest); n != 0 {
-		t.Fatalf("%d invocations outstanding: the priced run ignores its context", n)
+	//
+	// Asserted as "how long until the goroutine is gone", not as "which of the
+	// two counters it landed in". Those are different questions, and only the
+	// first one is about this code. Whether the match's return beats
+	// [abandonGrace] is decided by whether the scheduler runs its goroutine in
+	// the 5 ms after the deadline, so `Timeouts != 0` was a coin the machine
+	// tossed — it failed roughly one full-suite run in three. Both faces are
+	// correct behaviour: a match that observed its cancellation and was booked
+	// as abandoned because it was slow to be scheduled has still not outlived
+	// the request, which is the whole claim.
+	//
+	// The bound below is what the two answers actually differ by. A match that
+	// takes its context is finished within the deadline plus a scheduling
+	// hiccup; one that ignores it has 1.1 s of scanning left to do and cannot
+	// possibly be gone. Half a second sits between them with an order of
+	// magnitude either way.
+	outstanding := func() int { return e.Abandoned(HookFilterRequest) }
+	for deadline := time.Now().Add(500 * time.Millisecond); outstanding() > 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d invocations still outstanding half a second after a %v ceiling: "+
+				"the priced run ignores its context and is still matching", outstanding(), wall)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if n, ok := waitForGoroutines(base+2, time.Second); !ok {
 		t.Fatalf("goroutines settled at %d, baseline %d: a match is still running", n, base)

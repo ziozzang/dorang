@@ -465,7 +465,14 @@ func TestReportRecordsOnlyDiffsAndInconclusiveComparisons(t *testing.T) {
 		`{"id":"y","object":"chat.completion","created":2,"model":"m",`+
 			`"choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],`+
 			`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"extra":true}`))
-	waitFor(t, 3*time.Second, "the differing comparison", func() bool { return s.Stats().WithDiffs > 0 })
+	// Wait for the report line, not for the counter. process increments
+	// withDiffs inside the classification switch and calls report.write after
+	// it, so Stats().WithDiffs > 0 says a difference was FOUND, not that it has
+	// been WRITTEN — under load the worker loses the processor between the two
+	// and the read below sees an empty buffer. The record is what this test is
+	// about, so the record is what it waits for.
+	waitFor(t, 3*time.Second, "the differing comparison to be reported",
+		func() bool { return len(w.lines()) > 0 })
 
 	recs := w.lines()
 	if len(recs) != 1 {

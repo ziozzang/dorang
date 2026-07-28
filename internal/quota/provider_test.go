@@ -336,7 +336,16 @@ func TestRegistryRunStopsWithTheContext(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); reg.Run(ctx, 5*time.Millisecond) }()
-	time.Sleep(30 * time.Millisecond)
+	// Wait for the poll, not for thirty milliseconds. A 5 ms interval is a
+	// promise about the gap between ticks, not about how many of them fit in an
+	// arbitrary window on a machine running the rest of this suite — and
+	// cancelling before the first one turns "Run never polled" into a report
+	// about the scheduler. The cancel below still tests what it is here for:
+	// Run has to return, which wg.Wait establishes.
+	deadline := time.Now().Add(10 * time.Second)
+	for prober.Calls() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	cancel()
 	wg.Wait()
 	if prober.Calls() == 0 {

@@ -145,9 +145,20 @@ func asExitError(err error, out **exec.ExitError) bool {
 	return false
 }
 
-// fakeUpstream is a provider that answers one chat completion.
-func fakeUpstream(t *testing.T, delay time.Duration) *httptest.Server {
+// fakeUpstream is a provider that answers chat completions, optionally after a
+// delay.
+//
+// The second return is the handshake. dorang runs in a child process here, so a
+// test that needs a request to be genuinely IN FLIGHT has no way to ask the
+// gateway — but this handler runs in the test's own process and is entered only
+// once the request has crossed dorang and been dispatched. Receiving on the
+// channel is therefore proof, where a sleep is a guess that gets it wrong on a
+// loaded machine in the direction that fails the test.
+func fakeUpstream(t *testing.T, delay time.Duration) (*httptest.Server, <-chan struct{}) {
 	t.Helper()
+	// Buffered and sent to without blocking: the signal must never be able to
+	// hold a request open for a test that is not listening for it.
+	arrived := make(chan struct{}, 64)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
 			http.Error(w, `{"error":{"message":"no such route"}}`, http.StatusNotFound)
@@ -160,6 +171,10 @@ func fakeUpstream(t *testing.T, delay time.Duration) *httptest.Server {
 			http.Error(w, `{"error":{"message":"wrong upstream model"}}`, http.StatusBadRequest)
 			return
 		}
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
 		if delay > 0 {
 			time.Sleep(delay)
 		}
@@ -167,7 +182,7 @@ func fakeUpstream(t *testing.T, delay time.Duration) *httptest.Server {
 		_, _ = io.WriteString(w, upstreamAnswer)
 	}))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, arrived
 }
 
 const upstreamAnswer = `{"id":"chatcmpl-fake","object":"chat.completion","created":1700000000,` +
@@ -225,7 +240,7 @@ const chatRequest = `{"model":"model-x","messages":[{"role":"user","content":"pi
 // beyond a temporary HOME, and a request completes through a fake upstream.
 func TestSingleBinaryServesWithNoDependencies(t *testing.T) {
 	dir := t.TempDir()
-	up := fakeUpstream(t, 0)
+	up, _ := fakeUpstream(t, 0)
 	cfgPath := writeConfig(t, dir, up.URL)
 
 	c := start(t, []string{"--config", cfgPath},
@@ -291,7 +306,7 @@ func TestZeroConfigurationStarts(t *testing.T) {
 // completion.
 func TestDrainFinishesInFlightRequests(t *testing.T) {
 	dir := t.TempDir()
-	up := fakeUpstream(t, 1500*time.Millisecond)
+	up, arrived := fakeUpstream(t, 1500*time.Millisecond)
 	cfgPath := writeConfig(t, dir, up.URL)
 
 	c := start(t, []string{"--config", cfgPath},
@@ -311,8 +326,17 @@ func TestDrainFinishesInFlightRequests(t *testing.T) {
 	}()
 
 	// Let the request reach the upstream, then ask the process to stop while it
-	// is still in flight.
-	time.Sleep(400 * time.Millisecond)
+	// is still in flight. The upstream says when that has happened; the request
+	// is held there for another 1.5s, so the SIGTERM below lands squarely
+	// inside it. Guessing a duration instead gets this exactly backwards on a
+	// busy machine — the signal arrives before the request is accepted, the
+	// listener closes under it, and the drain is blamed for losing a request it
+	// never had.
+	select {
+	case <-arrived:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the request never reached the upstream, so nothing was ever in flight to drain")
+	}
 	if err := c.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +573,7 @@ func get(t *testing.T, url, token string) response {
 // group added to the file appears in GET /v1/models without a restart.
 func TestHotReloadOnSIGHUP(t *testing.T) {
 	dir := t.TempDir()
-	up := fakeUpstream(t, 0)
+	up, _ := fakeUpstream(t, 0)
 	cfgPath := writeConfig(t, dir, up.URL)
 
 	c := start(t, []string{"--config", cfgPath},

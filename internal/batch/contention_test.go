@@ -146,8 +146,17 @@ func runContention(t *testing.T, c *fakeCapacity) contentionResult {
 	return res
 }
 
+// tryInteractive measures how long the contended model makes an interactive
+// request wait, and whether it is admitted at all.
+//
+// The budget is [interactiveBound] and not something tighter on purpose. The
+// caller distinguishes two outcomes — "starved", which is a fatal defect, and
+// "admitted but slow", which is a latency number — and a ceiling below the
+// bound collapses them: every admission between the ceiling and the bound gets
+// reported as starvation on a machine that was merely busy. The deadline
+// enforced here has to be the deadline the assertions are written against.
 func tryInteractive(c *fakeCapacity, req CapacityRequest) (bool, time.Duration) {
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), interactiveBound)
 	defer cancel()
 	start := time.Now()
 	resv, err := c.Acquire(ctx, req)

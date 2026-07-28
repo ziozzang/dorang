@@ -19,7 +19,27 @@ func TestConcurrentRowsAndReaders(t *testing.T) {
 		c.CountFlush = 1 // write progress on every row, maximizing contention
 		c.MaxAttempts = 2
 	})
+	// The gate holds the fourth batch's rows inside the executor so that the
+	// Cancel below always lands on a batch that is still running.
+	//
+	// It was constructed and never wired, which left the cancel racing the
+	// batch: fifty rows of m2 against a Cancel issued from the test goroutine,
+	// and whichever won decided the outcome. Losing that race is not a slow
+	// machine reporting itself — the batch finishes, Cancel is refused with
+	// "invalid state: batch is writing its output files", and the await then
+	// waits for a [cancelled] that can never arrive. Measured at 1 run in 9
+	// with three copies of this suite running at once.
+	//
+	// Gating on the model rather than the batch id keeps the other three
+	// batches — the contention this test is actually about — running at full
+	// speed. Nothing here is deferred to a duration: the rows block until
+	// openAll, so the cancel is inside the window by construction.
+	g := newGate()
+	defer g.openAll()
 	h.exec.fn = func(ctx context.Context, req *ExecRequest, attempt int) (*ExecResult, error) {
+		if req.Model == "m2" {
+			return g.handler(ctx, req, attempt)
+		}
 		switch bucket(req.CustomID) % 11 {
 		case 0:
 			if attempt == 1 {
@@ -39,9 +59,9 @@ func TestConcurrentRowsAndReaders(t *testing.T) {
 		ids = append(ids, h.create(h.upload(jsonlFile(perBatch, "m1"))).ID)
 	}
 
-	// A fourth batch, cancelled while everything else is running.
-	g := newGate()
-	defer g.openAll()
+	// A fourth batch, cancelled while everything else is running. Its rows are
+	// the ones the gate above holds, so "while running" is a fact rather than a
+	// hope.
 	cancelled := h.create(h.upload(jsonlFile(50, "m2")))
 
 	stop := make(chan struct{})

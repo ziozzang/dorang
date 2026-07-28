@@ -237,7 +237,15 @@ func TestHangingProviderTimesOutAndKeepsSnapshot(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error does not report the deadline: %v", err)
 	}
-	if elapsed > time.Second {
+	// The claim is that the caller is released at all, not that it is released
+	// within any particular multiple of the 60 ms timeout. A provider that hangs
+	// without one holds this caller until the handler is released in cleanup —
+	// unbounded — so any finite ceiling separates the two answers, and the sharp
+	// assertions are the two above: the error is a transport failure and it
+	// names the deadline. One second was sixteen times the timeout and still not
+	// enough beside three other copies of this suite, where it reported the load
+	// rather than the deadline.
+	if elapsed > 20*time.Second {
 		t.Errorf("a hang held the caller for %v", elapsed)
 	}
 	got, ok := p.Snapshot(cred.ID())

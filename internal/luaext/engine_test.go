@@ -549,12 +549,33 @@ func TestALateHookIsNotAnAbandonedOne(t *testing.T) {
 			t.Fatalf("invocation %d denied the request", i)
 		}
 	}
-	if st := e.Stats(); st.Timeouts != 0 {
-		t.Fatalf("a hook that always came back was counted as abandoned %d times: %+v",
-			st.Timeouts, st)
+	// The hook returns the instant its context ends, so finish and abandon are
+	// deliberately racing on every one of these — the comment on the Native
+	// above says so. That makes "exactly zero" a claim about the scheduler
+	// rather than about the code: losing the race needs only that this
+	// goroutine is not run in the 5 ms of [abandonGrace], and it is one of
+	// thirty-six on a machine running the rest of the suite.
+	//
+	// The defect this guards is not subtle enough to need "exactly zero". It
+	// counted EVERY late-but-returned hook as abandoned, so it produces
+	// invocations timeouts — 36 — and the trip that follows at 32. The bound is
+	// set at a quarter of the invocations: ten times the couple the scheduler
+	// can cost, and a quarter of what the defect produces.
+	if st := e.Stats(); int(st.Timeouts)*4 >= invocations {
+		t.Fatalf("a hook that always came back was counted as abandoned %d times out of %d: %+v",
+			st.Timeouts, invocations, st)
 	}
-	if e.Abandoned(HookRequest) != 0 {
-		t.Fatalf("%d outstanding after every invocation returned", e.Abandoned(HookRequest))
+	// Outstanding is asserted as a drain rather than as an instant, for the same
+	// reason. A hook booked as abandoned is blocked on a context that has
+	// already fired: it is one scheduling slot from returning, and reading the
+	// counter in that slot measures the scheduler. What must not happen is that
+	// it stays outstanding, which is what a hook ignoring its cancellation does.
+	for deadline := time.Now().Add(5 * time.Second); e.Abandoned(HookRequest) > 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d still outstanding 5s after every invocation returned",
+				e.Abandoned(HookRequest))
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if e.Tripped(HookRequest) {
 		t.Fatalf("%d invocations that leaked nothing switched the hook off", invocations)
@@ -583,7 +604,19 @@ func TestABacklogRefusalDoesNotTripAFailClosedHook(t *testing.T) {
 
 	e := luaEngine(t, `dorang.register("on_filter_request", function(f) f.doc.text(1) end)`,
 		func(o *Options) {
-			o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: time.Millisecond}
+			// The wall clock is put out of reach, the way the ceiling tests in
+			// lua_test.go put it out of reach to isolate the instruction one.
+			// Nothing here is about a deadline: the backlog is saturated by hand
+			// below, and a refusal at the abandonment bound is returned before a
+			// goroutine exists, so the refusal loop never consults this value at
+			// all. The single invocation it does bound is the recovery at the
+			// end — the one invocation in this test that has to SUCCEED. At one
+			// millisecond that hook had to acquire a VM, read a document and
+			// mask it inside a ceiling shorter than a scheduling quantum, and it
+			// failed 8 times in 100 under sixteen-way load, reporting "the
+			// filter did not recover when its backlog drained" for a filter that
+			// had recovered perfectly well.
+			o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: time.Minute}
 		})
 	// Saturate the abandonment supply by hand: what is under test is what the
 	// refusals do, not how the backlog arose.
