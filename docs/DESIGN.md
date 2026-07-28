@@ -777,6 +777,20 @@ effective_used = max( provider_reported_used ,
 The provider figure re-baselines on every poll; local metering supplies the delta in
 between. Neither source can hide a burst.
 
+**Most providers have no such endpoint, and shipping a prober anyway is worse than shipping
+none** — §6.2 makes the reported figure authoritative, so a guessed one overrides a correct
+local count. Research across nine providers found three with a usable endpoint. Of the six
+without: several expose only organization-scoped usage behind an admin credential, which is a
+*different credential* from the one serving the traffic; one exposes key metadata with no
+usage at all; one is project-scoped, where a key-scoped answer is not well defined; and one
+publishes an endpoint whose percentage may encode **remaining** where every other provider
+encodes **consumed** — a reading that looks correct at 50% and is backwards everywhere else.
+That one is refused deliberately rather than implemented hopefully.
+
+The selection rule: **a prober authenticates with the credential that serves the traffic, and
+reports what is left of that credential's own allowance.** Anything else measures something
+adjacent and calls it the answer.
+
 Fetches run off the request path, in parallel, with per-provider timeouts. A failed fetch
 **never** disables a credential — a failed read is not an exhausted quota. The last good
 snapshot is retained and the staleness is exposed.

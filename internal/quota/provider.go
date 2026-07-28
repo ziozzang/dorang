@@ -135,6 +135,10 @@ type baseline struct {
 	localAt int64
 	resetAt time.Time
 	pct     float64
+	// abs reports whether the provider published a figure in the metric's
+	// units. See [Tracker.Adopt] for why a window without one carries only its
+	// reset instant.
+	abs bool
 }
 
 // NewTracker builds a tracker over a local counter. local may be nil, in which
@@ -153,6 +157,24 @@ func NewTracker(local LocalCounter) *Tracker {
 //	                      reported_at_last_poll + local_delta_since_that_poll )
 //
 // A provider figure that lags a burst therefore cannot erase the burst.
+//
+// # A window with no absolute figure carries only its reset
+//
+// The formula is unit-homogeneous arithmetic: reported_used and local_delta
+// must both be in the metric's units. The common real shape is not — a provider
+// reports "37% of your 5-hour allowance" and publishes no ceiling, so there is
+// no figure in tokens to add a token delta to. Doing it anyway produces a
+// number that is neither a percentage nor a count, and because the sum is
+// monotone while a rolling window is not, it grows past any configured limit
+// and parks the credential in a cooldown nothing can clear.
+//
+// So a window whose Used and Limit are both zero is kept for its reset instant
+// — which is what DESIGN §7.5a(c) needs and cannot get anywhere else — and
+// reports no usage: [Tracker.Effective] returns ok false for it, and the meter
+// falls back to local metering. The percentage is retained and readable through
+// [Tracker.UsedPercent]. An operator who declares the allowance's real size
+// turns the proportion into a figure in the metric's units, and the full
+// combination applies again.
 func (t *Tracker) Adopt(r ProbeResult) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -164,12 +186,16 @@ func (t *Tracker) Adopt(r ProbeResult) {
 		k := wmKey{w.Window, w.Metric}
 		cum := t.cumulative(w.Metric)
 		used := w.Used
-		if prev, ok := t.base[k]; ok {
+		abs := w.Used > 0 || w.Limit > 0
+		if prev, ok := t.base[k]; ok && abs && prev.abs {
 			if d := cum - prev.localAt; d > 0 {
 				if est := prev.used + d; est > used {
 					used = est
 				}
 			}
+		}
+		if !abs {
+			used = 0
 		}
 		t.base[k] = baseline{
 			used:    used,
@@ -178,6 +204,7 @@ func (t *Tracker) Adopt(r ProbeResult) {
 			localAt: cum,
 			resetAt: w.ResetAt,
 			pct:     w.UsedPercent,
+			abs:     abs,
 		}
 	}
 }
@@ -196,11 +223,15 @@ func (t *Tracker) Fail(err error, now time.Time) {
 }
 
 // Effective returns the combined used figure for one window and metric.
+//
+// ok is false for a window the provider reported only as a percentage: there is
+// no figure in the metric's units to combine, and answering with one would be
+// answering in the wrong unit. See [Tracker.Adopt].
 func (t *Tracker) Effective(w Window, m Metric, now time.Time) (used, limit int64, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	b, ok := t.base[wmKey{w, m}]
-	if !ok {
+	if !ok || !b.abs {
 		return 0, 0, false
 	}
 	// Both terms of the design's formula, written out. The second is the
@@ -214,6 +245,24 @@ func (t *Tracker) Effective(w Window, m Metric, now time.Time) (used, limit int6
 		return withLocal, b.limit, true
 	}
 	return reported, b.limit, true
+}
+
+// UsedPercent returns the provider's own percentage for a window and metric,
+// which for a provider that publishes no ceiling is the only figure there is.
+//
+// It is separate from [Tracker.Effective] because it is a different quantity in
+// a different unit: a proportion of an allowance whose size dorang does not
+// know. It cannot be compared with a [Rule]'s limit, and this package
+// deliberately offers no way to do so — a rule counts tokens or money, and a
+// percentage of an unknown total is not either.
+func (t *Tracker) UsedPercent(w Window, m Metric) (pct float64, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	b, ok := t.base[wmKey{w, m}]
+	if !ok || b.pct <= 0 {
+		return 0, false
+	}
+	return b.pct, true
 }
 
 // ResetAt returns the provider's reset instant for a window and metric.
