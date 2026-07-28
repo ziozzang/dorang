@@ -27,6 +27,14 @@
 // String, %v, %#v, YAML marshaling, or any error message this package
 // produces.
 //
+// A provider credential may authenticate by OAuth instead (DESIGN §11.2b). That
+// is `auth: oauth` plus an `oauth` block naming a token store, and it is an
+// ALTERNATIVE to the four spellings above on the same object rather than a
+// parallel shape: a credential that sets both is refused, because resolving two
+// answers by precedence is how a deployment sends the wrong credential with
+// nothing in the file to explain it. No token is ever written into the
+// configuration — the file holds a path to a store the vendor's own CLI keeps.
+//
 // # Model names are opaque
 //
 // Design §2.1: a model name is an opaque string. Nothing in this package splits
