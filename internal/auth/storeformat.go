@@ -30,7 +30,7 @@ const (
 	// store dorang creates itself looks like.
 	FormatGeneric StoreFormat = "generic"
 
-	// FormatCodex is the OpenAI Codex CLI's auth.json.
+	// FormatCodex is the OpenAI Codex CLI's own auth store.
 	//
 	//	{"auth_mode": "...", "tokens": {"id_token": "...", "access_token": "...",
 	//	 "refresh_token": "...", "account_id": "..."}, "last_refresh": "...",
@@ -42,12 +42,12 @@ const (
 	// says is not the mechanism.
 	FormatCodex StoreFormat = "codex"
 
-	// FormatClaude is the Claude Code CLI's .credentials.json, which nests
+	// FormatClaude is the Claude Code CLI's credentials file, which nests
 	// everything under one key and spells its fields in camel case with the
 	// expiry in unix milliseconds.
 	FormatClaude StoreFormat = "claude"
 
-	// FormatGemini is the Gemini CLI's oauth_creds.json: a Google OAuth token
+	// FormatGemini is the Gemini CLI's OAuth credentials file: a Google token
 	// response written to disk as-is, so it is flat and standard except that the
 	// expiry is `expiry_date` in unix milliseconds.
 	FormatGemini StoreFormat = "gemini"

@@ -32,7 +32,7 @@ func jwtWithExp(t *testing.T, exp time.Time) string {
 	return head + "." + body + ".not-a-signature"
 }
 
-// TestCodexStoreShapeIsReadable covers ~/.codex/auth.json's layout: tokens
+// TestCodexStoreShapeIsReadable covers the Codex CLI's layout: tokens
 // nested under "tokens", no expiry field anywhere, and an OPENAI_API_KEY of null
 // — that last one being why the account is OAuth-only and why this mattered.
 func TestCodexStoreShapeIsReadable(t *testing.T) {
@@ -75,7 +75,7 @@ func TestCodexStoreShapeIsReadable(t *testing.T) {
 	}
 }
 
-// TestClaudeStoreShapeIsReadable covers ~/.claude/.credentials.json: one nested
+// TestClaudeStoreShapeIsReadable covers the Claude Code CLI's: one nested
 // object, camel-cased keys, expiry in unix milliseconds.
 func TestClaudeStoreShapeIsReadable(t *testing.T) {
 	exp := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Millisecond)
@@ -107,7 +107,7 @@ func TestClaudeStoreShapeIsReadable(t *testing.T) {
 	}
 }
 
-// TestGeminiStoreShapeIsReadable covers ~/.gemini/oauth_creds.json: a Google
+// TestGeminiStoreShapeIsReadable covers the Gemini CLI's: a Google
 // token response written to disk verbatim, so flat and standard except that the
 // expiry is expiry_date in unix milliseconds.
 func TestGeminiStoreShapeIsReadable(t *testing.T) {
