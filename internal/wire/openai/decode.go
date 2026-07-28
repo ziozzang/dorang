@@ -345,12 +345,63 @@ func splitDataURL(s string) (mediaType, data string, ok bool) {
 // that can lose usage counts if refused and cannot bypass authorization if
 // accepted, because nothing is authorized against a response. [Message] is
 // still strict, since the same type decodes request messages.
+// It returns [ErrNotAResponse] for a JSON object that is not a chat completion.
+// Parsing without error is not the same fact as "this is an answer"; see
+// [ErrNotAResponse] and [IsChatCompletion].
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
 	}
+	if !IsChatCompletion(&w) {
+		return nil, ErrNotAResponse
+	}
 	return ResponseToCanonical(&w, opt)
+}
+
+// ErrNotAResponse is a JSON object that parsed cleanly and is not a chat
+// completion.
+//
+// It is a distinct condition from a decode failure. A vendor that answers HTTP
+// 200 with `{"code":500,"msg":"404 NOT_FOUND","success":false}` — a real answer
+// from a real coding-plan host, to a request addressed at a route it does not
+// serve — unmarshals into a zero-valued [Response] without error, and that
+// reaches the client as a successful turn with an empty `choices` array and a
+// null finish_reason. Nothing downstream can tell it from an answer: retries
+// never fire, the fallback chain never engages, health counts a success, and
+// metering records zero tokens.
+var ErrNotAResponse = errorString("openai: the body is a JSON object but not a chat completion")
+
+// IsChatCompletion reports whether a decoded body is a response of this family.
+//
+// It accepts on EITHER of two grounds, never on both being required:
+//
+//  1. the discriminator names this family — `"object": "chat.completion"`; or
+//  2. at least one payload-bearing member is PRESENT — `choices` or `usage`.
+//
+// Presence means the key was in the document, not that its value is
+// interesting. `{"object":"chat.completion","choices":[]}` is a valid answer —
+// an unauthenticated vLLM answering a probe sends exactly that — and so is a
+// body from one of the many OpenAI-compatible servers that never emits
+// `object`. Requiring the discriminator would refuse the second; requiring
+// non-empty choices would refuse the first.
+//
+// What it refuses is a body with neither: no `object: chat.completion`, no
+// `choices` key, no `usage` key. A vendor error envelope has none of the three.
+//
+// The `object` clause is deliberately an accept and not a reject: a body
+// labelled `text_completion` that also carries `choices` is accepted here. The
+// T1 surfaces of COMPATIBILITY §0 have their own decoders and their own routes,
+// and turning this function into an arbiter of which of them a caller asked for
+// would put that decision in the one place that cannot see the request.
+func IsChatCompletion(w *Response) bool {
+	if w == nil {
+		return false
+	}
+	if w.Object == ObjectCompletion {
+		return true
+	}
+	return w.Choices != nil || w.Usage != nil
 }
 
 // ResponseToCanonical converts a decoded wire response.

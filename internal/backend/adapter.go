@@ -198,6 +198,15 @@ var errNilRequest = errors.New("backend: the request has no neutral form")
 // errNotAnObject is a relayed body that is not a JSON object.
 var errNotAnObject = errors.New("backend: the body is not a JSON object")
 
+// errNotAResponse is a relayed body that IS a JSON object and carries none of
+// the members an answer of its shape has.
+//
+// It is the relay's half of the wire decoders' ErrNotAResponse, and it exists
+// for the same reason: an upstream that answers 200 with an error envelope
+// parses cleanly everywhere, and on a relay path the envelope reaches the
+// client verbatim.
+var errNotAResponse = errors.New("backend: the body is a JSON object but not a response")
+
 // noOperation builds an errNoOperation.
 func noOperation(api string, op Operation, detail string) error {
 	return &errNoOperation{api: api, op: op, detail: detail}
@@ -218,8 +227,26 @@ func relayRequest(body []byte, model string) ([]byte, error) {
 
 // relayResponse restores the client-facing model name and reads the usage
 // object, which is the only part of such a body dorang looks inside.
+//
+// It is the embeddings surface's half of D2, found by looking for the same
+// class rather than reported from the wire. A relay is the WORST place for the
+// defect: a vendor error body wearing a 200 is not merely rendered as an empty
+// answer here, it is handed to the client verbatim with a `model` member
+// spliced into it. Requiring one of the two members every embeddings answer has
+// is what separates that from an answer.
 func relayResponse(body []byte, model string) (*decoded, error) {
-	out, err := replaceModel(body, model)
+	obj, err := jsonObject(body)
+	if err != nil {
+		return nil, err
+	}
+	// `data` is the vectors and `usage` the counts. An answer has at least one;
+	// an error envelope has neither. `object: "list"` is deliberately not in the
+	// list — it is a discriminator some vendors omit, and accepting on it would
+	// also accept `object: "error"`.
+	if !hasAnyMember(obj, "data", "usage") {
+		return nil, errNotAResponse
+	}
+	out, err := marshalWithModel(obj, model)
 	if err != nil {
 		return nil, err
 	}
@@ -227,8 +254,26 @@ func relayResponse(body []byte, model string) (*decoded, error) {
 	return &decoded{raw: out, usage: u}, nil
 }
 
-// replaceModel swaps the top-level "model" of a JSON object.
-func replaceModel(body []byte, model string) ([]byte, error) {
+// relayCountTokens relays a token-count answer.
+//
+// The count IS the whole answer, so there is nothing to convert — but that also
+// means there is nothing between a vendor's 200-wrapped error body and a client
+// reading `input_tokens` off it and getting zero. This is the same check
+// [relayResponse] makes, against the one member this answer has.
+func relayCountTokens(body []byte) (*decoded, error) {
+	obj, err := jsonObject(body)
+	if err != nil {
+		return nil, err
+	}
+	if !hasAnyMember(obj, "input_tokens") {
+		return nil, errNotAResponse
+	}
+	return &decoded{raw: body}, nil
+}
+
+// jsonObject decodes a relayed body as a JSON object, distinguishing "not an
+// object" from a parse failure.
+func jsonObject(body []byte) (map[string]json.RawMessage, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
@@ -236,6 +281,32 @@ func replaceModel(body []byte, model string) ([]byte, error) {
 	if obj == nil {
 		return nil, errNotAnObject
 	}
+	return obj, nil
+}
+
+// hasAnyMember reports whether the object carries at least one of the named
+// keys. Presence is the test, not the value: an empty `data` array is a valid
+// answer to a request for no embeddings, and a measured zero is a measurement.
+func hasAnyMember(obj map[string]json.RawMessage, keys ...string) bool {
+	for _, k := range keys {
+		if _, ok := obj[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceModel swaps the top-level "model" of a JSON object.
+func replaceModel(body []byte, model string) ([]byte, error) {
+	obj, err := jsonObject(body)
+	if err != nil {
+		return nil, err
+	}
+	return marshalWithModel(obj, model)
+}
+
+// marshalWithModel re-encodes a decoded object with its model member replaced.
+func marshalWithModel(obj map[string]json.RawMessage, model string) ([]byte, error) {
 	enc, err := json.Marshal(model)
 	if err != nil {
 		return nil, err
@@ -245,6 +316,26 @@ func replaceModel(body []byte, model string) ([]byte, error) {
 }
 
 // scanRelayUsage reads the usage object of an embeddings-shaped answer.
+//
+// total_tokens is the FALLBACK and not the ignored field it used to be. An
+// embedding has no completion half, so on this shape the total IS the prompt
+// count — and the two vendors measured here disagree only about which key
+// carries it: Jina direct answers `{"total_tokens":4}` with no prompt_tokens at
+// all, and the same model through LiteLLM answers `{"prompt_tokens":0,
+// "total_tokens":4}`. Reading prompt_tokens alone returned zero for both.
+//
+// Zero is not a harmless number here. [Result.Usage] is the single source for
+// the X-Dorang-Tokens-* headers, for internal/meter and for pricing, and
+// §11.6's token guard triggers on Input+Output+Reasoning > 0 — so an embedding
+// priced at zero is also an embedding the guard cannot see. Nothing fails, so
+// nothing alerts, and in a retrieval-heavy deployment the budgets, the per-key
+// spend and the rate guard silently exclude most of the traffic. The rerank
+// path on the same run metered correctly, which is what makes this an oversight
+// rather than a policy.
+//
+// prompt_tokens wins whenever it is non-zero: a vendor that states both and
+// means different things by them is stating the prompt count in the field named
+// for it.
 func scanRelayUsage(body []byte) (canonical.Usage, bool) {
 	var shape struct {
 		Usage *struct {
@@ -255,7 +346,16 @@ func scanRelayUsage(body []byte) (canonical.Usage, bool) {
 	if err := json.Unmarshal(body, &shape); err != nil || shape.Usage == nil {
 		return canonical.Usage{}, false
 	}
-	return canonical.Usage{InputTokens: shape.Usage.PromptTokens}, true
+	in := shape.Usage.PromptTokens
+	if in == 0 {
+		in = shape.Usage.TotalTokens
+	}
+	u := canonical.Usage{InputTokens: in}
+	// The backend stated a prompt count, whichever key it used. Recording that
+	// it did is what separates a measured zero from an unmeasured one for every
+	// encoder downstream (see [canonical.Usage.Reported]).
+	u.Report(canonical.UsageInput)
+	return u, true
 }
 
 // itoa is strconv.Itoa under a shorter name, used where a number is spliced

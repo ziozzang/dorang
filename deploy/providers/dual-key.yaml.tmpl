@@ -1,0 +1,151 @@
+# dorang — two accounts on one provider, the per-credential concurrency axis
+#
+# WHAT THIS IS
+#   The shape of the `ollama` provider block in `providers.yaml.tmpl`, with one
+#   substitution: `base_url` points at deploy/providers/fake_upstream.py instead
+#   of the vendor. Everything that decides WHERE a request lands — the two
+#   credentials, their capacity groups, the group ceilings, the rotation and the
+#   stickiness — is byte-identical to the real file, so what this proves about
+#   dorang's routing is what the real file does.
+#
+# WHY THE UPSTREAM IS FAKE
+#   The claim under test is "a second model on this account does not raise its
+#   ceiling". Testing it upstream means holding six calls open on a subscription
+#   plan and then asking the vendor which key served each, which costs the
+#   user's quota and which the vendor does not answer. The fake answers it, and
+#   holds a call open for as long as the harness says, for nothing.
+#
+# THE CAPACITY MODEL BEING ASSERTED (DESIGN §5.1, §7.4a2)
+#   An Ollama plan allows 3 in flight PER ACCOUNT regardless of model. That is
+#   the `cgroup` axis: one bucket per account, counted across every model. It is
+#   NOT the `model` axis, which is per (provider, upstream model) and is what a
+#   z.ai coding plan's 7-per-model allowance would use — two models on one z.ai
+#   key is 14 in flight, two models on one Ollama account is still 3.
+#
+#   So each account gets its OWN credential group. Both credentials in ONE group
+#   would mean 3 across both accounts, which is a different (and wrong) claim:
+#   spilling from a saturated account to an idle one would then find the idle
+#   one already counted full.
+#
+# RENDER
+#     set -a; . ~/env; set +a          # not needed here; no ~/env value is used
+#     envsubst < dual-key.yaml.tmpl > "$RUNDIR/dual-key.yaml"
+#   Only ${FAKE_UPSTREAM_URL} is substituted. The two credentials are read from
+#   the environment by name (FAKE_KEY_A / FAKE_KEY_B) and are generated per run
+#   by run-dualkey.sh; nothing here is a credential.
+
+version: 1
+
+server:
+  listen: ":4200"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  request_timeout: 300s
+  shutdown_grace: 5s
+
+storage:
+  driver: sqlite
+  sqlite:
+    path: ~/.dorang/dorang.db
+
+providers:
+  - name: ollama
+    kind: ollama-cloud
+    base_url: ${FAKE_UPSTREAM_URL}
+    timeout: 300s
+    # One attempt. A retry would re-enter capacity and make the account a
+    # request landed on ambiguous, which is the one thing being measured.
+    retry: {max_attempts: 1}
+
+  # The CONTRAST. A z.ai-shaped coding plan: ONE account, and an allowance of 7
+  # in flight PER MODEL rather than per account. The two provider blocks differ
+  # in exactly one thing — which axis carries the ceiling — and the harness
+  # shows that one key here reaches 14 concurrent across two models while one
+  # Ollama account reaches 3 across two models. That is the distinction the
+  # per-credential axis exists for, stated as an experiment instead of a claim.
+  - name: planvendor
+    kind: openai
+    base_url: ${FAKE_UPSTREAM_URL}
+    timeout: 300s
+    retry: {max_attempts: 1}
+
+credentials:
+  - {id: ollama-1, provider: ollama, key_env: FAKE_KEY_A, capacity_group: ollama-acct-1}
+  - {id: ollama-2, provider: ollama, key_env: FAKE_KEY_B, capacity_group: ollama-acct-2}
+  # No capacity_group: this account's ceiling is not per account.
+  - {id: plan-1, provider: planvendor, key_env: FAKE_KEY_C}
+
+capacity:
+  credential_groups:
+    # Per ACCOUNT, across all models. This is the whole point of the file.
+    ollama-acct-1: {max_concurrency: 3}
+    ollama-acct-2: {max_concurrency: 3}
+  models:
+    # Deliberately NOTHING for the ollama provider: a per-(provider, model)
+    # ceiling there would hide the very axis under test. And exactly this, for
+    # the plan vendor: 7 per model, so two models on the one key is 14.
+    - {provider: planvendor, model: plan-x, max_concurrency: 7}
+    - {provider: planvendor, model: plan-y, max_concurrency: 7}
+
+key_rotation:
+  # failover, so the preference order is deterministic and account 1 is always
+  # tried first. least_used would also pass the ceiling tests but would make
+  # "which account did an unsaturated request pick" a race, and the affinity
+  # test needs a stable answer to compare against.
+  strategy: failover
+  providers:
+    ollama:
+      affinity_group: ollama-accounts
+      stickiness:
+        scope: session
+        on_capacity: spill      # applies to UNPINNED requests only (§7.4a2)
+      keys:
+        - {id: ollama-1, key_env: FAKE_KEY_A, capacity_group: ollama-acct-1}
+        - {id: ollama-2, key_env: FAKE_KEY_B, capacity_group: ollama-acct-2}
+
+models:
+  - name: dual-a
+    class: chat
+    deployments:
+      - {provider: ollama, upstream_model: "upstream-a", credentials: [ollama-1, ollama-2]}
+  - name: dual-b
+    class: chat
+    deployments:
+      - {provider: ollama, upstream_model: "upstream-b", credentials: [ollama-1, ollama-2]}
+
+  - name: plan-x
+    class: chat
+    deployments:
+      - {provider: planvendor, upstream_model: "plan-x", credentials: [plan-1]}
+  - name: plan-y
+    class: chat
+    deployments:
+      - {provider: planvendor, upstream_model: "plan-y", credentials: [plan-1]}
+
+classes:
+  chat: [dual-a, dual-b, plan-x, plan-y]
+
+routing:
+  sticky: {enabled: true, ttl: 1h, key: [api_key, session_id]}
+  # Off. There is one deployment, so prefix affinity has nothing to choose
+  # between, and leaving it on would only add a table to the picture.
+  prefix: {enabled: false}
+
+fallbacks:
+  # No hops. "Everything is busy" has to surface as the refusal the router
+  # produced, not as a second attempt at the same saturated group.
+  on:
+    rate_limit:      []
+    quota_exhausted: []
+    context_window:  []
+    content_policy:  []
+    upstream_5xx:    []
+    timeout:         []
+    budget_exceeded: []
+    auth:            []
+  max_hops: 0
+
+observability:
+  prometheus: true
+  log_level: debug

@@ -272,7 +272,7 @@ PostgreSQL에 **기본 파티션은 의도적으로 없다.** 기본 파티션�
 |---|---|---|---|---|
 | `name` | string | — | 프로바이더의 정체성. **프로바이더 식별은 여기와 `deployments[].upstream_model`에서만 오고, 모델 문자열 파싱에서 오지 않는다** | 빈 값·중복 거부. 프로바이더를 참조하는 모든 것이 이 이름과 대조된다 |
 | `kind` | string | — | 한 단어로 wire adapter, 능력 기본값, 프롬프트 캐시 스킴, 리즈닝 제어 형태를 선택. 모델 카탈로그를 통해 해결되므로 오버레이가 이 빌드가 모르는 kind를 추가할 수 있다 | 빈 값 거부. 알 수 없는 kind는 로드에서 거부되지 **않는다** — 카탈로그 레이어로 해결되며 `dorangctl catalog explain <kind> <model>`이 어느 레이어가 답했는지 알려준다 |
-| `base_url` | string | `""` | 업스트림 루트 | 비어 있으면 다이얼할 수 없다. `base_url`이 없는 프로바이더의 패스스루 라우트는 아무 데도 가리키지 않게 두는 대신 **조용히 삭제된다** |
+| `base_url` | string | `""` | 업스트림 루트. **적어 넣은 URL에 버전 세그먼트가 없으면 dorang이 붙인다** — §6.0 참고 | 비어 있으면 다이얼할 수 없고, `kind`가 선언한 기본값으로 되돌아간다. `base_url`이 없는 프로바이더의 패스스루 라우트는 아무 데도 가리키지 않게 두는 대신 **조용히 삭제된다** |
 | `timeout` | duration | `0` | 프로바이더별 요청 타임아웃. 배포가 override 가능 | 0이면 `server.request_timeout`으로 떨어진다 |
 | `max_concurrency` | int | `0` | `route` capacity 축 — 이 프로바이더 자신의 상한 | 음수 거부. `0`은 0짜리 상한이 **아니라** 이 축이 제약하지 않음을 뜻한다 |
 | `capacity_group` | string | `""` | 여러 프로바이더가 하나의 업스트림 풀을 공유할 때의 `provider_group` 축 멤버십 | `capacity.provider_groups`에 선언되지 않은 그룹은 이름과 함께 거부 |
@@ -289,6 +289,34 @@ PostgreSQL에 **기본 파티션은 의도적으로 없다.** 기본 파티션�
 | `metrics.enabled` | bool | `false` | `least_busy` / `highest_tps`용 백엔드 메트릭 스크레이프 | §6.2 |
 | `metrics.endpoint` | string | `""` | 스크레이프 URL | `metrics.enabled`가 true면 필수 |
 | `metrics.interval` | duration | `0` | 스크레이프 간격 | — |
+
+### 6.0 `base_url`의 의미와 dorang이 덧붙이는 것
+
+**벤더가 문서화한 루트를 그대로 적는다. 적어 넣은 URL에 버전 세그먼트가 없으면 dorang이 붙이고,
+그 다음에 오퍼레이션 경로를 붙인다.**
+
+| 적어 넣은 값 | dorang이 호출하는 주소 (chat) |
+|---|---|
+| `https://api.example.com` | `https://api.example.com/v1/chat/completions` |
+| `https://api.example.com/v1` | `https://api.example.com/v1/chat/completions` |
+| `https://api.example.com/api/anthropic` | `https://api.example.com/api/anthropic/v1/messages` |
+| `https://api.example.com/api/coding/paas/v4` | `https://api.example.com/api/coding/paas/v4/chat/completions` |
+| `https://api.example.com/v1/openai` | `https://api.example.com/v1/openai/chat/completions` |
+
+"이미 있다"는 것은 경로의 **어디든** 이라는 뜻이지 끝일 필요는 없다 — `v` 뒤에 숫자가 오는
+세그먼트(`v1`, `v4`, `v1beta`)다. 마지막 행이 그 이유다. 버전을 패밀리 접두사 앞에 두는 벤더가
+있고, 마지막 세그먼트만 보는 규칙은 `…/v1/openai/v1/chat/completions`를 호출하게 된다.
+
+> ⚠️ **세 번째 행이 틀려 있던 자리이고, 조용히 실패했다.** dorang은 베어 호스트에만 버전을
+> 붙였으므로, `https://…/api/anthropic`으로 설정한 Anthropic 호환 코딩 플랜은
+> `…/api/anthropic/messages`로 호출됐다 — 존재하지 않는 라우트다. 그런 벤더 하나는 서빙하지
+> 않는 라우트 요청에 **HTTP 200**과 `{"code":500,"msg":"404 NOT_FOUND"}`로 답하고, dorang은
+> 그것을 내용이 빈 성공한 어시스턴트 턴으로 렌더링했다. 양쪽 모두 고쳐졌다. 버전이 붙고,
+> 자기 패밀리의 응답이 아닌 업스트림 200은 `502 upstream_shape`이다.
+
+**벤더가 정말로 버전 없는 라우트를 서빙한다면.** 오퍼레이션 경로로 끝나는 `base_url`은 그대로
+쓰인다 — `https://api.example.com/api/gateway/chat/completions`라고 적으면 아무것도 삽입되지
+않는다. 오퍼레이션 하나를 고정하는 방식이므로, 하나만 서빙하는 프로바이더에 맞는다.
 
 ### 6.1 프로바이더 보고 쿼터를 대체가 아니라 결합하는 이유
 

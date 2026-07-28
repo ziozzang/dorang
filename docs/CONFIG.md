@@ -370,7 +370,7 @@ providers:
 |---|---|---|---|---|
 | `name` | string | — | The provider's identity. **Provider identity comes only from here and from `deployments[].upstream_model`, never from parsing a model string** | Empty or duplicate is refused. Everything that references a provider — credentials, capacity groups, deployments, passthrough routes, pricing matches — is checked against this name |
 | `kind` | string | — | Selects, in one word: the wire adapter, capability defaults, the prompt-cache scheme and the reasoning-control shape. Resolved through the model catalog, so an overlay can add a kind this build has never heard of | Empty is refused. An unknown kind is **not** refused at load — it resolves through the catalog's layers, and `dorangctl catalog explain <kind> <model>` tells you which layer answered |
-| `base_url` | string | `""` | The upstream root | Empty means the provider cannot be dialled. A passthrough route whose provider has no `base_url` is **silently dropped** rather than pointed at nothing |
+| `base_url` | string | `""` | The upstream root. **dorang appends the API version segment unless the URL you write already contains one** — see §6.0 | Empty means the provider cannot be dialled, and falls back to the one the `kind` declares. A passthrough route whose provider has no `base_url` is **silently dropped** rather than pointed at nothing |
 | `timeout` | duration | `0` | Per-provider request timeout. A deployment may override it | Zero falls through to `server.request_timeout` |
 | `max_concurrency` | int | `0` | The `route` capacity axis — this provider's own ceiling | Negative is refused. `0` means the axis does not constrain, **not** a ceiling of zero |
 | `capacity_group` | string | `""` | Membership in the `provider_group` axis, for several providers sharing one upstream pool | A group not declared under `capacity.provider_groups` is refused, by name |
@@ -387,6 +387,37 @@ providers:
 | `metrics.enabled` | bool | `false` | Scrapes a backend metrics endpoint for `least_busy` / `highest_tps` | See §6.2 |
 | `metrics.endpoint` | string | `""` | The scrape URL | Required when `metrics.enabled` is true |
 | `metrics.interval` | duration | `0` | Scrape interval | — |
+
+### 6.0 What `base_url` means, and what dorang appends to it
+
+**Write the root the vendor documents. dorang appends the version segment unless your URL
+already contains one, and then appends the operation's path.**
+
+| You write | dorang addresses (chat) |
+|---|---|
+| `https://api.example.com` | `https://api.example.com/v1/chat/completions` |
+| `https://api.example.com/v1` | `https://api.example.com/v1/chat/completions` |
+| `https://api.example.com/api/anthropic` | `https://api.example.com/api/anthropic/v1/messages` |
+| `https://api.example.com/api/coding/paas/v4` | `https://api.example.com/api/coding/paas/v4/chat/completions` |
+| `https://api.example.com/v1/openai` | `https://api.example.com/v1/openai/chat/completions` |
+
+"Already contains one" means **anywhere in the path**, not only at the end — a segment
+spelled `v` followed by a digit (`v1`, `v4`, `v1beta`). The last row is why: some vendors
+put the version before the family prefix, and a rule that looked only at the final segment
+would address `…/v1/openai/v1/chat/completions`.
+
+> ⚠️ **The third row is the one that used to be wrong, and it failed silently.** dorang
+> supplied the version only for a bare host, so an Anthropic-compatible coding plan
+> configured as `https://…/api/anthropic` was addressed at `…/api/anthropic/messages` — not
+> a route. One such vendor answers a request for a route it does not serve with **HTTP 200**
+> and `{"code":500,"msg":"404 NOT_FOUND"}`, which dorang rendered as a successful assistant
+> turn with empty content. Both halves are now fixed: the version is appended, and an
+> upstream 200 that is not a response of its family is a `502 upstream_shape`.
+
+**The escape hatch, if a vendor really serves the unversioned route.** A `base_url` that
+already ends in the operation's own path is used verbatim — write
+`https://api.example.com/api/gateway/chat/completions` and nothing is inserted. It pins one
+operation, so it suits a provider that serves one.
 
 ### 6.1 Why provider-reported quota is combined, not substituted
 

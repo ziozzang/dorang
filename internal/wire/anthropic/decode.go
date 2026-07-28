@@ -330,12 +330,55 @@ func metadataToCanonical(extra map[string]json.RawMessage, warn WarnFunc) map[st
 //
 // This is json.Unmarshal and not [strictUnmarshal] on purpose: the bytes are a
 // backend's, not a caller's, and the reasoning is in [strictUnmarshal].
+//
+// It returns [ErrNotAResponse] for a JSON object that is not a Messages
+// response. Parsing without error is not the same fact as "this is an answer",
+// and treating it as one is what turned a vendor's 200-wrapped error body into a
+// silent empty success; see [ErrNotAResponse] and [IsMessagesResponse].
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
 	}
+	if !IsMessagesResponse(&w) {
+		return nil, ErrNotAResponse
+	}
 	return ResponseToCanonical(&w, opt)
+}
+
+// IsMessagesResponse reports whether a decoded body is a response of this
+// family.
+//
+// # The test, and what it deliberately does not do
+//
+// It accepts on EITHER of two grounds, never on both being required:
+//
+//  1. the discriminator names this family — `"type": "message"`; or
+//  2. at least one payload-bearing member is PRESENT — `content`, `usage` or
+//     `stop_reason`.
+//
+// Presence means the key was in the document, not that its value is interesting.
+// `{"type":"message","content":[]}` is a valid, minimal answer — a model can
+// legitimately produce an empty turn — and so is a body from a vendor that has
+// never sent a `type` member but does send `content`. Requiring the
+// discriminator would refuse the second; requiring non-empty content would
+// refuse the first. Both are answers and both are accepted.
+//
+// What it refuses is a body with NEITHER: no `type: message`, no `content`, no
+// `usage`, no `stop_reason`. A vendor error envelope has none of the four, which
+// is the point; so does a JSON object from a completely different API. The cost
+// of the rule is that a hypothetical vendor that answers with only `{"id":…,
+// "role":"assistant","model":…}` and no content at all is refused — which is
+// the same empty turn the caller could not have used anyway, now with a 502 that
+// names the condition instead of a 200 that hides it.
+func IsMessagesResponse(w *Response) bool {
+	if w == nil {
+		return false
+	}
+	if w.Type == TypeMessage {
+		return true
+	}
+	return w.Content != nil || w.Usage != nil || w.StopReason != nil
 }
 
 // ResponseToCanonical converts a decoded wire response.

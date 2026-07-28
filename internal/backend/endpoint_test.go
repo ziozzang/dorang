@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,8 +13,10 @@ import (
 )
 
 // TestEndpointDerivation covers the rule that has to hold for every catalogued
-// kind at once: a base URL arrives either as a bare host or already carrying its
-// version segment, and both are correct.
+// kind at once: a base URL arrives as a bare host, as a host already carrying
+// its version segment, or as a host plus a path with no version at all, and all
+// three are correct. dorang supplies the version unless the base already
+// contains one.
 func TestEndpointDerivation(t *testing.T) {
 	cases := []struct {
 		name string
@@ -41,8 +45,36 @@ func TestEndpointDerivation(t *testing.T) {
 		{"count tokens", "anthropic", catalog.APIAnthropicMessages,
 			"https://api.anthropic.com", OpCountTokens,
 			"https://api.anthropic.com/v1/messages/count_tokens"},
-		{"a vendor path prefix survives", "minimax", catalog.APIAnthropicMessages,
-			"https://api.minimax.io/anthropic", OpChat, "https://api.minimax.io/anthropic/messages"},
+		// D1. A path prefix with NO version segment gets one. Both of the
+		// Anthropic-compatible coding plans this project exists to aggregate hand
+		// the operator exactly this shape — it is what a Claude-Code-shaped client
+		// puts in ANTHROPIC_BASE_URL, and that client appends "/v1/messages"
+		// itself — and dorang used to append nothing and address a route that does
+		// not exist.
+		{"a vendor path prefix keeps its version", "minimax", catalog.APIAnthropicMessages,
+			"https://api.minimax.io/anthropic", OpChat, "https://api.minimax.io/anthropic/v1/messages"},
+		{"an anthropic coding plan on a path", "anthropic", catalog.APIAnthropicMessages,
+			"https://api.z.ai.invalid/api/anthropic", OpChat,
+			"https://api.z.ai.invalid/api/anthropic/v1/messages"},
+		{"an anthropic coding plan on a different path", "anthropic", catalog.APIAnthropicMessages,
+			"https://dashscope.invalid/apps/anthropic", OpChat,
+			"https://dashscope.invalid/apps/anthropic/v1/messages"},
+		{"count_tokens on a path base", "anthropic", catalog.APIAnthropicMessages,
+			"https://api.z.ai.invalid/api/anthropic", OpCountTokens,
+			"https://api.z.ai.invalid/api/anthropic/v1/messages/count_tokens"},
+		// An operator who already wrote the version segment must not get a second
+		// one, whichever spelling the vendor uses.
+		{"an operator-supplied version is not doubled", "anthropic", catalog.APIAnthropicMessages,
+			"https://api.z.ai.invalid/api/anthropic/v1", OpChat,
+			"https://api.z.ai.invalid/api/anthropic/v1/messages"},
+		// The version is not always the LAST segment. deepinfra's catalogued base
+		// is /v1/openai and its route is /v1/openai/chat/completions; a rule keyed
+		// on the final segment would address /v1/openai/v1/chat/completions.
+		{"a version that is not the last segment", "deepinfra", catalog.APIOpenAIChat,
+			"https://api.deepinfra.com/v1/openai", OpChat,
+			"https://api.deepinfra.com/v1/openai/chat/completions"},
+		{"a non-numeric v-word is not a version", "openai", catalog.APIOpenAIChat,
+			"https://api.venice.ai/api", OpChat, "https://api.venice.ai/api/v1/chat/completions"},
 		// The two rerank spellings side by side. The vendor's own route lives at
 		// /v2 on a bare host, so the "/v1" every other OpenAI-shaped route takes
 		// would address /v1/v2/rerank, which 404s.
@@ -79,6 +111,103 @@ func TestEndpointDerivation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCatalogueBasesThatGainAVersion pins the blast radius of D1's rule change,
+// by name, for every catalogued kind it moves.
+//
+// The rule it replaced supplied the version segment only for a BARE HOST, and
+// its doc comment claimed that "leaves every catalogued kind pointing at a real
+// endpoint". That claim was false for five kinds, three of which are the
+// Anthropic-compatible coding plans this project exists to aggregate: dorang
+// addressed `<base>/messages` where the route is `<base>/v1/messages`.
+//
+// Two of the five are OpenAI-shaped and are the judgement call in this fix. The
+// catalog records their base URLs from a plugin manifest consumed by an SDK that
+// appends `/chat/completions` with no version of its own, so a reading exists
+// under which they wanted nothing appended. They are listed here so that reading
+// is one edit away and cannot be lost: an operator who needs the unversioned
+// route writes the full route as `base_url`, which [joinVersioned] returns
+// verbatim.
+func TestCatalogueBasesThatGainAVersion(t *testing.T) {
+	// kind -> the endpoint dorang now addresses for that kind's own operation.
+	want := map[string]string{
+		// Anthropic-shaped coding plans. A Claude-Code-shaped client is handed
+		// exactly this base and appends "/v1/messages" itself, which is why the
+		// vendor documents the base without a version.
+		"minimax":     "https://api.minimax.io/anthropic/v1/messages",
+		"kimi-coding": "https://api.kimi.com/coding/v1/messages",
+		"synthetic":   "https://api.synthetic.new/anthropic/v1/messages",
+		// OpenAI-shaped, and the judgement call described above.
+		"longcat":  "https://api.longcat.chat/openai/v1/chat/completions",
+		"kilocode": "https://api.kilo.ai/api/gateway/v1/chat/completions",
+	}
+
+	cat := catalog.Default()
+	got := make(map[string]string)
+	for _, name := range cat.Kinds() {
+		kd, ok := cat.Kind(name)
+		if !ok || kd.BaseURL == "" {
+			continue
+		}
+		// The two filters are spelled out here rather than borrowed from
+		// endpoint.go on purpose: a test that selects its own subjects with the
+		// function under test stops selecting them the moment that function
+		// regresses, and reports an empty set instead of a wrong URL.
+		if trimBase(kd.BaseURL) == baseHost(t, kd.BaseURL) {
+			continue // a bare host: it got the version under the old rule too
+		}
+		if pathNamesAVersion(t, kd.BaseURL) {
+			continue // already versioned: nothing was ever appended
+		}
+		p, err := NewProvider(Spec{Name: "p", Kind: name, API: kd.API, BaseURL: kd.BaseURL})
+		if err != nil {
+			t.Fatalf("%s: NewProvider: %v", name, err)
+		}
+		ep, err := p.Endpoint(OpChat, "m", false)
+		if err != nil {
+			t.Fatalf("%s: Endpoint: %v", name, err)
+		}
+		got[name] = ep
+	}
+
+	for name, url := range want {
+		if got[name] != url {
+			t.Errorf("kind %q addresses %q, want %q", name, got[name], url)
+		}
+		delete(got, name)
+	}
+	for name, url := range got {
+		t.Errorf("kind %q now addresses %q and is not in this test's list; a catalogued base "+
+			"whose route moves has to be named here, not discovered in production", name, url)
+	}
+}
+
+// baseHost returns the scheme and host of a base URL, with no path.
+func baseHost(t *testing.T, base string) string {
+	t.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse %q: %v", base, err)
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// pathNamesAVersion is the test's own reading of "this base is already
+// versioned". See the comment at its call site for why it is not
+// [hasVersionSegment].
+func pathNamesAVersion(t *testing.T, base string) bool {
+	t.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse %q: %v", base, err)
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if len(seg) >= 2 && seg[0] == 'v' && seg[1] >= '0' && seg[1] <= '9' {
+			return true
+		}
+	}
+	return false
 }
 
 func TestGeminiStreamEndpoint(t *testing.T) {

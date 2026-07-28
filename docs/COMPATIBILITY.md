@@ -57,6 +57,8 @@ the ratio, not a preference.
 | 2.3 | `object` is always `"chat.completion.chunk"`. | |
 | 2.4 | `id` and `created` are **pinned across every chunk** of one stream. | Regenerating `created` per chunk breaks clients that use it as a stream identity. |
 | 2.5 | `model` is **restamped on every chunk** to the client-facing name. | This independently confirms design §7.2: per-frame rewriting is the required behavior, not an optimization to avoid. Revision 1's "patch the first frame by offset" was wrong on this ground alone. |
+| 2.6 | **The first delta of each choice carries `role: "assistant"`.** | It is DESIGN §10.7's stream-open event, and it is what `message_start` maps to when a Messages stream is converted. Reproduced against a real provider: the byte relay carried the role because it carries everything, and the CONVERTED stream dropped it — so two clients of one gateway saw structurally different streams depending only on which family their deployment's upstream spoke. It rides on the first delta rather than as a frame of its own, so no stream gains a frame it did not have, and a role the source already stated is never overwritten. |
+| 2.7 | **`created` is a real timestamp on every path.** | The stream writer stamped one and the non-streaming converter did not, so a Messages answer rendered as a chat completion carried `"created":0` — 1970 — unless the caller passed `stream:true`. The value is the upstream's own where its family has the member, and the gateway's clock where it does not. See DESIGN §10.7's response-identity rule, which covers `id` in the same breath. |
 
 ## 3. Usage
 
@@ -220,15 +222,58 @@ one condition across four call paths.
 
 `code` is a **string or null**, never a number. `param` is the offending field or null.
 
-**Anthropic family** — `/v1/messages`:
+**Anthropic family** — `/v1/messages`, `/v1/messages/count_tokens`:
 
 ```json
-{"type":"error","error":{"type":"invalid_request_error","message":"…"}}
+{"type":"error","error":{"type":"invalid_request_error","message":"…","param":"model","code":"model_not_found"}}
 ```
 
-The outer `"type":"error"` is load-bearing: the Anthropic SDK dispatches on it. There is no
-`code` and no `param` in this family, so a condition dorang would express through `code` is
-folded into the message.
+The outer `"type":"error"` is load-bearing: the Anthropic SDK dispatches on it. A body
+carrying only the OpenAI object is not a differently-spelled error to such a client — it is
+one it cannot classify **at all**, because the member it switches on is absent. Every error
+dorang returned on this family was that body until the envelope became a function of the
+family: the projection of §11.2's `type` column landed in the other family's object, where
+nothing reads it.
+
+⚠️ **`param` and `code` are emitted here too, and that is a deliberate union rather than an
+oversight.** The vendor's own object has neither and §7.1 requires both, so emitting only one
+of the two breaks a reader: drop the outer type and this family's SDK cannot classify the
+failure, drop `param`/`code` and a client written against §7.1 reads a missing key. Every SDK
+in this family tolerates unknown members of the error object, so the union satisfies both and
+neither sees a field it must reject. It also keeps §11.2's `code` column — which is what
+application code matches on, and which is most of the information in that table — from being
+folded into prose that nothing can branch on. An earlier revision of this section said there
+was no `code` and no `param` here; no build has ever emitted that shape.
+
+The envelope is chosen by the family the **caller** is speaking, on the single path every
+error response takes: `(*server.Error).ForFamily` records the family alongside the projected
+type, and `server.appendEnvelope` renders that family's object — delegating the Anthropic one
+to `internal/wire/anthropic`, which already owns and golden-tests that serializer, rather than
+keeping a second renderer of one contract. Two renderers of one envelope is exactly what
+produced this defect. Every family that is neither — models, health, metrics, admin,
+passthrough, and the zero value a request that matched no route carries — is answered in the
+OpenAI object by the whitelist in `server.Family.Anthropic`, deliberately rather than by
+omission. `TestCompat11EnvelopeIsDispatchableOnBothFamilies` walks every row of §11.2 through
+both families and decodes the outer discriminator from the bytes.
+
+#### 11.1a The mid-stream error frame
+
+Once the first frame is out the status is 200 and cannot change (§1.3), so the error goes in
+band — and the two families do not frame it the same way. The envelope above is only half the
+answer; the framing is the other half, and getting it wrong is worse than getting the envelope
+wrong, because the client does not see the frame at all.
+
+| Family | Frames |
+|---|---|
+| OpenAI | `data: {"error":{…}}\n\n` then `data: [DONE]\n\n` (§1.1, §1.2) |
+| Anthropic | `event: error\ndata: {"type":"error","error":{…}}\n\n`, and **nothing after it** (§6.1, §6.2) |
+
+A client reading an Anthropic stream dispatches on the event **name**. A data-only frame is
+therefore not a frame it mis-parses — it is one it silently discards, which leaves a failed
+exchange indistinguishable from a truncated one. In the other direction a `[DONE]` in an
+Anthropic stream is a frame a conforming parser cannot name, and `message_stop` must not
+follow an `error`: the message did not stop, it failed. `TestMidStreamErrorUsesTheFamilysFraming`
+pins both, parsed out of the frames rather than substring-matched.
 
 ### 11.2 Canonical conditions
 

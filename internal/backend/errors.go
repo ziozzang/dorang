@@ -30,7 +30,21 @@ const (
 	CodeUpstreamTooLarge = "upstream_response_too_large"
 	// CodeUpstreamDecode is a response dorang could not understand.
 	CodeUpstreamDecode = "upstream_decode"
-	// CodeUpstreamShape is a relayed answer that was not a JSON object.
+	// CodeUpstreamShape is an upstream answer that parsed and is not a response:
+	// a relayed body that was not a JSON object at all, or a JSON object that is
+	// not a response of the family the deployment speaks.
+	//
+	// The second half is the one that had nowhere to go. A vendor that answers
+	// HTTP 200 with `{"code":500,"msg":"404 NOT_FOUND","success":false}` — which
+	// is what one real coding-plan host does for a route it does not serve —
+	// decodes into a zero-valued response, and dorang rendered that as a
+	// successful assistant turn with empty content. The failure was silent in
+	// every channel at once: no retry, no §7.6 fallback, a success in health, and
+	// zero tokens in the meter. The vendor next to it that answers the same
+	// misconfiguration with an honest 404 was diagnosable in seconds.
+	//
+	// It shares a code with the not-an-object case because the operator's next
+	// step is the same one: this deployment's base_url or api is wrong.
 	CodeUpstreamShape = "upstream_shape"
 	// CodeResponseEncode is a neutral answer that would not render in the
 	// caller's protocol.

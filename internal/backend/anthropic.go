@@ -66,8 +66,9 @@ func (anthropicAdapter) encode(x *exchange) ([]byte, error) {
 func (anthropicAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 	if x.call.Op == OpCountTokens {
 		// The count is the whole answer; there is nothing to convert and no
-		// usage to price beyond the request itself.
-		return &decoded{raw: body}, nil
+		// usage to price beyond the request itself. It is still checked for
+		// being an answer at all — see [relayCountTokens].
+		return relayCountTokens(body)
 	}
 	resp, err := anthropic.DecodeResponse(body, &anthropic.DecodeOptions{Model: x.call.Model})
 	if err != nil {

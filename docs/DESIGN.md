@@ -2243,6 +2243,7 @@ Three of these are traps and each gets a test:
 | Canonical | chat-completions | responses | messages |
 |---|---|---|---|
 | `ID` | `id` | `id` | `id` |
+| `Created` | `created` | `created_at` | — |
 | `Model` | `model` (restamped every chunk) | `model` | `model` |
 | `StopReason` | `choices[].finish_reason` | `status` + `incomplete_details.reason` | `stop_reason` |
 | `StopSequence` | — | — | `stop_sequence` |
@@ -2282,6 +2283,32 @@ invoice. Two normalizations are mandatory:
    in. `ReasoningTokens` is reported separately *and* is already contained in
    `OutputTokens`, so cost never adds them twice. A test asserts
    `OutputTokens >= ReasoningTokens`.
+
+#### Response identity — `id` and `created`
+
+**The upstream's `id` crosses unchanged when the answer did not change family, and is minted
+in the caller's family shape when it did. `created` is the upstream's own when its family has
+the member and this gateway's clock when it does not. Both rules hold on the streaming and
+the non-streaming path, and that is the whole of the rule.**
+
+Crossing the id is defensible — it is the only handle a support ticket has on the upstream's
+side of an exchange — and it is defensible *only* while the id is one the caller's family
+could have produced. `{"object":"chat.completion","id":"msg_2026…"}` is not: it is an
+identifier of another family under a member naming this one, and no client's own shape
+describes it.
+
+> ⚠️ **This was the second place the two paths disagreed, and the first was usage.** Converting
+> a Messages answer to a chat completion, the non-streaming converter emitted `"created":0` — a
+> timestamp in 1970 on every converted turn — and crossed the upstream `msg_…` id verbatim,
+> while the streaming writer for the identical conversion stamped a real timestamp and minted a
+> `chatcmpl-` id. Same request, same upstream, two different answers, selected by nothing but
+> `stream:true`.
+>
+> The pattern is worth naming because it has now recurred: a property is implemented once in a
+> streaming writer and once in a response encoder, and the two drift. Usage was pinned by
+> `TestStreamingAndNonStreamingAgreeOnUsage`; identity is pinned by
+> `TestStreamingAndNonStreamingAgreeOnIdentity`. **A third such property should be pinned by an
+> equivalence test on the day it is written, not on the day it is found in production.**
 
 #### Streaming events
 

@@ -78,6 +78,9 @@ type StreamWriter struct {
 	sawToolCall bool
 	// finished records which choice indexes already carried a finish_reason.
 	finished []bool
+	// opened records which choice indexes already announced delta.role. See
+	// [StreamWriter.openRole].
+	opened []bool
 
 	// args accumulates each tool call's argument text so that the terminal chunk
 	// is not upgraded to tool_calls over a body that does not parse. dorang does
@@ -231,7 +234,38 @@ func (s *StreamWriter) WriteEvent(ev canonical.StreamEvent) error {
 
 	default: // canonical.EventDelta
 		ch := ChunkChoice{Index: ev.Choice, Delta: deltaFrom(&ev.Delta)}
+		s.openRole(&ch)
 		return s.WriteChunk(&Chunk{Choices: []ChunkChoice{ch}})
+	}
+}
+
+// openRole announces the assistant role on a choice's first delta.
+//
+// DESIGN §10.7's streaming table maps this family's stream-open event to "first
+// chunk with delta.role", and message_start is what it maps to on the other
+// side — but nothing here emitted it. The consequence was a split of exactly
+// the kind §10.7 exists to prevent: OpenAI emits the role, the byte relay
+// forwards it because it forwards everything, and the CONVERTED stream dropped
+// it. Two clients of one gateway, one talking to an OpenAI-shaped upstream and
+// one to a Messages-shaped upstream, saw structurally different streams.
+//
+// It rides on the first delta rather than as a frame of its own so that no
+// stream gains a frame it did not have, and it never overwrites a role the
+// source already stated.
+func (s *StreamWriter) openRole(ch *ChunkChoice) {
+	i := ch.Index
+	if i < 0 {
+		i = 0
+	}
+	for len(s.opened) <= i {
+		s.opened = append(s.opened, false)
+	}
+	if s.opened[i] {
+		return
+	}
+	s.opened[i] = true
+	if ch.Delta.Role == nil {
+		ch.Delta.Role = ptr(string(canonical.RoleAssistant))
 	}
 }
 
@@ -547,6 +581,11 @@ func RoleChunk(role string) *Chunk {
 }
 
 // NewStreamID generates a chat-completion id.
+//
+// One generator serves both paths on purpose. `chatcmpl-…` is the id shape of
+// this family's answer, streamed or not, and a second generator is how the two
+// paths come to hand a client different-looking identifiers for the same
+// conversion (DESIGN §10.7).
 func NewStreamID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

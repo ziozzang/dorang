@@ -1,0 +1,298 @@
+# dorang — every real provider in the operator's environment, in one gateway.
+#
+# WHAT THIS IS
+#   The bring-up configuration for the eight upstreams the operator holds
+#   credentials for, including the two that expose the SAME account behind two
+#   different protocol families (z.ai and Qwen), and the two accounts on one
+#   provider (Ollama) that the per-credential concurrency axis exists for.
+#
+# WHY IT IS A TEMPLATE
+#   Two reasons, and only the first is dorang's.
+#
+#   1. `providers[].base_url` is a literal string. Environment expansion works
+#      for secret fields (`key_env` / `key_file`) and nowhere else, so a base
+#      URL that must come from the environment cannot be written here. That is
+#      gap G1, established by deploy/litellm-parity.
+#   2. Repository policy: no file here may contain a value taken from the
+#      operator's environment file. Several of these hosts are perfectly public
+#      but are *stated* in that file, so they are substituted rather than
+#      written out.
+#
+#   Where a provider kind's catalogued default base URL is already the right
+#   host (pkg/catalog/provider_defaults.yaml), `base_url` is simply OMITTED and
+#   dorang fills it in. That is the case for ollama-cloud, glm, qwen,
+#   openrouter and huggingface, so five of the eight need no substitution at
+#   all.
+#
+#   Render:
+#     set -a; . ~/env; set +a
+#     envsubst '${Z_AI_ANTHROPIC_BASE_URL} ${ANTHROPIC_BASE_URL} ${QWEN_TOKEN_PLAN_ANTHROPIC_URL} ${LITELLM_OPENAI_BASE_URL}' \
+#       < providers.yaml.tmpl > "$RUNDIR/providers.yaml"
+#
+#   No key is ever substituted: every credential stays a `key_env:` reference
+#   and is read from the process environment at load.
+
+version: 1
+
+server:
+  listen: ":4300"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  request_timeout: 300s
+  shutdown_grace: 10s
+
+storage:
+  driver: sqlite
+  sqlite:
+    path: ~/.dorang/dorang.db
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# Six protocol shapes are in play here and dorang picks each from the KIND, not
+# from any model name (§2.1):
+#   ollama-cloud, glm, qwen, openrouter, huggingface, litellm -> openai-chat
+#   anthropic                                                 -> anthropic-messages
+#   jina                                                      -> the jina surface
+# ---------------------------------------------------------------------------
+providers:
+
+  # --- two accounts on one provider; the headline case ---------------------
+  # Ollama's plan allows 3 in flight PER ACCOUNT across all models. See
+  # dual-key.yaml.tmpl, which is this block with a controllable upstream, and
+  # the proof harness that runs against it.
+  - name: ollama
+    kind: ollama-cloud          # base_url: https://ollama.com/v1 (catalogued)
+    timeout: 300s
+    retry: {max_attempts: 2, backoff: exponential, base: 500ms}
+
+  # --- z.ai, reachable two ways --------------------------------------------
+  # The same coding-plan account behind an OpenAI-shaped surface and an
+  # Anthropic-shaped one. Two providers, one credential each, both naming the
+  # same key: this is what makes the family-conversion comparison a comparison
+  # of dorang and not of two different upstreams.
+  - name: zai-openai
+    kind: glm                   # base_url: the coding-plan paas/v4 (catalogued)
+    timeout: 300s
+    retry: {max_attempts: 2, backoff: exponential, base: 500ms}
+  #
+  # THE `/v1` IS NO LONGER LOAD-BEARING, AND IS KEPT ONLY AS A RECORD. dorang
+  # used to supply the version segment only for a BARE HOST, so this vendor's
+  # Anthropic base — which carries a path — got nothing and addressed
+  # `<base>/messages`, which is not a route. That was defect D1, and getting it
+  # wrong did not produce an error: it produced an empty answer with a 200
+  # (defect D2). Both are closed. dorang now appends the version unless the
+  # configured URL already contains one, so this line and a bare
+  # `${Z_AI_ANTHROPIC_BASE_URL}` address the same endpoint. See REPORT.md.
+  - name: zai-anthropic
+    kind: anthropic
+    base_url: ${Z_AI_ANTHROPIC_BASE_URL}/v1
+    timeout: 300s
+    retry: {max_attempts: 2, backoff: exponential, base: 500ms}
+
+  # The same host again, reached through the variables a Claude-Code-shaped
+  # client already sets (ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN). It is
+  # declared separately because the operator states it separately; whether it
+  # is the same account as zai-anthropic is a question about the environment,
+  # not about this file, and the report answers it.
+  - name: glm-plan-anthropic
+    kind: anthropic
+    base_url: ${ANTHROPIC_BASE_URL}/v1     # see zai-anthropic above: D1, now closed
+    timeout: 300s
+
+  # --- Qwen, also reachable two ways ---------------------------------------
+  - name: qwen-openai
+    kind: qwen                  # base_url: the token-plan compatible-mode (catalogued)
+    timeout: 300s
+    retry: {max_attempts: 2, backoff: exponential, base: 500ms}
+  - name: qwen-anthropic
+    kind: anthropic
+    base_url: ${QWEN_TOKEN_PLAN_ANTHROPIC_URL}/v1   # see zai-anthropic above: D1, now closed
+    timeout: 300s
+
+  # --- the rest -------------------------------------------------------------
+  - name: openrouter
+    kind: openrouter            # base_url: https://openrouter.ai/api/v1 (catalogued)
+    timeout: 300s
+
+  # jina's kind declares NO base URL — it is the one kind here that must state
+  # one, and this host is not taken from the operator's environment.
+  - name: jina
+    kind: jina
+    base_url: https://api.jina.ai
+    timeout: 120s
+
+  - name: huggingface
+    kind: huggingface           # base_url: https://router.huggingface.co/v1 (catalogued)
+    timeout: 300s
+
+  # The operator's own LiteLLM, kept so the Jina models can be compared
+  # direct-vs-through-a-gateway on one dorang.
+  - name: litellm
+    kind: litellm
+    base_url: ${LITELLM_OPENAI_BASE_URL}
+    timeout: 600s
+
+credentials:
+  # Two accounts, two capacity groups. One group shared by both would mean
+  # "3 across both accounts", which is a different and wrong claim.
+  - {id: ollama-1, provider: ollama, key_env: OLLAMA_API_KEY,   capacity_group: ollama-acct-1}
+  - {id: ollama-2, provider: ollama, key_env: OLLAMA_API_KEY_2, capacity_group: ollama-acct-2}
+
+  - {id: zai-oai,  provider: zai-openai,    key_env: Z_AI_API_KEY}
+  - {id: zai-ant,  provider: zai-anthropic, key_env: Z_AI_API_KEY}
+  - {id: glm-plan, provider: glm-plan-anthropic, key_env: ANTHROPIC_AUTH_TOKEN}
+
+  - {id: qwen-oai, provider: qwen-openai,    key_env: QWEN_TOKEN_PLAN_KEY}
+  - {id: qwen-ant, provider: qwen-anthropic, key_env: QWEN_TOKEN_PLAN_KEY}
+
+  - {id: openrouter-1, provider: openrouter,  key_env: OPENROUTER_API_KEY}
+  - {id: jina-1,       provider: jina,        key_env: JINA_API_KEY}
+  - {id: hf-1,         provider: huggingface, key_env: HF_TOKEN}
+  - {id: litellm-1,    provider: litellm,     key_env: LITELLM_OPENAI_API_KEY}
+
+capacity:
+  credential_groups:
+    # Ollama: 3 in flight per ACCOUNT, counted across every model. This is the
+    # cgroup axis of §5.1 and it is the axis the whole dual-key case is about.
+    ollama-acct-1: {max_concurrency: 3}
+    ollama-acct-2: {max_concurrency: 3}
+  models:
+    # z.ai's coding plan allows 7 in flight PER MODEL on one key. Same vendor,
+    # a different axis: two models on this one key is 14 concurrent, where two
+    # models on one Ollama account is still 3. Stating both in one file is the
+    # point — one axis cannot express the other.
+    - {provider: zai-openai, model: glm-4.6, max_concurrency: 7}
+    - {provider: zai-openai, model: glm-4.7, max_concurrency: 7}
+
+key_rotation:
+  strategy: failover
+  providers:
+    ollama:
+      affinity_group: ollama-accounts
+      stickiness:
+        scope: session
+        on_capacity: spill        # unpinned requests only (§7.4a2)
+      keys:
+        - {id: ollama-1, key_env: OLLAMA_API_KEY,   capacity_group: ollama-acct-1}
+        - {id: ollama-2, key_env: OLLAMA_API_KEY_2, capacity_group: ollama-acct-2}
+
+# ---------------------------------------------------------------------------
+# Models
+#
+# Names are client-facing and opaque. The `-oai` / `-ant` suffixes here are not
+# structure dorang parses; they are how an operator reading a log can tell which
+# wire a request took, which matters precisely because the two names below can
+# reach the same weights.
+# ---------------------------------------------------------------------------
+models:
+
+  # ---- Ollama: the pool, and each account addressable on its own ----------
+  # The pool is the deployment an application uses. The two single-credential
+  # models exist so bring-up can verify each account independently — a pooled
+  # request proves only that ONE of the two keys works.
+  - name: ollama-pool
+    class: chat
+    deployments:
+      - {provider: ollama, upstream_model: "gpt-oss:20b", credentials: [ollama-1, ollama-2]}
+  - name: ollama-acct1
+    class: chat
+    deployments:
+      - {provider: ollama, upstream_model: "gpt-oss:20b", credentials: [ollama-1]}
+  - name: ollama-acct2
+    class: chat
+    deployments:
+      - {provider: ollama, upstream_model: "gpt-oss:20b", credentials: [ollama-2]}
+
+  # ---- z.ai, the same account through two protocol families --------------
+  - name: zai-oai-glm46
+    class: chat
+    deployments:
+      - {provider: zai-openai, upstream_model: "glm-4.6", credentials: [zai-oai]}
+  - name: zai-ant-glm46
+    class: chat
+    deployments:
+      - {provider: zai-anthropic, upstream_model: "glm-4.6", credentials: [zai-ant]}
+
+  # The GLM coding plan as a Claude-shaped client already addresses it.
+  - name: glm-plan
+    class: chat
+    deployments:
+      - {provider: glm-plan-anthropic, upstream_model: "glm-4.6", credentials: [glm-plan]}
+
+  # ---- Qwen, likewise ------------------------------------------------------
+  - name: qwen-oai-flash
+    class: chat
+    deployments:
+      - {provider: qwen-openai, upstream_model: "qwen3.6-flash", credentials: [qwen-oai]}
+  - name: qwen-ant-flash
+    class: chat
+    deployments:
+      - {provider: qwen-anthropic, upstream_model: "qwen3.6-flash", credentials: [qwen-ant]}
+
+  # ---- the rest ------------------------------------------------------------
+  - name: openrouter-free
+    class: chat
+    deployments:
+      - {provider: openrouter, upstream_model: "openai/gpt-oss-20b:free", credentials: [openrouter-1]}
+
+  - name: hf-qwen3-8b
+    class: chat
+    deployments:
+      - {provider: huggingface, upstream_model: "Qwen/Qwen3-8B", credentials: [hf-1]}
+
+  # Jina direct. The same three models are also served by the operator's
+  # LiteLLM, below, so the two paths can be compared on one gateway.
+  - name: jina-embed-nano
+    class: embedding
+    deployments:
+      - {provider: jina, upstream_model: "jina-embeddings-v5-text-nano", credentials: [jina-1]}
+  - name: jina-rerank
+    class: rerank
+    deployments:
+      - {provider: jina, upstream_model: "jina-reranker-v3", credentials: [jina-1]}
+
+  # The same three through LiteLLM.
+  - name: litellm-jina-embed-nano
+    class: embedding
+    deployments:
+      - {provider: litellm, upstream_model: "jina-embeddings-v5-text-nano", credentials: [litellm-1]}
+  - name: litellm-jina-rerank
+    class: rerank
+    deployments:
+      - {provider: litellm, upstream_model: "jina-reranker-v3", credentials: [litellm-1]}
+  - name: litellm-chat
+    class: chat
+    deployments:
+      - {provider: litellm, upstream_model: "gpt-oss:20b", credentials: [litellm-1]}
+
+classes:
+  chat: [ollama-pool, ollama-acct1, ollama-acct2, zai-oai-glm46, zai-ant-glm46,
+         glm-plan, qwen-oai-flash, qwen-ant-flash, openrouter-free, hf-qwen3-8b,
+         litellm-chat]
+  embedding: [jina-embed-nano, litellm-jina-embed-nano]
+  rerank: [jina-rerank, litellm-jina-rerank]
+
+routing:
+  sticky: {enabled: true, ttl: 1h, key: [api_key, session_id]}
+  prefix: {enabled: true}
+
+fallbacks:
+  # Off. These models are different vendors on different plans; falling a z.ai
+  # request over to an Ollama account because the first was busy would spend a
+  # different subscription than the caller asked for, and would make a
+  # bring-up report say a provider works when a substitute answered.
+  on:
+    rate_limit:      []
+    quota_exhausted: []
+    context_window:  []
+    content_policy:  []
+    upstream_5xx:    []
+    timeout:         []
+    budget_exceeded: []
+    auth:            []
+  max_hops: 0
+
+observability:
+  prometheus: true

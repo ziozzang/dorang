@@ -55,7 +55,10 @@ func (geminiAdapter) endpoint(p *Provider, op Operation, model string, stream bo
 		method = ":streamGenerateContent?alt=sse"
 	}
 	base := trimBase(p.base)
-	if bare(base) {
+	if !hasVersionSegment(base) {
+		// The same rule [joinVersioned] applies, for the same reason: a base
+		// carrying a path but no version segment used to get nothing appended
+		// and addressed a route that does not exist.
 		base += geminiDefaultVersion
 	}
 	// The model goes in the path, so it is escaped: a name is opaque (§2.1) and

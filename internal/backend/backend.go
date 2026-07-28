@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -452,6 +453,33 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 
+	// A streaming request the upstream answered with a JSON document instead of
+	// an event stream.
+	//
+	// It is refused here, before a byte is written, because the byte relay cannot
+	// refuse it later: that path forwards as it scans and only learns the body was
+	// never SSE when it runs out of input, by which time the vendor's error
+	// envelope has been written into the client's stream verbatim and
+	// [Result.FirstByteSent] has closed §7.6 fallback over bytes that were never
+	// an answer. The upstream's own Content-Type is the one signal available
+	// before the first write, and it is decisive: no SSE body is ever labelled
+	// application/json.
+	//
+	// Only that one label is refused. A missing Content-Type, or any of the
+	// text/event-stream spellings, goes to the relay exactly as before — an
+	// upstream that mislabels a real stream must not be turned away over a
+	// header.
+	if x.call.Stream && jsonLabelled(resp.Header.Get("Content-Type")) {
+		drain(resp.Body)
+		res.Total = b.now().Sub(start)
+		res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+			"the upstream answered a streaming request with a JSON document rather than an "+
+				"event stream").WithCode(CodeUpstreamShape)
+		res.Retryable = true
+		b.report(&res, *x.target, x.call)
+		return res
+	}
+
 	// The last moment anything can still be put on the response headers: they
 	// are stamped on the first write, and for a stream the first write is three
 	// lines below (DESIGN §10.4).
@@ -508,6 +536,14 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	res.Total = b.now().Sub(start)
 	if cerr != nil {
 		res.Err = cerr
+		// An answer that is not a response of this family — a wrong route, a
+		// wrong `api`, a vendor error envelope wearing a 200 — is offered to the
+		// fallback chain. Nothing was generated, so there is no billed turn to
+		// repeat, and a sibling deployment is exactly the right next hop: it is
+		// what the operator declared the chain FOR. Every other conversion
+		// failure stays terminal, because those describe an answer that did
+		// arrive and that a second deployment would not improve.
+		res.Retryable = cerr.Code == CodeUpstreamShape
 		b.report(&res, *x.target, x.call)
 		return res
 	}
@@ -515,6 +551,20 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	res.Body = out
 	res.ContentType = ctype
 	return res
+}
+
+// jsonLabelled reports whether a Content-Type names a JSON document.
+//
+// It reads only the media type, so `application/json; charset=utf-8` and
+// `application/json` are the same answer, and it is deliberately narrow: a
+// vendor-specific `+json` suffix, an empty header and every text/* spelling all
+// report false, because the only thing this decides is whether to refuse a body
+// before reading it.
+func jsonLabelled(ct string) bool {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), jsonType)
 }
 
 // maxErrorBody bounds how much of an error body is read. An upstream that
@@ -578,6 +628,18 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 				server.TypeAPIError, "the upstream answer was not a JSON object").
 				WithCode(CodeUpstreamShape)
 		}
+		if errors.Is(err, errNotAResponse) ||
+			errors.Is(err, anthropic.ErrNotAResponse) || errors.Is(err, openai.ErrNotAResponse) {
+			// A JSON object that parsed and is not a response of this family.
+			// The status is 502 and NOT 200: the upstream's own 200 was the
+			// defect, and passing it on is what made a misrouted deployment
+			// indistinguishable from a working one. See [CodeUpstreamShape].
+			return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway,
+				server.TypeAPIError,
+				"the upstream answered 200 with a body that is not a response of the "+
+					"protocol this deployment speaks").
+				WithCode(CodeUpstreamShape)
+		}
 		return nil, "", canonical.Usage{}, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not read the upstream response: "+err.Error()).WithCode(CodeUpstreamDecode)
 	}
@@ -612,14 +674,14 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 	}
 	// The T1 chat-shaped surfaces render differently from chat completions even
 	// though their caller speaks the same family, so they are asked first.
-	if out, done, eerr := encodeT1Client(dec.resp, x.call); done {
+	if out, done, eerr := encodeT1Client(dec.resp, x.call, b.now().Unix()); done {
 		if eerr != nil {
 			return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 				"could not render the response: "+eerr.Error()).WithCode(CodeResponseEncode)
 		}
 		return out, jsonType, usage, nil
 	}
-	out, eerr := encodeClient(dec.resp, x.call)
+	out, eerr := encodeClient(dec.resp, x.call, b.now().Unix())
 	if eerr != nil {
 		return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not render the response: "+eerr.Error()).WithCode(CodeResponseEncode)
@@ -658,13 +720,54 @@ func malformedToolCall(r *canonical.Response) (string, bool) {
 }
 
 // encodeClient renders a neutral answer in the caller's protocol.
-func encodeClient(r *canonical.Response, c *Call) ([]byte, error) {
+//
+// # Identity, and why it is decided here rather than in an encoder
+//
+// D4 and D5, which were one defect: the non-streaming converter disagreed with
+// the streaming one about both halves of a response's identity.
+//
+//   - `created`. The Messages family has no such member, so a Messages answer
+//     rendered as a chat completion carried `"created":0` — a timestamp in 1970
+//     on every converted turn. The STREAM writer for the identical conversion
+//     stamps a real one (COMPATIBILITY 2.4), so the same request differed
+//     depending only on whether the caller passed stream:true. The clock is the
+//     backend's injectable one, which is why the value arrives as an argument
+//     instead of being read inside an encoder.
+//
+//   - `id`. The rule is now stated by family, on both paths (DESIGN §10.7):
+//     **the upstream's id crosses unchanged when the answer did not change
+//     family, and is minted in the caller's family shape when it did.** An
+//     Anthropic upstream rendered as a chat completion used to hand the client
+//     `{"object":"chat.completion","id":"msg_2026…"}` — an id of the wrong
+//     family under an object member naming this one — while the streaming path
+//     for that same conversion minted a `chatcmpl-` id. Traceability is the
+//     argument for crossing the id, and it is a good one; it just has to be the
+//     same argument on both paths, and it does not extend to handing a client an
+//     identifier its own SDK's shape does not describe.
+func encodeClient(r *canonical.Response, c *Call, now int64) ([]byte, error) {
 	switch c.ClientAPI {
 	case catalog.APIAnthropicMessages:
-		return anthropic.MarshalResponse(r, &anthropic.ResponseOptions{Model: c.Model})
+		opt := &anthropic.ResponseOptions{Model: c.Model}
+		if !r.SameFamily(canonical.FamilyAnthropicMessages) {
+			opt.ID = anthropic.NewMessageID()
+		}
+		return anthropic.MarshalResponse(r, opt)
 	default:
-		return openai.MarshalResponse(r, &openai.ResponseOptions{Model: c.Model})
+		opt := &openai.ResponseOptions{Model: c.Model, Created: createdOr(r, now)}
+		if !r.SameFamily(canonical.FamilyOpenAIChat) {
+			opt.ID = openai.NewStreamID()
+		}
+		return openai.MarshalResponse(r, opt)
 	}
+}
+
+// createdOr resolves the creation timestamp: the upstream's own when it stated
+// one, this gateway's clock when its family has no such member.
+func createdOr(r *canonical.Response, now int64) int64 {
+	if r != nil && r.Created != 0 {
+		return r.Created
+	}
+	return now
 }
 
 // operationError renders a shape that does not serve an operation.

@@ -285,6 +285,23 @@ func (e *OpaqueError) ToError() *Error {
 		"cannot convert request: "+e.Reason+" at "+e.Detail).WithCode(e.Reason)
 }
 
+// ErrNotAResponse is a JSON object that parsed cleanly and is not a response of
+// this family.
+//
+// It is a distinct condition from a decode failure, and the difference is the
+// whole reason it exists. A vendor that answers HTTP 200 with
+// `{"code":500,"msg":"404 NOT_FOUND","success":false}` — which is a real answer
+// from a real coding-plan host, given to a request addressed at a route it does
+// not serve — unmarshals into a zero-valued [Response] without error. Handed
+// straight to [ResponseToCanonical] that becomes a successful assistant turn
+// with an empty content array and a synthesized id, which no caller can tell
+// from a real answer: retries never fire, the fallback chain never engages,
+// health counts a success, and metering records zero tokens.
+//
+// The upstream that returns an honest 404 for the same misconfiguration is
+// strictly easier to operate. This makes the dishonest one look like it.
+var ErrNotAResponse = errorString("anthropic: the body is a JSON object but not a Messages response")
+
 var (
 	errNilRequest  = errorString("anthropic: nil request")
 	errNilResponse = errorString("anthropic: nil response")

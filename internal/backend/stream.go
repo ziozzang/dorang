@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
@@ -119,7 +120,7 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	if err != nil {
 		return canonical.Usage{}, fw.n, err
 	}
-	sink, err := newEventSink(x.call, fw)
+	sink, err := newEventSink(x.call, fw, b.now)
 	if err != nil {
 		return canonical.Usage{}, fw.n, err
 	}
@@ -254,7 +255,12 @@ func scrubEvent(ev *canonical.StreamEvent, secrets []string) {
 }
 
 // newEventSink builds the writer for the caller's protocol.
-func newEventSink(c *Call, w io.Writer) (eventSink, error) {
+//
+// now is the BACKEND's clock, not the wire package's default. The two paths of
+// one conversion must agree about `created` (DESIGN §10.7, and see
+// [encodeClient]), and they cannot agree if one of them reads a clock a test
+// can move and the other reads time.Now directly.
+func newEventSink(c *Call, w io.Writer, now func() time.Time) (eventSink, error) {
 	switch c.ClientAPI {
 	case catalog.APIAnthropicMessages:
 		return &anthropicSink{w: anthropic.NewStreamWriter(w, anthropic.StreamConfig{Model: c.Model})}, nil
@@ -262,6 +268,7 @@ func newEventSink(c *Call, w io.Writer) (eventSink, error) {
 		return &openaiSink{w: openai.NewStreamWriter(w, openai.StreamConfig{
 			Model:        c.Model,
 			IncludeUsage: c.IncludeUsage,
+			Now:          now,
 		})}, nil
 	}
 	return nil, noOperation(string(c.ClientAPI), OpChat, "no streaming encoder for this caller protocol")

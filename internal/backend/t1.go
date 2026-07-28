@@ -147,10 +147,15 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 // It is separate from [encodeClient] because the caller's family is not enough
 // to decide the shape here: a /v1/completions client and a /v1/chat/completions
 // client both speak openai-chat and must get different objects.
-func encodeT1Client(r *canonical.Response, c *Call) ([]byte, bool, error) {
+func encodeT1Client(r *canonical.Response, c *Call, now int64) ([]byte, bool, error) {
 	switch c.Op {
 	case OpCompletions:
-		out, err := openai.MarshalCompletionResponse(r, &openai.ResponseOptions{Model: c.Model})
+		// `created` for the same reason as in [encodeClient]: this shape has the
+		// member, the family the answer may have come from does not, and a
+		// timestamp of 0 is a timestamp in 1970.
+		out, err := openai.MarshalCompletionResponse(r, &openai.ResponseOptions{
+			Model: c.Model, Created: createdOr(r, now),
+		})
 		return out, true, err
 	case OpResponses:
 		if c.ResponseID != "" {
