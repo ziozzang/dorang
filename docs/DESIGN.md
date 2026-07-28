@@ -1336,6 +1336,23 @@ So the context window is used for **routing and refusal**, never for rewriting:
 | Does not fit anywhere in the class | **fail with a clear error naming the real limit** |
 | Caller invokes a vendor's own compaction API | **pass it through** (§10.6), do not interpret it |
 
+**Compaction is passthrough by default, and that is the only safe default.** The survey found
+four incompatible server-side mechanisms across two vendors — a route, a sentinel item buried
+inside an input array with no request-line signal at all, an array-shaped field, and an
+object-shaped field gated by a beta header — of which two share a field name and nothing else.
+A gateway that tried to recognize them would have to detect four unrelated shapes correctly,
+and would silently mishandle the fifth that ships next month.
+
+So dorang does not detect compaction at all. Compaction endpoints and fields are relayed
+byte-identically as opaque state (§10.1), including the response, so the caller's own
+compaction cursor round-trips intact. dorang neither strips these fields when it does not
+recognize them nor normalizes them when it does — **not recognizing something is not a reason
+to remove it.**
+
+The one thing dorang must still do is *account* for it: a compaction round trip consumes
+tokens and costs money, so it is metered like any other request even though its body is never
+inspected (§10.6 step 5).
+
 > **Estimation must err pessimistic, and `bytes/4` does not.** That ratio undercounts CJK
 > substantially, and undercounting is precisely the optimistic direction §4.3 warns about:
 > dorang believes the request fits, dispatches it, and context-window fallback never fires.
