@@ -137,6 +137,41 @@ func TestMemoryCeilingStopsAHookThatAllocates(t *testing.T) {
 	}
 }
 
+// TestABuiltinIsChargedForWhatItReads is the general form of the search
+// family's defect, found by the same audit and worse in the measuring.
+//
+// A charged Lua instruction costs about 22 ns, so the 5 M default budget buys
+// roughly 110 ms. `while true do tonumber(s) end` against an 8 KiB argument was
+// still running after twenty seconds and had not hit any ceiling: tonumber
+// returns a *number*, so charging it for its output charged sixteen bytes for a
+// call that reads every byte of its argument, and the instruction ceiling
+// counted 5 M instructions while each of them dragged 8 KiB behind it.
+//
+// The subject comes off the view, which is the point: its length is the
+// caller's.
+func TestABuiltinIsChargedForWhatItReads(t *testing.T) {
+	e := luaEngine(t, `dorang.register("on_request", function(req)
+			while true do tonumber(req.key_id) end
+		end)`, func(o *Options) {
+		o.Limits = Limits{Instructions: 5_000_000, MemoryBytes: 32 << 20, Timeout: time.Minute}
+	})
+
+	start := time.Now()
+	d := e.OnRequest(context.Background(), &RequestView{KeyID: strings.Repeat("1", 8192)})
+	elapsed := time.Since(start)
+
+	if d.Denied {
+		t.Fatal("a ceiling breach denied the request; ceilings fail open")
+	}
+	if st := e.Stats(); st.LimitHits == 0 {
+		t.Fatalf("the instruction ceiling did not fire in %v: a builtin walked through it (%+v)",
+			elapsed, st)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("the hook ran for %v inside a 110 ms budget", elapsed)
+	}
+}
+
 // TestWallClockStopsAHookWithNoOtherCeiling covers the third ceiling on its own:
 // instructions unlimited, memory unlimited, only the clock left.
 func TestWallClockStopsAHookWithNoOtherCeiling(t *testing.T) {

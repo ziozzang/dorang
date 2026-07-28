@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -328,6 +330,152 @@ func TestRepeatedAbandonmentTripsTheHookOff(t *testing.T) {
 	// And once tripped it is free again.
 	if n := testing.AllocsPerRun(200, func() { _ = e.OnRequest(context.Background(), v) }); n != 0 {
 		t.Errorf("a tripped hook allocated %v times, want 0", n)
+	}
+}
+
+// --- abandonment is bounded -------------------------------------------------
+
+// settledGoroutines reads the goroutine count once it stops moving, so a
+// baseline is not taken in the middle of someone else's teardown.
+func settledGoroutines(t *testing.T) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := -1
+	for {
+		runtime.Gosched()
+		n := runtime.NumGoroutine()
+		if n == last {
+			return n
+		}
+		last = n
+		if time.Now().After(deadline) {
+			return n
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitForGoroutines polls rather than sleeps: an abandoned hook returns when it
+// returns, and a fixed sleep either flakes or hides the thing being measured.
+func waitForGoroutines(want int, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		n := runtime.NumGoroutine()
+		if n <= want {
+			return n, true
+		}
+		if time.Now().After(deadline) {
+			return n, false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// TestAbandonedInvocationsAreBounded is the promise the trip alone did not make.
+//
+// maxConsecutiveTimeouts bounds abandonment over *time* and says nothing about
+// an instant: before this bound existed, 32 requests to a wedged hook produced
+// 32 goroutines that were still running after the hook had been switched off, so
+// an operator saw hooks disabled and a machine still pinned with nothing joining
+// the two. The bound here is a supply: [maxAbandoned] outstanding invocations
+// per hook, after which invocations are refused before a goroutine exists to
+// abandon.
+func TestAbandonedInvocationsAreBounded(t *testing.T) {
+	release := make(chan struct{})
+	var closeOnce sync.Once
+	stop := func() { closeOnce.Do(func() { close(release) }) }
+	t.Cleanup(stop)
+
+	var running atomic.Int64
+	e := newEngine(t, nil, func(o *Options) {
+		o.Limits = Limits{Instructions: 1000, MemoryBytes: 1 << 20, Timeout: 5 * time.Millisecond}
+		o.Native = []Native{{
+			Name: "wedged",
+			Request: func(context.Context, *RequestView, *RequestDecision) {
+				running.Add(1)
+				defer running.Add(-1)
+				// Ignores its context, as a hook stuck in an uninterruptible
+				// call would. Only the test can end this.
+				<-release
+			},
+		}}
+	})
+
+	base := settledGoroutines(t)
+	v := &RequestView{Model: "gpt-4"}
+
+	const invocations = 4 * maxConsecutiveTimeouts
+	for i := 0; i < invocations; i++ {
+		if d := e.OnRequest(context.Background(), v); d.Denied {
+			t.Fatal("an abandoned hook refused a request; abandonment fails open")
+		}
+		if n := int(running.Load()); n > maxAbandoned {
+			t.Fatalf("after %d invocations, %d hooks are running at once, want at most %d",
+				i+1, n, maxAbandoned)
+		}
+		if n := e.Abandoned(HookRequest); n > maxAbandoned {
+			t.Fatalf("after %d invocations, %d are outstanding, want at most %d",
+				i+1, n, maxAbandoned)
+		}
+	}
+
+	// The goroutine count is the property that matters, because the counter
+	// above is the fix's own bookkeeping and could agree with itself while
+	// leaking. Slack covers the harness's own churn under -race.
+	const slack = 8
+	if n := runtime.NumGoroutine(); n > base+maxAbandoned+slack {
+		t.Fatalf("%d invocations of a wedged hook left %d goroutines (baseline %d); "+
+			"at most %d may be outstanding", invocations, n, base, maxAbandoned)
+	}
+	if !e.Tripped(HookRequest) {
+		t.Fatal("a hook that saturated its abandonment budget this long must be switched off")
+	}
+	if e.Stats().Refused == 0 {
+		t.Error("refusing an invocation rather than leaking one must be counted")
+	}
+
+	// And when the wedged hooks finally return, the goroutines go with them.
+	stop()
+	if n, ok := waitForGoroutines(base+slack, 5*time.Second); !ok {
+		t.Fatalf("goroutines settled at %d, baseline %d: abandoned hooks did not exit", n, base)
+	}
+}
+
+// TestASearchThatBlewItsCeilingDoesNotOutliveTheRequest is the other half of the
+// same failure, and the half the bound above cannot fix.
+//
+// A hook abandoned inside a single uninterruptible builtin never observes its
+// cancellation, so before the search family was priced these goroutines spun for
+// as long as the pattern took — a core each, outliving the request by seconds.
+// Every one of them must now die on its own, because the ceiling fires *inside*
+// the builtin. Fewer invocations are used than [maxAbandoned] deliberately: none
+// of them may be refused, so each abandoned goroutine has to exit by itself.
+func TestASearchThatBlewItsCeilingDoesNotOutliveTheRequest(t *testing.T) {
+	e := luaEngine(t, `
+		dorang.register("on_request", function(req)
+			string.find(req.key_id, ".-.-.-@")
+		end)`, func(o *Options) {
+		o.Limits = Limits{Instructions: 5_000_000, MemoryBytes: 32 << 20, Timeout: time.Millisecond}
+	})
+
+	base := settledGoroutines(t)
+	subject := strings.Repeat("a", 1024)
+	const invocations = maxAbandoned - 2
+	for i := 0; i < invocations; i++ {
+		if d := e.OnRequest(context.Background(), &RequestView{KeyID: subject}); d.Denied {
+			t.Fatal("an abandoned hook refused a request")
+		}
+	}
+	if st := e.Stats(); st.Refused != 0 {
+		t.Fatalf("%d invocations should all have run: %+v", invocations, st)
+	}
+
+	// The stated bound: an abandoned search exits within its own remaining
+	// instruction budget, which at the package default is a fraction of a
+	// second. Five seconds is the margin, not the expectation.
+	if n, ok := waitForGoroutines(base+4, 5*time.Second); !ok {
+		t.Fatalf("goroutines settled at %d, baseline %d: %d abandoned searches are still running",
+			n, base, invocations)
 	}
 }
 

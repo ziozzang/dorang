@@ -34,9 +34,16 @@
 //
 //   - **Instructions.** Source is parsed, the AST is rewritten to charge a
 //     budget at every function body, every loop body and every backward `goto`,
-//     and the rewritten AST is compiled. Those are the only three ways Lua can
-//     execute an unbounded number of instructions; everything else is
-//     straight-line code whose length is fixed at load. See luagas.go.
+//     and the rewritten AST is compiled. Those are the only three ways *Lua
+//     source* can execute an unbounded number of instructions; everything else
+//     is straight-line code whose length is fixed at load. See luagas.go.
+//   - **Instructions, the other half.** Counting instructions bounds how many
+//     builtins a plugin may call and says nothing about what one call does. A
+//     builtin is host code the counter cannot see into, so any builtin whose
+//     work is not bounded by its result is charged for that work before it runs:
+//     the search family (find, match, gmatch, gsub), whose backtracking is
+//     superlinear in a subject the *caller* supplies, and tonumber, which reads
+//     every byte of its argument to return a number. See luapattern.go.
 //   - **Memory.** Every allocation a plugin can cause is either O(1) per charge
 //     — hence bounded by the instruction ceiling — or is charged explicitly
 //     before it happens. String concatenation is rewritten into a charged host
@@ -50,12 +57,37 @@
 //     Cumulative allocation bounds peak live memory from above, so the ceiling
 //     holds; a long-running hook that allocates and releases repeatedly will hit
 //     it earlier than its true footprint deserves.
+//
 //   - The ceilings do not apply to a [Native], which is ordinary Go code with
 //     the whole process in reach. Only the wall clock and the panic guard do.
+//
 //   - A hook that ignores its context is **abandoned, not killed**. Go cannot
-//     kill a goroutine. The request proceeds on time; the goroutine leaks until
-//     the VM notices the cancelled context, and repeated abandonment trips the
-//     hook off entirely ([Engine.Tripped]).
+//     kill a goroutine. The request proceeds on time; the goroutine runs until it
+//     notices the cancelled context or exhausts a ceiling, and repeated
+//     abandonment trips the hook off entirely ([Engine.Tripped]).
+//
+//     What is bounded is *how many* — at most eight per hook, forty for an
+//     engine, at any instant and for its whole life; past that, invocations are
+//     refused before a goroutine exists to abandon ([Engine.Abandoned],
+//     [ErrAbandonBacklog]). That bound is what makes the leak affordable: the
+//     trip alone bounded abandonment over time and not at an instant, so a hook
+//     stuck in one uninterruptible builtin could pin a core per request and keep
+//     them all after being switched off. A Lua hook now also exits on its own,
+//     because there is no builtin left that can outrun its ceilings; a [Native]
+//     that blocks forever holds one of the eight forever.
+//
+//   - **String comparison and string-keyed indexing are charged O(1) and cost
+//     O(len).** `a == b`, `a < b` and `t[k]` are VM operators rather than
+//     builtins, so they are charged once by the enclosing block's tick while Go
+//     compares or hashes every byte. Measured against 64 KiB operands and the 5 M
+//     default budget: `a == b` 1.8 s, `t[k]` 1.9 s, `a < b` past a minute, where
+//     the same budget of ordinary Lua is 110 ms. The fix is the one already used
+//     for `..` — rewrite the expression into a charged host call — and it is not
+//     done here because it puts a host call on every comparison and every dynamic
+//     index in every plugin and has to carry __eq, __lt and __index with it. Only
+//     a plugin handed a long string can reach it, which today means §10.5b's
+//     document text and the request path.
+//
 //   - Plugin globals **persist across requests** inside one pooled VM instance,
 //     exactly as in any long-running Lua program. Nothing can leave — there is
 //     no I/O — but a plugin that stashes request text in a global has kept it.

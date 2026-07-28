@@ -70,6 +70,28 @@ type Options struct {
 // broken extension into exactly the outage fail-open exists to prevent.
 const maxConsecutiveTimeouts = 32
 
+// maxAbandoned is how many invocations of one hook may be *outstanding* — timed
+// out, no longer waited for, still running — at the same time.
+//
+// The trip above bounds abandonment over time and does not bound it at an
+// instant, and the difference is the whole problem. An abandoned goroutine that
+// is blocked costs a little memory; an abandoned goroutine that is *spinning*
+// costs a core, and thirty-two of them cost thirty-two. Worse, they outlive the
+// trip: the operator sees the hook switched off and the machine still pinned,
+// with nothing connecting the two.
+//
+// So abandonment is treated as a resource with a fixed supply. Once a hook has
+// this many invocations outstanding it stops being run at all — the invocation
+// is refused before the goroutine is created, which is cheaper than running it
+// and fails open exactly as a timeout does. A refusal counts toward the trip
+// like the abandonment it stands in for, so a hook that stays wedged is switched
+// off rather than refusing forever in silence.
+//
+// The bound this states: at most maxAbandoned goroutines per hook, so at most
+// numHooks × maxAbandoned for an engine, at any instant and for its whole life.
+// Nothing a plugin or a request rate can do raises it.
+const maxAbandoned = 8
+
 // Engine holds the compiled programs and registered natives for all four hooks.
 //
 // A nil *Engine is the disabled engine: every method is a constant and costs
@@ -93,6 +115,9 @@ type Engine struct {
 	tripped   atomic.Uint32
 	consecTMO [numHooks]atomic.Int64
 	lastWarn  [numHooks]atomic.Int64
+	// abandoned counts invocations of each hook that timed out and are still
+	// running. See [maxAbandoned].
+	abandoned [numHooks]atomic.Int64
 
 	st stats
 }
@@ -105,6 +130,7 @@ type stats struct {
 	timeouts    atomic.Uint64
 	limitHits   atomic.Uint64
 	tripped     atomic.Uint64
+	refused     atomic.Uint64
 }
 
 // Stats is a snapshot of what the hooks have done.
@@ -116,6 +142,11 @@ type Stats struct {
 	Timeouts    uint64
 	LimitHits   uint64
 	Tripped     uint64
+	// Refused counts invocations that were not run because the hook already
+	// had [maxAbandoned] outstanding. It is distinct from Timeouts because it
+	// is the *cheap* failure — nothing was started — and an operator watching
+	// it climb is watching a hook that is wedged rather than merely slow.
+	Refused uint64
 }
 
 // Stats returns a snapshot. It is safe on a nil engine.
@@ -131,7 +162,18 @@ func (e *Engine) Stats() Stats {
 		Timeouts:    e.st.timeouts.Load(),
 		LimitHits:   e.st.limitHits.Load(),
 		Tripped:     e.st.tripped.Load(),
+		Refused:     e.st.refused.Load(),
 	}
+}
+
+// Abandoned reports how many invocations of h timed out and are still running.
+// It is bounded by [maxAbandoned]; an operator seeing it pinned there is seeing
+// a hook that never returns.
+func (e *Engine) Abandoned(h Hook) int {
+	if e == nil || int(h) >= numHooks {
+		return 0
+	}
+	return int(e.abandoned[h].Load())
 }
 
 // New builds an engine.
@@ -282,9 +324,10 @@ func (e *Engine) Limits() Limits {
 // The ceiling is enforced on this side of the call, not inside it: fn runs on
 // its own goroutine and this function stops waiting when the deadline passes,
 // whether or not fn noticed. A hook that ignores its context delays the request
-// by the ceiling and no more. The goroutine is left running — there is no way
-// to kill a goroutine in Go — which is why repeated abandonment trips the hook
-// off entirely.
+// by the ceiling and no more. The goroutine is left running — there is no way to
+// kill a goroutine in Go — so what the host can promise is not that it stops but
+// that there are never more than [maxAbandoned] of them per hook: past that,
+// invocations are refused before a goroutine exists to abandon.
 func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) error) error {
 	e.st.invocations.Add(1)
 
@@ -292,14 +335,34 @@ func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) err
 		return guard(h, "invocation", func() error { return fn(ctx) })
 	}
 
+	if e.abandoned[h].Load() >= maxAbandoned {
+		// The hook already owns every goroutine it is allowed to lose. Starting
+		// another would be the leak this bound exists to refuse, and the answer
+		// would be thrown away at the deadline anyway.
+		e.st.refused.Add(1)
+		if err := ctx.Err(); err != nil {
+			// Same exemption as the timeout path below: a request that is
+			// already going away must not be able to trip an extension off,
+			// or a disconnect storm becomes a permanent outage of the hook.
+			return err
+		}
+		if e.consecTMO[h].Add(1) >= maxConsecutiveTimeouts {
+			e.trip(h)
+		}
+		return ErrAbandonBacklog
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, e.limits.Timeout)
 	defer cancel()
 
+	run := &inflight{e: e, h: h}
 	// Buffered so an abandoned hook's send never blocks and the goroutine can
 	// still finish and be collected.
 	done := make(chan error, 1)
 	go func() {
-		done <- guard(h, "invocation", func() error { return fn(cctx) })
+		err := guard(h, "invocation", func() error { return fn(cctx) })
+		run.finish()
+		done <- err
 	}()
 
 	select {
@@ -311,14 +374,50 @@ func (e *Engine) watch(ctx context.Context, h Hook, fn func(context.Context) err
 			// The *request* is going away, not the hook. Counting this would
 			// trip a perfectly good extension off during a client disconnect
 			// storm, which is the opposite of what the trip is for.
+			//
+			// The goroutine is still abandoned in the sense that nobody is
+			// waiting for it, so it is registered as one: a disconnect storm
+			// against a wedged hook leaks exactly as fast as anything else
+			// does, which is to say not at all past the bound.
+			run.abandon()
 			return err
 		}
+		run.abandon()
 		e.st.timeouts.Add(1)
 		if e.consecTMO[h].Add(1) >= maxConsecutiveTimeouts {
 			e.trip(h)
 		}
 		return ErrTimeout
 	}
+}
+
+// inflight is the handshake between a watchdog that has stopped waiting and the
+// goroutine it stopped waiting for.
+//
+// Exactly one of the two wins, and the counter is only touched when abandon
+// wins, so a hook that returns a microsecond after its deadline costs nothing.
+// abandon increments *before* claiming the state, so finish can never observe
+// the claim without also observing the increment and can never drive the count
+// below zero.
+type inflight struct {
+	e     *Engine
+	h     Hook
+	state atomic.Uint32 // 0 running, 1 finished, 2 abandoned
+}
+
+func (r *inflight) abandon() {
+	r.e.abandoned[r.h].Add(1)
+	if r.state.CompareAndSwap(0, 2) {
+		return
+	}
+	r.e.abandoned[r.h].Add(-1)
+}
+
+func (r *inflight) finish() {
+	if r.state.CompareAndSwap(0, 1) {
+		return
+	}
+	r.e.abandoned[r.h].Add(-1)
 }
 
 // trip switches a hook off for the life of the engine.

@@ -108,8 +108,31 @@ var mathAllow = map[string]bool{
 // budget is what bounds the single largest allocation a plugin can make.
 type preFn func(v *vmState, L *lua.LState, nargs int)
 
-// preflight lists them. Everything not here is charged for what it returned,
-// which is sound because its output is bounded by its input.
+// preflight lists them. Everything not here is charged for what it returned.
+//
+// This comment used to say that was sound "because its output is bounded by its
+// input", which is a claim about *output* and the ceiling is a claim about
+// *work*. They are not the same claim, and where they came apart a documented
+// builtin walked straight through the instruction ceiling. So the rest of the
+// library is written down here with its reason rather than left to a class:
+//
+//   - Bounded by what they return, and so soundly charged after the fact:
+//     len, lower, upper, reverse, sub and tostring each allocate one result
+//     linear in their input; all of math is arithmetic on numbers; assert,
+//     error, type, getmetatable, setmetatable, select and next are O(1); pairs
+//     and ipairs return an iterator whose every step is a charged loop body;
+//     table.insert, remove, maxn and sort do work linear or n·log n in a table
+//     the plugin was charged to build, with a comparator that is charged Lua.
+//   - Not bounded by what they return, and so charged before the call: the
+//     search family — find, match, gmatch and gsub — whose output is two
+//     integers and whose work is a backtracking search superlinear in a subject
+//     the caller supplies (see luapattern.go for the measurements), and
+//     tonumber, which reads every byte of its argument to return a number.
+//   - Known and *not* charged: rawequal, rawget and rawset do O(len) work on a
+//     string operand for an O(1) charge. They are left alone because `a == b`
+//     and `t[k]` are VM operators with the same cost and no wrapper to hang a
+//     charge on, so pricing only the spelled-out forms would buy nothing. The
+//     package documentation states the exposure and the fix.
 var preflight = map[string]map[string]preFn{
 	"string": {
 		"rep":    preRep,
@@ -117,12 +140,16 @@ var preflight = map[string]map[string]preFn{
 		"gsub":   preGsub,
 		"byte":   preByte,
 		"char":   preChar,
+		"find":   preFind,
+		"match":  preMatch,
+		"gmatch": preGmatch,
 	},
 	"table": {
 		"concat": preTableConcat,
 	},
 	"": {
-		"unpack": preUnpack,
+		"unpack":   preUnpack,
+		"tonumber": preToNumber,
 	},
 }
 
@@ -409,6 +436,24 @@ func preByte(v *vmState, L *lua.LState, n int) {
 	}
 }
 
+// preToNumber charges tonumber for the string it has to read.
+//
+// It returns a number, so charging for its output charged sixteen bytes for a
+// call that scans the whole argument. The audit that found the search family
+// found this too, and it is worse: `while true do tonumber(s) end` against an
+// 8 KiB argument never reached the instruction ceiling at all — 5 M charged
+// instructions is 116 ms of Lua and this was still running after 20 s, because
+// each of those instructions dragged 8 KiB behind it.
+//
+// Unlike the search family there is no cheaper spelling of the same mistake:
+// arithmetic coercion (`s + 0`) raises on anything a plugin could make long, so
+// this is the whole of it.
+func preToNumber(v *vmState, L *lua.LState, n int) {
+	if s, ok := L.Get(1).(lua.LString); ok {
+		v.gas(int64(len(s)))
+	}
+}
+
 func preUnpack(v *vmState, L *lua.LState, n int) {
 	t, ok := L.Get(1).(*lua.LTable)
 	if !ok {
@@ -480,6 +525,9 @@ func maxFormatWidth(f string) int {
 	return max
 }
 
+// preGsub bounds string.gsub twice over, because it can go wrong twice over: it
+// allocates a result that can exceed its input, and it *searches*, which the
+// memory charge alone never saw.
 func preGsub(v *vmState, L *lua.LState, n int) {
 	s := lua.LVAsString(L.Get(1))
 	repl := L.Get(3)
@@ -488,6 +536,10 @@ func preGsub(v *vmState, L *lua.LState, n int) {
 		per = int64(len(lua.LVAsString(repl))) + 1
 	}
 	v.charge(saturate(int64(len(s))+1, per) + stringOverhead)
+
+	if _, pat, ok := subjectAndPattern(L); ok {
+		price(v, s, pat, 0, optIndex(L, 4, -1))
+	}
 }
 
 func preTableConcat(v *vmState, L *lua.LState, n int) {

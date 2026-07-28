@@ -118,6 +118,10 @@ var (
 	// ErrTripped reports that a hook has been switched off because too many of
 	// its invocations were abandoned.
 	ErrTripped = errors.New("luaext: hook tripped off after repeated abandonment")
+	// ErrAbandonBacklog reports that a hook was not run because too many of its
+	// earlier invocations timed out and are still running. It is the cheap end
+	// of the wall-clock ceiling: nothing was started, so nothing was leaked.
+	ErrAbandonBacklog = errors.New("luaext: hook not run; its abandoned invocations are still running")
 	// ErrLuaSource reports a .lua file under the *policy* directory. Lua is
 	// executable here, but only when an operator names the file in the
 	// configuration: a plugin picked up from a writable directory is the

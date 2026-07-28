@@ -2697,9 +2697,28 @@ instruction counter and no per-state allocation accounting. Both are built on to
 wall clock alone is not a sandbox: a hook allocating in a tight loop exhausts the process long
 before a 200 ms deadline fires. The instruction ceiling is source instrumentation — a charge
 at every function body, every loop body and every backward `goto`, which are the only three
-ways Lua can run unboundedly. The memory ceiling is charged allocation: every allocation is
-either O(1) per charge, and so bounded by the instruction ceiling, or is charged before it
-happens.
+ways *Lua source* can run unboundedly.
+
+**Source instrumentation bounds instructions, not work**, and the distinction is not academic:
+one instruction can enter a builtin, and no rewrite of the source can see inside host code. A
+builtin whose work is not bounded by what it *returns* is therefore charged for that work
+before it runs. Two families needed it. The pattern matcher backtracks superlinearly in a
+subject the caller supplies — `.-.-.-@` against 256 bytes ran **4 seconds** while costing two
+units of budget, because `string.find` returns two integers. And `tonumber` reads its whole
+argument to return a number: 8 KiB of digits ran past **twenty seconds** with no ceiling ever
+firing. Both are now priced by running the match against a budgeted copy of the matcher first,
+and refusing before the real one is asked.
+
+Still open, and named rather than left to be discovered: string *comparison* and string-keyed
+*indexing* are O(length) per O(1) charge, so `s == s2`, `s < s2` and `t[s]` on a long
+caller-supplied string are unbounded the same way. They are VM operators rather than builtins,
+so closing them means extending the rewrite that already covers `..` to every comparison and
+every dynamic index in every plugin — carrying `__eq`, `__lt` and `__index` with it. The cost
+is charged to every plugin; the exposure needs an operator to write such a comparison against
+request text. That trade is open, not settled.
+
+The memory ceiling is charged allocation: every allocation is either O(1) per charge, and so
+bounded by the instruction ceiling, or is charged before it happens.
 
 Hooks: `on_request`, `on_route`, `on_response`, `on_event`, and §10.5b's `on_filter_request`.
 There is deliberately no `on_filter_response`: unmasking runs once per streamed frame inside
@@ -2733,6 +2752,14 @@ Lua hooks — `on_request`, `on_route`, `on_response`, `on_email` — run in a s
 instruction, memory, and wall-clock ceilings. Disabled by default on the hot path. Exceeding
 a limit skips the hook and warns (fail-open), except an explicit deny from `on_request`,
 which is honored (fail-closed).
+
+A hook is **abandoned, not killed** — Go cannot kill a goroutine — so what is bounded is *how
+many*. A fixed number per hook may be outstanding at once; past that, an invocation is refused
+before a goroutine exists to abandon, and the refusals count toward the same trip that switches
+a misbehaving hook off. Bounding abandonment *over time* is not the same as bounding it *at an
+instant*, and only the second is a bound: without it, a hook stuck inside one uninterruptible
+call pins a core per request and keeps every one of them after being taken out of service —
+the operator then sees hooks disabled and load unexplained.
 
 ---
 

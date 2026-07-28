@@ -263,9 +263,13 @@ func (e *Engine) OnEmail(ctx context.Context, v *EmailView) (EmailDecision, erro
 	}
 	j := &emailJob{e: e, v: v}
 	if err := e.watch(ctx, HookEmail, j.run); err != nil {
-		if fatal(err) || isPanic(err) || errors.Is(err, ErrTimeout) {
+		if fatal(err) || isPanic(err) || errors.Is(err, ErrTimeout) || errors.Is(err, ErrAbandonBacklog) {
 			e.skip(HookEmail, "invocation", err)
 			// Fail open: a broken filter must not silently swallow an alert.
+			// A backlog refusal is the same failure as the timeout it stands in
+			// for, and a notification driver must not retry it as a delivery
+			// error — the hook is wedged, and retrying is how that becomes a
+			// queue rather than a counter.
 			return EmailDecision{}, nil
 		}
 		return EmailDecision{}, err

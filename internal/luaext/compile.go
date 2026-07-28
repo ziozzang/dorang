@@ -27,6 +27,10 @@ import (
 type action uint8
 
 const (
+	// actNone is named so that zero is not a verb. Nothing constructs it and
+	// nothing should: it exists to keep actDeny off the zero value, because a
+	// rule whose action failed to parse would then refuse the request rather
+	// than being rejected at load. Deleting it as unused reintroduces that.
 	actNone action = iota
 	// actDeny refuses (on_request) or suppresses (on_email).
 	actDeny
@@ -38,6 +42,8 @@ const (
 
 func (a action) String() string {
 	switch a {
+	case actNone:
+		return "none"
 	case actDeny:
 		return "deny"
 	case actAllow:

@@ -22,13 +22,21 @@ import (
 // compiled. Two rewrites:
 //
 //  1. A charge call is inserted at the head of every function body, every loop
-//     body, and before every `goto`. Those are the only three ways Lua can
-//     execute an unbounded number of instructions — everything else is
+//     body, and before every `goto`. Those are the only three ways Lua *source*
+//     can execute an unbounded number of instructions — everything else is
 //     straight-line code whose length is fixed when the plugin loads. So the
 //     number of VM instructions a plugin can execute is bounded by
 //     (charges granted) × (longest straight-line run), both of which are known.
 //     The charge is the static node count of the block, so the counter tracks
 //     work rather than merely counting back-edges.
+//
+//     It bounds instructions and not *work*, and the difference is a hole unless
+//     something else closes it: one instruction can enter a builtin that runs for
+//     seconds, and no rewrite of the source can see inside host code. So the
+//     builtins whose work is not bounded by what they return are charged for
+//     that work before they run — see luapattern.go, which is where the ceiling
+//     was found to be walkable and how it stopped being.
+//
 //  2. `a .. b` becomes a call to a charged host concatenation. Concatenation is
 //     the one operator that can allocate more than a constant per instruction,
 //     and `s = s .. s` doubles: forty iterations is a terabyte, which no
@@ -40,9 +48,11 @@ import (
 // by the instruction ceiling — or is charged explicitly against the memory
 // budget before it happens. The explicit ones are concatenation and the library
 // functions whose output can exceed their input: string.rep, string.format,
-// string.gsub, string.byte and table.concat. Each of those pre-flights its
-// worst case against the *remaining* budget and refuses if it would not fit, so
-// the ceiling is enforced before the allocation rather than discovered after it.
+// string.gsub, string.byte, string.char, table.concat and unpack. Each of those
+// pre-flights its worst case against the *remaining* budget and refuses if it
+// would not fit, so the ceiling is enforced before the allocation rather than
+// discovered after it. gsub and gmatch collect every match before returning, so
+// the match set is charged too.
 //
 // The budget is cumulative rather than live: bytes charged are never refunded,
 // because a host cannot see when Lua's garbage collector frees a string. That is

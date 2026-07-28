@@ -1132,12 +1132,18 @@ is no per-state instruction counter and no per-state allocation accounting. Both
 top rather than withdrawn.
 
 - *Instructions* are charged by rewriting the plugin's syntax tree at load: a charge at every
-  function body, every loop body and every backward `goto`, which are the only three ways Lua
-  can execute unboundedly. `instructions` therefore counts work, not merely back-edges.
+  function body, every loop body and every backward `goto`, which are the only three ways
+  *Lua source* can execute unboundedly. `instructions` therefore counts work, not merely
+  back-edges — but a rewrite of the source cannot see inside a builtin, so a builtin whose work
+  is not bounded by what it returns is charged for that work before it runs. The pattern family
+  (`find`, `match`, `gmatch`, `gsub`) backtracks superlinearly in a subject the caller supplies,
+  and `tonumber` reads its whole argument to return a number; both are priced by running against
+  a budgeted copy of the matcher first. See DESIGN §11.5 for what remains open — string
+  comparison and string-keyed indexing are O(length) per O(1) charge.
 - *Memory* is charged allocation. Every allocation is either O(1) per charge — hence bounded by
   the instruction ceiling — or is charged before it happens: string concatenation is rewritten
-  into a charged host call, and `string.rep`, `string.format`, `string.gsub`, `string.byte` and
-  `table.concat` pre-flight their worst case. The budget is **cumulative, not live**: bytes
+  into a charged host call, and `string.rep`, `string.format`, `string.gsub`, `string.byte`,
+  `string.char`, `unpack` and `table.concat` pre-flight their worst case. The budget is **cumulative, not live**: bytes
   charged are never refunded, because a host cannot see when Lua's collector frees a string.
   That bounds peak memory from above, and it means a long-running hook that allocates and
   releases repeatedly hits the ceiling earlier than its true footprint deserves.
