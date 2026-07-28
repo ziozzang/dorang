@@ -1005,6 +1005,7 @@ func (r *Router) acquire(ctx context.Context, req *Request, c *candidate) (*capa
 		Model:         c.dep.UpstreamModel,
 		ProviderGroup: c.dep.ProviderGroup,
 		PrincipalID:   req.Principal,
+		PrincipalMax:  req.PrincipalMax,
 		Candidates:    c.creds,
 		Preferred:     c.preferred,
 		OnCapacity:    r.cfg.OnCapacity,

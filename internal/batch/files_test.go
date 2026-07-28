@@ -18,7 +18,7 @@ func TestFileLifecycle(t *testing.T) {
 
 	f, err := h.svc.UploadFile(ctx, UploadRequest{
 		Filename: "in.jsonl", Purpose: PurposeBatch, OwnerKeyID: "key-1",
-		Content: strings.NewReader(content), ExpiresAfter: time.Hour,
+		Content: strings.NewReader(content), ExpiresAfter: time.Hour, Authorize: allowAllModels,
 	})
 	if err != nil {
 		t.Fatalf("UploadFile: %v", err)
@@ -82,7 +82,7 @@ func TestFileLifecycle(t *testing.T) {
 func TestUploadRejectsReservedPurpose(t *testing.T) {
 	h := newHarness(t, nil)
 	_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-		Purpose: PurposeBatchOutput, Content: strings.NewReader("{}"),
+		Purpose: PurposeBatchOutput, Content: strings.NewReader("{}"), Authorize: allowAllModels,
 	})
 	if !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("err = %v, want ErrInvalidRequest", err)

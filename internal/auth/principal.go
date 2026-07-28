@@ -47,9 +47,48 @@ type Limits struct {
 	RPMLimit *int64
 	// TPMLimit is the tokens-per-minute ceiling.
 	TPMLimit *int64
-	// MaxParallel is the concurrency ceiling. It is enforced by
-	// internal/capacity and carried here so the value survives import.
+	// MaxParallel is the concurrency ceiling.
+	//
+	// It is enforced by internal/capacity, which learns it from
+	// capacity.Request.PrincipalMax — the value is carried out of here by the
+	// dispatcher rather than read from here by the broker, because the broker's
+	// own table is static configuration and this one arrives with the
+	// credential. Until that wiring existed this field reached no enforcement
+	// at all and the comment here said otherwise.
 	MaxParallel *int64
+}
+
+// MostRestrictiveParallel returns the smallest concurrency ceiling declared
+// across a set of subjects, or 0 when none declares one.
+//
+// Zero means "no ceiling" on both sides of this, matching internal/capacity's
+// convention, so a subject that declares nothing cannot lower the result to
+// zero and refuse everything.
+func MostRestrictiveParallel(ls ...*Limits) int {
+	out := int64(0)
+	for _, l := range ls {
+		if l == nil || l.MaxParallel == nil || *l.MaxParallel <= 0 {
+			continue
+		}
+		if out == 0 || *l.MaxParallel < out {
+			out = *l.MaxParallel
+		}
+	}
+	return int(out)
+}
+
+// RateSource supplies the per-minute counters the rate ceilings are compared
+// against, per subject.
+//
+// It is an interface on [Access] rather than two integers because the two
+// integers were the defect: one observed value cannot answer for three
+// subjects, so a team's requests-per-minute ceiling was being compared against
+// one key's count. A team limit means "across the team", and only the counter's
+// owner knows what a team's count is.
+type RateSource interface {
+	// ObservedRates returns the requests and tokens already counted for this
+	// subject in the current minute. kind is "key", "user" or "team".
+	ObservedRates(kind, id string) (rpm, tpm int64)
 }
 
 // Limit builds a limit value. The numeric limits are pointers because nil
@@ -102,12 +141,28 @@ type Access struct {
 	Model string
 	// Route is the request path. "" skips the route check.
 	Route string
-	// ObservedRPM is the requests already counted for this key in the current
-	// minute. Zero skips the check; internal/quota supplies the number.
+	// ObservedRPM is the requests already counted in the current minute, for
+	// every subject. Zero skips the check.
+	//
+	// It is the single-subject fallback and is used only when Rates is nil. A
+	// caller with more than one subject should supply Rates instead: this pair
+	// compares one number against three different subjects' ceilings, which is
+	// right only when they are all the same subject.
 	ObservedRPM int
-	// ObservedTPM is the tokens already counted for this key in the current
-	// minute. Zero skips the check.
+	// ObservedTPM is the tokens already counted in the current minute. Zero
+	// skips the check. Same caveat as ObservedRPM.
 	ObservedTPM int
+	// Rates supplies per-subject counters. Nil falls back to ObservedRPM and
+	// ObservedTPM.
+	Rates RateSource
+}
+
+// observed returns the counters to compare one subject's ceilings against.
+func (a Access) observed(kind, id string) (rpm, tpm int64) {
+	if a.Rates != nil && id != "" {
+		return a.Rates.ObservedRates(kind, id)
+	}
+	return int64(a.ObservedRPM), int64(a.ObservedTPM)
 }
 
 // Authorize enforces every authorization field across the key, its user and
@@ -129,24 +184,25 @@ func (p *Principal) Authorize(a Access) error {
 	if p.RequireOwner && p.UserID == "" && p.TeamID == "" {
 		return refuse(ReasonNoPrincipal, "key", p.KeyID)
 	}
-	if err := p.Key.authorize("key", a, now); err != nil {
+	if err := p.Key.authorize("key", p.KeyID, a, now); err != nil {
 		return err
 	}
 	if p.User != nil {
-		if err := p.User.authorize("user", a, now); err != nil {
+		if err := p.User.authorize("user", p.UserID, a, now); err != nil {
 			return err
 		}
 	}
 	if p.Team != nil {
-		if err := p.Team.authorize("team", a, now); err != nil {
+		if err := p.Team.authorize("team", p.TeamID, a, now); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// authorize applies one subject's limits.
-func (l *Limits) authorize(subject string, a Access, now time.Time) error {
+// authorize applies one subject's limits. id names the subject the rate
+// counters are read for.
+func (l *Limits) authorize(subject, id string, a Access, now time.Time) error {
 	if l.Blocked {
 		return refuse(ReasonBlocked, subject, "")
 	}
@@ -162,11 +218,14 @@ func (l *Limits) authorize(subject string, a Access, now time.Time) error {
 	if l.BudgetExceeded(now) {
 		return refuse(ReasonBudgetExceeded, subject, "")
 	}
-	if l.RPMLimit != nil && int64(a.ObservedRPM) >= *l.RPMLimit {
-		return refuse(ReasonRateLimited, subject, "rpm")
-	}
-	if l.TPMLimit != nil && int64(a.ObservedTPM) >= *l.TPMLimit {
-		return refuse(ReasonRateLimited, subject, "tpm")
+	if l.RPMLimit != nil || l.TPMLimit != nil {
+		rpm, tpm := a.observed(subject, id)
+		if l.RPMLimit != nil && rpm >= *l.RPMLimit {
+			return refuse(ReasonRateLimited, subject, "rpm")
+		}
+		if l.TPMLimit != nil && tpm >= *l.TPMLimit {
+			return refuse(ReasonRateLimited, subject, "tpm")
+		}
 	}
 	return nil
 }

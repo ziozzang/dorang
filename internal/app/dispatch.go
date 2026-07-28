@@ -17,6 +17,7 @@ import (
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
+	"github.com/ziozzang/dorang/internal/redact"
 	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
@@ -67,6 +68,47 @@ type dispatchState struct {
 
 	prefixOn bool
 	chunk    int
+
+	// maxResponseBytes bounds a non-streaming upstream body. Zero uses
+	// DefaultMaxResponseBytes.
+	maxResponseBytes int64
+}
+
+// DefaultMaxResponseBytes bounds the non-streaming upstream response.
+//
+// The error path on this same function has always been bounded at 1 MiB; the
+// success path was an unbounded io.ReadAll, which made a hostile or merely
+// broken backend able to OOM the gateway from the far side of the trust
+// boundary — and at three to four times the body size, because the buffer is
+// then unmarshalled and re-marshalled.
+//
+// It matches DefaultMaxBodyBytes rather than the 1 MiB error cap because a
+// legitimate answer can be large: an embeddings response for a big batch of
+// inputs is megabytes of floats, and a ceiling below the request cap would
+// refuse answers to requests dorang itself accepted.
+const DefaultMaxResponseBytes int64 = 32 << 20
+
+// errUpstreamTooLarge is the sentinel for a body that hit the ceiling.
+var errUpstreamTooLarge = errors.New("upstream response exceeded the configured ceiling")
+
+// readUpstreamBody reads a complete upstream answer under a hard ceiling.
+//
+// One byte past the limit is read so that hitting it is detected rather than
+// silently truncating the answer — a truncated JSON body would fail to decode
+// somewhere further along and be reported as a protocol error, which sends
+// whoever debugs it to the wrong place entirely.
+func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = DefaultMaxResponseBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, errUpstreamTooLarge
+	}
+	return b, nil
 }
 
 func newDispatcher(client *http.Client, logf func(string, ...any), now func() time.Time) *dispatcher {
@@ -322,25 +364,74 @@ func (d *dispatcher) decode(st *dispatchState, rq *server.Request) (*call, error
 		c.creq.Model = rq.Model
 	}
 
+	tenant := tenantOf(rq.Principal)
 	c.rreq = router.Request{
-		Model:           rq.Model,
-		Principal:       principalID(rq),
+		Model:     rq.Model,
+		Principal: principalID(rq),
+		// The leading component of the session pin (§7.4a) and of the prefix
+		// chain (§7.4b). It was never assigned outside the test harness, which
+		// made both keys tenant-scoped in their type and process-wide in the
+		// shipped binary: two tenants presenting the same session id shared a
+		// pin, and a prefix entry recorded by one tenant answered another
+		// tenant's lookup.
+		Tenant:          tenant,
 		Session:         rq.HTTP.Header.Get(HeaderSession),
 		AllowLossy:      parseAllowLossy(rq.HTTP.Header.Get(HeaderAllowLossy)),
 		InputTokens:     estimateInputTokens(body),
 		MaxOutputTokens: maxOutputTokens(c.creq),
 		Stream:          rq.Stream,
+		PrincipalMax:    principalMaxParallel(rq.Principal),
 	}
 	if c.creq != nil {
 		c.rreq.Required = c.creq.RequiredCapabilities()
 	}
 	if st.prefixOn && st.chunk > 0 {
-		// The chain is seeded with the client-facing model group so two models
-		// never share a prefix entry, and cut at byte boundaries — there is no
-		// tokenizer on this path (§7.4b).
-		c.rreq.Digests = prefix.Compute(rq.Model, body, st.chunk)
+		// The chain is seeded with the TENANT and then the client-facing model
+		// group, so two models never share a prefix entry and neither do two
+		// tenants. Cut at byte boundaries — there is no tokenizer on this path
+		// (§7.4b).
+		c.rreq.Digests = prefix.Compute(tenant, rq.Model, body, st.chunk)
 	}
 	return c, nil
+}
+
+// tenantOf names the isolation boundary a cache-affinity key leads with.
+//
+// Team first, because a team is what §7.4a means by a tenant: colleagues
+// sharing a conversation and a prompt cache is the behaviour session
+// stickiness and prefix affinity exist to produce. A key with no team falls
+// back to its user and then to itself, which is narrower than the truth rather
+// than wider — the failure mode is a missed cache hit, not a shared one.
+func tenantOf(p server.Principal) string {
+	if p == nil {
+		return ""
+	}
+	if t := p.TeamID(); t != "" {
+		return "team:" + t
+	}
+	if u := p.UserID(); u != "" {
+		return "user:" + u
+	}
+	if k := p.KeyID(); k != "" {
+		return "key:" + k
+	}
+	return ""
+}
+
+// principalMaxParallel is the concurrency ceiling the calling subject carries,
+// the most restrictive across key, user and team.
+//
+// It is read here rather than inside internal/capacity because capacity has
+// only the static YAML table, keyed by principal id, and the per-key column
+// lives on the authorization snapshot the request already holds. That gap is
+// why max_parallel_requests enforced nothing: the value was stored, imported
+// and administered, and the broker never saw it.
+func principalMaxParallel(p server.Principal) int {
+	l, ok := p.(interface{ MaxParallel() int })
+	if !ok {
+		return 0
+	}
+	return l.MaxParallel()
 }
 
 // result is one attempt's outcome, in the two shapes its two consumers need:
@@ -413,8 +504,14 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		if errors.Is(err, context.DeadlineExceeded) {
 			cause, status = router.CauseTimeout, http.StatusGatewayTimeout
 		}
+		// The transport error text names the upstream URL, which is an internal
+		// host and port, and Go's url.Error keeps the username too. The
+		// passthrough engine already refuses to relay it for exactly that
+		// reason; this path used to hand the caller a map of the operator's
+		// network. It goes to the log instead.
+		d.logf("app: upstream %s/%s unreachable: %v", dec.Provider, dec.Deployment, err)
 		res.err = server.NewError(status, server.TypeAPIError,
-			"upstream request failed: "+err.Error()).WithCode("upstream_unreachable")
+			"could not reach the upstream provider").WithCode("upstream_unreachable")
 		res.outcome = router.Outcome{Err: err, Cause: cause, Total: res.total}
 		res.retryable = true
 		return res
@@ -426,6 +523,20 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		res.total = d.now().Sub(start)
 		e := server.Normalize(resp.StatusCode, body)
+		// Normalize kept the upstream's text out of the client's envelope. What
+		// is left is the recorded copy, and that copy can still carry the key —
+		// a provider echoing "Invalid API key: sk-…", or a hostile backend
+		// answering with the x-api-key header it was just handed. The secret is
+		// known exactly here: it is the one this attempt sent.
+		if e.NativeMessage != "" || e.NativeType != "" {
+			secret := st.upstreams.secret(dec.Credential) // pragma: allowlist secret — a lookup, not a literal
+			e.NativeMessage = redact.Text(e.NativeMessage, secret)
+			e.NativeType = redact.Text(e.NativeType, secret)
+			if e.NativeMessage != "" {
+				d.logf("app: upstream %s/%s answered %d: %s",
+					dec.Provider, dec.Deployment, resp.StatusCode, e.NativeMessage)
+			}
+		}
 		cause := router.Classify(resp.StatusCode, nil)
 		res.err = e
 		res.outcome = router.Outcome{
@@ -459,9 +570,18 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		return res
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamBody(resp.Body, st.maxResponseBytes)
 	if err != nil {
 		res.total = d.now().Sub(start)
+		if errors.Is(err, errUpstreamTooLarge) {
+			// Not retryable: the same deployment will send the same oversized
+			// answer, and a fail-back hop would buffer another one.
+			res.err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+				"the upstream answer is larger than this gateway will buffer").
+				WithCode("upstream_response_too_large")
+			res.outcome = router.Outcome{Err: err, Cause: router.CauseUpstream5xx, Total: res.total}
+			return res
+		}
 		res.err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not read the upstream response").WithCode("upstream_body")
 		res.outcome = router.Outcome{Err: err, Cause: router.CauseUpstream5xx, Total: res.total}
@@ -739,6 +859,14 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	}
 	rq.Result.TTFTNS = res.ttft.Nanoseconds()
 	rq.Result.LatencyNS = res.total.Nanoseconds()
+
+	// The tokens-per-minute ceiling is fed here, because this is where the
+	// token count first exists. It bounds the NEXT request from this subject
+	// rather than this one, which is the only thing a post-hoc counter can do
+	// and is what a tpm limit means everywhere else it is published.
+	if p, ok := rq.Principal.(*principal); ok {
+		p.recordTokens(rq.Result.Tokens.Total)
+	}
 
 	if st.pricing == nil {
 		return

@@ -64,15 +64,33 @@ const (
 	DefaultStoreTimeout = 2 * time.Second
 	DefaultRehashQueue  = 256
 
-	// mergeThreshold is how many entries may accumulate in the overlay before
-	// they are folded into the lock-free snapshot. Folding copies the
-	// snapshot, so it is done in batches: a flood of unknown keys must not
-	// make every miss cost O(keys).
+	// mergeThreshold is how many PROMOTABLE entries may accumulate in the
+	// overlay before they are folded into the lock-free snapshot. Folding
+	// copies the snapshot, so it is done in batches: a flood of unknown keys
+	// must not make every miss cost O(keys).
+	//
+	// Counting promotable entries rather than all of them is the whole fix.
+	// mergeLocked promotes only positive entries and hands the negatives back
+	// as the new overlay, so a threshold on len(overlay) was satisfied
+	// permanently by 64 negatives: an unknown-key flood then merged on
+	// essentially every subsequent miss — roughly 8128 full snapshot copies per
+	// 8192 attacker requests, each one an O(loaded keys) map allocation under
+	// the exclusive lock, with every legitimate miss queued behind it. The
+	// mitigation the comment above promised was the one thing that could not
+	// happen.
 	mergeThreshold = 64
 	// maxOverlay bounds the overlay so that a flood of unknown keys cannot
 	// grow memory without limit. Reaching it drops the overlay wholesale;
 	// dropped entries are simply re-learned.
 	maxOverlay = 8192
+	// maxNegative bounds the negative entries alone.
+	//
+	// They need their own ceiling because they are the half an unauthenticated
+	// caller controls: every distinct unknown key is one more, and they are
+	// never promoted out. Reaching it drops the negatives and keeps the
+	// positives, so a flood costs the attacker's own cache and not the
+	// legitimate keys learned beside it.
+	maxNegative = 1024
 )
 
 // Config configures an Authenticator. It holds key material and redacts itself
@@ -148,6 +166,11 @@ type Stats struct {
 	RehashDone    uint64
 	SnapshotSize  int
 	OverlaySize   int
+	// Merges counts how many times the overlay has been folded into a fresh
+	// snapshot. Each fold copies the whole snapshot under the exclusive lock,
+	// so this is the number an unknown-key flood must not be able to drive:
+	// it is the difference between a miss costing O(1) and O(loaded keys).
+	Merges uint64
 }
 
 // Authenticator resolves credentials to principals.
@@ -174,6 +197,13 @@ type Authenticator struct {
 
 	mu      sync.RWMutex
 	overlay map[Lookup]*entry
+	// positives and negatives count the two kinds of overlay entry. They are
+	// maintained rather than recomputed because the merge decision is taken on
+	// every insert and walking the map to answer it would reintroduce the
+	// per-miss cost the batching exists to avoid.
+	positives int
+	negatives int
+	merges    atomic.Uint64
 
 	fl flight[Lookup, *entry]
 
@@ -280,7 +310,7 @@ func (a *Authenticator) Load(records []Record) error {
 	}
 	a.snap.Store(&m)
 	a.mu.Lock()
-	a.overlay = nil
+	a.dropOverlayLocked()
 	a.mu.Unlock()
 	return nil
 }
@@ -294,7 +324,10 @@ func (a *Authenticator) Invalidate(lookup string) error {
 		return err
 	}
 	a.mu.Lock()
-	delete(a.overlay, l)
+	if prev, ok := a.overlay[l]; ok {
+		a.uncount(prev)
+		delete(a.overlay, l)
+	}
 	cur := a.snap.Load()
 	if _, ok := (*cur)[l]; ok {
 		m := make(map[Lookup]*entry, len(*cur))
@@ -312,7 +345,7 @@ func (a *Authenticator) Invalidate(lookup string) error {
 // InvalidateAll drops every cached row.
 func (a *Authenticator) InvalidateAll() {
 	a.mu.Lock()
-	a.overlay = nil
+	a.dropOverlayLocked()
 	empty := map[Lookup]*entry{}
 	a.snap.Store(&empty)
 	a.mu.Unlock()
@@ -333,6 +366,7 @@ func (a *Authenticator) Stats() Stats {
 		RehashQueued:  a.rehashQueued.Load(),
 		RehashDropped: a.rehashDropped.Load(),
 		RehashDone:    a.rehashOK.Load(),
+		Merges:        a.merges.Load(),
 		SnapshotSize:  len(*a.snap.Load()),
 		OverlaySize:   ov,
 	}
@@ -556,14 +590,64 @@ func (a *Authenticator) insert(l Lookup, e *entry) {
 	if a.overlay == nil {
 		a.overlay = make(map[Lookup]*entry, mergeThreshold)
 	}
+	if prev, ok := a.overlay[l]; ok {
+		// Replacing an entry must not double-count its kind, or the counters
+		// drift away from the map they describe and the thresholds stop
+		// meaning anything.
+		a.uncount(prev)
+	}
 	a.overlay[l] = e
+	if e.found {
+		a.positives++
+	} else {
+		a.negatives++
+	}
+
 	switch {
 	case len(a.overlay) >= maxOverlay:
 		// Bounded: an unknown-key flood cannot grow this without limit.
-		a.overlay = nil
-	case len(a.overlay) >= mergeThreshold:
+		a.dropOverlayLocked()
+	case a.negatives >= maxNegative:
+		// The half a caller with no credential controls, dropped on its own.
+		a.dropNegativesLocked()
+	case a.positives >= mergeThreshold:
+		// Merge on what a merge can actually PROMOTE. Negatives are never
+		// promoted, so counting them here would ask for a snapshot copy that
+		// moves nothing — which is exactly what an unknown-key flood used to
+		// get, once per request.
 		a.mergeLocked()
 	}
+}
+
+// uncount removes an entry from the kind counters.
+func (a *Authenticator) uncount(e *entry) {
+	if e.found {
+		a.positives--
+	} else {
+		a.negatives--
+	}
+}
+
+// dropOverlayLocked discards the whole overlay.
+func (a *Authenticator) dropOverlayLocked() {
+	a.overlay = nil
+	a.positives, a.negatives = 0, 0
+}
+
+// dropNegativesLocked discards the negative entries and keeps the positives.
+//
+// A negative entry is a short-lived "this key does not exist" and re-learning
+// one costs the store query it would have cost anyway. A positive entry is a
+// real credential that a legitimate caller is using right now, and throwing it
+// away because an attacker flooded the same map is the amplification the cap
+// exists to prevent.
+func (a *Authenticator) dropNegativesLocked() {
+	for k, v := range a.overlay {
+		if !v.found {
+			delete(a.overlay, k)
+		}
+	}
+	a.negatives = 0
 }
 
 // mergeLocked folds the overlay into a fresh snapshot. Only positive entries
@@ -571,11 +655,12 @@ func (a *Authenticator) insert(l Lookup, e *entry) {
 // bounded overlay, not in the long-lived snapshot.
 func (a *Authenticator) mergeLocked() {
 	cur := *a.snap.Load()
-	m := make(map[Lookup]*entry, len(cur)+len(a.overlay))
+	a.merges.Add(1)
+	m := make(map[Lookup]*entry, len(cur)+a.positives)
 	for k, v := range cur {
 		m[k] = v
 	}
-	keep := make(map[Lookup]*entry)
+	keep := make(map[Lookup]*entry, a.negatives)
 	for k, v := range a.overlay {
 		if v.found {
 			m[k] = v
@@ -585,4 +670,6 @@ func (a *Authenticator) mergeLocked() {
 	}
 	a.snap.Store(&m)
 	a.overlay = keep
+	a.positives = 0
+	// negatives is unchanged: they are exactly what was kept.
 }

@@ -154,10 +154,10 @@ func FuzzRouteLookup(f *testing.F) {
 
 	noop := func(w http.ResponseWriter, rq *Request) error { return nil }
 	table, err := newRouteTable([]*Route{
-		{Pattern: "/v1/chat/completions", Methods: MethodPOST, Name: "chat", Handler: noop},
+		{Pattern: "/v1/chat/completions", Methods: MethodPOST, Name: "chat", ModelAuth: ModelAuthNone, Handler: noop},
 		{Pattern: "/openai/deployments/{model}/chat/completions",
-			Methods: MethodPOST, Name: "azure", Handler: noop},
-		{Pattern: "/anthropic/{ptpath...}", Methods: MethodPOST, Name: "pt", Handler: noop},
+			Methods: MethodPOST, Name: "azure", ModelAuth: ModelAuthNone, Handler: noop},
+		{Pattern: "/anthropic/{ptpath...}", Methods: MethodPOST, Name: "pt", ModelAuth: ModelAuthNone, Handler: noop},
 	})
 	if err != nil {
 		f.Fatalf("newRouteTable: %v", err)

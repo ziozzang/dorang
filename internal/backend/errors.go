@@ -22,6 +22,9 @@ const (
 	CodeUpstreamRedirect = "upstream_redirect"
 	// CodeUpstreamBody is a response whose body could not be read.
 	CodeUpstreamBody = "upstream_body"
+	// CodeUpstreamTooLarge is a non-streaming response past the buffering
+	// ceiling.
+	CodeUpstreamTooLarge = "upstream_response_too_large"
 	// CodeUpstreamDecode is a response dorang could not understand.
 	CodeUpstreamDecode = "upstream_decode"
 	// CodeUpstreamShape is a relayed answer that was not a JSON object.
@@ -108,9 +111,19 @@ func scrub(s string, secrets []string) string {
 func upstreamError(status int, body []byte, h http.Header, secrets []string) *server.Error {
 	e := server.Normalize(status, body)
 	// Every field of the normalized error that came from the upstream's bytes,
-	// scrubbed before anything can render it: the message goes in the envelope,
-	// the native type goes in a response header, and the code goes in both.
+	// scrubbed before anything can render it.
+	//
+	// COMPATIBILITY §11.3 is what decides where each one goes: Normalize no
+	// longer copies the upstream's text into Error.Message at all — the body
+	// gets dorang's own canonical wording — so the upstream's words live in
+	// NativeMessage, which reaches the ledger and the log. Scrubbing has to
+	// follow the text: scrubbing Message and not NativeMessage would have been
+	// a scrubber pointed at a field that no longer carries anything.
+	//
+	// Message is scrubbed anyway. It costs a strings.Contains over a short
+	// constant and it is the field a future branch would leak into.
 	e.Message = scrub(e.Message, secrets)
+	e.NativeMessage = scrub(e.NativeMessage, secrets)
 	e.NativeType = scrub(e.NativeType, secrets)
 	e.Code = scrub(e.Code, secrets)
 	if w := retryAfter(h); w > 0 {
@@ -139,10 +152,17 @@ func redirectError(status int) *server.Error {
 
 // transportError is a request that produced no HTTP response.
 //
-// The transport error's own text is included because it names the host and the
-// syscall, which is what makes an outage debuggable — and because it cannot
-// carry a credential: it is produced by net/http from the URL and the
-// connection, neither of which this package ever puts key material into.
+// The transport error's own text is deliberately NOT relayed. It carries no
+// credential — net/http builds it from the URL and the connection, neither of
+// which this package puts key material into — but it does carry the operator's
+// internal hostname, port and IP, e.g. `dial tcp 10.0.3.14:8000: connect:
+// connection refused`, and that is a map of the internal network handed to
+// anyone holding an ordinary key. internal/server/passthrough.go states the
+// rule for the same condition and has since the relay was written; the
+// dispatch path states it now too. Three call sites, one answer.
+//
+// The detailed error is not lost: it is returned alongside for the caller to
+// log, which is where a hostname belongs.
 func transportError(err error) (e *server.Error, timeout bool) {
 	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 		return server.NewError(http.StatusGatewayTimeout, server.TypeAPIError,
@@ -154,7 +174,7 @@ func transportError(err error) (e *server.Error, timeout bool) {
 			WithCode(CodeUpstreamUnreachable), false
 	}
 	return server.NewError(http.StatusBadGateway, server.TypeAPIError,
-		"upstream request failed: "+err.Error()).WithCode(CodeUpstreamUnreachable), false
+		"could not reach the upstream provider").WithCode(CodeUpstreamUnreachable), false
 }
 
 // isTimeout reports whether err is a net timeout without depending on its type.

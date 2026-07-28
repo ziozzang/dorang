@@ -43,6 +43,10 @@ func (p *fakePrincipal) Authorize(a Access) error {
 	return nil
 }
 
+// ModelsRestricted implements ModelRestricted. A fake with no list restricts
+// nothing, which is what most of these tests are about.
+func (p *fakePrincipal) ModelsRestricted() bool { return len(p.models) > 0 }
+
 func (p *fakePrincipal) AllowsModel(m string) bool {
 	if p.models == nil {
 		return true

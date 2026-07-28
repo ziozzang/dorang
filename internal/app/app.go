@@ -127,6 +127,11 @@ type App struct {
 	// [R1-C7]). Nil when no store is configured, which makes `store: true`
 	// answer a named 501 rather than silently not storing.
 	responses *responsesStore
+	// rates counts requests and tokens per subject per minute, which is what
+	// rpm_limit and tpm_limit are compared against. It lives on the App rather
+	// than in a dispatch snapshot because a hot reload must not reset a
+	// caller's rate window.
+	rates *rateMeter
 
 	logf func(string, ...any)
 	now  func() time.Time
@@ -160,6 +165,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if a.now == nil {
 		a.now = time.Now
 	}
+	a.rates = newRateMeter(a.now)
 	a.cfg.Store(cfg)
 
 	// 1. Model catalog. It is needed before the router, which reads a
@@ -354,7 +360,7 @@ func (a *App) Config() *config.Config { return a.cfg.Load() }
 // serverOptions renders the HTTP surface's configuration from the file.
 func (a *App) serverOptions(cfg *config.Config) server.Options {
 	return server.Options{
-		Auth:              &authAdapter{a: a.Auth, now: a.now},
+		Auth:              &authAdapter{a: a.Auth, now: a.now, rates: a.rates},
 		Dispatcher:        a.dispatch,
 		Models:            a.models,
 		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics},

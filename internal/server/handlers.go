@@ -24,6 +24,9 @@ func (s *Server) baseRoutes() []*Route {
 			Name:      name,
 			Family:    family,
 			NeedsBody: true,
+			// The gate scans the model out of the body and enforces the
+			// allow-list before this handler runs.
+			ModelAuth: ModelAuthGate,
 			Handler:   s.handleInference,
 		}
 	}
@@ -33,7 +36,12 @@ func (s *Server) baseRoutes() []*Route {
 			Methods: MethodGET | MethodHEAD,
 			Name:    "models",
 			Family:  FamilyModels,
-			Handler: s.handleModels,
+			// The listing is FILTERED by the allow-list rather than gated on
+			// it: a key sees the models it may use and nothing else, which is
+			// COMPATIBILITY §7.4 and is not an authorization decision about a
+			// model call, because no model is called.
+			ModelAuth: ModelAuthNone,
+			Handler:   s.handleModels,
 		}
 	}
 	modelRetrieve := func(pattern string) *Route {
@@ -42,17 +50,23 @@ func (s *Server) baseRoutes() []*Route {
 			Methods: MethodGET | MethodHEAD,
 			Name:    "models_retrieve",
 			Family:  FamilyModels,
-			Handler: s.handleModelRetrieve,
+			// Same rule as the listing, applied to one record:
+			// handleModelRetrieve answers 404 for a model the key may not use,
+			// so the allow-list is a FILTER here and not a gate. No model is
+			// called, so there is nothing for the gate to authorize.
+			ModelAuth: ModelAuthNone,
+			Handler:   s.handleModelRetrieve,
 		}
 	}
 	health := func(pattern, name string, kind healthKind) *Route {
 		return &Route{
-			Pattern: pattern,
-			Methods: MethodGET | MethodHEAD | MethodOPTIONS,
-			Name:    name,
-			Family:  FamilyHealth,
-			Public:  true,
-			Handler: s.healthHandler(kind),
+			Pattern:   pattern,
+			Methods:   MethodGET | MethodHEAD | MethodOPTIONS,
+			Name:      name,
+			Family:    FamilyHealth,
+			Public:    true,
+			ModelAuth: ModelAuthNone,
+			Handler:   s.healthHandler(kind),
 		}
 	}
 
@@ -136,12 +150,13 @@ func (s *Server) baseRoutes() []*Route {
 		health("/health", "health", healthOverall),
 
 		{
-			Pattern: "/metrics",
-			Methods: MethodGET | MethodHEAD,
-			Name:    "metrics",
-			Family:  FamilyMetrics,
-			Public:  true,
-			Handler: s.handleMetrics,
+			Pattern:   "/metrics",
+			Methods:   MethodGET | MethodHEAD,
+			Name:      "metrics",
+			Family:    FamilyMetrics,
+			Public:    true,
+			ModelAuth: ModelAuthNone,
+			Handler:   s.handleMetrics,
 		},
 	}
 
@@ -188,15 +203,12 @@ func (s *Server) handleInference(w http.ResponseWriter, rq *Request) error {
 			"the request did not name a model").
 			WithCode("missing_model").WithParam("model")
 	}
-	// COMPATIBILITY §7.2 puts tag-routing misses at 401, and the reference
-	// proxy answers a model outside a key's allow-list the same way. It reads
-	// oddly — the caller authenticated fine — but it is what deployed clients
-	// branch on, and a 403 here would be a divergence they notice.
-	if rq.Principal != nil && !rq.Principal.AllowsModel(rq.Model) {
-		return NewError(http.StatusUnauthorized, TypeAuthentication,
-			"this key is not allowed to use the requested model").
-			WithCode("model_not_allowed").WithParam("model")
-	}
+	// The allow-list is NOT consulted here any more. It used to be, and that is
+	// precisely how it came to be enforced on one route and no other: this
+	// handler is reached by the six inference patterns and by nothing else, so
+	// a check living here was a check that batch create and passthrough could
+	// not reach. It now runs at the gate for every ModelAuthGate route
+	// (Server.serve), which is the same set plus anything added later.
 
 	err := cfg.dispatcher.Dispatch(rq.Context(), rq, w)
 	if err == nil {

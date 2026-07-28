@@ -278,7 +278,7 @@ func TestScenario14_ThousandRowBatchWithPartialFailuresAndInteractiveLatency(t *
 
 	file, err := svc.UploadFile(ctx, batch.UploadRequest{
 		Filename: "in.jsonl", Purpose: batch.PurposeBatch, OwnerKeyID: "key-1",
-		Content: strings.NewReader(batchJSONL(rows)),
+		Content: strings.NewReader(batchJSONL(rows)), Authorize: func(string) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("UploadFile: %v", err)

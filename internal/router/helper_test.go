@@ -151,5 +151,5 @@ func dep(id, provider, kind, model string, creds ...string) Deployment {
 // prefixFor computes a request's hash chain the way the frontend would, seeded
 // with the model group so two groups can never share an entry.
 func prefixFor(group, body string) []prefix.Digest {
-	return prefix.Compute(group, []byte(body), 0)
+	return prefix.Compute("t", group, []byte(body), 0)
 }

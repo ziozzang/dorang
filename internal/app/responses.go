@@ -309,6 +309,12 @@ func (a *App) responsesRoutes() []server.Route {
 			Methods: server.MethodGET | server.MethodDELETE,
 			Name:    "responses_object",
 			Family:  server.FamilyOpenAIResponses,
+			// The sub-resources read a stored response back and delete it. No
+			// model is called on any of them — the inference half is
+			// /v1/responses, which is ModelAuthGate — so there is no allow-list
+			// decision to make here. Ownership is enforced separately, against
+			// principalID(rq) rather than a request parameter.
+			ModelAuth: server.ModelAuthNone,
 			Handler: byMethod(map[string]server.Handler{
 				http.MethodGet:    a.handleResponseRetrieve,
 				http.MethodDelete: a.handleResponseDelete,
@@ -317,16 +323,18 @@ func (a *App) responsesRoutes() []server.Route {
 		{
 			Pattern: "/v1/responses/{id}/input_items",
 			Methods: server.MethodGET,
-			Name:    "responses_input_items",
-			Family:  server.FamilyOpenAIResponses,
-			Handler: a.handleResponseInputItems,
+			Name:      "responses_input_items",
+			Family:    server.FamilyOpenAIResponses,
+			ModelAuth: server.ModelAuthNone,
+			Handler:   a.handleResponseInputItems,
 		},
 		{
 			Pattern: "/v1/responses/{id}/cancel",
 			Methods: server.MethodPOST,
-			Name:    "responses_cancel",
-			Family:  server.FamilyOpenAIResponses,
-			Handler: a.handleResponseCancel,
+			Name:      "responses_cancel",
+			Family:    server.FamilyOpenAIResponses,
+			ModelAuth: server.ModelAuthNone,
+			Handler:   a.handleResponseCancel,
 		},
 	}
 }
