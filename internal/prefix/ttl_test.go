@@ -26,8 +26,8 @@ func TestPerTargetTTLExpiresIndependently(t *testing.T) {
 	const hosted, selfHosted = uint32(1), uint32(2)
 	tab.SetTargetTTLs([]time.Duration{hosted: 5 * time.Minute, selfHosted: time.Hour})
 
-	hostedChain := Compute("m", []byte("a hosted conversation prefix"), 8)
-	selfChain := Compute("m", []byte("a self-hosted conversation prefix"), 8)
+	hostedChain := Compute("t", "m", []byte("a hosted conversation prefix"), 8)
+	selfChain := Compute("t", "m", []byte("a self-hosted conversation prefix"), 8)
 	tab.Record(hostedChain, hosted)
 	tab.Record(selfChain, selfHosted)
 
@@ -50,7 +50,7 @@ func TestUntilEvictedNeverExpiresOnAClock(t *testing.T) {
 	const engine = uint32(3)
 	tab.SetTargetTTLs([]time.Duration{engine: -1})
 
-	chain := Compute("m", []byte("a long-lived prefix on a self-hosted engine"), 8)
+	chain := Compute("t", "m", []byte("a long-lived prefix on a self-hosted engine"), 8)
 	tab.Record(chain, engine)
 
 	now = now.Add(30 * 24 * time.Hour)
@@ -73,7 +73,7 @@ func TestUntilEvictedIsStillBoundedByBytes(t *testing.T) {
 	tab.SetTargetTTLs([]time.Duration{engine: -1})
 
 	for i := 0; i < 5000; i++ {
-		tab.Record(Compute("m", []byte("prefix "+string(rune('A'+i%26))+string(rune(i))), 4), engine)
+		tab.Record(Compute("t", "m", []byte("prefix "+string(rune('A'+i%26))+string(rune(i))), 4), engine)
 		now = now.Add(time.Second)
 	}
 	if _, _, _, bytes := tab.Stats(); bytes > budget {
@@ -91,7 +91,7 @@ func TestTargetTTLsAreReplacedWholesale(t *testing.T) {
 	tab := NewTable(Options{TTL: 10 * time.Minute, Now: fixedClock(&now)})
 	tab.SetTargetTTLs([]time.Duration{1: -1})
 
-	chain := Compute("m", []byte("prefix"), 8)
+	chain := Compute("t", "m", []byte("prefix"), 8)
 	tab.Record(chain, 1)
 	now = now.Add(time.Hour)
 	if _, _, ok := tab.Lookup(chain, nil); !ok {
@@ -113,7 +113,7 @@ func TestTargetTTLsAreReplacedWholesale(t *testing.T) {
 func TestTableTTLNegativeMeansNoClock(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	tab := NewTable(Options{TTL: -1, Now: fixedClock(&now)})
-	chain := Compute("m", []byte("prefix"), 8)
+	chain := Compute("t", "m", []byte("prefix"), 8)
 	tab.Record(chain, 7)
 	now = now.Add(365 * 24 * time.Hour)
 	if _, _, ok := tab.Lookup(chain, nil); !ok {

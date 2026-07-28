@@ -3042,6 +3042,42 @@ is compensating for a gap rather than exercising a path.
 Consequence for the milestone gates in §17: a package is not done when its tests pass. It is
 done when something end to end exercises it and asserts an observable outside it.
 
+#### Applying the rule: the harness's second dispatch path
+
+`PriorityTier` was one spliced field. The same harness also held its own `convertResponse`, its
+own `relayStream`, its own request encoder and its own priority splice — a complete second
+dispatch path, the third instance of the pattern after `internal/backend`'s zero-importer copy
+and the harness's own `len/3+16` token estimator, which carried the identical `bytes/3` defect
+that was refusing multimodal traffic in production.
+
+The harness now calls `internal/backend` for all of it. What that changed is measurable rather
+than aesthetic. Four one-line defects introduced into the production conversion path — the
+response no longer carrying the caller's model name (§7.2), the per-engine priority splice
+negated (§7.5), the `service_tier` fold dropped, and the streaming relay restamping the wrong
+name — left the old scenario suite **completely green**. Every one of them now fails a named
+scenario.
+
+Removing the substitution also exposed three things the harness could do that production could
+not. Each was a passing assertion that proved nothing:
+
+| The harness did | Production does not | Consequence |
+|---|---|---|
+| scan a relayed stream for an in-band `"error"` frame and report a failed outcome | `backend.relay` copies it through and returns nil | the failure reaches neither `internal/health` nor §7.6's committed-stream boundary; a backend that fails every stream after the first frame keeps its full share of traffic |
+| surface `*anthropic.OpaqueError` to the caller | `backend.encodeError` flattens it to a message string under `conversion_failed`, with no `Unwrap` | the `Construct` id that `x-dorang-allow-lossy` takes never reaches the caller, so §10.1's "refuse, and say what to opt into" is prose only |
+| read `x-ratelimit-reset-requests` into `Outcome.ResetAt` | nothing sets `Outcome.ResetAt` from an upstream at all | a provider-signalled window reset cannot reach the cooldown; only dorang's own quota source can |
+
+One duplication survives, and it is worth naming so it is not mistaken for a clean result.
+`internal/app`'s `backendResult` and `backendCause` — the mapping from a `backend.Result` onto
+a `router.Outcome` — are unexported, so the harness holds a mirror of them. Lifting that pair
+into `internal/backend`, or exporting it, would leave the harness with no copy of anything at
+all. Until then, the mirror is the last place the two can drift; the residual risk is bounded
+because the harness's copy classifies only what §10.5a documents as the frontend's job.
+
+The generalization: **a harness that reimplements the subject cannot fail, and the difference
+between what it does and what the subject does is a defect list.** Where the difference cannot
+be closed in the same change, it belongs in the suite as a characterization subtest that skips
+itself the day the real path catches up — not as a silently narrower assertion.
+
 ## 18. Open risks
 
 | # | Risk | Status |

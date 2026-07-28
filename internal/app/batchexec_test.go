@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
 	"github.com/ziozzang/dorang/internal/capacity"
@@ -87,7 +88,7 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 
 	d := newDispatcher(up.Client(), t.Logf, time.Now)
 	d.swap(&dispatchState{upstreams: table})
-	exec := &batchExecutor{d: d}
+	exec := &batchExecutor{d: d, owners: testOwners("key-1")}
 
 	res, err := exec.Execute(ctx, &batch.ExecRequest{
 		BatchID:       "batch-1",
@@ -97,6 +98,7 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 		Provider:      "p1",
 		UpstreamModel: "up-1",
 		Credential:    resv.CredentialID(),
+		OwnerKeyID:    "key-1",
 		Body:          []byte(`{"model":"m1","messages":[{"role":"user","content":"ping"}]}`),
 	})
 	if err != nil {
@@ -110,4 +112,24 @@ func TestBatchExecutorUsesTheReservedCredential(t *testing.T) {
 			"secret %q — the reservation holds slots on cred-b's axes",
 			sawAuth, "Bearer secret-b")
 	}
+}
+
+// fakeOwnerLoader resolves a fixed set of key ids to unrestricted principals.
+type fakeOwnerLoader struct{ ids map[string]*auth.Principal }
+
+func (l *fakeOwnerLoader) principalByKeyID(_ context.Context, id string) (*auth.Principal, error) {
+	if p, ok := l.ids[id]; ok {
+		return p, nil
+	}
+	return nil, errOwnerGone
+}
+
+// testOwners builds a resolver that knows the given key ids and restricts
+// nothing about them.
+func testOwners(ids ...string) *ownerResolver {
+	m := make(map[string]*auth.Principal, len(ids))
+	for _, id := range ids {
+		m[id] = &auth.Principal{KeyID: id}
+	}
+	return newOwnerResolver(&fakeOwnerLoader{ids: m}, time.Now)
 }

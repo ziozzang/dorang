@@ -21,6 +21,12 @@ import (
 // because an empty history reads as "nothing ever failed", which is the most
 // reassuring possible answer and the least likely to be checked.
 func (c *call) healthHistory() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of deployment health history, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("deployment health history"); err != nil {
+		return err
+	}
 	if c.a.cfg.Health == nil {
 		f := dependencyOff("health history recorder", "/health/history")
 		f.Detail = map[string]any{

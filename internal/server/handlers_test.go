@@ -572,6 +572,7 @@ func TestCustomRouteWithParam(t *testing.T) {
 			Name:      "azure_chat",
 			Family:    FamilyOpenAIChat,
 			NeedsBody: true,
+			ModelAuth: ModelAuthGate,
 			Handler: func(w http.ResponseWriter, rq *Request) error {
 				seen = rq.Param("model")
 				w.Header().Set("Content-Type", "application/json")
@@ -621,9 +622,13 @@ func TestDispatcherNormalizedUpstreamError(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400", w.Code)
 	}
-	want := `{"error":{"message":"context length exceeded","type":"invalid_request_error","param":null,"code":"400"}}`
+	// dorang's own words for a 400, not the backend's. COMPATIBILITY §11.3.
+	want := `{"error":{"message":"the upstream provider rejected the request","type":"invalid_request_error","param":null,"code":"400"}}`
 	if got := w.Body.String(); got != want {
 		t.Errorf("body\n got %s\nwant %s", got, want)
+	}
+	if strings.Contains(w.Body.String(), "context length exceeded") {
+		t.Error("the upstream's own message reached the client-facing envelope")
 	}
 	if got := w.Header().Get(HeaderNativeErrorType); got != "BadRequestError" {
 		t.Errorf("native error type %q", got)

@@ -141,6 +141,9 @@ func budgetSet(mustExist bool) handler {
 		if err != nil {
 			return err
 		}
+		if err := c.permitBudgetSubject(sub); err != nil {
+			return err
+		}
 
 		existing, err := bs.GetBudget(c.ctx(), sub)
 		switch {
@@ -219,6 +222,9 @@ func (c *call) budgetInfo() error {
 	if err != nil {
 		return err
 	}
+	if err := c.permitBudgetSubject(sub); err != nil {
+		return err
+	}
 	b, err := bs.GetBudget(c.ctx(), sub)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -245,6 +251,9 @@ func (c *call) budgetDelete() error {
 	}
 	sub, err := spec.subject(&httpQuery{c})
 	if err != nil {
+		return err
+	}
+	if err := c.permitBudgetSubject(sub); err != nil {
 		return err
 	}
 	b, err := bs.GetBudget(c.ctx(), sub)
@@ -284,6 +293,9 @@ func (c *call) budgetList() error {
 	}
 	list, err := bs.ListBudgets(c.ctx(), o)
 	if err != nil {
+		return err
+	}
+	if list, err = c.keepBudgetsInScope(list); err != nil {
 		return err
 	}
 	out := make([]budgetView, 0, len(list))

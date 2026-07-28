@@ -156,6 +156,43 @@ type importer struct {
 	priceSeen map[string]string
 }
 
+// suggestEnvName invents the environment variable a literal secret should move
+// to. Distinct literals for one provider get distinct names, so two accounts do
+// not silently collapse onto one variable.
+func (im *importer) suggestEnvName(provider string) string {
+	base := "DORANG_" + envIdent(provider) + "_API_KEY"
+	n := 0
+	for i := range im.cfg.Credentials {
+		if im.cfg.Credentials[i].Provider == provider {
+			n++
+		}
+	}
+	if n == 0 {
+		return base
+	}
+	return base + "_" + strconv.Itoa(n+1)
+}
+
+// envIdent renders a provider id as an environment-variable fragment.
+func envIdent(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			out = append(out, c-32)
+		case c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			out = append(out, c)
+		default:
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "PROVIDER"
+	}
+	return string(out)
+}
+
 func (im *importer) warn(path, format string, args ...any) {
 	im.warnings = append(im.warnings, Warning{Path: path, Message: fmt.Sprintf(format, args...)})
 }
@@ -468,10 +505,27 @@ func (im *importer) credential(path, provider, raw string) (string, bool) {
 		}
 		ref, key = SecretRef{Env: env}, provider+"\x00env\x00"+env
 	} else {
-		ref, key = SecretRef{Inline: raw}, provider+"\x00inline\x00"+raw
-		im.warn(path+".api_key", "the api_key is a literal secret. It was imported as an inline key, "+
-			"which only loads when server.env is development. Move it to an environment variable and "+
-			"use key_env, or use key_file or key_ref (§4.1)")
+		// A literal secret in the source file becomes a key_env REFERENCE in
+		// the generated one, never a copy of the literal.
+		//
+		// Importing it inline used to be the behaviour, on the reasoning that
+		// an inline literal only loads when server.env is development. That
+		// reasoning is about loading; the problem is writing. The generated
+		// configuration is printed to stdout — into a new file, into terminal
+		// scrollback, into CI logs if the migration is scripted — and the one
+		// tool whose entire job is to produce a configuration was the one
+		// putting secrets in it (DESIGN §4.1).
+		//
+		// The operator still has the value: it is in the file they are
+		// migrating FROM. What they need from us is where to put it, which the
+		// warning names. The secret itself is not echoed, because the fix for
+		// "a secret ended up somewhere it should not" is not to print it
+		// somewhere else.
+		envName := im.suggestEnvName(provider)
+		ref, key = SecretRef{Env: envName}, provider+"\x00inline\x00"+raw
+		im.warn(path+".api_key", "the api_key is a literal secret and was NOT copied into the "+
+			"generated configuration. It was replaced with key_env: %s — set that environment "+
+			"variable to the value from your source file before starting dorang (§4.1)", envName)
 	}
 	if id, ok := im.credByKey[key]; ok {
 		return id, true

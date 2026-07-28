@@ -69,16 +69,20 @@
 
 | 코드 | 의미 |
 |---|---|
-| `route_not_implemented` | dorang이 선언했으나 이 빌드가 마운트하지 않은 라우트: `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`, 그리고 관리 표면 전체(`/key/*`, `/user/*`, `/team/*`, `/model/*`, `/model_group/*`, `/budget/*`, `/spend/*`, `/global/spend/*`, `/health/history`). `/v1/responses`, `/v1/files`, `/v1/batches`도 이 목록에 있는데, 그 서브시스템이 조건부로 마운트되기 때문이다 — 그것들이 없는 빌드는 "그런 경로 없음"이 아니라 "선언됨, 미구축"으로 답해야 한다 |
+| `route_not_implemented` | dorang이 선언했으나 이 빌드가 마운트하지 않은 라우트: `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`. `/v1/responses`, `/v1/files`, `/v1/batches`도 이 목록에 있는데, 그 서브시스템이 조건부로 마운트되기 때문이다 — 그것들이 없는 빌드는 "그런 경로 없음"이 아니라 "선언됨, 미구축"으로 답해야 한다 |
 | `route_unknown` | 그 밖의 모든 것 |
 
 501은 `X-Dorang-Unimplemented: <path>`를 싣는다. 알려진 경로에 잘못된 메서드는 `Allow` 헤더와 코드
 `method_not_allowed`를 담은 **405**로 답한다.
 
-⚠️ **이 빌드에는 HTTP 관리 표면이 없다.** `internal/admin` 패키지는 존재하고 테스트돼 있으며 읽기 전용
-내장 UI까지 있지만 **`cmd/dorang`이 마운트하지 않는다.** 오늘 모든 `/key/*`, `/user/*`, `/team/*`,
-`/budget/*`, `/spend/*`, `/admin/*` 경로가 501을 답한다. 관리는 `dorangctl`과 데이터베이스다. 계획에
-반영할 것: 설계와 바이너리 사이의 가장 큰 간극이다.
+**HTTP 관리 표면은 마운트되어 있다.** `/key/*`, `/user/*`, `/team/*`, `/model/*`, `/budget/*`,
+`/spend/*`, `/admin/*`와 `/ui`의 읽기 전용 내장 UI를 `cmd/dorang`이 서빙한다. 접근 조건은
+`DORANG_MASTER_KEY` 또는 소유 사용자가 관리 role을 가진 키다. 모든 변경은 `audit_logs` 행을 남긴다.
+
+다만 모든 엔드포인트에 저장소가 붙어 있지는 않다. 붙어 있지 않은 것은 무엇이 없는지를 이름으로 밝히는
+**501 `dependency_not_configured`**로 답한다 — 목록은 §3.2, 이유는 §12. 501을 읽을 때 이 구분이
+중요하다: `dependency_not_configured`는 *이 빌드가 서빙할 수 없다*, `route_not_implemented`는
+*dorang이 아직 만들지 않았다*는 뜻이다.
 
 ### 0.3 로그를 읽기 전에 알아 둘 동작 하나
 
@@ -286,7 +290,112 @@ dorangctl key revoke --config /etc/dorang/config.yaml <key-id>
 리로드에 반영된다. `dorangctl key revoke`가 stderr로 그렇게 말한다. 지금 필요하면 폐기 후 프로세스에
 `SIGHUP`을 보낼 것.
 
-### 3.1 관리 크리덴셜
+### 3.1 유출된 키 폐기
+
+사고 대응 절차다. HTTP 클라이언트와 관리 크리덴셜만 있으면 된다 — 서버 셸도, DB 클라이언트도, 재시작도
+필요 없다.
+
+```
+curl -s -X POST http://gateway:4000/key/block \
+  -H "Authorization: Bearer $DORANG_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"key_id":"<key id>"}'
+```
+
+응답은 키의 새 상태다. 호출이 반환되기 전에 `audit_logs` 행이 기록된다. 감사 기록을 남길 수 없는 변경은
+조용히 적용되지 않고 거부되며, 변경이 적용된 *뒤에* 기록에 실패하면 재시도가 아니라 대조하라는 뜻의
+`500 audit_write_failed`가 돌아온다.
+
+**언제 반영되는가.** `internal/auth`는 로드된 크리덴셜을 `DefaultEntryTTL`(60초) 동안 캐시하므로 차단
+후 1분 이내에 키가 동작을 멈춘다. `Authenticator.use`는 인가 검사와 독립적으로 매 요청 `Blocked`를
+강제하므로 두 번째 관문에 도달할 필요가 없다. 그 1분이 중요하면 `SIGHUP`으로 캐시를 즉시 비운다.
+
+**진행 중인 배치도 멈춘다.** `batchExecutor`는 30초 소유자 해석 TTL 안에서 소유 크리덴셜을 행마다 다시
+해석하고 `Authorize`를 호출하므로, 차단된 키의 실행 중 배치는 지출을 멈춘다. 이 검사가 없던 시절에는
+차단 전에 제출된 배치가 끝날 때까지 계속 지출했다.
+
+**유출 신고에서 키 id 찾기.** 라벨은 lookup 다이제스트의 앞 8자리 hex에서 유도되며(`store.LabelFor`)
+비밀 자체의 문자에서 유도되지 않는다. 따라서 유출된 토큰을 어디에도 보내지 않고 라벨만으로 행을 특정할
+수 있다:
+
+```
+curl -s "http://gateway:4000/key/list?limit=200" \
+  -H "Authorization: Bearer $DORANG_MASTER_KEY"
+```
+
+⚠️ **평문 키를 파라미터로 보내지 말 것.** `/key/info`와 `/key/block`은 `key_id`를 받고 `key`
+파라미터는 코드 `secret_in_request`로 거부한다. URL 안의 살아 있는 크리덴셜은 액세스 로그, 프록시 추적,
+셸 히스토리 안의 살아 있는 크리덴셜이다 — 지금 대응 중인 그 유출이 흔히 그렇게 생긴다.
+
+**차단 대신 회전.** `POST /key/regenerate`는 같은 키 id 뒤의 비밀만 새로 발급하고 모든 인가 필드를
+유지하며, 새 토큰을 정확히 한 번 반환한다. 전환은 즉시다: 옛 비밀이 계속 검증되는 유예 창은 없다. 사고
+경로에서의 유예 창은 침해된 비밀을 그 기간만큼 계속 살려 두는 것이기 때문이다.
+
+**이 표면이 마운트되기 전에는** 유일한 수단이 데이터베이스에 직접 쓰는
+`UPDATE api_keys SET blocked = 1 WHERE id = '<key id>'`였다. 노드 셸 접근이 필요하고, 런북에서 HTTP로
+실행할 수 없으며, 감사 행도 남지 않는다. 이제 그것은 절차가 아니다. 관리 크리덴셜 자체가 유출된 경우의
+비상 수단으로만 남는다.
+
+### 3.2 관리 표면이 서빙하는 것과 서빙하지 않는 것
+
+마운트되어 동작하는 것:
+
+| 경로 | 비고 |
+|---|---|
+| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | 크리덴셜 수명주기 전체. `/key/regenerate`는 유예 없이 옛 시크릿을 즉시 끊는다 — 사고 대응 경로다 |
+| `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c 로테이션: 유예 기간을 둔 새 시크릿, 조기 컷, "클라이언트가 갈아탔는가"를 답하기 위한 목록. 키 id는 그대로이므로 예산·지출·허용 목록·원장 이력은 건드리지 않는다 |
+| `/key/pend`, `/key/release` | §11.6의 되돌릴 수 있는 거부. block과 구분된다 — pend는 틀릴 수 있는 통계적 판단이고 운영자가 한 동작으로 해제한다 |
+| `/spend/logs` | 요청별 원장. `key_id`, `team_id`, `trace_id`, `tag`, `errors_only` 중 하나와 유계 날짜 범위가 필요하다 — §9.3은 무계 스캔을 느리게 답하지 않고 거부한다 |
+| `/admin/capacity` | 축별 브로커 점유 현황 |
+| `/admin/catalog/explain`, `/admin/catalog/unverified` | 카탈로그 모델 필드의 출처 |
+| `/health/history` | 인프로세스 링. 재시작할 때마다 비어 있는 상태로 시작한다 |
+| `/ui` | 읽기 전용 운영 UI. 관리 크리덴셜로 로그인하며 세션은 1시간이다 — 폐기된 크리덴셜이 UI를 잃기까지의 지연이기도 하다 |
+
+이 빌드에서 **501 `dependency_not_configured`**로 답하는 것. 뒤에 있어야 할 저장소가 아직 없기
+때문이다 — `internal/store`에는 `users`, `teams`, `team_members`, `deployments`, `model_aliases`에
+대한 Go 코드가 없고 범위 집계 리포트 쿼리도 없다:
+
+| 경로 | 없는 것 | 대신 사용 |
+|---|---|---|
+| `/user/*`, `/team/*` | 디렉터리 | `dorangctl`, 또는 데이터베이스 |
+| `/model/*`, `/model_group/info` | 모델 레지스트리 | 설정 + `SIGHUP` |
+| `/budget/*` | 예산 저장소 | `dorangctl key create --budget-usd` |
+| `/global/spend/report`, `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | 롤업 쿼리 | `/spend/logs`, 또는 `request_logs` 직접 조회 |
+| `/admin/credentials/health`, `/admin/quota` | 쿼터 레지스트리 | `/metrics` |
+| `/spend/calculate`, `/admin/pricing/preview` | 가격 엔진 | — |
+| `/admin/config/reload` | 리로더 | `SIGHUP` |
+
+### 3.3 관리 범위(scope)
+
+관리자는 두 종류이며, 그 차이는 스키마가 이미 가지고 있는 사실이다.
+
+- **전역.** `DORANG_MASTER_KEY`, 그리고 **어느 팀에도 속하지 않은** 관리 키. 운영자다: 모든 주체, 모든
+  엔드포인트.
+- **팀 범위.** 팀에 **속한**(`api_keys.team_id`) 관리 키. 그 팀의 키, 멤버, 예산, 지출만 관리하며 그
+  밖은 아무것도 관리하지 못한다.
+
+범위는 저장되지 않고 키에서 유도되므로 잊을 수가 없다: 팀에 속한 키는 속해 있다는 사실만으로 범위가
+정해진다. 설정해야 할 `admin_team` role도, 빠뜨릴 마이그레이션도 없다.
+
+팀 범위 관리자가 받는 답:
+
+| 시도 | 답 |
+|---|---|
+| 자기 팀 키를 id로 조회 | 서빙 |
+| 다른 팀 키를 id로 조회 | **404**, 존재하지 않는 id와 동일 — 403이면 모든 키 id가 존재 여부 오라클이 된다 |
+| `?team_id=`로 다른 팀 지정 | **403 `out_of_scope`** — 파라미터 거부는 아무것도 노출하지 않으면서 어느 파라미터를 고칠지 알려 준다 |
+| 필터 없는 `/key/list` | 자기 팀만. 배포 전체가 아니다 |
+| `key_id`/`trace_id`로 다른 팀 원장 행에 도달 | 행이 제거된다. 저장소 필터는 최적화이고 행 검사가 강제다 |
+| 다른 팀에, 또는 어느 팀에도 속하지 않게 키 발급 | **403** — 팀 없는 키는 *전역* 관리자가 된다 |
+| 사용자의 `user_role` 변경 | **403** — role이 누가 관리자인지를 결정하므로 그것을 쓰는 것은 권한 상승이다 |
+| `/model/*`, `/admin/*`, `/global/spend/report`, `/user/new`, `/team/new`, `/health/history` | **403** — 배포 전역이며 "설정을 리로드한다"의 팀별 뷰라는 것은 없다 |
+
+인증은 됐지만 관리 권한이 없는 크리덴셜은 401이 아니라 **403**을 받는다. 동작하는 키에게 키가 동작하지
+않는다고 말하면 운영자를 엉뚱한 문제로 보내기 때문이다. **401**은 쓸 수 있는 크리덴셜이 없다는 뜻이고,
+이제 인증되지 않은 호출자에게는 알려지지 않은 경로를 포함해 모든 관리 경로가 401로 답한다. 인증 전에
+라우트 테이블을 읽을 수 없다.
+
+### 3.4 관리 크리덴셜
 
 `DORANG_MASTER_KEY`는 out-of-band로 상수 시간 비교되며 **절대 행이 아니다.** 발급되지도, 목록에
 나오지도, `dorangctl`로 폐기되지도 않는다. 회전은 환경 변경 + 재시작이다.
@@ -798,21 +907,18 @@ effective_used = max( provider_reported_used ,
 
 | 영역 | 상태 |
 |---|---|
-| **HTTP 관리** | `internal/admin`은 완성돼 있고 테스트돼 있으며 **마운트되지 않는다.** `/key/*`, `/user/*`, `/team/*`, `/model/*`, `/budget/*`, `/spend/*`, `/admin/*`, 내장 `/ui` 전부 501. `dorangctl`을 쓸 것 |
-| **계측 degradation 신호** | 다섯 사유와 히스테리시스로 내부 추적되고 **아무것도 읽지 않는다.** 메트릭도 health 필드도 없다. `internal/notify`는 별도로 보고되는 자체 degraded 상태를 갖는데, 둘은 같은 신호가 아니다 |
-| `observability.prometheus` | 절대 읽히지 않음; `/metrics`는 무조건이고 인증이 없다 |
+| **HTTP 관리** | 마운트됨(§3.1–3.3). 키, `/spend/logs`, capacity, catalog, health history, `/ui`는 서빙된다. 사용자·팀·배포·예산과 집계 지출 리포트는 `internal/store`에 해당 테이블 코드가 없어 `501 dependency_not_configured`로 답한다. 그것들은 `dorangctl`을 쓸 것 |
+| **감사 기록 조회** | `audit_logs`는 모든 관리 변경이 기록하지만 `/audit/list`는 이름이 붙은 501이다. 테이블을 직접 조회할 것 |
 | `observability.otlp_endpoint` | exporter가 연결돼 있지 않다. 지연 내역은 기록되고 export되지 않는다 |
-| 키/유저/팀별 `rpm`, `tpm` | 저장되어 principal에 실리지만 관측 rate 입력이 **절대 공급되지 않아** 검사가 발화하지 않는다. `deployments[].limits[]`(크리덴셜별 롤링-분 쿼터가 된다)와 `capacity.principals`를 쓸 것 |
-| 키별 `max_parallel` | 저장되고 capacity broker에 전달되지 않는다. `capacity.principals.<key-id>.max_concurrent`를 쓸 것 |
-| `capacity.*.rpm`, `.tpm`, `.max_queue`, `.max_queue_wait` | 검증되고 연결되지 않음. broker는 세는 게이지만 구현한다 |
-| `key_rotation.strategy` | 검증되고 연결되지 않음. 크리덴셜은 설정 순서로 시도된다 |
+| `capacity.*.rpm`, `.tpm` | **로드 시 거부**되며, 동작하는 자리를 이름으로 알려준다: 배포별 rate는 `deployments[].limits[]`, 호출자별 rate는 api 키 자신의 `rpm_limit`/`tpm_limit` |
+| 노드 간 rate 제한 | 롤링 분은 프로세스별이다. N-노드 배포는 모든 `rpm_limit`, `tpm_limit`를 N배로 허용한다. durable 원장이 닫을 수 있으나 요청마다 store 쓰기가 든다 — 택하지 않았다 |
+| `tpm_limit`는 **다음** 요청을 제한한다 | 토큰 수는 정산 시점에야 존재하므로, 거대한 요청 하나는 아무것도 거부하기 전에 상한을 한 번 넘을 수 있다 |
 | **Lua** | **Lua 인터프리터가 없고**, 그것은 누락이 아니라 결정이다 — [CONFIG.ko.md](CONFIG.ko.md) §16. 네 훅 지점, 그 상한, 비밀값 없는 view는 구축돼 있다; 그 안에서 도는 것은 total 정책 언어(`*.policy`)이거나 컴파일된 Go `Native`다. `extensions.lua.dir` 아래의 `.lua` 파일은 조용히 무시되는 게 아니라 **로드 에러**다 |
 | `on_route`에서의 재라우팅 | 훅은 선택된 배포를 보고 거부할 수 있지만 다른 것을 요구할 수는 없다 |
-| `quota_urgency` 라우팅 | 설계됨(만료 임박 쿼터 urgency); 허용되는 전략 이름이 아니다 |
 | 최상위 `quotas:`, `budget:` 블록 | 스키마에 없다. 예산은 `dorangctl key create --budget-usd`로 키별 |
 | 기존 데이터베이스로부터의 크리덴셜 임포트 | 스토어에 구현돼 있고 **CLI 진입점이 없다** — [MIGRATION.ko.md](MIGRATION.ko.md) §3 |
-| capacity / health / prefix / cluster 메트릭 | 상태는 존재하고, 아무것도 export하지 않으며, 그것을 노출할 관리 API는 마운트되지 않았다 |
-| `dorangctl health` | 이미지의 `HEALTHCHECK`가 참조; 존재하지 않는다 |
+| prefix / cluster 메트릭 | 상태는 존재하고 아무것도 export하지 않는다. capacity와 health는 `/admin/capacity`, `/health/history`에서 읽을 수 있다 |
+| `providers[].usage_probe`, `providers[].metrics.interval`, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. 목록은 `internal/config/consumed_test.go`에 실행 가능한 상태로 있어 드리프트할 수 없다 — [CONFIG.ko.md](CONFIG.ko.md) §23.1 |
 
 ---
 

@@ -187,6 +187,7 @@ func TestBatchSurvivesARestartWithoutRerunningFinishedRows(t *testing.T) {
 		Purpose:    batch.PurposeBatch,
 		OwnerKeyID: "key-1",
 		Content:    strings.NewReader(jsonlRows(rows)),
+		Authorize:  func(string) error { return nil },
 	})
 	if err != nil {
 		t.Fatalf("UploadFile: %v", err)

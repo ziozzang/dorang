@@ -145,6 +145,13 @@ func (c *call) userNew() error {
 	if err := c.requireAudit(); err != nil {
 		return err
 	}
+	// Creating a directory user is deployment-wide: a user exists before any
+	// team owns them, so there is no team for a scoped administrator to create
+	// one "inside". A team administrator adds an EXISTING user to its team with
+	// /team/member_add, which is scoped.
+	if err := c.requireGlobal("creating a directory user"); err != nil {
+		return err
+	}
 	var spec userSpec
 	if err := decodeBody(c.w, c.r, &spec); err != nil {
 		return err
@@ -197,22 +204,22 @@ func (c *call) userInfo() error {
 	if id == "" {
 		return badRequest("user_id is required").withParam("user_id")
 	}
-	u, err := d.GetUser(c.ctx(), id)
+	u, err := c.loadUser(d, id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return notFound("user", id)
-		}
 		return err
 	}
 	out := map[string]any{"user": viewUser(u)}
 
 	// The keys a user owns are part of "user info" for every operator who asks
-	// the question, and it is one query on an index that exists.
+	// the question, and it is one query on an index that exists. They are
+	// filtered by scope: a user may hold keys on several teams, and a
+	// administrator of one of them has no business reading the others.
 	if ks := c.a.cfg.Keys; ks != nil {
 		keys, err := ks.ListKeys(c.ctx(), KeyFilter{UserID: id, Limit: c.a.cfg.ListLimit})
 		if err != nil {
 			return err
 		}
+		keys = c.keepKeysInScope(keys)
 		views := make([]keyView, 0, len(keys))
 		for _, k := range keys {
 			views = append(views, viewKey(k))
@@ -240,17 +247,23 @@ func (c *call) userUpdate() error {
 		return badRequest("user_id is required").withParam("user_id")
 	}
 	id := strings.TrimSpace(*spec.UserID)
-	u, err := d.GetUser(c.ctx(), id)
+	u, err := c.loadUser(d, id)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return notFound("user", id)
-		}
 		return err
 	}
 	before := viewUser(u)
 	updated := *u
 	if err := spec.apply(&updated); err != nil {
 		return err
+	}
+	// user_role is the bit that decides who is an administrator at all
+	// (Principal.IsAdmin joins through it), so writing it is an escalation
+	// primitive: a team administrator that could set a role could promote
+	// itself, or one of its members, to global. It stays with the operator.
+	if updated.Role != u.Role {
+		if err := c.requireGlobal("changing a user's administrative role"); err != nil {
+			return err
+		}
 	}
 	updated.UpdatedAt = c.a.now().UTC()
 	if err := d.UpdateUser(c.ctx(), &updated); err != nil {
@@ -271,6 +284,11 @@ func (c *call) userDelete() error {
 		return err
 	}
 	if err := c.requireAudit(); err != nil {
+		return err
+	}
+	// The mirror of userNew: removing a user from the directory removes them
+	// from every team, including teams this caller does not administer.
+	if err := c.requireGlobal("deleting a directory user"); err != nil {
 		return err
 	}
 	var body struct {
@@ -323,6 +341,13 @@ func (c *call) userList() error {
 	}
 	out := make([]userView, 0, len(users))
 	for _, u := range users {
+		ok, err := c.userInScope(d, u.ID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
 		out = append(out, viewUser(u))
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{

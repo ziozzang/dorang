@@ -88,6 +88,13 @@ type dispatchState struct {
 	chunk    int
 }
 
+// The non-streaming upstream body is bounded in internal/backend, which is the
+// layer that now makes the call: backend.Options.MaxResponseBytes, its
+// DefaultMaxResponseBytes and the non-retryable upstream_response_too_large it
+// answers with. This package held a second copy of that read while it had its
+// own HTTP client; the client moved down a layer and the copy went with it,
+// rather than staying behind as the version nothing calls.
+
 func newDispatcher(client *http.Client, logf func(string, ...any), now func() time.Time) *dispatcher {
 	d := &dispatcher{logf: logf, now: now}
 	d.backend = backend.New(backend.Options{Client: client, Credentials: d, Now: now})
@@ -380,18 +387,27 @@ func (d *dispatcher) decode(ctx context.Context, st *dispatchState, rq *server.R
 		c.creq.Model = rq.Model
 	}
 
+	tenant := tenantOf(rq.Principal)
 	c.rreq = router.Request{
-		Model:      rq.Model,
-		Principal:  principalID(rq),
-		Session:    rq.HTTP.Header.Get(HeaderSession),
-		AllowLossy: parseAllowLossy(rq.HTTP.Header.Get(HeaderAllowLossy)),
-		// The caller's own ceiling, and only theirs. A caller who named none
-		// reserves the TARGET's declared ceiling instead, which is a per
-		// deployment number and therefore the router's to apply — nothing here
-		// knows yet which deployment will serve this.
+		Model:     rq.Model,
+		Principal: principalID(rq),
+		// The leading component of the session pin (§7.4a) and of the prefix
+		// chain (§7.4b). It was never assigned outside the test harness, which
+		// made both keys tenant-scoped in their type and process-wide in the
+		// shipped binary: two tenants presenting the same session id shared a
+		// pin, and a prefix entry recorded by one tenant answered another
+		// tenant's lookup.
+		Tenant:          tenant,
+		Session:         rq.HTTP.Header.Get(HeaderSession),
+		AllowLossy:      parseAllowLossy(rq.HTTP.Header.Get(HeaderAllowLossy)),
 		MaxOutputTokens: maxOutputTokens(c.creq),
 		Stream:          rq.Stream,
 	}
+	// The caller's own concurrency ceiling, their priority class and their
+	// priority hint, all three of which were loaded and dropped. This is the one
+	// place they are read; PrincipalMax is deliberately not also set in the
+	// literal above, because two writers of one field is how the value that
+	// loses stops being noticed.
 	applyPrincipalPolicy(rq, &c.rreq)
 	if c.creq != nil {
 		c.rreq.Required = c.creq.RequiredCapabilities()
@@ -435,28 +451,22 @@ func (d *dispatcher) decode(ctx context.Context, st *dispatchState, rq *server.R
 		image = prefixImage(c, body)
 	}
 	if st.prefixOn && st.chunk > 0 && !c.noAffinity {
-		// The chain is seeded with the client-facing model group AND the
-		// principal, and cut at byte boundaries — there is no tokenizer on this
-		// path (§7.4b).
+		// The chain is seeded with the TENANT and then the client-facing model
+		// group, and cut at byte boundaries — there is no tokenizer on this path
+		// (§7.4b).
 		//
-		// The principal is in the seed because a prompt cache belongs to an
-		// account (§7.4a2). Without it two tenants sending identical bodies
-		// produce identical digests, so the affinity table pins tenant B to the
+		// The tenant is in the seed because a prompt cache belongs to an account
+		// (§7.4a2). Without it two tenants sending identical bodies produce
+		// identical digests, so the affinity table pins tenant B to the
 		// deployment tenant A warmed — for a hit that cannot happen when they
 		// authenticate with different credentials, and, worse, for one B can
 		// *observe*: cache_read_input_tokens, or simply TTFT, answers "has
-		// somebody else recently sent exactly this?". The order of the two
-		// inputs is part of the digest, so it is fixed here and length-prefixed
-		// for the same reason chain.go suffixes segment lengths: two different
-		// splits must not produce one seed.
-		c.rreq.Digests = prefix.Compute(prefixSeed(rq.Model, c.rreq.Principal), image, st.chunk)
+		// somebody else recently sent exactly this?". prefix.NewChain takes the
+		// tenant as its own parameter, separated by a NUL, so the seed cannot be
+		// built without one and two components cannot run together.
+		c.rreq.Digests = prefix.Compute(tenant, rq.Model, image, st.chunk)
 	}
 	return c, nil
-}
-
-// prefixSeed builds the chain seed. See the comment at its only call site.
-func prefixSeed(model, principal string) string {
-	return strconv.Itoa(len(model)) + ":" + model + "|" + strconv.Itoa(len(principal)) + ":" + principal
 }
 
 // prefixImage renders the post-filter request for hashing.
@@ -474,6 +484,29 @@ func prefixImage(c *call, body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// tenantOf names the isolation boundary a cache-affinity key leads with.
+//
+// Team first, because a team is what §7.4a means by a tenant: colleagues
+// sharing a conversation and a prompt cache is the behaviour session
+// stickiness and prefix affinity exist to produce. A key with no team falls
+// back to its user and then to itself, which is narrower than the truth rather
+// than wider — the failure mode is a missed cache hit, not a shared one.
+func tenantOf(p server.Principal) string {
+	if p == nil {
+		return ""
+	}
+	if t := p.TeamID(); t != "" {
+		return "team:" + t
+	}
+	if u := p.UserID(); u != "" {
+		return "user:" + u
+	}
+	if k := p.KeyID(); k != "" {
+		return "key:" + k
+	}
+	return ""
 }
 
 // result is one attempt's outcome, in the two shapes its two consumers need:
@@ -707,6 +740,11 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	rq.Result.TTFTNS = res.ttft.Nanoseconds()
 	rq.Result.LatencyNS = res.total.Nanoseconds()
 
+	// The tokens-per-minute ceiling is fed from App.recordMetrics, at the
+	// meter, because that is the one point every finished request passes and it
+	// carries all three subject ids. Feeding it a second time here would count
+	// every interactive request's tokens twice.
+
 	if st.pricing == nil {
 		return
 	}
@@ -828,9 +866,31 @@ func (d *dispatcher) defaultMaxTokens(kind, upstreamModel string) int {
 	return st.catalog.Model(kind, upstreamModel).MaxOutputTokens
 }
 
+// MasterOwnerID is the owner recorded for an object the master credential
+// created.
+//
+// The master credential has no api_keys row by construction (DESIGN §2.4), so
+// its KeyID() is "". Writing that into a record's OwnerKeyID produced an
+// UNOWNED object, and batch.ownedBy used to read an unowned object as public —
+// every `sk-` key in the deployment could read, use and delete a file the
+// operator had uploaded. The identity has to be a real string for the ownership
+// comparison to mean anything.
+//
+// The "master:" prefix cannot collide with a key id: key ids are generated
+// identifiers and this one contains a colon, which none of them does.
+const MasterOwnerID = "master:credential"
+
+// principalID names the owner of an object this request creates.
+//
+// A request with no principal returns "" and that is deliberate: it is an
+// internal or unauthenticated path, it creates nothing, and an object it did
+// create would be refused a reader rather than handed to all of them.
 func principalID(rq *server.Request) string {
 	if rq.Principal == nil {
 		return ""
+	}
+	if m, ok := rq.Principal.(interface{ IsMaster() bool }); ok && m.IsMaster() {
+		return MasterOwnerID
 	}
 	return rq.Principal.KeyID()
 }

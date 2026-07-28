@@ -79,6 +79,12 @@ func viewCredential(s CredentialStatus) credentialView {
 }
 
 func (c *call) adminCredentials() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of provider credential health, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("provider credential health"); err != nil {
+		return err
+	}
 	if c.a.cfg.Credentials == nil {
 		return dependencyOff("credential reporter", "credential health")
 	}
@@ -110,6 +116,12 @@ func (c *call) adminCredentials() error {
 // are close to exhaustion". Flattening the windows makes the second one a
 // sort rather than a nested walk.
 func (c *call) adminQuota() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of provider quota, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("provider quota"); err != nil {
+		return err
+	}
 	if c.a.cfg.Credentials == nil {
 		return dependencyOff("credential reporter", "quota snapshots")
 	}
@@ -163,6 +175,12 @@ func viewQuotaWindow(w QuotaWindow) quotaWindowView {
 // ---------------------------------------------------------------------------
 
 func (c *call) adminCapacity() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of capacity occupancy, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("capacity occupancy"); err != nil {
+		return err
+	}
 	if c.a.cfg.Capacity == nil {
 		return dependencyOff("capacity broker", "capacity occupancy")
 	}
@@ -206,6 +224,12 @@ func (c *call) adminCapacity() error {
 
 // GET /admin/catalog/explain?kind=&model=
 func (c *call) adminCatalogExplain() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of the model catalog, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("the model catalog"); err != nil {
+		return err
+	}
 	if c.a.cfg.Catalog == nil {
 		return dependencyOff("model catalog", "catalog provenance")
 	}
@@ -251,6 +275,12 @@ func (c *call) adminCatalogExplain() error {
 
 // GET /admin/catalog/unverified
 func (c *call) adminCatalogUnverified() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of the model catalog, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("the model catalog"); err != nil {
+		return err
+	}
 	if c.a.cfg.Catalog == nil {
 		return dependencyOff("model catalog", "the unverified-model list")
 	}
@@ -415,6 +445,12 @@ func orDefault(v, def string) string {
 
 // POST /admin/pricing/preview
 func (c *call) adminPricingPreview() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of price explanation, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("price explanation"); err != nil {
+		return err
+	}
 	if c.a.cfg.Pricing == nil {
 		return dependencyOff("pricing engine", "the price preview")
 	}
@@ -459,6 +495,12 @@ func (c *call) adminPricingPreview() error {
 // ---------------------------------------------------------------------------
 
 func (c *call) adminConfigReload() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of reloading the configuration, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("reloading the configuration"); err != nil {
+		return err
+	}
 	if c.a.cfg.Reloader == nil {
 		return dependencyOff("configuration reloader", "reload")
 	}
@@ -495,6 +537,12 @@ func (c *call) adminConfigReload() error {
 // operator meeting a 501 can confirm the cause in one request instead of
 // guessing.
 func (c *call) adminStatus() error {
+	// Deployment configuration and process state, not tenant data: there is
+	// no team-scoped view of process status, so a scoped
+	// administrator is refused rather than served a filtered fiction.
+	if err := c.requireGlobal("process status"); err != nil {
+		return err
+	}
 	cfg := c.a.cfg
 	m := c.a.Metrics()
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{

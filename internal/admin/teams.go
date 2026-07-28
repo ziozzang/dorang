@@ -154,6 +154,11 @@ func (c *call) teamNew() error {
 	if err := c.requireAudit(); err != nil {
 		return err
 	}
+	// Creating a team is creating a new scope. An administrator confined to
+	// one team that could mint another would be minting its own authority.
+	if err := c.requireGlobal("creating a team"); err != nil {
+		return err
+	}
 	var spec teamSpec
 	if err := decodeBody(c.w, c.r, &spec); err != nil {
 		return err
@@ -200,7 +205,7 @@ func (c *call) teamInfo() error {
 	if id == "" {
 		return badRequest("team_id is required").withParam("team_id")
 	}
-	t, members, err := c.loadTeam(d, id)
+	t, members, err := c.loadTeamScoped(d, id)
 	if err != nil {
 		return err
 	}
@@ -240,7 +245,7 @@ func (c *call) teamUpdate() error {
 		return badRequest("team_id is required").withParam("team_id")
 	}
 	id := strings.TrimSpace(*spec.TeamID)
-	t, members, err := c.loadTeam(d, id)
+	t, members, err := c.loadTeamScoped(d, id)
 	if err != nil {
 		return err
 	}
@@ -268,6 +273,11 @@ func (c *call) teamDelete() error {
 		return err
 	}
 	if err := c.requireAudit(); err != nil {
+		return err
+	}
+	// Deleting a team deletes a scope, including this caller's own if it is
+	// the one named. It is the operator's act.
+	if err := c.requireGlobal("deleting a team"); err != nil {
 		return err
 	}
 	var body struct {
@@ -324,6 +334,9 @@ func (c *call) teamList() error {
 	}
 	out := make([]teamView, 0, len(teams))
 	for _, t := range teams {
+		if !c.scope().AllowsTeam(t.ID) {
+			continue
+		}
 		members, err := d.ListTeamMembers(c.ctx(), t.ID)
 		if err != nil {
 			return err
@@ -392,7 +405,7 @@ func (c *call) teamMemberAdd() error {
 	if userID == "" {
 		return badRequest("user_id is required").withParam("user_id")
 	}
-	t, members, err := c.loadTeam(d, teamID)
+	t, members, err := c.loadTeamScoped(d, teamID)
 	if err != nil {
 		return err
 	}
@@ -448,7 +461,7 @@ func (c *call) teamMemberDelete() error {
 	if userID == "" {
 		return badRequest("user_id is required").withParam("user_id")
 	}
-	t, members, err := c.loadTeam(d, teamID)
+	t, members, err := c.loadTeamScoped(d, teamID)
 	if err != nil {
 		return err
 	}

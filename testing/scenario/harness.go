@@ -440,11 +440,12 @@ func (g *Gateway) Do(ctx context.Context, c Call) (*Reply, error) {
 	rr.InputTokens = est.Tokens
 	rr.InputTokensExact, rr.InputTokensMethod = est.Exact, est.Method
 	if c.Prefix {
-		// The chain is seeded with the model group so two groups can never
-		// share an entry (DESIGN §7.4b). The group is what the alias resolves
-		// to, not the name the client typed.
+		// The chain is seeded with the tenant and then the model group, so
+		// neither two groups nor two tenants can share an entry (DESIGN §7.4b
+		// as amended). The group is what the alias resolves to, not the name
+		// the client typed.
 		group, _ := g.Router.Resolve(req.Model)
-		rr.Digests = prefix.Compute(group, c.Body, 0)
+		rr.Digests = prefix.Compute(c.Tenant, group, c.Body, 0)
 	}
 
 	reply := &Reply{Header: http.Header{}}
@@ -569,8 +570,15 @@ func (g *Gateway) dispatch(ctx context.Context, c Call, req *canonical.Request, 
 		// decodes all five upstream envelope shapes; router.ClassifyBody reads
 		// the result. Leaving Cause zero for anything unrecognised keeps every
 		// other 400 terminal, as before.
+		//
+		// NativeMessage, not Message: COMPATIBILITY §11.3 moved the upstream's
+		// own text out of the client-facing Message, which is now a function of
+		// the status line alone. This is the same field internal/app's
+		// upstreamCause reads, and it has to be — a classifier scanning dorang's
+		// own words for a vendor's phrase finds none and silently stops
+		// classifying.
 		if e := server.Normalize(resp.StatusCode, body); e != nil {
-			oc.Cause = router.ClassifyBody(resp.StatusCode, e.Code, e.Message)
+			oc.Cause = router.ClassifyBody(resp.StatusCode, e.Code, e.NativeMessage)
 		}
 		if ra := resp.Header.Get("retry-after"); ra != "" {
 			if secs, err := strconv.Atoi(ra); err == nil {

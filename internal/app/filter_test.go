@@ -559,35 +559,36 @@ func TestMeteringDescribesWhatTheUpstreamWasSent(t *testing.T) {
 	}
 }
 
-// TestPrefixDigestIsPerPrincipal is a cross-tenant property, not a hashing one:
-// two principals sending byte-identical bodies must not share an affinity entry.
-func TestPrefixDigestIsPerPrincipal(t *testing.T) {
+// TestPrefixDigestIsPerTenant is a cross-tenant property, not a hashing one:
+// two tenants sending byte-identical bodies must not share an affinity entry.
+//
+// The seed leads with the TENANT — team, else user, else key — rather than with
+// the api key alone, because §7.4a's tenant is what a prompt cache belongs to:
+// colleagues on one team sharing a cache is the behaviour affinity exists to
+// produce, and two teams sharing one is the oracle the review found.
+func TestPrefixDigestIsPerTenant(t *testing.T) {
 	const body = "the same body, byte for byte"
-	a := prefix.Compute(prefixSeed("m1", "key_alpha"), []byte(body), 4096)
-	b := prefix.Compute(prefixSeed("m1", "key_beta"), []byte(body), 4096)
+	a := prefix.Compute("team:alpha", "m1", []byte(body), 4096)
+	b := prefix.Compute("team:beta", "m1", []byte(body), 4096)
 	if len(a) == 0 || len(b) == 0 {
 		t.Fatal("no digests")
 	}
 	for i := range a {
 		if i < len(b) && a[i] == b[i] {
-			t.Fatalf("two principals share affinity entry %d; a cache hit that cannot happen, "+
+			t.Fatalf("two tenants share affinity entry %d; a cache hit that cannot happen, "+
 				"and a confirmation oracle that can", i)
 		}
 	}
-	// The same principal still matches itself, or affinity is simply off.
-	c := prefix.Compute(prefixSeed("m1", "key_alpha"), []byte(body), 4096)
+	// The same tenant still matches itself, or affinity is simply off.
+	c := prefix.Compute("team:alpha", "m1", []byte(body), 4096)
 	for i := range a {
 		if a[i] != c[i] {
-			t.Fatal("the same principal and body produced different digests")
+			t.Fatal("the same tenant and body produced different digests")
 		}
 	}
 	// And the model still separates, as it did before.
-	d := prefix.Compute(prefixSeed("m2", "key_alpha"), []byte(body), 4096)
+	d := prefix.Compute("team:alpha", "m2", []byte(body), 4096)
 	if a[0] == d[0] {
 		t.Fatal("two models share an affinity entry")
-	}
-	// The seed is unambiguous: no pair of (model, principal) splits may collide.
-	if prefixSeed("ab", "c") == prefixSeed("a", "bc") {
-		t.Fatal("the seed is ambiguous")
 	}
 }

@@ -29,11 +29,11 @@ func TestLongestPrefixWins(t *testing.T) {
 	shared := bytes.Repeat([]byte("s"), seg*3)
 
 	// A served the shared head plus its own tail.
-	a := Compute("g", append(append([]byte{}, shared...), bytes.Repeat([]byte("a"), seg*8)...), seg)
+	a := Compute("t", "g", append(append([]byte{}, shared...), bytes.Repeat([]byte("a"), seg*8)...), seg)
 	tab.Record(a, 1)
 
 	// B shares only the head.
-	b := Compute("g", append(append([]byte{}, shared...), bytes.Repeat([]byte("b"), seg*8)...), seg)
+	b := Compute("t", "g", append(append([]byte{}, shared...), bytes.Repeat([]byte("b"), seg*8)...), seg)
 	tab.Record(b, 2)
 
 	// A's exact conversation must come back to A at full depth, not to B just
@@ -48,7 +48,7 @@ func TestLongestPrefixWins(t *testing.T) {
 
 	// A conversation that only shares the head must still find a warm backend
 	// via a shallower entry rather than missing entirely.
-	c := Compute("g", append(append([]byte{}, shared...), bytes.Repeat([]byte("c"), seg*8)...), seg)
+	c := Compute("t", "g", append(append([]byte{}, shared...), bytes.Repeat([]byte("c"), seg*8)...), seg)
 	if _, d, ok := tab.Lookup(c, nil); !ok {
 		t.Fatal("partial match found nothing; shallow entries are not being recorded")
 	} else if d >= len(c) {
@@ -59,7 +59,7 @@ func TestLongestPrefixWins(t *testing.T) {
 // Cache affinity must never resurrect a target that is unhealthy or exhausted.
 func TestLookupSkipsInvalidTarget(t *testing.T) {
 	tab := NewTable(Options{})
-	ds := Compute("g", bytes.Repeat([]byte("x"), 200), 16)
+	ds := Compute("t", "g", bytes.Repeat([]byte("x"), 200), 16)
 	tab.Record(ds, 7)
 
 	if _, _, ok := tab.Lookup(ds, func(uint32) bool { return false }); ok {
@@ -73,7 +73,7 @@ func TestLookupSkipsInvalidTarget(t *testing.T) {
 func TestTTLExpiry(t *testing.T) {
 	now, advance := fakeClock(time.Unix(1700000000, 0))
 	tab := NewTable(Options{TTL: time.Hour, Now: now})
-	ds := Compute("g", bytes.Repeat([]byte("x"), 200), 16)
+	ds := Compute("t", "g", bytes.Repeat([]byte("x"), 200), 16)
 	tab.Record(ds, 3)
 
 	if _, _, ok := tab.Lookup(ds, nil); !ok {
@@ -90,7 +90,7 @@ func TestTTLExpiry(t *testing.T) {
 func TestTTLRefreshesOnUse(t *testing.T) {
 	now, advance := fakeClock(time.Unix(1700000000, 0))
 	tab := NewTable(Options{TTL: time.Hour, Now: now})
-	ds := Compute("g", bytes.Repeat([]byte("x"), 200), 16)
+	ds := Compute("t", "g", bytes.Repeat([]byte("x"), 200), 16)
 	tab.Record(ds, 3)
 
 	for i := 0; i < 5; i++ {
@@ -110,7 +110,7 @@ func TestByteBudgetEnforced(t *testing.T) {
 
 	for i := 0; i < 500; i++ {
 		body := append(bytes.Repeat([]byte("p"), 64), []byte(fmt.Sprint(i))...)
-		tab.Record(Compute("g", body, 16), uint32(i))
+		tab.Record(Compute("t", "g", body, 16), uint32(i))
 	}
 
 	_, _, evicted, bytesUsed := tab.Stats()
@@ -154,7 +154,7 @@ func TestConcurrentUse(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 400; i++ {
 				body := []byte(fmt.Sprintf("conversation-%d-%d", g%4, i%20))
-				ds := Compute("g", body, 16)
+				ds := Compute("t", "g", body, 16)
 				if _, _, ok := tab.Lookup(ds, nil); !ok {
 					tab.Record(ds, uint32(g))
 				}
@@ -214,7 +214,7 @@ func TestInternerConcurrent(t *testing.T) {
 
 func BenchmarkTableLookupHit(b *testing.B) {
 	tab := NewTable(Options{MaxBytes: 64 << 20})
-	ds := Compute("g", bytes.Repeat([]byte("x"), 64<<10), DefaultBaseSegment)
+	ds := Compute("t", "g", bytes.Repeat([]byte("x"), 64<<10), DefaultBaseSegment)
 	tab.Record(ds, 1)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -225,7 +225,7 @@ func BenchmarkTableLookupHit(b *testing.B) {
 
 func BenchmarkTableLookupMiss(b *testing.B) {
 	tab := NewTable(Options{MaxBytes: 64 << 20})
-	ds := Compute("g", bytes.Repeat([]byte("y"), 64<<10), DefaultBaseSegment)
+	ds := Compute("t", "g", bytes.Repeat([]byte("y"), 64<<10), DefaultBaseSegment)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

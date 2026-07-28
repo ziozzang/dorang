@@ -18,7 +18,7 @@ func TestFileLifecycle(t *testing.T) {
 
 	f, err := h.svc.UploadFile(ctx, UploadRequest{
 		Filename: "in.jsonl", Purpose: PurposeBatch, OwnerKeyID: "key-1",
-		Content: strings.NewReader(content), ExpiresAfter: time.Hour,
+		Content: strings.NewReader(content), ExpiresAfter: time.Hour, Authorize: allowAllModels,
 	})
 	if err != nil {
 		t.Fatalf("UploadFile: %v", err)
@@ -82,7 +82,7 @@ func TestFileLifecycle(t *testing.T) {
 func TestUploadRejectsReservedPurpose(t *testing.T) {
 	h := newHarness(t, nil)
 	_, err := h.svc.UploadFile(context.Background(), UploadRequest{
-		Purpose: PurposeBatchOutput, Content: strings.NewReader("{}"),
+		Purpose: PurposeBatchOutput, Content: strings.NewReader("{}"), Authorize: allowAllModels,
 	})
 	if !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("err = %v, want ErrInvalidRequest", err)
@@ -257,5 +257,35 @@ func TestEndToEndOnDisk(t *testing.T) {
 	}
 	if got := len(h.lines(final.OutputFileID)); got != 25 {
 		t.Errorf("output file has %d lines, want 25", got)
+	}
+}
+
+// An unowned record is not everybody's.
+//
+// ownedBy(recordOwner, owner) returned true whenever recordOwner was "", so a
+// file or batch created with an empty OwnerKeyID was readable, usable and
+// deletable by every key in the deployment. A master-credential upload produced
+// exactly such a record: the master has no api_keys row, so its key id is "".
+//
+// The write path now records a real owner for the master (internal/app's
+// MasterOwnerID) and this is the read side: an empty owner on a record is no
+// longer a wildcard.
+func TestAnUnownedRecordIsNotVisibleToEveryKey(t *testing.T) {
+	cases := []struct {
+		name               string
+		recordOwner, owner string
+		want               bool
+	}{
+		{"a key sees its own", "key-a", "key-a", true},
+		{"a key does not see another's", "key-a", "key-b", false},
+		{"a key does not see an unowned record", "", "key-a", false},
+		{"an administrative caller sees an owned record", "key-a", "", true},
+		{"an administrative caller sees an unowned record", "", "", true},
+	}
+	for _, c := range cases {
+		if got := ownedBy(c.recordOwner, c.owner); got != c.want {
+			t.Errorf("%s: ownedBy(%q, %q) = %v, want %v",
+				c.name, c.recordOwner, c.owner, got, c.want)
+		}
 	}
 }

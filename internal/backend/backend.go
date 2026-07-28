@@ -63,6 +63,9 @@ type Options struct {
 	Observer Observer
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
+	// MaxResponseBytes bounds a non-streaming upstream body. Zero means
+	// [DefaultMaxResponseBytes].
+	MaxResponseBytes int64
 }
 
 // Backend is L5: it turns a routing decision into an upstream exchange.
@@ -70,20 +73,25 @@ type Options struct {
 // It is immutable after construction and safe for concurrent use. A hot reload
 // rebuilds providers, not this.
 type Backend struct {
-	client *http.Client
-	creds  Credentials
-	obs    Observer
-	now    func() time.Time
+	client  *http.Client
+	creds   Credentials
+	obs     Observer
+	now     func() time.Time
+	maxBody int64
 }
 
 // New builds a Backend.
 func New(o Options) *Backend {
-	b := &Backend{client: o.Client, creds: o.Credentials, obs: o.Observer, now: o.Now}
+	b := &Backend{client: o.Client, creds: o.Credentials, obs: o.Observer, now: o.Now,
+		maxBody: o.MaxResponseBytes}
 	if b.client == nil {
 		b.client = NewClient()
 	}
 	if b.now == nil {
 		b.now = time.Now
+	}
+	if b.maxBody <= 0 {
+		b.maxBody = DefaultMaxResponseBytes
 	}
 	return b
 }
@@ -463,9 +471,19 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readUpstreamBody(resp.Body, b.maxBody)
 	if err != nil {
 		res.Total = b.now().Sub(start)
+		if errors.Is(err, errUpstreamTooLarge) {
+			// Not retryable: a fail-back hop would buffer another one, and the
+			// deployment that answered this way will answer the next hop the
+			// same way.
+			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+				"the upstream response exceeded the size this gateway will buffer").
+				WithCode(CodeUpstreamTooLarge)
+			b.report(&res, *x.target, x.call)
+			return res
+		}
 		res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not read the upstream response").WithCode(CodeUpstreamBody)
 		res.Retryable = true
@@ -493,6 +511,44 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 // answers a failure with a hundred megabytes of HTML must not be able to make
 // dorang read it.
 const maxErrorBody = 1 << 20
+
+// DefaultMaxResponseBytes bounds a non-streaming upstream body.
+//
+// The error path above has always been bounded at 1 MiB and the success path
+// was an unbounded io.ReadAll, which is the same asymmetry the interactive
+// dispatcher shipped: a hostile, compromised or merely broken backend — and
+// DESIGN §4.4 makes a self-hosted vLLM/SGLang node a first-class provider —
+// could OOM the gateway from the far side of the trust boundary at three to
+// four times the body size, because the buffer is then decoded and re-encoded.
+//
+// It matches the request cap rather than the 1 MiB error cap because a
+// legitimate answer can be large: an embeddings response for a big batch of
+// inputs is megabytes of floats, and a ceiling below the request cap would
+// refuse answers to requests dorang itself accepted.
+const DefaultMaxResponseBytes int64 = 32 << 20
+
+// errUpstreamTooLarge is the sentinel for a body that hit the ceiling.
+var errUpstreamTooLarge = errors.New("upstream response exceeded the configured ceiling")
+
+// readUpstreamBody reads a complete upstream answer under a hard ceiling.
+//
+// One byte past the limit is read so that hitting it is detected rather than
+// silently truncating the answer — a truncated JSON body would fail to decode
+// somewhere further along and be reported as a protocol error, which sends
+// whoever debugs it to the wrong place entirely.
+func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		limit = DefaultMaxResponseBytes
+	}
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, errUpstreamTooLarge
+	}
+	return b, nil
+}
 
 // convert turns the upstream answer into the caller's protocol.
 //

@@ -264,6 +264,48 @@ func AuthRecord(k *store.APIKey, sec *store.KeySecret, tiers *auth.TierSet) (aut
 	if err != nil {
 		return auth.Record{}, err
 	}
+	p, err := AuthPrincipal(k, tiers)
+	if err != nil {
+		return auth.Record{}, err
+	}
+	// The secret's expiry is the LATER of nothing and its own; the key's expiry
+	// is separate and already on the limits. Keeping them apart is what lets a
+	// caller be told "use the secret from the last rotation" instead of "your
+	// key expired".
+	secretExpiry := sec.ExpiresAt
+	if !sec.RevokedAt.IsZero() && (secretExpiry.IsZero() || sec.RevokedAt.Before(secretExpiry)) {
+		secretExpiry = sec.RevokedAt
+	}
+	p.SecretID = sec.ID
+	p.SecretGeneration = int(sec.Generation)
+	p.SecretExpiresAt = secretExpiry
+	return auth.Record{
+		Lookup:    sec.Lookup,
+		Digest:    digest,
+		Scheme:    scheme,
+		Principal: p,
+	}, nil
+}
+
+// AuthPrincipal is the KEY half of [AuthRecord]: the authorization envelope a
+// stored row carries, with no secret attached.
+//
+// It exists because the batch path has to recover a row's owner from an api key
+// id alone, hours after the request that created the batch is gone and with no
+// secret in hand. Building a second, batch-shaped view of a credential's limits
+// there would be a second place for a field to go missing — which is exactly
+// what R1-A recorded — so both callers derive from this one conversion and a new
+// authorization column has one place to be added.
+//
+// Every authorization field of §2.4 is carried, because a field dropped here is
+// a field the gateway fails open on. The tier is resolved through the operator's
+// configured set and is applied to the key's own limits, so the envelope the hot
+// path enforces is already narrowed — a tier that only decided a default
+// somewhere else would be a tier the request path never sees.
+func AuthPrincipal(k *store.APIKey, tiers *auth.TierSet) (auth.Principal, error) {
+	if k == nil {
+		return auth.Principal{}, errors.New("cluster: AuthPrincipal needs a key")
+	}
 	limits := auth.Limits{
 		Blocked:          k.Blocked,
 		Pended:           k.Pended(),
@@ -288,36 +330,20 @@ func AuthRecord(k *store.APIKey, sec *store.KeySecret, tiers *auth.TierSet) (aut
 			// the default — resolving it would silently move a key to a tier
 			// nobody assigned, in whichever direction the default happens to
 			// lie.
-			return auth.Record{}, terr
+			return auth.Principal{}, terr
 		}
 		tierName = t.Name
 		limits = t.Apply(limits)
 		class = t.NarrowClass(class, tiers.Classes())
 	}
-	// The secret's expiry is the LATER of nothing and its own; the key's expiry
-	// is separate and already on the limits. Keeping them apart is what lets a
-	// caller be told "use the secret from the last rotation" instead of "your
-	// key expired".
-	secretExpiry := sec.ExpiresAt
-	if !sec.RevokedAt.IsZero() && (secretExpiry.IsZero() || sec.RevokedAt.Before(secretExpiry)) {
-		secretExpiry = sec.RevokedAt
-	}
-	return auth.Record{
-		Lookup: sec.Lookup,
-		Digest: digest,
-		Scheme: scheme,
-		Principal: auth.Principal{
-			KeyID:            k.ID,
-			SecretID:         sec.ID,
-			SecretGeneration: int(sec.Generation),
-			SecretExpiresAt:  secretExpiry,
-			Tier:             tierName,
-			Label:            k.KeyLabel,
-			UserID:           k.UserID,
-			TeamID:           k.TeamID,
-			PriorityClass:    class,
-			Tags:             k.Tags,
-			Key:              limits,
-		},
+	return auth.Principal{
+		KeyID:         k.ID,
+		Tier:          tierName,
+		Label:         k.KeyLabel,
+		UserID:        k.UserID,
+		TeamID:        k.TeamID,
+		PriorityClass: class,
+		Tags:          k.Tags,
+		Key:           limits,
 	}, nil
 }

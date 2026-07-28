@@ -499,7 +499,43 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 		}
 	}
 
-	return rt.Handler(rw, rq)
+	// The allow-list, at the gate, for every route that declared the gate
+	// enforces it.
+	//
+	// Authorize above is not that check. It skips the model when rq.Model is
+	// "" (internal/auth: `a.Model != "" && …`), which is the correct rule for
+	// a route that names no model and the wrong one for a route that names a
+	// model the gate simply failed to find. Asking AllowsModel here — rather
+	// than in one handler, which is where it used to live — is what makes the
+	// answer the same for every route that shares this mode.
+	if rq.Route.ModelAuth == ModelAuthGate && rq.Model != "" {
+		if err := rq.AuthorizeModel(rq.Model); err != nil {
+			s.metrics.authFailures.Add(1)
+			return err
+		}
+	}
+
+	err := rt.Handler(rw, rq)
+
+	// Post-condition, not a second check: a ModelAuthHandler route promised to
+	// name its models and did not. Failing the request is the only answer that
+	// does not silently reinstate the bypass — an omission here is exactly the
+	// shape of every model-allow-list defect this mechanism replaced. It runs
+	// after the handler because the handler is what was supposed to do it, and
+	// it cannot un-send bytes, so it also reports when it is too late.
+	if err == nil && rt.ModelAuth == ModelAuthHandler && !rq.modelAuthorized {
+		s.metrics.authFailures.Add(1)
+		cfg.logf("server: route %s declares ModelAuthHandler and never called AuthorizeModel", rt.Name)
+		if rw.wrote {
+			return NewError(http.StatusInternalServerError, TypeAPIError,
+				"the request was served without a model authorization decision").
+				WithCode("model_auth_missing")
+		}
+		return NewError(http.StatusInternalServerError, TypeAPIError,
+			"this route did not make a model authorization decision").
+			WithCode("model_auth_missing")
+	}
+	return err
 }
 
 // fail turns a handler error into a response.
@@ -511,6 +547,10 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 	e := asError(err, http.StatusInternalServerError, TypeAPIError)
 	rw.errShape = e.Shape
+	// The upstream's own words, kept for the ledger and kept out of the body.
+	// The dispatcher has already scrubbed the credential it sent from these.
+	rq.Result.NativeErrorType = e.NativeType
+	rq.Result.NativeErrorMessage = e.NativeMessage
 	if !rw.wrote {
 		WriteError(rw, e)
 		return

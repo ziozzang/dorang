@@ -296,12 +296,20 @@ func (c *call) spendLogs() error {
 		errorsOnly = *b
 	}
 
+	// The team filter used to be read off the request and handed to the store
+	// as-is: naming another tenant's team returned that tenant's request log,
+	// prompt sizes, models, costs and trace ids. It is narrowed against the
+	// caller's scope, and the rows are filtered again below.
+	team, err := c.scopedTeamFilter(firstNonEmpty(body.TeamID, queryString(c.r, "team_id")))
+	if err != nil {
+		return err
+	}
 	q := LogQuery{
 		Range:      rng,
 		Limit:      limit,
 		After:      cursor,
 		KeyID:      firstNonEmpty(body.KeyID, body.KeyID2, queryString(c.r, "api_key", "key_id")),
-		TeamID:     firstNonEmpty(body.TeamID, queryString(c.r, "team_id")),
+		TeamID:     team,
 		UserID:     firstNonEmpty(body.UserID, queryString(c.r, "user_id")),
 		TraceID:    firstNonEmpty(body.TraceID, queryString(c.r, "trace_id", "request_id")),
 		Tag:        firstNonEmpty(body.Tag, queryString(c.r, "tag")),
@@ -311,8 +319,17 @@ func (c *call) spendLogs() error {
 	if err != nil {
 		return c.ledgerError(err)
 	}
+	sc := c.scope()
 	rows := make([]spendLogView, 0, len(page.Rows))
 	for _, r := range page.Rows {
+		// The enforcement, independent of the store honouring the filter. A
+		// key_id, user_id, trace_id or tag filter can also select rows from
+		// another team — trace ids in particular are handed around in support
+		// tickets — so the check is on the ROW's team rather than on which
+		// filter produced it.
+		if !sc.AllowsTeam(r.TeamID) {
+			continue
+		}
 		rows = append(rows, viewLog(r))
 	}
 	out := map[string]any{
@@ -427,6 +444,14 @@ func (c *call) globalSpendReport() error {
 	if err != nil {
 		return err
 	}
+	// The name is the specification: this aggregates the whole deployment, and
+	// ReportQuery carries no subject filter to narrow it with. A scoped
+	// administrator gets the per-dimension endpoints below, which do narrow.
+	// Serving it a "global" report containing one team's numbers would be a
+	// different endpoint wearing this one's name.
+	if err := c.requireGlobal("the deployment-wide spend report"); err != nil {
+		return err
+	}
 	var body struct {
 		rangeSpec
 		GroupBy []string `json:"group_by"`
@@ -532,6 +557,32 @@ func dailyActivity(dim GroupBy, idParams ...string) handler {
 		for _, p := range idParams {
 			for _, id := range queryList(c.r, p) {
 				wanted[id] = true
+			}
+		}
+		// The requested ids are intersected with what the caller may see. An
+		// empty request means "everything", which for a scoped administrator
+		// means "everything in scope" and not "everything" — the difference is
+		// the finding. Ledger.Report takes no subject filter, so this set is
+		// the only place the narrowing can happen, and every row below is
+		// admitted through it including the ones that build the total.
+		allowed, err := c.activityScope(dim)
+		if err != nil {
+			return err
+		}
+		if allowed != nil {
+			if len(wanted) == 0 {
+				wanted = allowed
+			} else {
+				for id := range wanted {
+					if !allowed[id] {
+						delete(wanted, id)
+					}
+				}
+				if len(wanted) == 0 {
+					// Every id asked for is out of scope. Answering with an
+					// empty result would read as "that team spent nothing".
+					return outOfScope(string(dim), "", c.scope())
+				}
 			}
 		}
 

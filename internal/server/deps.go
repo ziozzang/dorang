@@ -65,6 +65,22 @@ func isAdmin(p Principal) bool {
 	return ok && a.IsAdmin()
 }
 
+// ModelRestricted is an optional [Principal] capability: it reports whether the
+// caller's model allow-list refuses anything at all.
+//
+// It exists for the one question [Principal.AllowsModel] cannot answer — "is
+// there a list?" — which is what a route has to know when it could not
+// determine the model. A passthrough body that is not JSON names no model this
+// package can read; whether that is fine or fatal depends entirely on whether
+// the key was restricted in the first place.
+//
+// A Principal that does not implement it is treated as restricted, so the
+// absence of the method costs availability rather than enforcement.
+type ModelRestricted interface {
+	// ModelsRestricted reports whether any subject's allow-list is non-empty.
+	ModelsRestricted() bool
+}
+
 // Access describes the request being authorized.
 type Access struct {
 	// Model is the client-facing model name, "" when the route has none.
@@ -420,6 +436,17 @@ type Result struct {
 	// because the wire mapping to OpenAI's vocabulary is lossy in a way that
 	// tells the client a failed turn ended normally (COMPATIBILITY §4.2a).
 	NativeStopReason string
+	// NativeErrorType and NativeErrorMessage are the upstream's own error
+	// fields, recorded here for the ledger.
+	//
+	// This is the other half of COMPATIBILITY §11.3: the text is kept out of
+	// the response body, so it has to be kept SOMEWHERE or an outage becomes
+	// undebuggable. The ledger is that somewhere. Whoever fills these is
+	// responsible for having scrubbed provider credentials out of them first —
+	// a backend that echoes the key it was given puts it in exactly this
+	// string, and a ledger row is not a safe place for one either.
+	NativeErrorType    string
+	NativeErrorMessage string
 	// DroppedParams lists what parameter conversion removed (DESIGN §10.3).
 	DroppedParams string
 

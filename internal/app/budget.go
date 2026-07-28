@@ -28,11 +28,34 @@ import (
 // the entire ceiling at risk on one node's crash.
 const DefaultBudgetBlockNanoUSD int64 = 50_000_000
 
-// budgetSubjectKind is what a key-scoped budget is recorded against in
-// budget_state. DESIGN §6.4 allows a budget on a credential, key, user, team or
-// globally; the key is the one the gate can name without a store lookup,
-// because it is on the authorization snapshot the request already carries.
-const budgetSubjectKind = "key"
+// The subject kinds a budget is recorded against in budget_state. DESIGN §6.4
+// allows a budget on a credential, key, user, team or globally; all three of
+// these are on the authorization snapshot the request already carries, so none
+// of them costs a store lookup at the gate.
+const (
+	budgetKindKey  = "key"
+	budgetKindUser = "user"
+	budgetKindTeam = "team"
+)
+
+// budgetSubject is one ceiling and the subject that declared it.
+//
+// The pair is the whole point. A ceiling separated from its subject is a number
+// with nowhere to be counted, and the previous arrangement — take the smallest
+// ceiling across key, user and team, then count it against the KEY — is what
+// let ten keys under one 100 USD team budget spend 1000 USD. Each of them was
+// correctly refused at 100; there were simply ten counters.
+//
+// The period travels with the ceiling for the same reason internal/auth's
+// Limits.BudgetPeriod does: a daily ceiling applied over a monthly window is
+// thirty times too permissive, and taking the minimum limit from one subject
+// and the period from another manufactures exactly that pairing.
+type budgetSubject struct {
+	kind   string
+	id     string
+	limit  int64
+	window quota.Window
+}
 
 // budgetGate holds money before it is spent, durably.
 //
@@ -85,11 +108,12 @@ const (
 	budget80Denominator = 5
 )
 
-// budgetHold is one request's hold. A nil hold is the unbudgeted case and every
-// method on it is a no-op, so the caller has no branch to forget.
+// budgetHold is one request's holds — one per binding subject. A nil hold is
+// the unbudgeted case and every method on it is a no-op, so the caller has no
+// branch to forget.
 type budgetHold struct {
-	gate *budgetGate
-	hold *cluster.Hold
+	gate  *budgetGate
+	holds []*cluster.Hold
 }
 
 // reserve takes a hold for the upper bound of what this attempt may cost.
@@ -101,47 +125,114 @@ type budgetHold struct {
 func (g *budgetGate) reserve(ctx context.Context, st *dispatchState, c *call,
 	dec *router.Decision, rq *server.Request) (*budgetHold, error) {
 
+	// The nil-gate check comes before the estimate, not inside reserveFor:
+	// estimate is a method on the gate and reads its clock, so an unconfigured
+	// gate must not reach it. (A no-store deployment has a nil gate, and the
+	// batch executor reaches this with one in tests.)
 	if g == nil || g.ledger == nil {
 		return nil, nil
 	}
-	p, ok := rq.Principal.(*principal)
-	if !ok || p == nil {
-		// No principal means a public route; there is no subject to charge.
-		return nil, nil
+	var p *auth.Principal
+	if pr, ok := rq.Principal.(*principal); ok && pr != nil {
+		p = pr.p
 	}
-	limit, window, ok := p.budget()
-	if !ok {
-		return nil, nil
-	}
-
-	amount := g.estimate(st, c, dec)
-	now := g.now()
-	subject := notify.Subject{Kind: budgetSubjectKind, ID: p.KeyID()}
-	hold, err := g.ledger.Reserve(ctx,
-		cluster.BudgetKey(budgetSubjectKind, p.KeyID(), window, now), limit, amount)
+	hold, limit, err := g.reserveFor(ctx, budgetSubjectsOf(p), g.estimate(st, c, dec), rq)
 	if err != nil {
-		if errors.Is(err, cluster.ErrExhausted) {
-			g.raise(notify.EventBudgetExceeded, subject, now, limit, limit, window, rq)
-			return nil, server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
-				"the budget for this credential is exhausted for the current "+
-					window.String()+" period").WithCode("budget_exceeded")
-		}
-		return nil, server.NewError(http.StatusServiceUnavailable, server.TypeAPIError,
-			"the budget could not be reserved: "+err.Error()).WithCode("budget_unavailable")
+		return nil, err
 	}
-	rq.Result.BudgetNanoUSD = limit
+	if hold != nil {
+		rq.Result.BudgetNanoUSD = limit
+	}
+	return hold, nil
+}
 
-	// budget_80pct (§11.5). This is discovered on the request path and must not
-	// be *sent* from it: Admit is a sharded map lookup that allocates nothing
-	// and returns true at most once per subject per period, and everything
-	// after it — rendering, connecting, retrying — happens on a worker.
-	//
-	// Without the deduplication this fires on every request past the threshold,
-	// which is the difference between an alert and a filter rule.
-	if spent, seen := hold.Consumed(); seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
-		g.raise(notify.EventBudget80, subject, now, spent, seen, window, nil)
+// reserveBatch is the batch path's entry to the same gate.
+//
+// It exists so the two call sites read alike and share every line below the
+// estimate. The refusal is wrapped terminal: a budget that is spent is not a
+// condition a retry improves, and internal/batch would otherwise re-dispatch
+// the row through its backoff until MaxAttempts, spending the ceiling's worth
+// of refusals on the store.
+func (g *budgetGate) reserveBatch(ctx context.Context, st *dispatchState, c *call,
+	dec *router.Decision, id *execIdentity) (*budgetHold, error) {
+
+	if g == nil || g.ledger == nil {
+		return nil, nil
 	}
-	return &budgetHold{gate: g, hold: hold}, nil
+	if id == nil {
+		return nil, errors.New("app: a batch row reached the budget gate with no identity")
+	}
+	hold, _, err := g.reserveFor(ctx, id.subs, g.estimate(st, c, dec), nil)
+	if err != nil {
+		return nil, &terminalError{msg: err.Error()}
+	}
+	return hold, nil
+}
+
+// reserveFor takes one hold per binding subject for an amount already
+// estimated.
+//
+// This is the whole budget gate. Both callers reach it — the interactive
+// dispatcher and the batch executor — because a batch row that reserved
+// nothing was not "unbudgeted", it was unpriced spend on the operator's
+// credential, and giving the two paths separate reservation code is how they
+// came to disagree in the first place.
+//
+// Every subject that declares a ceiling gets its own hold against its own
+// durable counter, with its own limit and its own window. Any one of them
+// refusing refuses the request, and the ones already taken are released before
+// the error returns — a partial reservation would leak budget on every refusal.
+//
+// The returned limit is the smallest ceiling among the subjects, which is what
+// the client-facing header reports: it is the number that actually bounds this
+// request.
+//
+// §11.5's budget_80pct and budget_exceeded are raised per subject, because the
+// subject is what the operator is being told about: a team crossing 80% and a
+// key crossing 80% are different facts and the notifier deduplicates on the
+// subject, not on the request.
+func (g *budgetGate) reserveFor(ctx context.Context, subs []budgetSubject,
+	amount int64, rq *server.Request) (*budgetHold, int64, error) {
+
+	if g == nil || g.ledger == nil || len(subs) == 0 {
+		return nil, 0, nil
+	}
+	h := &budgetHold{gate: g, holds: make([]*cluster.Hold, 0, len(subs))}
+	minLimit := int64(-1)
+	now := g.now()
+	for _, s := range subs {
+		subject := notify.Subject{Kind: s.kind, ID: s.id}
+		hold, err := g.ledger.Reserve(ctx,
+			cluster.BudgetKey(s.kind, s.id, s.window, now), s.limit, amount)
+		if err != nil {
+			h.release()
+			if errors.Is(err, cluster.ErrExhausted) {
+				g.raise(notify.EventBudgetExceeded, subject, now, s.limit, s.limit, s.window, rq)
+				return nil, 0, server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
+					"the "+s.kind+" budget for this credential is exhausted for the current "+
+						s.window.String()+" period").WithCode("budget_exceeded")
+			}
+			return nil, 0, server.NewError(http.StatusServiceUnavailable, server.TypeAPIError,
+				"the budget could not be reserved: "+err.Error()).WithCode("budget_unavailable")
+		}
+		h.holds = append(h.holds, hold)
+		if minLimit < 0 || s.limit < minLimit {
+			minLimit = s.limit
+		}
+
+		// budget_80pct (§11.5). This is discovered on the request path and must
+		// not be *sent* from it: Admit is a sharded map lookup that allocates
+		// nothing and returns true at most once per subject per period, and
+		// everything after it — rendering, connecting, retrying — happens on a
+		// worker.
+		//
+		// Without the deduplication this fires on every request past the
+		// threshold, which is the difference between an alert and a filter rule.
+		if spent, seen := hold.Consumed(); seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
+			g.raise(notify.EventBudget80, subject, now, spent, seen, s.window, nil)
+		}
+	}
+	return h, minLimit, nil
 }
 
 // raise queues a budget notification, once per subject per period.
@@ -216,56 +307,64 @@ func (g *budgetGate) estimate(st *dispatchState, c *call, dec *router.Decision) 
 	return cost.TotalNano
 }
 
-// settle records what the request actually cost and returns the difference.
+// settle records what the request actually cost, against every subject that
+// held budget for it.
 func (h *budgetHold) settle(actual int64) {
-	if h == nil || h.hold == nil {
+	if h == nil {
 		return
 	}
-	_ = h.gate.ledger.Settle(h.hold, actual)
+	for _, hold := range h.holds {
+		_ = h.gate.ledger.Settle(hold, actual)
+	}
 }
 
-// release returns the hold in full. It is the path for everything that never
-// reached an upstream (§6.4, R1-20).
+// release returns every hold in full. It is the path for everything that never
+// reached an upstream (§6.4, R1-20), and for a partial reservation that has to
+// be undone because a later subject refused.
 func (h *budgetHold) release() {
-	if h == nil || h.hold == nil {
+	if h == nil {
 		return
 	}
-	_ = h.gate.ledger.Release(h.hold)
+	for _, hold := range h.holds {
+		_ = h.gate.ledger.Release(hold)
+	}
+	h.holds = nil
 }
 
-// budget reads the calling credential's ceiling and its period.
+// budgetSubjectsOf lists every ceiling that binds this principal, one per
+// subject that declares one.
 //
-// The most restrictive of key, user and team wins (DESIGN §11.2). Only the key
-// is charged, because it is the only subject the durable counter can be keyed by
-// without a second lookup — but a user or team ceiling lower than the key's
-// still binds the request, which is the direction that cannot fail open.
-func (p *principal) budget() (limitNano int64, window quota.Window, ok bool) {
-	if p == nil || p.p == nil || p.p.Master {
-		return 0, quota.Window{}, false
+// DESIGN §11.2's "the most restrictive wins" is satisfied by holding against
+// all of them rather than by picking the smallest: a team ceiling and a key
+// ceiling are different counters over different populations, and the smallest
+// NUMBER counted against the key is not the team's ceiling — it is the team's
+// ceiling granted separately to every key under it.
+//
+// Each subject keeps its own period. A key with a monthly 10 USD budget under a
+// team with a daily 1 USD budget now yields two holds — 10 USD monthly on the
+// key, 1 USD daily on the team — instead of one 1 USD ceiling applied over a
+// month.
+func budgetSubjectsOf(p *auth.Principal) []budgetSubject {
+	if p == nil || p.Master {
+		return nil
 	}
-	var (
-		limit  int64
-		period string
-	)
-	for _, l := range []*auth.Limits{&p.p.Key, p.p.User, p.p.Team} {
-		if l == nil || l.MaxBudgetNanoUSD == nil {
-			continue
+	var out []budgetSubject
+	add := func(kind, id string, l *auth.Limits) {
+		if l == nil || l.MaxBudgetNanoUSD == nil || id == "" {
+			return
 		}
-		if v := *l.MaxBudgetNanoUSD; !ok || v < limit {
-			limit, ok = v, true
+		w, err := quota.ParseWindow(l.BudgetPeriod)
+		if err != nil || !w.Valid() {
+			// §6.4's own example is a monthly budget, and a period that does
+			// not parse must not become "no budget at all".
+			w = quota.Monthly
 		}
-		if period == "" {
-			period = l.BudgetPeriod
-		}
+		out = append(out, budgetSubject{
+			kind: kind, id: id, limit: *l.MaxBudgetNanoUSD, window: w,
+		})
 	}
-	if !ok {
-		return 0, quota.Window{}, false
-	}
-	w, err := quota.ParseWindow(period)
-	if err != nil || !w.Valid() {
-		// §6.4's own example is a monthly budget, and a period that does not
-		// parse must not become "no budget at all".
-		w = quota.Monthly
-	}
-	return limit, w, true
+	add(budgetKindKey, p.KeyID, &p.Key)
+	add(budgetKindUser, p.UserID, p.User)
+	add(budgetKindTeam, p.TeamID, p.Team)
+	return out
 }

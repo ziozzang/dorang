@@ -20,9 +20,9 @@ func TestRouteSpecificityBeatsRegistrationOrder(t *testing.T) {
 	}
 	// Registered catch-all first, on purpose.
 	table, err := newRouteTable([]*Route{
-		{Pattern: "/openai/{rest...}", Methods: MethodPOST, Name: "catchall", Handler: hit("catchall")},
-		{Pattern: "/openai/deployments/{model}/chat/completions", Methods: MethodPOST, Name: "deployment", Handler: hit("deployment")},
-		{Pattern: "/openai/deployments/{model}/{rest...}", Methods: MethodPOST, Name: "deployment-any", Handler: hit("deployment-any")},
+		{Pattern: "/openai/{rest...}", Methods: MethodPOST, Name: "catchall", ModelAuth: ModelAuthNone, Handler: hit("catchall")},
+		{Pattern: "/openai/deployments/{model}/chat/completions", Methods: MethodPOST, Name: "deployment", ModelAuth: ModelAuthNone, Handler: hit("deployment")},
+		{Pattern: "/openai/deployments/{model}/{rest...}", Methods: MethodPOST, Name: "deployment-any", ModelAuth: ModelAuthNone, Handler: hit("deployment-any")},
 	})
 	if err != nil {
 		t.Fatalf("newRouteTable: %v", err)
@@ -65,7 +65,7 @@ func TestRouteSpecificityBeatsRegistrationOrder(t *testing.T) {
 // work because of how the table was built is not specificity ordering.
 func TestRouteSpecificityIsIndependentOfOrder(t *testing.T) {
 	mk := func(p, n string) *Route {
-		return &Route{Pattern: p, Methods: MethodGET, Name: n,
+		return &Route{Pattern: p, Methods: MethodGET, Name: n, ModelAuth: ModelAuthNone,
 			Handler: func(http.ResponseWriter, *Request) error { return nil }}
 	}
 	a := []*Route{
@@ -185,8 +185,8 @@ func TestCompileRejectsBadPatterns(t *testing.T) {
 func TestDuplicateExactRouteRejected(t *testing.T) {
 	h := func(http.ResponseWriter, *Request) error { return nil }
 	_, err := newRouteTable([]*Route{
-		{Pattern: "/x", Methods: MethodGET, Handler: h},
-		{Pattern: "/x", Methods: MethodPOST, Handler: h},
+		{Pattern: "/x", Methods: MethodGET, ModelAuth: ModelAuthNone, Handler: h},
+		{Pattern: "/x", Methods: MethodPOST, ModelAuth: ModelAuthNone, Handler: h},
 	})
 	if err == nil {
 		t.Fatal("duplicate exact route accepted")

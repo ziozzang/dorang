@@ -552,12 +552,17 @@ func (h *harness) restart(tune func(*Config)) {
 	})
 }
 
+// allowAllModels is the authorizer these tests use when the point under test is
+// not the allow-list. It is written out rather than defaulted inside the
+// service, because a nil authorizer is exactly the omission UploadFile refuses.
+func allowAllModels(string) error { return nil }
+
 // upload stores content as a batch input file and returns its id.
 func (h *harness) upload(content string) string {
 	h.t.Helper()
 	f, err := h.svc.UploadFile(context.Background(), UploadRequest{
 		Filename: "input.jsonl", Purpose: PurposeBatch, OwnerKeyID: "key-1",
-		Content: strings.NewReader(content),
+		Content: strings.NewReader(content), Authorize: allowAllModels,
 	})
 	if err != nil {
 		h.t.Fatalf("UploadFile: %v", err)
