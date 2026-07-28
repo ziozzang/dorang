@@ -65,3 +65,23 @@ jobs:
           if git grep -nE '/(home|Users)/[A-Za-z0-9_.-]+/' -- '*.md'; then
             echo "::error::absolute home paths found in docs"; exit 1
           fi
+
+      # Several defaults are written as `~/...` and resolve against the
+      # operator's home when DORANG_STATE_DIR is unset. A package whose tests
+      # forget to override them appends to the real state directory instead of a
+      # temporary one — which is rude, and worse, makes the spool shared state
+      # that carries between runs. internal/app did this until 36 MB had piled
+      # up in a live installation and started slowing the meter the tests were
+      # measuring. Nothing failed; a directory just grew.
+      - name: tests write no state to the home directory
+        run: |
+          mkdir -p "$HOME/.dorang"
+          before=$(find "$HOME/.dorang" -type f | wc -l)
+          go test -count=1 ./... >/dev/null
+          after=$(find "$HOME/.dorang" -type f | wc -l)
+          if [ "$after" -ne "$before" ]; then
+            echo "::error::the test suite wrote into \$HOME/.dorang ($before -> $after files)."
+            echo "Set DORANG_STATE_DIR to a temp dir in that package's TestMain; see internal/app/main_test.go."
+            find "$HOME/.dorang" -type f | head -20
+            exit 1
+          fi
