@@ -726,19 +726,22 @@ is deliberately an upper bound: exact input tokens priced, plus output priced at
 
 Two corrections from review:
 
-- **Reservations expire [R1-5].** `budget_state` carries `reserved_until`. A process killed
+- **Reservations expire [R1-19].** `budget_state` carries `reserved_until`. A process killed
   between reserve and settle would otherwise lock that amount forever, and over time
   reserved-but-never-settled amounts would exhaust a budget nothing actually spent. The
   leader sweeps expired reservations, exactly as §5.3 does for capacity. The two mechanisms
   are the same pattern and now have the same safety net.
-- **Unexecuted requests are refunded in full [R1-6].** A request may reserve budget at the
+- **Unexecuted requests are refunded in full [R1-20].** A request may reserve budget at the
   gate and then be rejected while waiting for capacity, never reaching an upstream. Revision
   1 defined settlement only for completion. Revision 2 makes budget a **soft hold** at the
   gate that becomes a **hard hold only after capacity is acquired**; anything that fails
   before dispatch releases the full amount.
 
 Budgets attach to a credential, key, user, team, or globally. Exceeding one is **not**
-a fallback condition — failing is the correct outcome.
+a fallback condition — failing is the correct outcome, and it surfaces as a terminal `400`
+rather than a `429` **[R1-21]**. A `429` is a rate-limit signal: emitting one here would send
+the request down the fallback chain and spend a different subject's budget on a model the
+caller never asked for.
 
 ---
 

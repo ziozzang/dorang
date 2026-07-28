@@ -125,7 +125,11 @@ The importer must therefore read credentials *before* any key rotation, and say 
 > at gateway concurrency. This is a good example of why inherited mechanisms need
 > re-validation against the new load profile rather than being adopted on reputation.
 
-### Quota and budget (1 finding) — ACCEPTED
+### Quota and budget (4 findings) — ACCEPTED
+
+> Findings 19–21 were raised later, during implementation, and are numbered at the end of
+> this section's sequence rather than inserted — renumbering would break every `[R1-n]` tag
+> already carried in the design.
 
 8. **Asynchronous local counting and multi-node accuracy are mutually exclusive as written.**
    Either nodes overshoot the limit while their counts converge, or every request contends
@@ -134,6 +138,25 @@ The importer must therefore read credentials *before* any key rotation, and say 
    a node leases a block of quota and decrements locally. Small limits force an atomic
    shared path. Each mode now declares its **maximum possible overshoot as a number**,
    rather than implying exactness it cannot deliver.
+
+19. **Budget reservations had no expiry, while capacity reservations did.** The two are the
+   same reserve-then-settle pattern, but only one had a safety net. A process killed between
+   reserving and settling locks that amount forever, and over time a budget is exhausted by
+   money nobody spent — a false stop with no way to diagnose it.
+   → Revision 2 gives `budget_state` a `reserved_until` and a leader-run sweep, matching
+   §5.3. Same pattern, same net.
+
+20. **A request could consume budget without ever reaching an upstream.** Budget was reserved
+    at the gate; the request can then be refused while waiting for capacity and never
+    dispatch. Revision 1 defined settlement only for completion, so that reservation leaked.
+    → Revision 2 makes the gate hold **soft**, hardening it only once capacity is acquired,
+    and refunds in full for anything that fails before dispatch.
+
+21. **Budget refusal must not be a fallback trigger.** Exceeding a budget surfaces as a
+    terminal `400`, deliberately not `429`. A `429` is a rate-limit signal and would send the
+    request down the fallback chain (§7.6) to spend a *different* subject's budget on a model
+    the caller never asked for. The error type carries an explicit terminal flag so this
+    cannot be re-derived incorrectly downstream.
 
 ### Pricing (3 findings) — ACCEPTED
 
