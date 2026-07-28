@@ -279,9 +279,10 @@ func usdString(nano int64) string {
 // the accounting path; routing must call Price". A comment did not prevent that,
 // so the estimate now holds a type through which the mutating call is not
 // reachable at all. Settling twice is not a double charge — the second settle
-// wins the ledger row — but it advances the subscription period accumulator
-// twice, once at max_tokens, which is the denominator every later request's
-// amortized share is divided by.
+// wins the ledger row — but it consumes the carried sub-nano remainder and
+// advances the subscription period's attributed total, so the plan share the
+// quote takes is attributed to a row that is never written and the real row
+// records nothing.
 type quoter interface {
 	Price(pricing.Request) (pricing.Cost, error)
 }
@@ -307,10 +308,11 @@ func (st *dispatchState) quoteOnly() quoter {
 // free to reserve.
 //
 // It quotes; it does not settle. The two differ in more than a name: Settle
-// consumes the carried sub-nano remainder and adds the request's marginal cost
-// to the subscription accumulator, and doing that from a pre-flight estimate
-// priced at max_tokens inflates the accumulator by the ratio of the ceiling to
-// the real generation before the request has produced a single token.
+// consumes the carried sub-nano remainder and advances the subscription period's
+// attributed total (§8.1), and doing either from a pre-flight quote spends state
+// on a request that has not produced a single token yet — the remainder against a
+// cost priced at max_tokens, and the period's accrued plan share against a ledger
+// row that will never exist.
 func (g *budgetGate) estimate(st *dispatchState, c *call, dec *router.Decision) int64 {
 	price := st.quoteOnly()
 	if price == nil {

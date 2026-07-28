@@ -359,17 +359,20 @@ rules:
 	}
 }
 
+// TestSubscriptionPeriods checks that every period length places its own boundaries and
+// starts its own attribution over: two requests, one at the half-way mark and one at the
+// last instant, take half the plan cost each and sum to exactly the plan cost, and the
+// next period does the same again rather than continuing the last one (§8.1).
 func TestSubscriptionPeriods(t *testing.T) {
 	for _, tc := range []struct {
 		period string
-		first  string // a settlement early in the period
-		later  string // still inside it
-		next   string // the following period
+		p      Period
+		inside string // any instant inside the period under test
 	}{
-		{"daily", "2026-07-28T01:00:00Z", "2026-07-28T23:00:00Z", "2026-07-29T00:00:00Z"},
-		{"weekly", "2026-07-27T01:00:00Z", "2026-08-02T23:00:00Z", "2026-08-03T00:00:00Z"}, // Monday to Sunday
-		{"monthly", "2026-07-01T01:00:00Z", "2026-07-31T23:00:00Z", "2026-08-01T00:00:00Z"},
-		{"yearly", "2026-01-01T01:00:00Z", "2026-12-31T23:00:00Z", "2027-01-01T00:00:00Z"},
+		{"daily", PeriodDaily, "2026-07-28T01:00:00Z"},
+		{"weekly", PeriodWeekly, "2026-07-27T01:00:00Z"}, // Monday to Sunday
+		{"monthly", PeriodMonthly, "2026-07-01T01:00:00Z"},
+		{"yearly", PeriodYearly, "2026-01-01T01:00:00Z"},
 	} {
 		t.Run(tc.period, func(t *testing.T) {
 			c := mustCatalog(t, `
@@ -381,25 +384,37 @@ rules:
     amount_per_period: "10.00"
     period: `+tc.period+`
 `)
+			const plan, half = int64(10_000_000_000), int64(5_000_000_000)
 			req := Request{Model: "m", Credential: "c1", InputTokens: 1_000_000}
-			req.At = at(t, tc.first)
-			if cost, err := c.Settle(req); err != nil {
-				t.Fatal(err)
-			} else if cost.SubscriptionNano != 10_000_000_000 {
-				t.Fatalf("first settlement = %d", cost.SubscriptionNano)
+			settle := func(when time.Time) int64 {
+				t.Helper()
+				req.At = when
+				cost, err := c.Settle(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return cost.SubscriptionNano
 			}
-			req.At = at(t, tc.later)
-			if cost, err := c.Settle(req); err != nil {
-				t.Fatal(err)
-			} else if cost.SubscriptionNano != 5_000_000_000 {
-				t.Fatalf("second settlement in the same period = %d, want half", cost.SubscriptionNano)
+
+			start, end := periodBounds(tc.p, at(t, tc.inside), time.UTC)
+			var total int64
+			if got := settle(start.Add(end.Sub(start) / 2)); got != half {
+				t.Fatalf("half way through the period = %d, want half the plan cost %d", got, half)
+			} else {
+				total += got
 			}
-			req.At = at(t, tc.next)
-			if cost, err := c.Settle(req); err != nil {
-				t.Fatal(err)
-			} else if cost.SubscriptionNano != 10_000_000_000 {
-				t.Fatalf("first settlement of the next period = %d, want the whole plan cost",
-					cost.SubscriptionNano)
+			if got := settle(end.Add(-time.Nanosecond)); got != half {
+				t.Fatalf("at the end of the period = %d, want the remaining %d", got, half)
+			} else {
+				total += got
+			}
+			if total != plan {
+				t.Fatalf("the period attributed %d, want exactly the plan cost %d", total, plan)
+			}
+			nextStart, nextEnd := periodBounds(tc.p, end, time.UTC)
+			if got := settle(nextStart.Add(nextEnd.Sub(nextStart) / 2)); got != half {
+				t.Fatalf("half way through the NEXT period = %d, want %d: each period "+
+					"attributes its own plan cost from zero", got, half)
 			}
 		})
 	}
@@ -419,7 +434,7 @@ rules:
 `)
 	req := Request{Model: "m", Credential: "c1", InputTokens: 1_000_000}
 	// 2026-07-28T16:00Z is 2026-07-29T01:00 in Seoul: a new day there, the same day in UTC.
-	req.At = at(t, "2026-07-28T10:00:00Z") // 19:00 Seoul on the 28th
+	req.At = at(t, "2026-07-28T10:00:00Z") // 19:00 Seoul on the 28th: 19/24 of that day
 	if _, err := c.Settle(req); err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +443,11 @@ rules:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cost.SubscriptionNano != 10_000_000_000 {
-		t.Fatalf("the catalog timezone was not used to place the period: %d", cost.SubscriptionNano)
+	// One hour into a fresh Seoul day: 10.00 x 1/24, less the third of a nano the first
+	// settlement of the previous day carried. Placed in UTC instead, this instant would
+	// fall six hours later in the SAME period and take 10.00 x 6/24 = 2.50.
+	if want := int64(416_666_666); cost.SubscriptionNano != want {
+		t.Fatalf("the catalog timezone was not used to place the period: %d, want %d",
+			cost.SubscriptionNano, want)
 	}
 }

@@ -139,9 +139,9 @@ var uiFuncs = template.FuncMap{
 	},
 	// leverage renders notional ÷ billed over the window. §8.5 is explicit that
 	// this ratio is meaningful per *period* and misleading per request, because
-	// a flat plan with no marginal rule amortizes by elapsed time — so a quiet
-	// hour reads as poor leverage and a busy one as excellent, when neither is a
-	// fact about the plan. The screen therefore renders it only for the whole
+	// a plan cost accrues with its period (§8.1) rather than with usage — so a
+	// quiet hour reads as poor leverage and a busy one as excellent, when
+	// neither is a fact about the plan. The screen therefore renders it only for the whole
 	// selected window, and the caption says so.
 	"leverage": func(u Usage) string {
 		if !u.NotionalKnown {

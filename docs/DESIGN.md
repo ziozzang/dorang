@@ -1231,7 +1231,7 @@ Revision 2 gives each class its own winner, and composes across classes:
 | Class | Meaning | Composition |
 |---|---|---|
 | `marginal_usage` | per-token, per-request, per-character, per-second | most specific rule wins |
-| `fixed_subscription` | plan cost independent of this request | most specific wins; amortized |
+| `fixed_subscription` | plan cost independent of this request | most specific wins; accrues over the period |
 | `adjustment` | discounts, margins, taxes | all applicable rules apply in order |
 | `notional_rate` | **what this traffic would have cost at list price** — never billed | most specific wins; §8.5 |
 
@@ -1239,10 +1239,70 @@ Revision 2 gives each class its own winner, and composes across classes:
 cost = marginal(winner) + amortized(subscription winner) then adjustments applied in order
 ```
 
-**Amortization has one formula**: `period_cost × (request_marginal ÷ period_marginal_to_date)`,
-falling back to elapsed-fraction when marginal is zero. It is computed for **accounting**
-only. Routing uses `marginal_usage` alone, because a sunk subscription cost must not make a
-saturated plan look cheap. The two are separate fields, never conflated.
+**Amortization is stated as a property, not a formula**: *the shares a period attributes sum
+to the plan cost, and never to more.* Over a period that carried traffic throughout, a 100 USD
+plan attributes 100 USD — at one request, at a hundred, at a million — and less, never more,
+if the traffic stopped early. It is computed for
+**accounting** only. Routing uses `marginal_usage` alone, because a sunk subscription cost
+must not make a saturated plan look cheap. The two are separate fields, never conflated.
+
+> ⚠️ **Revision 2 stated a formula here, and it summed to `plan_cost × H_N`.**
+> The rule was `period_cost × (request_marginal ÷ period_marginal_to_date)`, computed per
+> request and added up by the ledger. For N equal requests that is `plan_cost × (1 + ½ + ⅓ +
+> … + 1/N)`: **a 100 USD plan attributed about 519 USD over 100 requests, 749 USD over 1,000,
+> and it never stopped growing.** It is recorded here rather than quietly replaced, because
+> the number reached the ledger, and every figure derived from it — per-key attribution,
+> per-team chargeback, the notional-versus-actual comparison §8.5 exists for — was wrong by a
+> factor that depended on traffic volume.
+>
+> The cause is structural, not arithmetic. Each share was an estimate of *the same quantity*
+> — the plan cost per unit of traffic so far — and estimates of one quantity must supersede
+> one another, not accumulate. Only increments may be added.
+
+So the period's attributed total is **one running total that is revised, not a sum that
+grows**, and a request's recorded share is the increment that brings it up to date:
+
+- **The plan accrues with its period.** A fixed plan buys a *period*, so the fraction of the
+  period that has passed is the fraction of the plan cost that has been incurred. A request
+  records what has accrued since the previous settlement. Requests spread evenly across a
+  period therefore take `plan_cost ÷ N` each — the per-request figure the old formula only
+  ever produced for the first request.
+- **Usage-to-date cannot be the denominator.** A period's total usage is unknowable until the
+  period closes; every mid-period estimate of it is too small, and dividing by a denominator
+  that is too small is exactly what over-attributed every request. The period is the one
+  denominator known in advance, which is what makes the total bounded. The exact
+  usage-weighted apportionment is still available where it is sound — as a rollup over the
+  ledger's marginal column *after* the period closes — but a per-request column settled in
+  real time cannot wait for it, and §8.5's notional figure already answers "who consumed the
+  value" per key and per team.
+- **A settled row never changes.** Restating history to fix an estimate would be worse than
+  the defect it fixes: the number an operator has already seen, exported or invoiced stays
+  what they saw. Shares are increments precisely so that no row has to be rewritten.
+- **The cap is structural.** The elapsed fraction is clamped to the period inside the single
+  function `Price`, `Settle` and `Explain` all reach the figure through — the same shape as
+  the floor under `TotalNano`, which caught a third call site nobody had named. There is no
+  call site left that can attribute a plan twice. One gap remains and is stated rather than
+  left to be found: the accumulator lives with the loaded catalog, so a **config reload**
+  starts an open period's attribution over and can attribute the rest of that period a second
+  time — bounded by one plan cost per reload, where the summed formula was bounded by nothing.
+  Carrying the accumulator across a reload closes it.
+- **A share is never negative**, and a row that arrives out of order inside the open period
+  attributes zero rather than clawing back what a settled row already took.
+- **A period with no requests attributes nothing**, and a period whose traffic stopped early
+  attributes only what had accrued while it ran. The plan still cost the operator its plan
+  cost, and the honest place for that is the *gap* between the plan cost and what the period
+  attributed — an idle month reads as an unattributed plan, which is the number that says the
+  plan is not worth renewing. Attributing it to no request, or to the next period's first
+  request, would both invent traffic that never happened.
+- **A late row from a closed period attributes zero plan cost** (its marginal cost is priced
+  as usual). That period's plan cost was apportioned among the rows settled while it was open
+  and the accumulator that would bound a further share is gone; any positive share would be an
+  unbounded guess that can push a closed period above its plan cost. This is the same
+  reasoning as the backfill guard: a late row must not resurrect an over-attributing period.
+
+The property, not the formula, is what the tests assert: for N from 1 to 10,000, a period's
+settled shares sum to exactly the plan cost, with N = 100 and N = 1,000 named so the harmonic
+growth cannot return unnoticed.
 
 ### 8.5 Notional cost — what a subscription is actually worth
 
@@ -1301,13 +1361,14 @@ that, and each exists because the alternative is a number that looks authoritati
 
 What it buys, stated plainly so the feature is judged on it: `notional ÷ amortized
 subscription` is the plan's realized leverage — **with one caveat that matters when reading it
-per request**. A flat plan usually has no `marginal_usage` rule at all, so §8.1's amortization
-falls back to elapsed-fraction, and the denominator is apportioned by *time* rather than by
-usage. Over a full period the ratio is exactly right; within a period a quiet hour reads as
-poor leverage and a busy one as excellent, when neither is a fact about the plan. Read it
-per period, or against the notional total, not per request; `notional` per key or team is who is consuming
-the value a flat bill hides; and `notional` over the period is the number to compare against a
-vendor quote when the plan stops fitting. Extension headers expose it as
+per request**. §8.1's plan cost accrues with the *period*, so the denominator is apportioned by
+time rather than by usage. Over a full period the ratio is exactly right; within a period a
+quiet hour reads as poor leverage and a busy one as excellent, when neither is a fact about the
+plan. Read it per period, or against the notional total, not per request; `notional` per key or
+team is who is consuming the value a flat bill hides — it is the usage-weighted half of the
+pair, and the one to read when the question is *which* team, since the subscription column
+answers only *how much of the plan has been paid for so far*; and `notional` over the period is
+the number to compare against a vendor quote when the plan stops fitting. Extension headers expose it as
 `x-dorang-notional-usd`, and the ledger carries it per request, so the comparison is available
 at any grain rather than only in aggregate.
 

@@ -235,10 +235,29 @@ type subState struct {
 	snap atomic.Pointer[subSnapshot]
 }
 
+// subSnapshot is what a period has already attributed, not what it has already used.
+//
+// The field that used to live here was the period's marginal-usage total, because each
+// request's share was computed as plan_cost x (request_marginal / marginal_to_date) and
+// then added to the ledger. Those shares are each an estimate of the SAME quantity — the
+// plan cost per unit of traffic so far — so adding them counted the plan cost once per
+// request: a period of N equal requests reported plan_cost x H_N, 5.19 plan costs at
+// N = 100 and still climbing (§8.1).
+//
+// Carrying the attributed total instead makes the period's rows increments of one running
+// total rather than repeated estimates of it. attributed only ever rises, never above the
+// plan cost, and a request records the difference — so the rows sum to the total by
+// construction and no settled row is ever restated.
+// The accumulator lives for the life of this Catalog, which is the life of one loaded
+// configuration. A config reload builds a fresh Catalog, so an open period starts its
+// attribution over from the reload instant and can attribute the rest of the period a
+// second time — bounded by one plan cost per reload, where the summed formula was bounded
+// by nothing, but stated here rather than left to be discovered. Carrying this state (and
+// the rounding carries beside it) across a reload is the fix; it belongs with whatever
+// hands the new catalog its predecessor, not here.
 type subSnapshot struct {
 	periodStart time.Time
-	marginal    u128      // marginal atto-units accrued in the period
-	last        time.Time // instant of the most recent settlement in the period
+	attributed  u128 // plan cost already attributed to this period, in atto-units
 }
 
 // LoadCatalog reads and compiles a price catalog from disk.

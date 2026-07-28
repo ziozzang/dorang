@@ -1007,10 +1007,12 @@ pay-as-you-go list price. It is:
   one. Zero would make a subscription look infinitely efficient, which is the most flattering
   possible answer and the one least likely to be questioned.
 
-> One caveat before trusting the leverage ratio. A flat plan usually has no `marginal_usage`
-> rule at all, so amortization falls back to elapsed fraction and the denominator is apportioned
-> by *time* rather than by usage. Over a full period the ratio is right; within one, a quiet hour
-> reads as poor leverage and a busy one as excellent, when neither is a fact about the plan.
+> One caveat before trusting the leverage ratio. A plan cost accrues with its period (§8.1), so
+> the denominator is apportioned by *time* rather than by usage: a request records what the plan
+> has accrued since the previous one, and a period's shares sum to the plan cost and never to
+> more. Over a full period the ratio is right; within one, a quiet hour reads as poor leverage
+> and a busy one as excellent, when neither is a fact about the plan. Usage is what the notional
+> figure weights, and it is the one to read per key or per team.
 
 Preview any of this with `dorangctl price <model> --input N --output N`, which runs the same
 evaluator the ledger runs.

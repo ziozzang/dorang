@@ -101,22 +101,18 @@ rules:
 // accounting path; routing must call Price", and the pre-flight budget estimate
 // called it — priced at max_tokens, which is nine times the generation this test
 // produces. Settling is not a double charge (the second settle wins the ledger
-// row) but it advances the subscription period accumulator, which is the
-// denominator every later request's amortized share is divided by. Nine
-// requests' worth of imaginary usage per real request makes every subsequent
-// share wrong.
+// row) but it is state: it consumes the carried sub-nano remainder, and it
+// advances the subscription period's attributed total. A plan share taken by a
+// pre-flight quote is attributed to a row that is never written, and the real row
+// that follows it then finds the period already up to date and records nothing.
+// The period's attribution does not overshoot — it silently goes missing.
 //
-// The accumulator is not exported, so it is measured where it is spent: the
-// amortized share of a probe settle is plan_cost * marginal / (accumulator +
-// marginal), which inverts to the accumulator exactly.
+// The accumulator is not exported, so it is measured where it is spent: an
+// identical catalog settled once at the last instant says what the period had
+// accrued, and the rows of the catalog under test must add up to exactly that.
 func TestThePreflightEstimateDoesNotSettle(t *testing.T) {
 	const (
-		nano     = int64(1_000_000_000)
-		planNano = 100 * nano // amount_per_period: 100.00
-		reqNano  = 1 * nano   // 1000 output tokens at 0.001/token
-		requests = 9
-	)
-	cat := mustPriceCatalog(t, `
+		catalog = `
 currency: USD
 rules:
   - id: usage
@@ -128,46 +124,48 @@ rules:
     match: { model: m }
     amount_per_period: "100.00"
     period: monthly
-`)
+`
+		requests = 9
+	)
+	cat := mustPriceCatalog(t, catalog)
 
-	now := time.Unix(1_700_000_000, 0).UTC()
+	start := time.Unix(1_700_000_000, 0).UTC()
+	now := start
 	g := &budgetGate{now: func() time.Time { return now }}
 	st := &dispatchState{pricing: cat}
 	dec := &router.Decision{Provider: "p", UpstreamModel: "m", Credential: "cred-1"}
 	maxTokens := 9000
 	c := &call{creq: &canonical.Request{MaxTokens: &maxTokens}}
+	settled := func(cat *pricing.Catalog, at time.Time) pricing.Cost {
+		t.Helper()
+		cost, err := cat.Settle(pricing.Request{Provider: "p", Model: "m",
+			Credential: "cred-1", OutputTokens: 1000, Requests: 1, At: at})
+		if err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+		return cost
+	}
 
+	var attributed int64
 	for i := 0; i < requests; i++ {
+		now = start.Add(time.Duration(i) * time.Minute)
 		// The gate quotes the pessimistic upper bound...
 		if est := g.estimate(st, c, dec); est <= 0 {
 			t.Fatalf("estimate %d = %d, want a positive upper bound", i, est)
 		}
 		// ...and then the request settles at what it actually generated.
-		if _, err := cat.Settle(pricing.Request{Provider: "p", Model: "m",
-			Credential: "cred-1", OutputTokens: 1000, Requests: 1, At: now}); err != nil {
-			t.Fatalf("Settle %d: %v", i, err)
-		}
+		attributed += settled(cat, now).SubscriptionNano
 	}
 
-	probe, err := cat.Settle(pricing.Request{Provider: "p", Model: "m",
-		Credential: "cred-1", OutputTokens: 1000, Requests: 1, At: now})
-	if err != nil {
-		t.Fatalf("probe Settle: %v", err)
+	// The same traffic against a catalog no estimate has touched.
+	want := settled(mustPriceCatalog(t, catalog), now).SubscriptionNano
+	if want <= 0 {
+		t.Fatalf("the test is not exercising the hazard: the period accrued %d", want)
 	}
-	share := probe.SubscriptionNano
-	if share <= 0 {
-		t.Fatalf("probe subscription share = %d, want > 0", share)
-	}
-	// share = plan * req / (accumulator + req), so an accumulator of exactly N
-	// requests' marginal cost — one per request, not one per request plus one
-	// nine-times-larger quote — makes the probe's share plan/(N+1).
-	if want := planNano / (requests + 1); share != want {
-		// Inverting the same identity says what the accumulator actually holds.
-		acc := float64(reqNano) * float64(planNano-share) / float64(share)
-		t.Fatalf("probe subscription share = %d, want %d: the accumulator holds "+
-			"%.0f nano-USD after %d requests of %d (%.1fx), so the pre-flight "+
-			"estimate is settling as well as quoting",
-			share, want, acc, requests, reqNano,
-			acc/float64(int64(requests)*reqNano))
+	if attributed != want {
+		t.Fatalf("the settled rows attribute %d nano-USD of the %d this period accrued "+
+			"(%.0f%%): the pre-flight estimate is settling as well as quoting, so the "+
+			"plan share it took belongs to a row that was never written",
+			attributed, want, 100*float64(attributed)/float64(want))
 	}
 }

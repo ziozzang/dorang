@@ -146,8 +146,14 @@ rules:
 // in, and it was replaced outright on every Settle. One row with a timestamp in
 // last month — a backfill, a replay, a clock that stepped back — therefore moved
 // the recorded period backwards, and every subsequent row in the open period
-// found a period that did not match its own, read a to-date of zero, and took
-// the entire plan cost as its share.
+// found a period that did not match its own, read an attributed total of zero,
+// and let the open period attribute its whole plan cost a second time.
+//
+// The late row itself attributes nothing. Its own period is closed: the plan cost
+// was apportioned among the rows settled while it was open, and the accumulator
+// that would say how much is left is gone, so any positive share is an unbounded
+// guess that can take a closed period above its plan cost. Its marginal cost is
+// priced as usual — only the plan share is withheld.
 func TestABackfilledSettlementDoesNotResetThePeriodAccumulator(t *testing.T) {
 	c := mustCatalog(t, `
 currency: USD
@@ -162,34 +168,50 @@ rules:
     amount_per_period: "100.00"
     period: monthly
 `)
-	const (
-		nano     = int64(1_000_000_000)
-		planNano = 100 * nano
-	)
-	now := at(t, "2026-07-15T12:00:00Z")
+	start, end := periodBounds(PeriodMonthly, at(t, "2026-07-15T12:00:00Z"), time.UTC)
+	span := end.Sub(start)
 	req := func(when time.Time) Request {
 		return Request{Provider: "p", Model: "m", Credential: "c1",
 			OutputTokens: 1000, Requests: 1, At: when}
 	}
-
-	for i := 0; i < 4; i++ {
-		if _, err := c.Settle(req(now)); err != nil {
-			t.Fatalf("Settle %d: %v", i, err)
+	settle := func(when time.Time) Cost {
+		t.Helper()
+		cost, err := c.Settle(req(when))
+		if err != nil {
+			t.Fatalf("Settle at %s: %v", when, err)
 		}
-	}
-	// A row from the closed period arrives late.
-	if _, err := c.Settle(req(at(t, "2026-06-30T23:59:00Z"))); err != nil {
-		t.Fatalf("backfilled Settle: %v", err)
+		return cost
 	}
 
-	got, err := c.Settle(req(now))
-	if err != nil {
-		t.Fatalf("Settle after backfill: %v", err)
+	var total int64
+	total += settle(start.Add(span / 4)).SubscriptionNano
+	total += settle(start.Add(span / 2)).SubscriptionNano
+	if want := planNano / 2; total != want {
+		t.Fatalf("half a period of traffic attributed %d, want %d", total, want)
 	}
-	// Four requests of 1 USD are already in this period, so the fifth takes a
-	// fifth of the plan. A reset accumulator would hand it the whole 100.
-	if want := planNano / 5; got.SubscriptionNano != want {
-		t.Fatalf("share after a backfilled row = %d, want %d: the late row reset the "+
-			"open period's accumulator", got.SubscriptionNano, want)
+
+	// A row from the closed period arrives late.
+	late := settle(at(t, "2026-06-30T23:59:00Z"))
+	if late.SubscriptionNano != 0 {
+		t.Fatalf("a row from a closed period attributed %d: the period it belongs to has "+
+			"already apportioned its plan cost, and nothing bounds a further share",
+			late.SubscriptionNano)
+	}
+	if late.MarginalNano != 1_000_000_000 {
+		t.Fatalf("the late row's marginal cost = %d: withholding the plan share must not "+
+			"change what the request itself cost", late.MarginalNano)
+	}
+
+	// The open period carries on from where it was, and still ends at the plan cost.
+	next := settle(start.Add(3 * (span / 4))).SubscriptionNano
+	total += next
+	if want := planNano / 4; next != want {
+		t.Fatalf("the row after a backfilled one attributed %d, want %d: the late row reset "+
+			"the open period's attributed total, and the period is now at %d of a %d plan",
+			next, want, total, planNano)
+	}
+	total += settle(end.Add(-time.Nanosecond)).SubscriptionNano
+	if total != planNano {
+		t.Fatalf("the period attributed %d in total, want exactly the plan cost %d", total, planNano)
 	}
 }

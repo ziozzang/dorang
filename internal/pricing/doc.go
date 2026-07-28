@@ -12,6 +12,12 @@
 //     [Cost.MarginalNano] is the only field routing may read. [Cost.SubscriptionNano] is
 //     imputed accounting: a sunk plan cost must never make a saturated plan look cheap.
 //
+//     The subscription share a row records is an increment of the period's attributed
+//     total, not an estimate of the row's own share of the plan. A period's rows therefore
+//     sum to the plan cost and never to more (§8.1). The formula this replaced divided the
+//     plan cost by usage-to-date per request and let the ledger add the results up, which
+//     reported plan_cost x H_N for N requests — 5.19 plan costs at N = 100.
+//
 //     A fourth class, notional_rate, prices the same traffic at pay-as-you-go list rates
 //     so an operator on a flat-billed plan can still see what the traffic is worth (§8.5).
 //     It lands in [Cost.NotionalNano], which is not a term of [Cost.TotalNano] and reaches
@@ -35,8 +41,8 @@
 //   - [Catalog.Price] is pure. It mutates nothing, takes no lock unless a subscription
 //     rule matches, and is safe to call once per candidate deployment while routing.
 //   - [Catalog.Settle] is the accounting path. It consumes and updates the carried
-//     rounding remainder and the subscription period accumulator, and must be called at
-//     most once per request.
+//     rounding remainder and advances the subscription period's attributed total, and must
+//     be called at most once per request.
 //
 // An unpriced model is not silently free: [Cost.Missing] is set so the caller can
 // increment its counter and warn (§8.3). Silent zero-cost accounting is the failure this

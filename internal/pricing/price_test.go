@@ -50,8 +50,10 @@ func TestSubscriptionDoesNotZeroTokenCost(t *testing.T) {
 		t.Fatalf("a credential-scoped subscription zeroed the model-scoped token cost: "+
 			"marginal = %d, want %d", withPlan.MarginalNano, wantMarginal)
 	}
-	if withPlan.SubscriptionNano != 20_000_000_000 {
-		t.Fatalf("subscription = %d, want 20_000_000_000", withPlan.SubscriptionNano)
+	// 20.00 x 14.5 days of a 31 day month: what the plan has accrued by this instant,
+	// reported separately from the token cost rather than replacing it.
+	if withPlan.SubscriptionNano != 9_354_838_710 {
+		t.Fatalf("subscription = %d, want 9_354_838_710", withPlan.SubscriptionNano)
 	}
 	if withPlan.TotalNano != withPlan.MarginalNano+withPlan.SubscriptionNano+withPlan.AdjustmentNano {
 		t.Fatalf("total %d is not the sum of its parts %+v", withPlan.TotalNano, withPlan)
@@ -96,44 +98,58 @@ rules:
 	}
 }
 
-func TestSubscriptionAmortizationConvergesAndIsPeriodScoped(t *testing.T) {
+// TestSubscriptionSharesAreScopedToTheirPeriod: what a period has attributed belongs to
+// that period. A denser burst inside it takes smaller shares rather than a larger total,
+// and the next period starts from zero rather than from where the last one stopped.
+//
+// The convergence property itself — that a period's shares sum to the plan cost — is
+// TestAPeriodAttributesExactlyThePlanCost.
+func TestSubscriptionSharesAreScopedToTheirPeriod(t *testing.T) {
 	c := mustCatalog(t, planAndTokens)
 	req := Request{
 		Provider: "plan-a", Model: "model-x", Credential: "plan-a-1",
 		InputTokens: 1_000_000, At: at(t, "2026-07-15T12:00:00Z"),
 	}
-	var prev int64
+	// Five settlements one second apart, deep inside a 31 day month.
+	var july int64
 	for i := 1; i <= 5; i++ {
 		cost, err := c.Settle(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// period_cost x (request_marginal / period_marginal_to_date) = 20 / i
-		want := int64(20_000_000_000 / int64(i))
-		if diff := cost.SubscriptionNano - want; diff > 1 || diff < -1 {
-			t.Fatalf("settlement %d: subscription = %d, want ~%d", i, cost.SubscriptionNano, want)
-		}
-		if i > 1 && cost.SubscriptionNano >= prev {
-			t.Fatalf("settlement %d: share did not fall (%d then %d)", i, prev, cost.SubscriptionNano)
-		}
-		prev = cost.SubscriptionNano
+		july += cost.SubscriptionNano
 		if cost.MarginalNano != 850_000_000 {
 			t.Fatalf("settlement %d: marginal = %d", i, cost.MarginalNano)
 		}
+		req.At = req.At.Add(time.Second)
 	}
-	// A request in the next period starts the accumulator over.
+	// 20.00 x 14.5 days of 31 (9.354838710), plus the four seconds the burst spans
+	// (29868 nano), and not a cent more however many requests shared it.
+	if want := int64(9_354_838_710 + 29_868); july != want {
+		t.Fatalf("five settlements attributed %d over four seconds of a month, want %d",
+			july, want)
+	}
+	// A request in the next period starts over: it takes what August has accrued, not
+	// what July had left.
 	next := req
-	next.At = at(t, "2026-08-01T00:00:00Z")
+	next.At = at(t, "2026-08-02T00:00:00Z") // one day into a 31 day August
 	cost, err := c.Settle(next)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cost.SubscriptionNano != 20_000_000_000 {
-		t.Fatalf("new period: subscription = %d, want the whole plan cost", cost.SubscriptionNano)
+	// 20.00 x 1 day of 31, plus the sub-nano remainder July carried into it.
+	if want := int64(645_161_291); cost.SubscriptionNano != want {
+		t.Fatalf("new period: subscription = %d, want %d", cost.SubscriptionNano, want)
 	}
 }
 
-func TestSubscriptionFallsBackToElapsedFractionWhenMarginalIsZero(t *testing.T) {
+// TestSubscriptionAttributionIsUnchangedWithoutAMarginalRule states that the shape of the
+// traffic does not change how a plan cost is attributed: a plan with no marginal_usage
+// rule at all — the usual shape of a flat plan — accrues exactly as one beside a token
+// rule does. This used to be a separate fallback path taken only when the period's
+// marginal usage was zero; it is now the one rule, because a denominator built from
+// usage-to-date cannot bound the total (§8.1).
+func TestSubscriptionAttributionIsUnchangedWithoutAMarginalRule(t *testing.T) {
 	c := mustCatalog(t, `
 rules:
   - id: plan
@@ -142,8 +158,8 @@ rules:
     amount_per_period: "31.00"
     period: monthly
 `)
-	// A month with no marginal usage at all: the share is the elapsed fraction since the
-	// previous settlement, so a whole period's settlements sum to the plan cost.
+	// A month with no marginal usage at all: each share is what the plan accrued since
+	// the previous settlement, so a whole period's settlements sum to the plan cost.
 	req := Request{Credential: "c1", At: at(t, "2026-07-11T00:00:00Z")}
 	cost, err := c.Settle(req)
 	if err != nil {
@@ -311,10 +327,11 @@ rules:
 	if cost.AdjustmentNano != -5_000_000_000 {
 		t.Fatalf("adjustment = %d, want -5e9 (half of the marginal only)", cost.AdjustmentNano)
 	}
-	if cost.SubscriptionNano != 20_000_000_000 {
-		t.Fatalf("subscription = %d", cost.SubscriptionNano)
+	const plan = int64(9_354_838_710) // 20.00 x 14.5 days of a 31 day month
+	if cost.SubscriptionNano != plan {
+		t.Fatalf("subscription = %d, want %d", cost.SubscriptionNano, plan)
 	}
-	if want := int64(10_000_000_000 + 20_000_000_000 - 5_000_000_000); cost.TotalNano != want {
+	if want := 10_000_000_000 + plan - 5_000_000_000; cost.TotalNano != want {
 		t.Fatalf("total = %d, want %d", cost.TotalNano, want)
 	}
 }

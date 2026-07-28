@@ -79,8 +79,8 @@ func (c *Catalog) Price(req Request) (Cost, error) {
 
 // Settle prices one request and records it: the sub-nano rounding remainder is carried
 // into the next settlement of the same bucket (Request.Settlement, defaulting to the
-// credential), and the request's marginal cost is added to the subscription period
-// accumulator that amortization divides by.
+// credential), and the subscription period's attributed total is advanced by the share
+// this row takes, so no later row attributes it a second time.
 //
 // Call it at most once per request, from the accounting path. Routing must call Price.
 func (c *Catalog) Settle(req Request) (Cost, error) {
@@ -111,7 +111,10 @@ func (c *Catalog) Explain(req Request) Explanation {
 	}
 	if cost.SubscriptionNano != 0 {
 		ex.Notes = append(ex.Notes,
-			"the subscription share is imputed for accounting; routing compares MarginalNano only")
+			"the subscription share is the plan cost this period has accrued since the previous "+
+				"settlement, not a per-request estimate of the whole: the period's shares sum to "+
+				"the plan cost and never exceed it. It is imputed for accounting; routing "+
+				"compares MarginalNano only")
 	}
 	if cost.Floored {
 		ex.Notes = append(ex.Notes,
@@ -165,13 +168,14 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		})
 	}
 
-	// fixed_subscription: the most specific rule wins, then it is amortized.
+	// fixed_subscription: the most specific rule wins, then this request takes the share
+	// of the plan cost that has accrued since the previous settlement.
 	if ex != nil {
 		trace = &ex.Classes[ClassSubscription]
 	}
 	var subscription amt
 	if sub := c.idx[ClassSubscription].selectWinner(req, at, &ev.examined, trace); sub != nil {
-		s, err := c.subscriptionShare(sub, marginal, at, settle)
+		s, err := c.subscriptionShare(sub, at, settle)
 		if err != nil {
 			return Cost{}, err
 		}
@@ -480,15 +484,22 @@ func gradedInput(r *rule, req *Request, comps *[]Component) (amt, error) {
 	return total, nil
 }
 
-// subscriptionShare amortizes a plan cost onto this request, using the one formula §8.1
-// fixes: period_cost x (request_marginal / period_marginal_to_date), falling back to the
-// elapsed fraction of the period when the period's marginal is zero.
+// subscriptionShare attributes part of a fixed plan cost to this request (§8.1).
 //
-// The denominator includes this request, so the share is defined for the first request of
-// a period (it takes the whole plan cost) and falls as the period accumulates usage. That
-// is inherent to attributing a fixed cost before the period ends, and it is exactly why
-// this number is accounting-only and never reaches routing.
-func (c *Catalog) subscriptionShare(r *rule, marginal amt, at time.Time, mutate bool) (amt, error) {
+// What this request records is an INCREMENT of the period's attributed total, not an
+// independent estimate of its own share. The period carries the total it has attributed so
+// far; this request records the amount that brings that total up to the plan cost accrued
+// by now. The period's rows therefore sum to the attributed total by construction, the
+// total is bounded by the plan cost, and no settled row is ever restated.
+//
+// The formula this replaces charged request i a share of plan_cost x (request_marginal /
+// marginal_to_date) and the ledger added those up. Each of those shares is an estimate of
+// the same quantity, and estimates of one quantity must supersede one another rather than
+// accumulate: summing them made a period of N equal requests report plan_cost x H_N — 519
+// USD of a 100 USD plan at N = 100, 749 at N = 1000, with no bound. Every figure derived
+// from it (per-key attribution, per-team chargeback, the notional-versus-actual comparison
+// §8.5 exists for) was wrong by a factor that grew with traffic.
+func (c *Catalog) subscriptionShare(r *rule, at time.Time, mutate bool) (amt, error) {
 	st := c.subs[r.id]
 	if st == nil { // not reachable for a compiled catalog; defensive.
 		return amt{}, errors.New("pricing: subscription state missing")
@@ -499,89 +510,77 @@ func (c *Catalog) subscriptionShare(r *rule, marginal amt, at time.Time, mutate 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 	}
-	var (
-		toDate u128
-		last   time.Time
-	)
-	if cur := st.snap.Load(); cur != nil && cur.periodStart.Equal(start) {
-		toDate, last = cur.marginal, cur.last
+	var attributed u128
+	if cur := st.snap.Load(); cur != nil {
+		switch {
+		case cur.periodStart.Equal(start):
+			attributed = cur.attributed
+		case cur.periodStart.After(start):
+			// The instant falls in a period the accumulator has already moved past
+			// — a backfill, a replayed row, a clock that stepped back. That
+			// period's plan cost was apportioned among the rows settled while it
+			// was open, and the accumulator that would say how much of it is left
+			// is gone. A late row therefore attributes nothing: with no state to
+			// bound it, any positive share could take the closed period above the
+			// plan cost, which is precisely the defect this shape removes. The
+			// row's marginal cost is real and is priced as usual; only the plan
+			// share is withheld.
+			//
+			// It must also not become the state of the subscription. Storing it
+			// would move periodStart backwards, and the next request in the OPEN
+			// period would find a period that does not match its own, read an
+			// attributed total of zero, and let the open period accrue its whole
+			// plan cost a second time.
+			return amt{}, nil
+		}
 	}
 
-	share, err := amortize(r.amountAtto, marginal.m, toDate, at, start, end, last)
+	accrued, err := accrue(r.amountAtto, at, start, end)
 	if err != nil {
 		return amt{}, err
 	}
-
+	if accrued.cmp(attributed) <= 0 {
+		// Nothing has accrued since the last row took its share: two rows at the same
+		// instant, or a row that arrives out of order inside the open period. Zero,
+		// never negative — a settled row is not restated, and a negative share would
+		// hand budget and quota back exactly as a negative total would.
+		return amt{}, nil
+	}
+	share, _ := accrued.sub(attributed)
 	if mutate {
-		// A settlement whose instant falls in a period that has already closed —
-		// a backfill, a replayed row, a clock that stepped back — is priced
-		// against its own period, but it must not become the state of the
-		// subscription. Storing it would move periodStart backwards, and the
-		// next request in the OPEN period would then find a period that does not
-		// match its own, read a to-date of zero, and take the whole plan cost
-		// again: one late row would reset the accumulator every other row in the
-		// period is divided by.
-		if cur := st.snap.Load(); cur != nil && cur.periodStart.After(start) {
-			return attoAmt(share), nil
-		}
-		sum, ok := toDate.add(marginal.m)
-		if !ok {
-			return amt{}, ErrOverflow
-		}
-		st.snap.Store(&subSnapshot{periodStart: start, marginal: sum, last: at})
+		st.snap.Store(&subSnapshot{periodStart: start, attributed: accrued})
 	}
 	return attoAmt(share), nil
 }
 
-func amortize(amount, reqMarginal, toDate u128, at, start, end, last time.Time) (u128, error) {
-	if amount.isZero() {
+// accrue returns how much of a period's plan cost exists to be attributed at instant at.
+//
+// A fixed plan buys a PERIOD, so the fraction of the period that has passed is the
+// fraction of the plan cost that has been incurred. That denominator is known in advance,
+// which is what makes the result bounded. Usage-to-date cannot serve as one: a period's
+// total usage is unknowable until the period closes, every mid-period estimate of it is
+// too small, and dividing by a denominator that is too small is what over-attributed every
+// request and produced the harmonic sum. The exact usage-weighted apportionment is still
+// available — it is a rollup over the ledger's marginal column once the period has closed
+// — but a per-request column settled in real time cannot wait for it.
+//
+// The clamp on elapsed is where "a period never attributes more than the plan cost" is
+// enforced. Price, Settle and Explain all reach the subscription figure through this one
+// function, so there is no call site left to forget it: the same shape as the floor under
+// TotalNano, which caught a third caller nobody had named.
+func accrue(amount u128, at, start, end time.Time) (u128, error) {
+	span := end.Sub(start)
+	if amount.isZero() || span <= 0 {
 		return u128{}, nil
 	}
-	total, ok := toDate.add(reqMarginal)
-	if !ok {
-		return u128{}, ErrOverflow
+	elapsed := at.Sub(start)
+	if elapsed < 0 {
+		elapsed = 0
 	}
-	if total.isZero() {
-		// No marginal usage to apportion by: fall back to the elapsed fraction of the
-		// period since the last settlement, which sums to the plan cost over the period.
-		base := last
-		if base.Before(start) {
-			base = start
-		}
-		elapsed := at.Sub(base)
-		if elapsed < 0 {
-			elapsed = 0
-		}
-		span := end.Sub(start)
-		if span <= 0 {
-			return u128{}, nil
-		}
-		if elapsed > span {
-			elapsed = span
-		}
-		v, _, ok := amount.mulDiv(uint64(elapsed), uint64(span))
-		if !ok {
-			return u128{}, ErrOverflow
-		}
-		return v, nil
+	if elapsed >= span {
+		return amount, nil // the cap: a whole plan cost, and never more than one
 	}
-	// Reduce the ratio to 64 bits, keeping 63 significant bits of the denominator. The
-	// ratio of two accumulated amounts is not an exact decimal in general; this is the
-	// one place the result is an approximation, it is bounded at 1 part in 2^62, and it
-	// is accounting-only.
-	shift := 0
-	if bl := total.bitLen(); bl > 63 {
-		shift = bl - 63
-	}
-	num := reqMarginal.shr(uint(shift))
-	den := total.shr(uint(shift))
-	if den.hi != 0 || den.isZero() {
-		return u128{}, ErrOverflow
-	}
-	if num.hi != 0 {
-		return u128{}, ErrOverflow
-	}
-	v, _, ok := amount.mulDiv(num.lo, den.lo)
+	v, _, ok := amount.mulDiv(uint64(elapsed), uint64(span))
 	if !ok {
 		return u128{}, ErrOverflow
 	}

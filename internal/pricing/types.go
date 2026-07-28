@@ -12,8 +12,9 @@ const (
 	// ClassMarginal is per-token, per-request, per-character or per-second cost.
 	// The most specific matching rule wins.
 	ClassMarginal Class = iota
-	// ClassSubscription is plan cost that does not depend on this request.
-	// The most specific matching rule wins, then the plan cost is amortized.
+	// ClassSubscription is plan cost that does not depend on this request. The most
+	// specific matching rule wins, then the plan cost is attributed as it accrues over
+	// its period, so a period's shares sum to it and never exceed it (§8.1).
 	ClassSubscription
 	// ClassAdjustment is a discount, margin or tax. Every matching rule applies, in order.
 	ClassAdjustment
@@ -366,7 +367,13 @@ type Cost struct {
 	// MarginalNano is what this request costs at the margin. Routing uses this, and only
 	// this: a sunk subscription cost must not make a saturated plan look cheap.
 	MarginalNano int64
-	// SubscriptionNano is the amortized share of a fixed plan cost. Accounting only.
+	// SubscriptionNano is this request's share of a fixed plan cost. Accounting only.
+	//
+	// It is the plan cost the period has accrued since the previous settlement, so the
+	// shares recorded across a period sum to the plan cost and never exceed it (§8.1).
+	// It is not an estimate of "the plan cost divided by the requests so far" — that
+	// number, summed over N requests, reports the plan cost N-times-over-counted as
+	// plan_cost x H_N, which is the defect this field's definition was changed to remove.
 	SubscriptionNano int64
 	// AdjustmentNano is the net effect of all adjustment rules; negative for a discount.
 	AdjustmentNano int64

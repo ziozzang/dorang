@@ -163,12 +163,13 @@ func TestNotionalNeverChangesTheBill(t *testing.T) {
 	}
 	// An adjustment is a billing construct: a 50% discount on the bill must not discount
 	// what the traffic is worth at list rates. The discount is half of the 1.00 of tokens
-	// plus the 20.00 amortized plan, and the 99.00 estimate is untouched by it.
-	if withNotional.AdjustmentNano != -10_500_000_000 {
+	// plus the 9.354838710 the 20.00 plan has accrued by mid-month, and the 99.00 estimate
+	// is untouched by it.
+	if withNotional.AdjustmentNano != -5_177_419_355 {
 		t.Fatalf("adjustment = %d", withNotional.AdjustmentNano)
 	}
-	if withNotional.TotalNano != 10_500_000_000 {
-		t.Fatalf("total = %d, want 10.5e9", withNotional.TotalNano)
+	if withNotional.TotalNano != 5_177_419_355 {
+		t.Fatalf("total = %d, want 5_177_419_355", withNotional.TotalNano)
 	}
 
 	// Settling must not move the notional figure into the ledger's billed total either.

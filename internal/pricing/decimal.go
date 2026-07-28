@@ -69,24 +69,11 @@ func (a u128) sub(b u128) (u128, bool) {
 	return u128{hi: hi, lo: lo}, br2 == 0
 }
 
-func (a u128) shr(n uint) u128 {
-	switch {
-	case n == 0:
-		return a
-	case n >= 128:
-		return u128{}
-	case n >= 64:
-		return u128{lo: a.hi >> (n - 64)}
-	}
-	return u128{hi: a.hi >> n, lo: a.lo>>n | a.hi<<(64-n)}
-}
-
-func (a u128) bitLen() int {
-	if a.hi != 0 {
-		return 64 + bits.Len64(a.hi)
-	}
-	return bits.Len64(a.lo)
-}
+// shr and bitLen used to live here. Their only caller was the amortization ratio, which
+// reduced two accumulated 128-bit amounts to 64 bits and was the one approximation in the
+// price path (bounded at 1 part in 2^62). §8.1's plan cost now accrues against the period,
+// whose span is a duration that already fits in 64 bits, so the reduction — and with it the
+// only inexact step before the final half-to-even rounding — is gone.
 
 // mulDiv computes a*b/d at 192-bit intermediate width, returning the quotient, the exact
 // remainder, and whether the quotient fits in 128 bits. This is the only multiplication
