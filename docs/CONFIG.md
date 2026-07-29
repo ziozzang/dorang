@@ -1317,8 +1317,8 @@ droppable, with the drop counted.
 | `flush_interval` | duration | `250ms` | How often counters merge and the spool ships | Zero or negative is refused. It is also the window over which a crash loses precision: quota rings and rollups are reconstructible from their last upsert plus the ledger, so losing the tail costs precision rather than correctness, and this interval is how much |
 
 **Measured cost of metering:** +148 ns steady state and **+110 ns at a full buffer**, which is
-0.031% of the measured 480 µs warm-local p50 budget (DESIGN §15.1; it was published as
-200 µs and never measured until `testing/perf` measured it). The full buffer being *cheaper* is the split working
+0.039% of the measured 375 µs warm-local p50 budget (DESIGN §15.1; it was published as
+200 µs and never measured until `testing/perf` measured it, then corrected twice). The full buffer being *cheaper* is the split working
 as designed — a failed ring push skips the payload copy while the numeric path does identical
 work. Note that "metering on vs off < 5%" needed a denominator: against a no-op meter the ratio
 is 7.6×, but the no-op returns after one branch, so dividing by it measures nothing about a real

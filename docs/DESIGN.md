@@ -692,7 +692,7 @@ one is a place a plausible reading produces broken behavior.
    11 in the worst case, against a hole that was previously unbounded. Cost is one idled unit
    per claimed axis key, and measured **+5.3%** on the mixed contended workload that provokes
    it, nil on single-axis contention (which never claims). On by default; capacity acquisition
-   is ~450 ns against §15.1's measured 480 µs budget, so the trade is a liveness guarantee for a
+   is ~450 ns against §15.1's measured 375 µs budget, so the trade is a liveness guarantee for a
    fraction of a percent of the gateway.
 
 6. **Check order.** §5.3 and §5.7 stated different orders. §5.7's is authoritative because it
@@ -3594,19 +3594,19 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 
 | Profile | p50 | p99 | Notes |
 |---|---|---|---|
-| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | **480 µs** | 2 ms | headline, **measured**; was published as 200 µs, see below |
+| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | **375 µs** | 2 ms | headline, **measured**; was published as 200 µs, corrected to 480 µs, and now 375 µs because the codec got faster — see below |
 | `cold-auth` — auth cache miss, one store read | — | 15 ms | |
 | `shared-redis` — clustered exact capacity | — | 5 ms | +1 RTT, deliberate |
 | `external-auth` — delegated auth | — | governed by the callee | stated, not promised |
 | `lua-enabled` — hooks active | — | +hook ceiling | ceiling is configured |
-| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | **55 ms / 852 ms** | **measured**; published as 6 ms / 60 ms, and misnamed — see below |
+| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | **34 ms / 512 ms** | **measured**; published as 6 ms / 60 ms, and misnamed — see below |
 
 | Other | Target | Measured |
 |---|---|---|
-| Added TTFT, streaming | p99 < 1 ms | **p99 648 µs** — holds |
+| Added TTFT, streaming | p99 < 1 ms | **p99 600 µs** — holds |
 | Idle RSS, notebook profile | < 100 MB | **62 MB** including the load generator and a fake backend in the same process — holds |
 | 1000 concurrent streams | < 300 MB **including** the replay budget (§15.4) | **256 MB** for three participants in one address space — holds, with the gateway's own share strictly less |
-| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.031%** of the measured 480 µs warm-local p50 |  |
+| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.039%** of the measured 375 µs warm-local p50 |  |
 
 > **"5%" needed a denominator.** An earlier draft said only "metering on vs off < 5%", which never
 > said 5% *of what*. Measured against a no-op meter the ratio is **7.6×** — but the no-op returns after
@@ -3616,9 +3616,9 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 > metering is *cheaper* (110 ns), because a failed ring push skips the payload copy while the numeric
 > path does identical work. That asymmetry is the two-queue split (§12.1) behaving as designed.
 >
-> The gate's absolute bound stayed at **10 µs** when the budget above was corrected from 200 µs to
-> 480 µs. 5% of the corrected figure would be 24 µs, and a bound that loosens because the thing it
-> is a fraction of got slower is a ratchet pointing the wrong way.
+> The gate's absolute bound stayed at **10 µs** through both corrections of the budget above — up
+> from 200 µs to 480 µs, then down to 375 µs. 5% of either figure would be looser than 10 µs, and a
+> bound that moves because the thing it is a fraction of moved is a ratchet, not a bound.
 
 #### The 200 µs p50 was never measured, and it does not hold
 
@@ -3633,16 +3633,16 @@ fixed sleep, would not survive a streaming relay whose work is interleaved with 
 Measured on a 16-core AMD Ryzen 7 8745HS, warm, prefix on, metering with traces at full
 sampling, 100 pricing rules loaded, two deployments competing, four concurrent clients:
 
-| request body | p50 | p90 | p99 |
-|---|---|---|---|
-| 256 B | 191 µs | 276 µs | 367 µs |
-| 1 KiB | 248 µs | 337 µs | 457 µs |
-| **4 KiB** (the profile's stated ceiling) | **492 µs** | 656 µs | **855 µs** |
-| 16 KiB (outside the profile) | 1.27 ms | 1.65 ms | 2.03 ms |
+| request body | p50 | p90 | p99 | p50 before the codec fix below |
+|---|---|---|---|---|
+| 256 B | 158 µs | 232 µs | 344 µs | 186 µs |
+| 1 KiB | 198 µs | 279 µs | 382 µs | 251 µs |
+| **4 KiB** (the profile's stated ceiling) | **355 µs** | 475 µs | **635 µs** | 469 µs |
+| 16 KiB (outside the profile) | 1.04 ms | 1.40 ms | 1.74 ms | 1.18 ms |
 
 So the published 200 µs held for a request of a few hundred bytes and was never true at the
-4 KiB the profile names. The p99 of 2 ms holds with better than a factor of two, and the p99 is
-the number an operator notices: a p50 is a story about the machine, a p99 is a story about a
+4 KiB the profile names. The p99 of 2 ms holds with better than a factor of three, and the p99
+is the number an operator notices: a p50 is a story about the machine, a p99 is a story about a
 client that timed out.
 
 **Where it goes.** Every configurable feature is free: measured with each of prefix affinity,
@@ -3650,11 +3650,60 @@ trace metering, a 100-rule price catalog and a second deployment turned on and o
 arm moved the p50 outside the noise (341 µs bare, 344 µs with all four). The cost is the four
 JSON passes a cross-protocol gateway makes over the body — decode the client's request into the
 canonical form, encode the upstream's, decode the upstream's response, encode the client's —
-and they are ~85% of the CPU the request path burns. `internal/wire/openai.DecodeRequest` alone
-runs at **31 MB/s with 143 allocations per KiB**, because each wire type's `UnmarshalJSON`
-parses its own bytes twice: once into the struct and once into a `map[string]json.RawMessage`
-to split the unmodelled members out (`wirejson.SplitExtra`). That is the whole of the slope in
-the table above, and it is where a p50 improvement would have to come from.
+and they are ~85% of the CPU the request path burns. That fraction has not moved; what the
+passes cost has.
+
+#### Two of those passes were the same bytes read twice, and are gone
+
+The last column above is what this profile measured before the change described here. Nothing
+about the architecture changed: it is still four passes, still `encoding/json`, still no new
+dependency. Two pieces of pure duplication were removed from inside them.
+
+**The Extra split was a second full parse per nesting level.** Every wire type with an `Extra`
+map decoded its own bytes twice — once into the struct, and once more into a
+`map[string]json.RawMessage` so the members the struct does not model survive the crossing
+(§10.5a). Because *every* type did it, a chat request paid it at the request, at each message
+and at each content part; and because `json.Unmarshal` into a map materializes the value of
+every member, the largest thing it copied was `messages` — nearly the whole body — which the
+next line deleted again as a modelled key. `wirejson.SplitExtra` is now a structural walk of
+the top level that skips modelled values and allocates only for members that survive: **0
+allocations** on a body whose members are all modelled, against 20 allocations and a copy of
+the body before.
+
+**The top-level `json.Unmarshal` walked the body twice to hand it to a method that already
+had it.** `json.Unmarshal(b, v)` where `v` decodes itself runs `checkValid` over the whole
+document and then the decoder's `skip()` over it again, purely to slice out the bytes it was
+passed, before calling `v.UnmarshalJSON` — which validates a third time. `wirejson.UnmarshalSelf`
+validates once and calls the method. It is *not* `v.UnmarshalJSON(b)`: the differential fuzzer
+found that dropping the validation makes `{"Model":A}` decode cleanly, because COMPATIBILITY
+2.0's filter excises the case-colliding member before the malformed value is ever looked at,
+and a body no other parser accepts must not become a body dorang forwards.
+
+| | before | after |
+|---|---|---|
+| `openai.DecodeRequest`, 1 KiB | 31 MB/s, 143 allocs, 12.4 KB | **57 MB/s, 65 allocs, 6.4 KB** |
+| `openai.DecodeRequest`, 32 KiB | 35 MB/s, 2 092 allocs | **62 MB/s, 1 042 allocs** |
+| `openai.DecodeRequest`, 400 KiB | 36 MB/s, 25 112 allocs | **62 MB/s, 12 555 allocs** |
+| one dispatched 4 KiB request | 391 allocs, 71 KB | **262 allocs, 55 KB** |
+| throughput ceiling (§15.3) | 20 489 req/s | **23 532 req/s** |
+
+Both are pinned by differential tests rather than by argument — `wirejson`'s
+`FuzzSplitExtra` and each adapter's `FuzzDirectDecode` run the new form and the one it
+replaced over arbitrary bytes and require the same members, the same values and the same error
+text. The strict-decode differential (`canonical.FuzzGateAdapterAgreement`) and the gate's own
+(`server.FuzzPeekRequest`) are unchanged and still pass, which is what says W10 survived.
+
+**What is left is the encode side, and it is the same shape of problem.** With decode halved,
+`MarshalRequest` is now the largest single component of the request path — ~35% of it, against
+decode's ~34% — and one function inside it, `encoding/json.appendCompact`, is **34% of the
+request path on its own**. Every nested type's `MarshalJSON` returns a byte slice, and
+`encoding/json` re-scans and copies that slice into the output buffer, once per nesting level:
+the same "read the same bytes again to satisfy an interface" that decode had, in the other
+direction. It is the `json.Marshaler` contract, not a defect, and removing it means not
+implementing `MarshalJSON` on nested types — a much larger change than this one, and one that
+would put the byte-exact serializer contract (COMPATIBILITY 2.1a) at risk to buy it. It is
+named here so that the next person measuring this starts where the cost is rather than where it
+used to be.
 
 **The measurement depends on the offered rate, and the profile should say so.** The same gateway
 doing the same work measured 259 µs at 1585 req/s, 347 µs at 558 req/s and 510 µs at 344 req/s
@@ -3664,11 +3713,11 @@ without one is the kind of unfalsifiable number the top of this section refuses.
 
 #### The large-body rows were wrong by an order of magnitude, and misnamed
 
-| profile | published p99 | measured p99 |
-|---|---|---|
-| 256 KiB | — | 17.8 ms |
-| `prefix-1MiB` | 6 ms | **55 ms** |
-| `prefix-16MiB` | 60 ms | **852 ms** |
+| profile | published p99 | measured p99 | measured before the codec fix |
+|---|---|---|---|
+| 256 KiB | — | 10.1 ms | 14.8 ms |
+| `prefix-1MiB` | 6 ms | **34 ms** | 45 ms |
+| `prefix-16MiB` | 60 ms | **512 ms** | 682 ms |
 
 The name is the more useful defect. **The prefix chain is about 1% of these figures.** Its own
 benchmark puts a 16 MiB chain at **7.1 ms and 728 B in 17 allocations**, running at 2.36 GB/s —
@@ -3688,9 +3737,9 @@ configuration names and this note says what is actually in them.
    > **This says "gate", not "hot path", and the change is a correction.** It read "no
    > allocation on the hot path", which was never true of a request that gets dispatched.
    > Measured end to end (`testing/perf`, `BenchmarkGatewayRequest` minus its no-gateway
-   > control) one 4 KiB non-streaming request allocates about **390 objects and 71 KB** — 16×
-   > the request body. Essentially all of it is the four JSON passes of §15.1's note, and none
-   > of it is in the gate. The claim was true about the code it was written about and false
+   > control) one 4 KiB non-streaming request allocates about **262 objects and 55 KB** — 13×
+   > the request body, down from 391 and 71 KB before §15.1's codec fix. Essentially all of it
+   > is the four JSON passes of §15.1's note, and none of it is in the gate. The claim was true about the code it was written about and false
    > about the sentence it was written in, which is the failure mode this document exists to
    > avoid.
 3. **Single-pass, no-decode streaming relay [R1-C1]** — upstream SSE frames are scanned,
@@ -3721,26 +3770,29 @@ state. Two numbers are reported separately and both must hold:
 with a 5 ms think time and 4 KiB bodies, and reports where it stops scaling. On a 16-core
 Ryzen 7 8745HS, with the load generator and the fake backend in the same process:
 
-| concurrent clients | req/s | overhead p50 | overhead p99 |
-|---|---|---|---|
-| 1 | 155 | 711 µs | 1.13 ms |
-| 16 | 2 419 | 793 µs | 1.45 ms |
-| 64 | 10 138 | 407 µs | 1.24 ms |
-| **128** | **19 607** | 423 µs | 3.21 ms |
-| 256 | 20 417 | 424 µs | 5.99 ms |
-| 512 | 19 606 | 435 µs | 18.50 ms |
+| concurrent clients | req/s | overhead p50 | overhead p99 | req/s before the codec fix |
+|---|---|---|---|---|
+| 1 | 159 | 535 µs | 877 µs | 153 |
+| 16 | 2 471 | 607 µs | 1.22 ms | 2 381 |
+| 64 | 10 227 | 316 µs | 1.09 ms | 10 027 |
+| **128** | **21 246** | 310 µs | 1.57 ms | 20 117 |
+| 256 | **23 532** | 320 µs | 6.33 ms | 20 489 |
+| 512 | 22 076 | 332 µs | 18.37 ms | 19 268 |
 
 Throughput is linear in offered concurrency to about 128 clients and flat after it. The knee is
 sharper in the p99 than in the throughput, which is what an operator sees first: past it, extra
-concurrency buys queueing and nothing else.
+concurrency buys queueing and nothing else. The knee moved out from 128 clients to 256 and the
+plateau rose about 15% when §15.1's codec duplication came out, which is what a CPU-bound
+ceiling does when the CPU gets cheaper.
 
 **What holds it there is CPU, and the CPU is JSON.** At the knee the three participants together
 saturate the machine, and 85% of the request path's own cycles are the four codec passes of
-§15.1. It is not a lock. Mutex profiles taken in steady state at the knee — after warm-up, so
+§15.1 — a share that did not move when those passes were made ~1.8× cheaper, which is the
+clearest statement available that the ceiling is the codec and nothing else. It is not a lock. Mutex profiles taken in steady state at the knee — after warm-up, so
 the connection-pool and SQLite cold starts are excluded — put the largest identified contention
 inside `capacity.Broker`, reached three or more times per request (`TryAcquire`, `Release`, and
 once per candidate from `least_busy`), and even that is smaller than the Go allocator's heap
-lock, which is itself a consequence of the 390 allocations per request rather than a cause.
+lock, which is itself a consequence of the 262 allocations per request rather than a cause.
 None of `internal/prefix`'s table, `internal/meter`'s ring or the auth snapshot appears at all.
 
 > **`least_busy` takes one turn at the broker's single mutex per candidate**, so the routing
@@ -3755,8 +3807,10 @@ None of `internal/prefix`'s table, `internal/meter`'s ring or the auth snapshot 
 > and touches that lock about 1% of the time.
 
 **Footprint follows the allocation rate, not the concurrency.** At the knee the heap in use is
-about 600 MB against 66 MB live after collection — Go's pacer doing its job against a 1.3 GB/s
-allocation rate (20k req/s × 65 KB), not a leak. With a thousand streams held genuinely open
+about 740 MB against 66 MB live after collection — Go's pacer doing its job against a 1.3 GB/s
+allocation rate (23.5k req/s × 55 KB), not a leak. Halving the allocations per request did not
+halve the heap at the knee, because the throughput rose to spend them: the pacer sizes against
+the allocation RATE, and that is roughly where it was. With a thousand streams held genuinely open
 the resident set is 256 MB (§15.1). An operator who needs a smaller heap at high throughput
 sets `GOGC` or `GOMEMLIMIT`; an operator who needs both wants the codec passes reduced.
 

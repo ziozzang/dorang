@@ -780,7 +780,6 @@ func TestRollingRestartOfTwoNodesLosesNoRequest(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // DESIGN 11.2c: revocation propagates within the published bound
 // ---------------------------------------------------------------------------

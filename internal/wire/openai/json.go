@@ -44,11 +44,23 @@ func marshalTo(dst *bytes.Buffer, v any) error { return wirejson.MarshalTo(dst, 
 func strictUnmarshal(b []byte, v any) error { return canonical.StrictUnmarshal(b, v) }
 
 // strictBytes is [strictUnmarshal]'s filter on its own, for the UnmarshalJSON
-// methods that must decode the SAME bytes twice — once into the struct and once
-// into the raw member map that feeds Extra. Filtering once and using the result
-// for both is what keeps a dropped key from reappearing in Extra and being
-// relayed to the next hop.
+// methods that read the SAME bytes twice — once with encoding/json to fill the
+// struct, and once with [wirejson.SplitExtra]'s structural walk to collect the
+// members the struct does not model. Filtering once and using the result for
+// both is what keeps a dropped key from reappearing in Extra and being relayed
+// to the next hop.
 func strictBytes(b []byte, v any) []byte { return canonical.StrictBytes(b, v) }
+
+// decodeSelf decodes b with v's own UnmarshalJSON.
+//
+// It is not a shortcut around the strict filter — every type it is used with
+// calls [strictBytes] as the first thing its method does, so COMPATIBILITY 2.0
+// applies exactly as before. What it skips is encoding/json handing v bytes that
+// were already v's: json.Unmarshal validates the document and then walks it
+// again to find where it ends, before calling the method that validates it once
+// more. See [wirejson.UnmarshalSelf] for the precondition and for the
+// differential that pins every application of it.
+func decodeSelf(b []byte, v json.Unmarshaler) error { return wirejson.UnmarshalSelf(b, v) }
 
 func getBuf() *bytes.Buffer  { return wirejson.GetBuf() }
 func putBuf(b *bytes.Buffer) { wirejson.PutBuf(b) }

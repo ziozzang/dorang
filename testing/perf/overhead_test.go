@@ -38,9 +38,13 @@ import (
 // The p50 was published as 200 µs and was never measured end to end. It holds
 // for a request of a few hundred bytes and not at the profile's stated 4 KiB
 // ceiling, where the four JSON passes over the body dominate everything else.
-// The p99 was published as 2 ms and holds with better than a factor of two.
+// This figure has now been corrected twice: up to 480 µs when it was first
+// measured here, and back down to 375 µs when two duplicate parses came out of
+// those four passes (§15.1, "Two of those passes were the same bytes read
+// twice"). It is still the codec that sets it. The p99 was published as 2 ms and
+// holds with better than a factor of three.
 const (
-	warmLocalP50 = 480 * time.Microsecond
+	warmLocalP50 = 375 * time.Microsecond
 	warmLocalP99 = 2 * time.Millisecond
 )
 
@@ -50,7 +54,11 @@ const (
 // passes anything is the disagreement check below — a machine that cannot
 // answer is skipped rather than accommodated, which is how a gate stays a gate
 // instead of drifting upward every time CI is loaded.
-const p50Bound = 900 * time.Microsecond
+//
+// It came DOWN from 900 µs with the budget, which is the direction a bound
+// derived from a measurement has to move when the measurement improves. A
+// ceiling left where it was would stop catching the regression it exists for.
+const p50Bound = 750 * time.Microsecond
 
 // measurable is how far two measurements of the same thing may differ before
 // the host is judged unable to answer. Same instrument and same reasoning as
@@ -224,6 +232,10 @@ func TestTheInstrumentSeparatesTheUpstream(t *testing.T) {
 // JSON passes over the body (client decode, upstream encode, upstream decode,
 // client encode). An operator sizing a deployment needs the slope, not the
 // intercept.
+//
+// The slope is what moved when the duplicate parses inside those passes came
+// out: 186/251/469/1179 µs before, 158/198/355/1037 after. The intercept barely
+// moved, because the intercept was never the codec.
 func TestGatewayOverheadByBodySize(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: this is a measurement, not a unit test")
@@ -266,11 +278,11 @@ func TestGatewayOverheadByBodySize(t *testing.T) {
 // TestGatewayOverheadLargeBodies measures §15.1's `prefix-1MiB` and
 // `prefix-16MiB` rows, published as p99 6 ms and 60 ms.
 //
-// Neither holds, and the row is misnamed as well as wrong: the prefix chain is
-// not the cost. `internal/prefix`'s own benchmark puts a 16 MiB chain at 7.1 ms
-// and 728 B — about 1% of the measured figure — while the four JSON passes over
-// the body are the other 99%. A profile named after the cheap component invites
-// exactly the wrong optimization.
+// Neither holds — 34 ms and 512 ms measured — and the row is misnamed as well as
+// wrong: the prefix chain is not the cost. `internal/prefix`'s own benchmark
+// puts a 16 MiB chain at 7.1 ms and 728 B — about 1% of the measured figure —
+// while the four JSON passes over the body are the other 99%. A profile named
+// after the cheap component invites exactly the wrong optimization.
 //
 // The 16 MiB arm is opt-in because it takes the better part of a minute. Set
 // DORANG_PERF_16MIB=1.

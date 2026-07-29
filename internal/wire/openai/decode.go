@@ -51,7 +51,10 @@ func (o *DecodeOptions) warn() WarnFunc {
 // none into the backend. See [strictUnmarshal].
 func DecodeRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := strictUnmarshal(b, &w); err != nil {
+	// [decodeSelf], not strictUnmarshal: Request.UnmarshalJSON applies the strict
+	// filter itself, and going through json.Unmarshal to reach it costs two extra
+	// walks of the whole body.
+	if err := decodeSelf(b, &w); err != nil {
 		return nil, err
 	}
 	return RequestToCanonical(&w)
@@ -340,7 +343,7 @@ func splitDataURL(s string) (mediaType, data string, ok bool) {
 
 // DecodeResponse parses a non-streaming completion into the neutral form.
 //
-// This is json.Unmarshal and not [strictUnmarshal] on purpose. The bytes are a
+// This does NOT apply the strict filter, on purpose. The bytes are a
 // backend's, not a caller's: a differently-cased key here is a vendor quirk
 // that can lose usage counts if refused and cannot bypass authorization if
 // accepted, because nothing is authorized against a response. [Message] is
@@ -357,7 +360,7 @@ func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 		return DecodeResponsesResponse(b, opt)
 	}
 	var w Response
-	if err := json.Unmarshal(b, &w); err != nil {
+	if err := decodeSelf(b, &w); err != nil {
 		return nil, err
 	}
 	if !IsChatCompletion(&w) {

@@ -32,7 +32,10 @@ func (o *DecodeOptions) warn() WarnFunc {
 // through the authorization gate.
 func DecodeRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := strictUnmarshal(b, &w); err != nil {
+	// [decodeSelf], not strictUnmarshal: Request.UnmarshalJSON applies the strict
+	// filter itself, and going through json.Unmarshal to reach it costs two extra
+	// walks of the whole body.
+	if err := decodeSelf(b, &w); err != nil {
 		return nil, err
 	}
 	if w.MaxTokens == nil {
@@ -49,7 +52,7 @@ func DecodeRequest(b []byte) (*canonical.Request, error) {
 // (COMPATIBILITY 6.9).
 func DecodeCountTokensRequest(b []byte) (*canonical.Request, error) {
 	var w Request
-	if err := strictUnmarshal(b, &w); err != nil {
+	if err := decodeSelf(b, &w); err != nil {
 		return nil, err
 	}
 	return RequestToCanonical(&w, nil)
@@ -328,8 +331,8 @@ func metadataToCanonical(extra map[string]json.RawMessage, warn WarnFunc) map[st
 
 // DecodeResponse parses a non-streaming response into the neutral form.
 //
-// This is json.Unmarshal and not [strictUnmarshal] on purpose: the bytes are a
-// backend's, not a caller's, and the reasoning is in [strictUnmarshal].
+// This does NOT apply the strict filter, on purpose: the bytes are a backend's,
+// not a caller's, and the reasoning is in [strictUnmarshal].
 //
 // It returns [ErrNotAResponse] for a JSON object that is not a Messages
 // response. Parsing without error is not the same fact as "this is an answer",
@@ -337,7 +340,7 @@ func metadataToCanonical(extra map[string]json.RawMessage, warn WarnFunc) map[st
 // silent empty success; see [ErrNotAResponse] and [IsMessagesResponse].
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
 	var w Response
-	if err := json.Unmarshal(b, &w); err != nil {
+	if err := decodeSelf(b, &w); err != nil {
 		return nil, err
 	}
 	if !IsMessagesResponse(&w) {

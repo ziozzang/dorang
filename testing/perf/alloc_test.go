@@ -103,11 +103,13 @@ func gatewayRequest(g *Gateway, secret string, body []byte) *http.Request {
 // gates it.
 //
 // The bound is a ceiling on a REGRESSION, not a target: the measured figure is
-// roughly 370 allocations and 65 KB for a 4 KiB request, essentially all of it
-// the four JSON passes a cross-protocol gateway makes over the body (decode the
-// client's request, encode the upstream's, decode the upstream's response,
-// encode the client's). Halving it is a change to internal/wire, not to
-// anything this package can reach; what this gate catches is a fifth pass.
+// roughly 390 allocations and 86 KB for a 4 KiB request INCLUDING the control
+// below, essentially all of it the four JSON passes a cross-protocol gateway
+// makes over the body (decode the client's request, encode the upstream's,
+// decode the upstream's response, encode the client's). It was 518 and 101 KB
+// until the duplicate parses inside those passes came out (§15.1); the
+// gateway's own share, with the control subtracted, went from 391 to 262. What
+// this gate catches is a fifth pass.
 func TestHotPathAllocations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: this is a measurement, not a unit test")
@@ -142,8 +144,10 @@ func TestHotPathAllocations(t *testing.T) {
 	// Generous, because the control is subtracted from a benchmark that ran
 	// under a different iteration count and both are wall-clock adaptive. What
 	// it catches is an order of magnitude, which is what a new decode pass or a
-	// lost buffer pool looks like.
-	const allocCeiling = 900
+	// lost buffer pool looks like. It came down from 900 with the measurement:
+	// a ceiling that stays where it was after a 25% improvement has stopped
+	// being a ceiling on anything.
+	const allocCeiling = 700
 	if gwAllocs > allocCeiling {
 		t.Errorf("one request allocates %d objects, over the %d ceiling: "+
 			"something on the dispatch path started allocating per element",
@@ -328,7 +332,7 @@ func TestThroughputCeiling(t *testing.T) {
 	t.Logf("  after two GCs: live %5.0f MB, spans %5.0f MB, RSS %5.0f MB, %d goroutines",
 		mbu(quiet.HeapAlloc), mbu(quiet.HeapInuse), mb(rssBytes()), runtime.NumGoroutine())
 	t.Logf("  the first figure is Go's pacer against the allocation rate")
-	t.Logf("  (~390 allocations per request x the throughput above), not a leak;")
+	t.Logf("  (~262 allocations per request x the throughput above), not a leak;")
 	t.Logf("  the live figure after collection is what a leak would show up in.")
 	t.Log("====================================================================")
 }

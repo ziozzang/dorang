@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 
 // Marshal encodes v the way the reference serializer does.
@@ -63,11 +63,23 @@ func marshalTo(dst *bytes.Buffer, v any) error {
 func strictUnmarshal(b []byte, v any) error { return canonical.StrictUnmarshal(b, v) }
 
 // strictBytes is [strictUnmarshal]'s filter on its own, for the UnmarshalJSON
-// methods that decode the SAME bytes twice — once into the struct and once into
-// the raw member map that feeds Extra. Filtering once and using the result for
+// methods that read the SAME bytes twice — once with encoding/json to fill the
+// struct, and once with [wirejson.SplitExtra]'s structural walk to collect the
+// members the struct does not model. Filtering once and using the result for
 // both is what keeps a dropped key from reappearing in Extra and being relayed
 // to the next hop, where a Go parser would match it again.
 func strictBytes(b []byte, v any) []byte { return canonical.StrictBytes(b, v) }
+
+// decodeSelf decodes b with v's own UnmarshalJSON.
+//
+// It is not a shortcut around the strict filter — every type it is used with
+// calls [strictBytes] as the first thing its method does, so COMPATIBILITY 2.0
+// applies exactly as before. What it skips is encoding/json handing v bytes that
+// were already v's: json.Unmarshal validates the document and then walks it
+// again to find where it ends, before calling the method that validates it once
+// more. See [wirejson.UnmarshalSelf] for the precondition and for the
+// differential that pins every application of it.
+func decodeSelf(b []byte, v json.Unmarshaler) error { return wirejson.UnmarshalSelf(b, v) }
 
 var bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
@@ -113,22 +125,7 @@ func knownKeys(names ...string) map[string]struct{} {
 // folding would accept a key the authorization gate never saw
 // (COMPATIBILITY 2.0).
 func splitExtraFold(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
-	raw, err := splitExtra(b, known)
-	if err != nil || len(raw) == 0 {
-		return raw, err
-	}
-	for k := range raw {
-		for want := range known {
-			if strings.EqualFold(k, want) {
-				delete(raw, k)
-				break
-			}
-		}
-	}
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	return raw, nil
+	return wirejson.SplitExtraFold(b, known)
 }
 
 // splitExtra returns the members of a JSON object that are not in known.
@@ -136,20 +133,13 @@ func splitExtraFold(b []byte, known map[string]struct{}) (map[string]json.RawMes
 // This is how context_management, cache_edits, mcp_servers and every field this
 // package has never heard of survive a crossing (DESIGN §10.5a: "not
 // recognizing something is not a reason to remove it").
+//
+// The walk is [wirejson.SplitExtra]'s rather than a copy of it: this package
+// used to carry its own second json.Unmarshal, which meant an Anthropic request
+// paid the same double parse the chat path did and would have kept paying it
+// after the chat path stopped.
 func splitExtra(b []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, err
-	}
-	for k := range raw {
-		if _, ok := known[k]; ok {
-			delete(raw, k)
-		}
-	}
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	return raw, nil
+	return wirejson.SplitExtra(b, known)
 }
 
 // marshalWithExtra marshals v and splices extra's members into the resulting

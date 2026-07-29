@@ -488,6 +488,26 @@ func foldable(s []byte) bool {
 // than a coincidence.
 // ---------------------------------------------------------------------------
 
+// ScanSpace, ScanString and ScanValue are the walk above, exported for
+// [github.com/ziozzang/dorang/internal/wire/wirejson], which splits the
+// unmodelled members out of an object without re-parsing it.
+//
+// They are exported rather than copied because the adapter and the filter walk
+// THE SAME BYTES of the same request, one immediately after the other, and a
+// third opinion about where a value ends is a third thing that can disagree with
+// the gate. There are two copies of this walk in dorang — this one and
+// internal/server/peek.go's — and that is two on purpose, held together by a
+// differential test. A third would not be.
+func ScanSpace(b []byte, i int) int { return jsonSkipSpace(b, i) }
+
+// ScanString consumes a string literal starting at b[i] == '"'. See
+// [ScanSpace] for why this is exported.
+func ScanString(b []byte, i int) (end int, escaped, ok bool) { return jsonScanString(b, i) }
+
+// ScanValue consumes one JSON value and returns the index just past it, or -1.
+// See [ScanSpace] for why this is exported.
+func ScanValue(b []byte, i int) int { return jsonSkipValue(b, i) }
+
 func isJSONSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }

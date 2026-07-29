@@ -26,7 +26,12 @@ func benchBody(n int) []byte {
 // BenchmarkDecodeRequest measures the whole request decode at DESIGN §17's M3
 // sizes. COMPATIBILITY 2.0's case-sensitive decode adds one structural scan of
 // the body ahead of encoding/json's own; BenchmarkStrictFilter isolates that
-// scan so the two numbers can be read against each other.
+// scan so the two numbers can be read against each other — it is ~2% of the
+// figure below, which is worth knowing before anyone proposes paying for the
+// bypass W10 closed.
+//
+// The figure to compare against is DESIGN §15.1's: 31 MB/s and 143 allocations
+// per KiB before the duplicate parses came out, ~57 MB/s and 65 after.
 func BenchmarkDecodeRequest(b *testing.B) {
 	for _, size := range []int{1 << 10, 32 << 10, 400 << 10} {
 		body := benchBody(size)
