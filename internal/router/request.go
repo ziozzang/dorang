@@ -210,8 +210,21 @@ type Decision struct {
 	// Stream mirrors Request.Stream, so Report knows whether the first-byte
 	// boundary applies.
 	Stream bool
-	// Dropped names the droppable parameters this deployment cannot apply. They
-	// are reported, not fatal: the request still means what it meant (§10.1).
+	// Capabilities is the set this deployment was FILTERED on, carried out so it
+	// can be the set the request is ENCODED against (§10.1).
+	//
+	// It exists because those were two separate computations of one fact —
+	// internal/app's, which built the routing table, and internal/backend's
+	// wireCapabilities, which the encoder fell back to when a target declared
+	// nothing. The two agreeing was a property of both spelling the same switch,
+	// and the failure mode when they stop is silent: routing admits a request on
+	// one set and the encoder drops a construct against the other, which is the
+	// exact outcome §10.1 is written to prevent.
+	Capabilities canonical.Capability
+	// Dropped names what this deployment will not apply: the droppable
+	// parameters it cannot express, and the constructs dorang declines to send
+	// it (see [Deployment.Suppressed]). They are reported, not fatal: the request
+	// still means what it meant (§10.1).
 	Dropped canonical.Capability
 	// PriorityHintDropped reports that the caller sent a priority hint and this
 	// principal has no §10.5 grant, so the class alone decided.

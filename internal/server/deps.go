@@ -477,6 +477,14 @@ type Result struct {
 	NativeErrorMessage string
 	// DroppedParams lists what parameter conversion removed (DESIGN §10.3).
 	DroppedParams string
+	// Downgraded lists the structural constructs this request lost with the
+	// caller's consent, by construct id (DESIGN §10.1).
+	//
+	// It is empty on the overwhelming majority of requests, because a structural
+	// loss without x-dorang-allow-lossy is a 400 and never reaches a response at
+	// all. That is what makes it safe to stamp: the header appears only when the
+	// caller asked for the mechanism and the mechanism fired.
+	Downgraded string
 
 	RateLimit         RateLimit
 	RetryAfterSeconds int

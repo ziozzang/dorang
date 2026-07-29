@@ -600,6 +600,12 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		PriorityField: dec.PriorityField,
 		Priority:      dec.Priority,
 		PriorityTier:  dec.PriorityTier,
+		// The set this candidate was FILTERED on, so it is also the set the
+		// request is ENCODED against (§10.1). Left unset, internal/backend
+		// computed its own from the wire shape — a second answer to a question
+		// this package had already answered when it built the routing table, and
+		// the day the two stop agreeing routing admits what encoding then drops.
+		Capabilities: dec.Capabilities,
 	}
 	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
 }
@@ -645,7 +651,7 @@ func (d *dispatcher) backendCall(st *dispatchState, c *call, dec *router.Decisio
 		// afterwards is invisible (DESIGN §10.4). For a stream the first write
 		// happens inside the backend, so this is the last moment the routing
 		// decision can still reach the client.
-		Accepted: func() { fillRouteResult(rq, dec) },
+		Accepted: func() { fillRouteResult(rq, dec, c) },
 	}
 }
 
@@ -904,7 +910,11 @@ func billedUnit(u canonical.BilledUnit) pricing.BilledUnit {
 
 // fillRouteResult stamps the routing decision onto the request before the first
 // byte goes out.
-func fillRouteResult(rq *server.Request, dec *router.Decision) {
+//
+// c carries the decoded request, which the §10.1 downgrade report needs: the
+// neutral form, and the opt-in already parsed onto the routing request rather
+// than read off the headers a second time.
+func fillRouteResult(rq *server.Request, dec *router.Decision, c *call) {
 	// The deployment still on the Result is the one the previous attempt used,
 	// which is the only moment it is knowable — one line later it is gone.
 	prev := rq.Result.Deployment
@@ -918,26 +928,103 @@ func fillRouteResult(rq *server.Request, dec *router.Decision) {
 		rq.Result.FallbackFrom = dec.Reason
 		rq.Result.FallbackFromDeployment = prev
 	}
-	rq.Result.DroppedParams = droppedParams(dec)
+	rq.Result.DroppedParams = droppedParams(dec, c)
+	rq.Result.Downgraded = downgraded(c, dec)
 }
 
-// droppedParams is what x-dorang-dropped-params carries: the capability
-// conversion removed, plus the client priority hint when this principal has no
-// §10.5 grant.
+// downgraded is what x-dorang-downgraded carries: the structural constructs this
+// deployment cannot express that the caller opted into losing.
 //
-// The hint belongs on the same header for the reason §10.3 gives — silently
-// discarding something a caller sent leaves them believing it took effect — and
-// §10.5 names this header specifically. Before this, a hint was dropped in
-// complete silence, which was easy to miss because it was also never read.
-func droppedParams(dec *router.Decision) string {
+// DESIGN §10.1 has promised this header since revision 2 and nothing wrote it.
+// The gap was arguable — x-dorang-allow-lossy is per construct, so the consent
+// already named the thing — and the argument does not survive contact with how
+// the opt-in is actually used. A client sets the header once, in its transport
+// layer, for every request it will ever send; the header answers a different
+// question, about ONE response. Consent says a PDF may be dropped. This says it
+// was.
+//
+// It is computed from the capability masks rather than from the encoders' own
+// [canonical.LossReport], because nothing on the request path collects one: the
+// backend adapters pass no Loss to either encoder, so the located detail those
+// encoders build is discarded where it is produced. The mask answers the same
+// question at construct granularity — a construct the target lacks and the
+// request uses IS lost — and it is one subtraction rather than a second walk over
+// the request. The one thing it cannot see is a loss the encoder raises while
+// holding the bit: crossing a thinking block's SIGNATURE into the OpenAI family
+// is reported as a downgrade even though CapThinkingBlocks is present, because
+// no field there carries integrity material. That case needs the encoder's own
+// report to travel out of internal/backend, and it is the only one.
+//
+// The opt-in is intersected deliberately. A structural loss the caller did NOT
+// consent to is a 400 from routing or from the material gate and never reaches a
+// response at all, so a header naming one would be describing a request that was
+// refused.
+func downgraded(c *call, dec *router.Decision) string {
+	if c == nil || c.creq == nil || dec.Capabilities == 0 || c.rreq.AllowLossy == 0 {
+		return ""
+	}
+	lost := dec.Capabilities.Missing(c.creq.RequiredCapabilities()).Structural() & c.rreq.AllowLossy
+	if lost == 0 {
+		return ""
+	}
+	return strings.Join(lost.Names(), ",")
+}
+
+// droppedParams is what x-dorang-dropped-params carries: everything the caller
+// sent that dorang did not apply.
+//
+// Three sources, and they belong together because a caller asking "was what I
+// sent used" does not care which layer decided otherwise:
+//
+//   - the capability conversion removed, and the constructs this deployment is
+//     ABLE to carry that §4.4 declines to send it ([router.Decision.Dropped]);
+//   - the client priority hint, when this principal has no §10.5 grant;
+//   - the caller's service_tier, when §10.5's fold sent a different one.
+//
+// All three are here for the reason §10.3 gives — silently discarding something
+// a caller sent leaves them believing it took effect — and §10.5 names this
+// header specifically. Each of them was, at some point, discarded in complete
+// silence, and each was easy to miss because the value was also never read.
+func droppedParams(dec *router.Decision, c *call) string {
 	names := dec.Dropped.Params()
 	if dec.PriorityHintDropped {
 		names = append(names, HeaderClientPriority)
+	}
+	if tierOverridden(dec, c) {
+		names = append(names, canonical.ConstructServiceTier)
 	}
 	if len(names) == 0 {
 		return ""
 	}
 	return strings.Join(names, ",")
+}
+
+// tierOverridden reports that the caller named a service tier and dorang sent a
+// different one.
+//
+// §10.5's tier fold puts DORANG's priority class in the field, and §7.5 says why
+// — priority is an operator grant and honouring the caller's value here would be
+// the self-elevation §10.5 refuses. What it does not say is that the caller can
+// find out, and they could not: their `service_tier: priority` left as
+// `service_tier: flex` with a 200 and nothing else. service_tier is material
+// precisely because it selects a PRICE BAND, so of every parameter dorang
+// rewrites this is the one a caller most needs told.
+//
+// It is decided here rather than on the routing decision because it needs the
+// value the caller wrote. The router knows only that this deployment has a fold,
+// and reporting on that alone would claim an override on every request where
+// dorang's class happened to choose the tier the caller already asked for.
+//
+// `auto` is not an override: it delegates the band to the provider, so the
+// caller expressed no band for dorang to have replaced. That matches
+// [canonical.Request.RequiredCapabilities], which raises no bit for it either.
+func tierOverridden(dec *router.Decision, c *call) bool {
+	if dec.PriorityTier == "" || c == nil || c.creq == nil {
+		return false
+	}
+	got := c.creq.ServiceTier
+	return got != "" && !strings.EqualFold(got, canonical.ServiceTierAuto) &&
+		!strings.EqualFold(got, dec.PriorityTier)
 }
 
 // routeError renders a routing refusal as an HTTP answer. router.Error already
@@ -968,6 +1055,29 @@ func routeError(err error) error {
 			e = e.WithParam("model")
 		case router.CodeContextWindow:
 			e = e.WithParam("messages")
+		case router.CodeUnsupportedConstruct:
+			// §10.1's "machine-readable body naming the unsupported construct",
+			// which [router.Error.Constructs] computes and nothing carried out.
+			// The refusal is raised at two gates on purpose — routing asks
+			// whether ANY deployment expresses the request, the backend asks
+			// whether the chosen one does — and only the second one named the
+			// construct and filled `param`. A caller who trips the first gate is
+			// the one who has never seen the construct vocabulary before, and
+			// they were handed the sentence with none of it in.
+			if len(re.Constructs) > 0 {
+				list := strings.Join(re.Constructs, ", ")
+				e.Message += ": " + list + "; retry with " + HeaderAllowLossy + ": " +
+					strings.Join(re.Constructs, ",")
+				// The MATERIAL half only. Its construct id is a real request
+				// field; the located half is a capability, and naming
+				// `thinking_block` as a param would send a field-locating SDK to
+				// a member that does not exist — the same rule
+				// internal/backend's materialRefusal applies to the identical
+				// refusal one layer down.
+				if p := constructParam(re.Constructs); p != "" {
+					e = e.WithParam(p)
+				}
+			}
 		case router.CodeNoCapacity, router.CodeNoCandidate:
 			// §11.2's two capacity rows are the only ones whose type is chosen
 			// by condition rather than by status: 429 is `rate_limit_error` to
@@ -980,6 +1090,25 @@ func routeError(err error) error {
 		return e
 	}
 	return err
+}
+
+// constructParam is the wire parameter a refused construct list can point at,
+// or "" when none of them is a request field.
+//
+// Only [canonical.Material] constructs have one, and for those the construct id
+// IS the parameter name — that is the whole difference between the two halves of
+// [canonical.Structural].
+func constructParam(constructs []string) string {
+	for _, name := range constructs {
+		c, ok := canonical.ParseCapability(name)
+		if !ok {
+			continue
+		}
+		if p := c.Material().Params(); len(p) > 0 {
+			return p[0]
+		}
+	}
+	return ""
 }
 
 // defaultMaxTokens is the output ceiling handed to an encoder when the caller

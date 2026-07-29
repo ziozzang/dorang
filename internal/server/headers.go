@@ -112,6 +112,25 @@ const (
 	HeaderBudgetRemainingUSD = "X-Dorang-Budget-Remaining-Usd"
 	// HeaderDroppedParams lists what conversion removed.
 	HeaderDroppedParams = "X-Dorang-Dropped-Params"
+	// HeaderDowngraded lists the structural constructs this request actually
+	// lost, by construct id (DESIGN §10.1).
+	//
+	// It is the other half of x-dorang-allow-lossy and not a restatement of it.
+	// The opt-in names what MAY be lost, once, for every request a client sends;
+	// this names what WAS lost, on this one. A caller who sets
+	// `x-dorang-allow-lossy: document_block` because one conversation in fifty
+	// carries a PDF has consented to the loss and still cannot tell which fifty
+	// answers were the degraded ones — and "which requests lost the document" is
+	// the whole question the consent was given in order to be able to ask.
+	//
+	// The value is the construct id list, comma separated, in the same
+	// vocabulary and the same spelling x-dorang-allow-lossy accepts, so a client
+	// can compare the two directly. The per-instance location
+	// ("messages[2].content[1]: application/pdf") is deliberately not here: that
+	// detail belongs to the 400 body, which is what a caller who did NOT consent
+	// receives, and a header is not a place to put an unbounded list of
+	// positions.
+	HeaderDowngraded = "X-Dorang-Downgraded"
 	// HeaderNativeStopReason carries the backend's own stop reason, which the
 	// wire mapping loses (COMPATIBILITY §4.2a).
 	HeaderNativeStopReason = "X-Dorang-Native-Stop-Reason"
@@ -422,6 +441,13 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	}
 	if r.DroppedParams != "" {
 		h.Set(HeaderDroppedParams, r.DroppedParams)
+	}
+	// Beside the drop list rather than in the always-on set, because the two
+	// answer one question — "what did dorang do to this request that the request
+	// did not ask for" — and two headers of one class that arrive under different
+	// conditions is a second, disagreeing answer to when a loss is visible.
+	if r.Downgraded != "" {
+		h.Set(HeaderDowngraded, r.Downgraded)
 	}
 	if r.NativeStopReason != "" {
 		h.Set(HeaderNativeStopReason, r.NativeStopReason)

@@ -1839,10 +1839,70 @@ therefore:
 
 The first and the third are separate obligations and both are implemented. Routing answers
 "does any deployment of this model express it"; the backend answers "does the one that was
-chosen", against the capability set that deployment declared and after the engine
-normalizations of §4.4 have run — which is the only point at which the request that will
-actually be encoded exists. A gateway that gated only at routing would refuse correctly for
-as long as the two capability sets agree, and silently downgrade the day they do not.
+chosen", after the engine normalizations of §4.4 have run — which is the only point at which
+the request that will actually be encoded exists.
+
+**Both gates read one value.** They used to read two: `internal/app` computed a deployment's
+capability set to build the routing table, and `internal/backend` computed the same thing
+again from the same wire shape because nothing handed it the first answer. The two agreed,
+and agreed by coincidence — both spelled the same switch over the same catalog-resolved
+`api`, and nothing made them. The failure mode when two answers to one question part company
+is not a wrong refusal, which somebody would notice: it is **routing admitting what encoding
+then drops**, which is a `200` with the construct gone. So the set now travels —
+`app.capabilitiesFor` → `router.Deployment.Capabilities` → `router.Decision.Capabilities` →
+`backend.Target.Capabilities` — and the deployment that is *refused* for a capability and the
+deployment that is *encoded* for it are decided by the same bits.
+
+Two gates, one vocabulary: both refusals name the construct in the body and, for the material
+half, fill `param` with the wire field. The routing gate used to name neither, which is the
+wrong way round — a caller who trips it is the one who has never seen the construct
+vocabulary before.
+
+#### What `x-dorang-downgraded` carries, and what it does not
+
+The header names the constructs this request **actually lost**, comma separated, in the same
+ids `x-dorang-allow-lossy` accepts. It is not a restatement of the opt-in and the difference
+is the point: the opt-in is set once in a client's transport layer and says a document *may*
+be dropped on every request it will ever send; this says one *was* dropped on this one. A
+caller whose PDF traffic is one conversation in fifty has consented and, without it, still
+cannot tell the forty-nine intact answers from the degraded one — and "which requests lost
+the document" is the whole question the consent was given in order to be able to ask.
+
+It is absent on the overwhelming majority of responses, because a structural loss the caller
+did *not* consent to is a `400` and never reaches a response body at all. That is what makes
+it safe to attach: its presence always means the mechanism fired.
+
+Two bounded omissions, stated rather than left to be discovered:
+
+- **The per-instance location is not in it.** `messages[2].content[1]: application/pdf` is in
+  the `400` body, which is what a caller who did not consent receives. A header is not a
+  place for an unbounded list of positions.
+- **A loss an encoder raises while HOLDING the capability is not in it.** The header is
+  computed from the capability masks, and one case escapes them: crossing a thinking block's
+  *signature* into the OpenAI family is a downgrade even though `CapThinkingBlocks` is
+  present, because no field there carries integrity material and §10.2 forbids fabricating
+  one. Covering it needs the encoders' own `canonical.LossReport` to travel out of
+  `internal/backend`, and today nothing collects one — the adapters pass no `Loss` to either
+  encoder, so the located detail those encoders build is discarded where it is produced.
+  §10.2's "reported in `x-dorang-dropped-params`" for a reasoning budget that collapsed below
+  the minimum has no writer for the same reason.
+
+#### A deployment can also express a construct and not be sent it
+
+§4.4 clears `service_tier` before a request reaches a self-hosted engine, because emitting it
+would express nothing. That is not a capability gap — the OpenAI wire shape a vLLM serves
+accepts the field perfectly well — and it must not be modelled as one. A missing capability
+bit is a `400` at both gates above, and the reason `service_tier` is material is the **price
+band**, which does not exist on hardware the operator owns; refusing there would refuse for a
+reason that is not true of the deployment.
+
+So the deployment carries a second, smaller set — `router.Deployment.Suppressed` — for
+constructs dorang *declines to send* rather than *cannot send*. The request is served and the
+construct is named in `x-dorang-dropped-params`, on the same header an ignored priority hint
+rides and for the identical §10.3 reason: silently discarding something a caller sent leaves
+them believing it took effect. The same rule covers §10.5's tier fold, where dorang's own
+priority class overwrites a caller's `service_tier` — the caller's value did not decide, so
+the caller is told.
 
 The full construct list is a versioned table in the compatibility document (§7.9), and every
 entry has a conversion test in both directions.
@@ -1939,7 +1999,8 @@ Every removal is reported.
 | `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative. The ceiling comes from the authorization snapshot and is always known; the SPEND comes from the budget hold, which is hydrated by the reservation, so a request that reserves nothing (a zero-rated one) omits `-spend-usd` and `-budget-remaining-usd` rather than reporting a `0` nobody looked up. Same rule as the streamed cost header: absent claims nothing, zero claims a measurement |
 | `x-dorang-quota-*-used-pct` | credential quota windows |
-| `x-dorang-dropped-params` | what conversion removed |
+| `x-dorang-dropped-params` | what conversion removed: the knobs the target has no field for, the constructs §4.4 and §10.5 decline to send it (§10.1), and an ignored client priority hint (§10.5) |
+| `x-dorang-downgraded` | the structural constructs this request actually lost, by construct id, for a caller who consented with `x-dorang-allow-lossy` (§10.1). Absent unless a loss occurred |
 | `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form |
 | `retry-after` | on 429 |
 
@@ -1968,6 +2029,15 @@ The rest are emitted when `x-dorang-detail: full` is requested, or when
 `observability.always_full_headers` is set. Revision 1 attached roughly thirty headers to
 every response, which risks intermediary header-size limits and adds bytes ahead of the
 first streamed byte — against the very target it was serving **[R1-C9]**.
+
+`x-dorang-dropped-params` and `x-dorang-downgraded` are in the gated set **together**. They
+answer one question — what did dorang do to this request that the request did not ask for —
+and two headers of one class arriving under different conditions would be a second,
+disagreeing answer to when a loss is visible. There is an argument that both belong in the
+always-on set under the act-on rule above, since neither is telemetry and neither costs a byte
+on a request that lost nothing; it is not taken here, because moving them is a change to what
+every caller receives and it should be made deliberately rather than as a side effect of
+adding the second one.
 
 **Streaming delivery is one channel, opt-in [R1-C9].** Revision 1 promised a terminal SSE
 event *and* HTTP trailers. Trailers are a dead channel — mainstream LLM client libraries

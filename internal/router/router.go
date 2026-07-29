@@ -1266,6 +1266,7 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 		Class:         c.dep.gclass,
 		Kind:          c.dep.Kind,
 		Family:        c.dep.Family,
+		Capabilities:  c.dep.Capabilities,
 		PrefixDepth:   c.prefixDepth,
 		Stream:        req.Stream,
 		interned:      c.dep.interned,
@@ -1292,7 +1293,28 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 
 	// Droppable losses are reported, never fatal: the request still means what
 	// it meant (§10.1).
-	d.Dropped = c.dep.Capabilities.Missing(req.Required).Droppable()
+	//
+	// Suppression is the other term, and it is not a capability gap — see
+	// [Deployment.Suppressed]. A self-hosted engine's wire shape carries
+	// service_tier perfectly well and §4.4 clears the field anyway, so the
+	// caller's value goes nowhere and nothing said so. It is reported here, on
+	// the same header the ignored priority hint rides, and for the identical
+	// reason §10.3 gives: silently discarding something a caller sent leaves them
+	// believing it took effect.
+	//
+	// The intersection with Required is what keeps this from becoming noise:
+	// Required raises CapServiceTier only for a tier that SELECTS something.
+	// `auto` delegates the band to the provider, which is exactly what not
+	// sending the field does, so there is nothing to report — and SDKs fill that
+	// value whether or not the application asked for it.
+	//
+	// §10.5's tier fold is the other way a caller's service_tier fails to reach
+	// the wire, and it is settled by the dispatcher rather than here: deciding it
+	// needs the VALUE the caller wrote, and a decision that reported an override
+	// whenever dorang chose a tier would fire on requests where dorang chose the
+	// same one.
+	d.Dropped = c.dep.Capabilities.Missing(req.Required).Droppable() |
+		c.dep.Suppressed&req.Required
 
 	// Estimate is priced for the credential that was actually acquired, which
 	// is not necessarily the one ranking priced. When it is, the ranking's

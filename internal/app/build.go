@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/config"
@@ -238,6 +239,7 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 				Priority:      d.Priority,
 				Timeout:       d.Timeout.Duration(),
 				Capabilities:  capabilitiesFor(cat, p.Kind),
+				Suppressed:    suppressedFor(p.Kind),
 				PrefixTTL:     cfg.PrefixTTLFor(d.Provider, d).TableTTL(),
 			}
 			if rd.Timeout == 0 {
@@ -309,13 +311,70 @@ func deploymentID(group, provider, upstream string) string {
 // capabilitiesFor is what a deployment of this kind can express (DESIGN §10.1).
 // It comes from the kind's wire adapter, because that adapter is what will do
 // the encoding and therefore what decides what survives.
+//
+// # It is the only answer, and it used to be one of two
+//
+// internal/backend had its own wireCapabilities computing this from the same two
+// constants and the same wire shape, because the encoder needed the number and
+// nothing handed it one. The two agreed, but by coincidence: both spelled the
+// same switch over the same catalog-resolved `api`, and nothing made them. That
+// is the arrangement DESIGN §10.1's last paragraph names as the failure — routing
+// answers "does any deployment express this" on one set and the encoder converts
+// against another — and the codebase has been bitten by two implementations of
+// one fact three times.
+//
+// So this value now travels: onto [router.Deployment.Capabilities], out on
+// [router.Decision.Capabilities], and into [backend.Target.Capabilities], which
+// the encoder reads in preference to its own default. The deployment that is
+// REFUSED for a capability and the deployment that is ENCODED for it are decided
+// by the same bits.
 func capabilitiesFor(cat *catalog.Catalog, kind string) canonical.Capability {
-	switch apiFor(cat, kind) {
+	return capabilitiesForAPI(apiFor(cat, kind))
+}
+
+// capabilitiesForAPI is [capabilitiesFor] for a wire shape that is already
+// resolved.
+//
+// The batch executor is the caller: it holds a [backend.Provider], which carries
+// the api it was built with, and going back to the catalog to derive the same
+// value from the kind would be the second derivation this whole change removes.
+// It is also the only path where the catalog can be absent, and a capability set
+// guessed from a nil lookup is not a set anyone should encode against.
+func capabilitiesForAPI(api catalog.API) canonical.Capability {
+	switch api {
 	case catalog.APIAnthropicMessages:
 		return anthropic.DefaultCapabilities
 	default:
 		return openai.DefaultCapabilities
 	}
+}
+
+// suppressedFor is what dorang declines to send to a deployment of this kind
+// even though [capabilitiesFor] says the wire shape accepts it.
+//
+// A self-hosted engine gets no `service_tier`: internal/backend clears it before
+// encoding, in either direction of DESIGN §4.4's argument — as a priority signal
+// it is a lie, because vLLM accepts the field with no consumers for it and SGLang
+// does not have it on chat/completions at all, and as a relayed caller field it
+// is the tell §4.4's single-surface commitment exists to remove.
+//
+// This is why the answer is not simply to clear the bit in [capabilitiesFor].
+// `service_tier` is [canonical.Material] since the capability pass, so a missing
+// bit is a `400` in both readers of it — and the reason it is material is the
+// PRICE BAND, which does not exist on hardware the operator owns. Refusing there
+// would refuse for a reason that is not true of the deployment. The loss is real
+// and costs nothing, which is the exact definition of something that belongs in
+// x-dorang-dropped-params; see [router.Deployment.Suppressed].
+//
+// The engine profile is internal/backend's, read through its own exported
+// mapping rather than re-spelled here — a second table of which kinds are
+// self-hosted is how this function would come to disagree with the code that
+// actually clears the field.
+func suppressedFor(kind string) canonical.Capability {
+	if backend.EngineForKind(kind).SelfHosted() {
+		return canonical.CapServiceTier
+	}
+	return 0
 }
 
 // apiFor is the wire adapter a provider kind speaks (DESIGN §4.3). A kind the

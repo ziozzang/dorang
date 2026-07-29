@@ -275,6 +275,12 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		UpstreamModel: req.UpstreamModel,
 		Credential:    cred,
 		Kind:          up.Kind(),
+		// The same capability set the interactive path filters and encodes
+		// against (§10.1). A batch row is scheduled rather than routed, so it
+		// inherits no decision — which is exactly the case that would have gone
+		// on reading internal/backend's own default while every other path read
+		// this package's. One answer means one answer on both paths.
+		Capabilities: capabilitiesForAPI(up.API()),
 	}
 
 	// The budget, held before the row goes upstream and settled or released
@@ -298,6 +304,7 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		Provider:      up,
 		Credential:    cred,
 		UpstreamModel: req.UpstreamModel,
+		Capabilities:  dec.Capabilities,
 	}, &backend.Call{
 		Op:               backend.OpChat,
 		ClientAPI:        catalog.APIOpenAIChat,

@@ -108,7 +108,28 @@ type Deployment struct {
 	Family string
 	// Capabilities is what this deployment can express (§10.1). A request whose
 	// required structural set is not covered is filtered out before ranking.
+	//
+	// It is also what [Decision.Capabilities] carries down to the encoder, so the
+	// set a candidate is FILTERED on and the set the request is ENCODED against
+	// are one value rather than two computations that happen to agree.
 	Capabilities canonical.Capability
+	// Suppressed is what dorang declines to send to this deployment even though
+	// its wire shape accepts it.
+	//
+	// It is deliberately NOT expressed by clearing the bit in Capabilities, and
+	// the difference is the whole point. A missing capability is a statement that
+	// the construct cannot cross, and both readers of that statement — the
+	// structural filter above and internal/backend's material gate — turn it into
+	// a `400`. Suppression is the opposite case: the construct crosses fine and
+	// dorang has decided not to send it, so the request must still be SERVED and
+	// the caller must still be TOLD. Folding the two together would answer a
+	// deployment-level policy with a refusal.
+	//
+	// Today it holds exactly [canonical.CapServiceTier], for a self-hosted engine
+	// whose price bands do not exist (§4.4). The set the caller opted into losing
+	// does not apply: there is nothing here to consent to, because nothing about
+	// the answer or the bill changes.
+	Suppressed canonical.Capability
 	// ContextWindow is the real window in tokens. Zero means UNDECLARED, which
 	// is not zero and not unlimited (§4.3): an undeclared window neither
 	// excludes a deployment nor qualifies it as "larger" for the

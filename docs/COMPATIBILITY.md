@@ -52,7 +52,7 @@ the ratio, not a preference.
 |---|---|---|
 | 2.1 | **Absent fields are omitted, never emitted as `null`.** | ⚠️ Corrected framing: this is **not** merely avoiding a Go mistake. Real OpenAI *does* emit `"logprobs":null` and `"finish_reason":null` on chunks; the reference proxy omits them. The two disagree, and dorang follows **the reference proxy**, because that is what the clients in front of us were built against. Choosing the other way is a one-line option, but it must be a choice, not an accident. |
 | 2.0 | ⚠️ **Field matching is case-SENSITIVE, and this is a security property, not a style choice.** | Go's `encoding/json` matches struct tags case-insensitively, so a struct decode fills a `model` field from a key spelled `Model` or `moDel`. A hand-written scanner — and every Python backend downstream — does not. If the authorization gate scans and the adapter unmarshals, a request carrying `{"Model":"expensive"}` is **authorized as having no model and dispatched as having one**: the allow-list check (§7.4) never sees it. Every decode path must therefore be case-sensitive, and a differential test must assert the gate and the adapter resolve the same field from the same bytes. |
-| 2.1a | **The serializer itself is normative.** | A "byte-for-byte" claim is meaningless without saying which serializer. Compact separators (no space after `:` or `,`), raw UTF-8 rather than `\uXXXX` escaping, and **Go's HTML escaping disabled** — left on, Go turns `&&` into `&&`, which no other server does. |
+| 2.1a | **The serializer itself is normative.** | A "byte-for-byte" claim is meaningless without saying which serializer. Compact separators (no space after `:` or `,`), raw UTF-8 rather than `\uXXXX` escaping, and **Go's HTML escaping disabled** — left on, Go turns `&&` into `\u0026\u0026`, which no other server does. ⚠️ **It held everywhere except the field a caller actually controls.** `SetEscapeHTML(false)` is set on the package encoder, so every plain struct field was correct — and every test that checked was checking one of those. A **string-or-array** type carries its own `MarshalJSON`, and the three that do — `openai.Content`, `openai.StopSequences`, `anthropic.BlockList` — called `encoding/json.Marshal`, whose escaping is on by default. So a user message reading `a && b <tag>` went upstream as `a \u0026\u0026 b \u003ctag\u003e` while the `name` beside it went as itself, and a client doing the substring match this row exists for did not find its own prompt. The rule applies to **every** serializer a body passes through, not to the outermost one. `TestNoHTMLEscapingOnTheRequestPath` pins the string form, the array form and `stop` together. |
 | 2.2 | A plain text chunk is exactly `{id, object, created, model, choices:[{index, delta:{role?,content?}, finish_reason?}]}` — nothing more. | Extra keys are a divergence. |
 | 2.3 | `object` is always `"chat.completion.chunk"`. | |
 | 2.4 | `id` and `created` are **pinned across every chunk** of one stream. | Regenerating `created` per chunk breaks clients that use it as a stream identity. |
@@ -234,7 +234,9 @@ absent from both tables above should expect it not to arrive.
 DESIGN §10.1 splits conversion loss in two. A **droppable** loss is a knob the target does
 not have: dorang omits it, lists it in `x-dorang-dropped-params`, and the request still means
 what it meant. A **refused** loss answers `400` with `code: unsupported_construct` naming the
-construct, unless the caller listed that construct in `x-dorang-allow-lossy`.
+construct, unless the caller listed that construct in `x-dorang-allow-lossy` — in which case
+the request is served and the construct is named in `x-dorang-downgraded`, which reports what
+this request lost rather than what the caller once agreed might be lost.
 
 The test is one question, and it is not "can the target represent it":
 
@@ -294,11 +296,19 @@ Two things the table is deliberate about:
   default", so they raise no capability and cost the everyday caller nothing. SDKs fill `n`
   whether or not the application asked for it; a classification that 400'd on that would be a
   worse defect than the one it replaces.
-- **The refusal is raised twice, on purpose.** Routing answers "does any deployment of this
-  model express it" (DESIGN §7.1); the backend answers "does the one that was chosen",
-  against that deployment's declared capability set and after the self-hosted normalizations
-  of DESIGN §4.4 have run. Gating only at routing is correct exactly as long as the two
-  capability sets agree, and silently downgrades the day they do not.
+- **The refusal is raised twice, on purpose, against one set.** Routing answers "does any
+  deployment of this model express it" (DESIGN §7.1); the backend answers "does the one that
+  was chosen", after the self-hosted normalizations of DESIGN §4.4 have run. The two gates
+  read the *same* capability value, carried from the routing table onto the decision and into
+  the encoder — they used to compute it independently, and two answers to one question fail
+  in the invisible direction: routing admits, encoding drops, the caller gets a `200`.
+- **A construct can be expressible and still not sent.** A self-hosted engine's wire shape
+  accepts `service_tier`; §4.4 clears it anyway, because there are no price bands to select
+  between. That is not a capability gap and is not refused — the request is served and
+  `service_tier` is listed in `x-dorang-dropped-params`. The same applies where DESIGN §10.5
+  puts dorang's own priority class in the field and the caller's value never reaches the
+  wire. Modelling either as a missing capability would produce a `400` for a reason that is
+  not true of the deployment.
 
 ## 8. Routing behavior is part of compatibility
 
