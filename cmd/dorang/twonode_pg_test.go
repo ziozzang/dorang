@@ -18,7 +18,7 @@ package main
 // stated in seconds is measured in seconds.
 //
 // They are behind the `integration` tag and skip without DORANG_TEST_PG. See
-// docs/OPERATIONS.md 8.6 for the command.
+// docs/OPERATIONS.md 8.5 for the command, and 10.1 for the numbers they measure.
 
 import (
 	"context"
@@ -453,22 +453,28 @@ func TestKilledNodeLeasesAreReclaimed(t *testing.T) {
 	// heartbeat is a declaration and a lapsed lease is a fact, and reclaiming a
 	// live node's block is precisely the defect that admitted 190 against 100.
 	// So the units come back one LEDGER lease TTL after the dead node's last
-	// renewal, plus the leader tick that notices:
+	// renewal, plus however many leader ticks pass before a sweep lands after
+	// that instant:
 	//
-	//	DefaultLedgerTTL (60s) + DefaultTick (5s) = 65s
+	//	DefaultLedgerTTL (60s) + up to 2 x DefaultTick (5s) = 70s
 	//
-	// which is what this measures.
-	bound := cluster.DefaultLedgerTTL + 2*cluster.DefaultTick
+	// Two ticks and not one, measured: the sweep is scheduled on the leader's
+	// own tick phase, which is unrelated to when the dead node's lease happens
+	// to expire, so a sweep that lands just before the expiry costs a whole
+	// further period. Runs of this test have produced 65.2s and 70.2s. A bound
+	// stated as one tick would be a bound that is wrong one time in two, which
+	// is the failure mode this whole file exists to find.
+	bound := cluster.DefaultLedgerTTL + 3*cluster.DefaultTick
 	took := eventually(t, 3*time.Minute, "the killed node's leases are reclaimed", func() bool {
 		return held("a") == 0
 	})
 	t.Logf("MEASURED: a SIGKILLed node's quota leases were reclaimed %s after the kill "+
-		"(ledger lease TTL %s + leader tick %s = %s)",
+		"(ledger lease TTL %s + up to two leader ticks of %s = %s)",
 		took.Round(100*time.Millisecond), cluster.DefaultLedgerTTL, cluster.DefaultTick,
-		cluster.DefaultLedgerTTL+cluster.DefaultTick)
+		cluster.DefaultLedgerTTL+2*cluster.DefaultTick)
 	if took > bound {
-		t.Errorf("reclaim took %s, beyond the published bound of %s "+
-			"(ledger lease TTL + one leader tick, with a tick of slack)", took, bound)
+		t.Errorf("reclaim took %s, beyond %s (ledger lease TTL + two leader ticks, "+
+			"with a third tick of slack)", took, bound)
 	}
 	_ = killed
 

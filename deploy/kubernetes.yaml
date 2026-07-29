@@ -161,8 +161,28 @@ data:
 
     cluster:
       enabled: true
+      # There is deliberately no `node_id` here, and adding one to THIS file
+      # breaks the deployment. Every replica mounts this one ConfigMap, so a
+      # configured id is the SAME id on both — and two processes under one id
+      # are a single node to the registry, to the leadership lease and to every
+      # leased limit. The second pod refuses to start rather than lead
+      # alongside the first:
+      #
+      #   cluster: node id dorang is in use by another process; this node will
+      #   not join, lead or run any leader job.
+      #
+      # An empty node_id derives one per process and cannot collide, which is
+      # what a Deployment of interchangeable replicas wants. If you need stable
+      # ids — to reclaim leases across a restart instead of waiting out their
+      # TTL — the id has to come from the pod, not from the ConfigMap: switch to
+      # a StatefulSet and set it from the ordinal, or use the downward API to
+      # pass metadata.name through an env var and reference it. See
+      # OPERATIONS.md §10 and DESIGN.md §13.
+      #
       # `local` is exact on one node and overshoots N-fold on N nodes, so
       # `enabled: true` with `capacity_mode: local` refuses to start (§5.6).
+      # shared-pg publishes an overshoot of 0, measured across two processes
+      # (OPERATIONS.md §10.1).
       capacity_mode: shared-pg
 
     # providers, credentials and models: see deploy/config.example.yaml.

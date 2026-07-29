@@ -5,12 +5,15 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/url"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/store"
@@ -362,11 +365,22 @@ func TestPostgresDeadlockIsRetriedNotReturned(t *testing.T) {
 	go func() { defer wg.Done(); errs[1] = side("row-y", "row-x", readyB, readyA, &attemptsB) }()
 	wg.Wait()
 
+	// Whether a cycle formed is established from the SERVER's verdict, not from
+	// the retry count. Counting attempts alone would be circular: a build that
+	// does not retry makes two attempts in total, which is also what "no
+	// deadlock happened" looks like -- so the skip below would swallow exactly
+	// the regression this test exists to catch.
 	total := attemptsA.Load() + attemptsB.Load()
-	if total < 3 {
-		// Both sides committed on their first attempt, so no cycle formed and
-		// there is nothing to have retried. Say so rather than pass silently.
-		t.Skipf("no deadlock formed (%d attempts in total); the fixture proved nothing", total)
+	deadlocked := total > 2
+	for _, err := range errs {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40P01" {
+			deadlocked = true
+		}
+	}
+	if !deadlocked {
+		t.Skipf("no deadlock formed (%d attempts in total, no 40P01); the fixture proved nothing",
+			total)
 	}
 	for i, err := range errs {
 		if err != nil {

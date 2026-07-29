@@ -848,6 +848,46 @@ resetting a cooldown to trusting a timestamp from another era.
 
 ---
 
+### 8.5 Running the tests that need a database
+
+Most of dorang's suite runs with `go test` and no external service, which is deliberate: the
+notebook tier of DESIGN §0.2 has no dependencies, so neither should proving it works. Everything
+that can only be shown against a real PostgreSQL — the migration set, the partitioned ledger's
+query plans, the advisory-lock election, and the two-node behaviour §10.1 publishes numbers for —
+is behind the `integration` build tag and needs one.
+
+```
+make deps-up          # docker compose: PostgreSQL on 55432, Redis on 56379
+make test-integration
+make deps-down        # -v, so the scratch data goes with it
+```
+
+`deps-up` uses `deploy/docker-compose.test.yml`, whose PostgreSQL keeps its data on a `tmpfs`: it
+is a scratch database and is meant to be thrown away. It does not touch, and must not be pointed
+at, a database that serves anything.
+
+Without a database the same command still passes — every test behind the tag reads
+`DORANG_TEST_PG` and skips when it is unset, so a contributor with no Docker gets a green run and
+not a wall of connection errors. That is also why it is worth running the pair above before
+believing one: a suite that skips silently and a suite that passes look identical from the exit
+code.
+
+To point at a database you already have, set the variable yourself:
+
+```
+DORANG_TEST_PG='postgres://user:pass@host:5432/scratch?sslmode=disable' \
+  go test -tags=integration -count=1 ./...
+```
+
+Each test creates its own schema (`t_…` or `n_…`) and drops it on the way out, so the suite is
+safe to run repeatedly against one database and several copies can run against one server. It
+still writes: use a scratch database.
+
+The two-node tests in `cmd/dorang` start real gateway processes and bind ephemeral ports on
+`127.0.0.1`. `TestKilledNodeLeasesAreReclaimed` waits out a 60-second lease TTL by design and is
+the reason the package takes a couple of minutes.
+
+
 ## 9. Upgrade
 
 The schema is versioned and migrations are embedded and forward-only. There is no downgrade
@@ -956,6 +996,38 @@ budget reservation sweeps, batch assignment, lease rebalancing — moves on elec
 leader leaves. Leases and reservations are released as part of the drain. A node with a stable
 `cluster.node_id` reclaims its own leases on restart instead of waiting for them to expire, which
 is why §CONFIG 4 covers setting it.
+
+### 10.1 What two nodes are measured to do
+
+DESIGN §13 states the mechanisms and, until now, no numbers: an operator sizing a fleet or writing
+an incident runbook had adjectives. These are measured on two `dorang` processes against one
+PostgreSQL, with real clocks and a real network round trip — not with an injected clock inside one
+process. Reproduce them with §8.6.
+
+| Event | Measured | Arithmetic |
+|---|---|---|
+| A leader is elected from cold | **5.0 s** | one tick (`cluster` tick, 5 s) |
+| Exactly one leader, sampled every 250 ms for 15 s | **1 lease row, 1 holder** | one row of `capacity_leases` with `axis = 'leader'` |
+| A **SIGKILL**ed node's quota and budget leases return to the fleet | **65–70 s** | ledger lease TTL (60 s) + up to two leader ticks (5 s each) |
+| A revocation reaches a node that did not issue it | **9–15 ms** | `auth.revocation.poll + store_latency`; at `poll: 20ms` a published bound of 270 ms |
+| Budget ceiling honoured across both nodes | **0 overshoot** | 39 admitted against a ceiling of 40, driven concurrently at both |
+| Rolling restart of both nodes | **0 lost**, over four runs of ~200 000 requests each | with `pre_stop_delay` per §10 above |
+
+**The reclaim figure is 65–70 s and not 30 s, and the difference matters.** The registry declares a
+node dead after the 30-second heartbeat TTL, but the reclaim then deliberately refuses to take a
+lease that has not itself expired: a lapsed heartbeat is a declaration, a lapsed lease is a fact,
+and reclaiming a live node's block is how a two-node cluster once admitted 190 against a limit of
+100. So a killed node's units come back on the **lease** clock, and on a sweep scheduled by the
+leader's own tick phase rather than by the expiry — which is where the second tick comes from.
+If you are waiting for a dead node's budget to free up, wait 70 seconds, not 30; if you are
+sizing headroom for a node loss, size it for a minute of one node's leases being held by
+nobody.
+
+**`shared-pg` publishes an overshoot of 0, and the 0 holds while every holder renews its lease.**
+One lapse — an undersized TTL, a store write that missed its window, a heartbeat lost to a pause —
+adds up to the whole ceiling, because the counter is the sum of the *live* lease rows. That is the
+same mechanism as the reclaim above, pointed the other way: what makes a dead holder's units come
+back with no supervisor is what makes a live holder's units come back if its renewal is late.
 
 A stable id has to be a **distinct** id. Two processes under one `cluster.node_id` are one node to
 the registry, to the leadership lease and to every leased limit, and every leader-only job then

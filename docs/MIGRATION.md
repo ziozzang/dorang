@@ -561,6 +561,11 @@ Before moving production traffic:
 - [ ] `DORANG_KEY_PEPPER` set explicitly, and backed up with the database.
 - [ ] `DORANG_MASTER_KEY` set, and known to be set — not the generated fallback.
 - [ ] A restore has been rehearsed (§[OPERATIONS.md](OPERATIONS.md) §8.4), not just a backup taken.
+- [ ] The store is the one you intend to keep (§6.1). There is no SQLite→PostgreSQL converter, so
+      a shadow phase run on SQLite means re-importing keys before cutover.
+- [ ] If more than one node: `capacity_mode` is not `local`, every `node_id` is distinct or empty,
+      and `pre_stop_delay` covers the balancer's detection window (§6.4). The first two refuse to
+      start; the third loses requests on every roll without saying so.
 
 ### 5.3 Sequencing
 
@@ -573,7 +578,9 @@ Before moving production traffic:
    `dorang_auth_failures_total`. A 501 storm names the missing route in
    `X-Dorang-Unimplemented`.
 4. **Move the rest by weight**, at the load balancer. dorang's request path is stateless and any
-   node can serve any request, so this is a routing decision rather than a coordination one.
+   node can serve any request, so *routing* is a routing decision. Standing the second node up is
+   not: it needs a shared store and three settings that the gateway refuses to start without, or
+   silently exceeds a ceiling with. See §6 before you add a node.
 5. **Keep the incumbent reachable** until the legacy verification window (§3.4) closes and
    `dorangctl key list` shows every live key on `dorang_v1`. Until then, the incumbent is your
    rollback.
@@ -595,6 +602,135 @@ There is no schema downgrade. The rollback plan is:
 
 ---
 
+## 6. The store, and the second node
+
+Everything above is about one dorang process on its default store. An incumbent that is already
+backed by PostgreSQL is usually already more than one process, and the replacement has to be too.
+This section is the part of the plan that is *not* a routing decision.
+
+### 6.1 Choosing the store
+
+dorang defaults to SQLite because [DESIGN.md](DESIGN.md) §0.2 requires a binary with no mandatory
+dependencies. That default is right for the shadow phase in §4 and wrong for the deployment you
+are migrating to:
+
+| | SQLite | PostgreSQL |
+|---|---|---|
+| Nodes | **1** | 1–N |
+| `cluster.enabled` | must stay `false` | `true` for two or more |
+| Ledger partitioning | none — one table, retention deletes rows | daily partitions, retention drops whole partitions ([DESIGN.md](DESIGN.md) §9.5) |
+| Restart gap | a sub-second outage on every restart, and it cannot be closed | none, with two nodes and a balancer |
+
+```yaml
+storage:
+  driver: postgres
+  postgres:
+    url_env: DORANG_DATABASE_URL   # postgres://user:pass@host/dorang?sslmode=require
+    max_conns: 32
+```
+
+**There is no SQLite→PostgreSQL converter.** If you ran the shadow phase on SQLite, the keys you
+imported live in that file. Either run the shadow phase on the store you intend to keep, or re-run
+`dorangctl import keys` against PostgreSQL before cutover — it reads the *incumbent's* database,
+so it is repeatable and needs no plaintext (§3.2).
+
+### 6.2 dorang can share the incumbent's database server
+
+It does not have to share its schema, and should not. Name a schema in the DSN and dorang's
+thirty-odd tables land inside it:
+
+```
+DORANG_DATABASE_URL='postgres://user:pass@host/litellm?search_path=dorang&sslmode=require'
+```
+
+Create it once (`CREATE SCHEMA dorang;`) and dorang's migrations do the rest. This keeps the
+incumbent's tables and dorang's out of each other's way during the overlap in §5.3, when both
+gateways are live and `dorangctl import keys --from postgres://…` is reading one while dorang
+writes the other. Sharing a *server* is a capacity decision; sharing a *schema* is a collision
+waiting for the first migration.
+
+### 6.3 Migrations
+
+Embedded, forward-only, and applied inside one transaction under an advisory lock, so several
+nodes starting at once is the normal case rather than a race — the loser blocks, then finds every
+step recorded and applies nothing.
+
+- **On an empty database** and **on a database that already holds rows**, the set applies cleanly.
+  Both are tested against a real PostgreSQL, the second one step at a time with data planted
+  between every pair of steps (`TestMigrateOntoADatabaseWithData`).
+- **The SQLite and PostgreSQL migration sets are compared**, after application, by introspecting
+  both engines: tables, columns, type classes, nullability, primary keys, index columns,
+  uniqueness and partial-index predicates (`TestMigrationSetsDoNotDrift`). They agree.
+- **Upgrading a fleet:** apply once, from one node, *before* rolling — see
+  [OPERATIONS.md](OPERATIONS.md) §9. Two binaries at different schema versions writing the same
+  ledger is a schema race.
+
+### 6.4 The three settings a second node needs
+
+```yaml
+cluster:
+  enabled: true
+  node_id: ""            # empty derives one per process, and cannot collide
+  capacity_mode: shared-pg
+server:
+  pre_stop_delay: 10s    # >= your balancer's detection window
+```
+
+Each of them fails in its own way, and two of the three fail loudly:
+
+- **`capacity_mode` must not be `local`.** `cluster.enabled: true` with `capacity_mode: local`
+  **refuses to start** ([DESIGN.md](DESIGN.md) §5.6). Node-local counting is exact on one node and
+  counts every ceiling once per node on N, so two nodes admit twice a provider's plan limit and
+  the resulting upstream `429`s cascade into the fallback chain and consume the capacity of
+  unrelated models. `shared-pg` publishes a maximum overshoot of **0**, and that figure is
+  measured across two real processes rather than asserted.
+- **`node_id` must be distinct, or empty.** Two processes carrying the same id are *one* node to
+  the registry, to the leadership lease and to every leased limit — one lease that both hold, so
+  every leader-only job runs twice. The second process refuses to start. An empty `node_id`
+  derives one per process and is the only setting that cannot collide; its whole cost is that a
+  restarted process cannot recognise its own leases and waits out their TTL.
+- **`pre_stop_delay` is the one that fails quietly.** It is how long a draining node keeps serving
+  *after* readiness goes false, and it exists because every balancer discovers unreadiness by
+  polling. Set it below your balancer's detection window and a rolling restart is
+  connection-refused at the client:
+
+  ```
+  pre_stop_delay >= probe period x failure threshold + probe timeout
+                    + endpoint-withdrawal propagation
+  ```
+
+  Measured, two nodes over one PostgreSQL, a client driving both through a readiness-aware
+  balancer polling at 100 ms: with `pre_stop_delay: 0s`, a rolling restart lost **870 of 59 600**
+  requests. With `pre_stop_delay: 3s` and nothing else changed, **0 of 200 229**
+  (`TestRollingRestartOfTwoNodesLosesNoRequest`). `deploy/kubernetes.yaml`'s probes need five
+  seconds; the shipped default of `10s` covers them.
+
+### 6.5 What two nodes actually cost you, in numbers
+
+These are measured on two `dorang` processes against one PostgreSQL, with real clocks — not with
+an injected clock in one process. An operator planning an incident response or a fleet size needs
+the arithmetic, not the adjective:
+
+| Event | Measured | Arithmetic |
+|---|---|---|
+| A leader is elected from cold, two nodes | **5.0 s** | one tick (5 s) |
+| A **hard-killed** node's quota and budget leases return to the fleet | **65–70 s** | ledger lease TTL (60 s) + up to two leader ticks (5 s each) — **not** the 30 s node TTL, which only declares the node dead |
+| A revocation reaches a node that did not issue it | **9–15 ms** | `poll + store_latency`; at `poll: 20ms` that is a published bound of 270 ms |
+| Budget ceiling across both nodes | **0 overshoot** | 39 requests admitted against a ceiling of 40, driven concurrently at both nodes |
+| A rolling restart of both nodes | **0 lost**, over four runs of ~200 000 requests each | with `pre_stop_delay` set per §6.4 |
+
+The reclaim figure is the one worth reading twice. The registry declares a node dead after
+`node_ttl` (30 s), but the reclaim then deliberately refuses to take a lease that has not itself
+expired — a lapsed heartbeat is a declaration, a lapsed lease is a fact, and reclaiming a live
+node's block is how a two-node cluster once admitted 190 against a limit of 100. So a killed
+node's units come back on the *lease* clock, not the heartbeat clock. Size a fleet against 70 s.
+
+**Budget overshoot across nodes is 0 while every holder renews its lease**, and one lapse adds up
+to the whole ceiling. That condition is not a footnote: it is the same mechanism as the recovery
+above, pointed in the other direction.
+
+---
+
 ## See also
 
 - [CONFIG.md](CONFIG.md) §18 — every shadow key; §1 — the three refuse-to-start conditions an
@@ -603,4 +739,5 @@ There is no schema downgrade. The rollback plan is:
   never had because it never talked to a self-hosted engine.
 - [COMPATIBILITY.md](COMPATIBILITY.md) — the wire contracts, the deliberate divergences from the
   reference proxy, and the error taxonomy a shadow diff will surface.
-- [DESIGN.md](DESIGN.md) §2.4 — the credential-import rules; §14.1 — shadow comparison.
+- [DESIGN.md](DESIGN.md) §2.4 — the credential-import rules; §14.1 — shadow comparison; §5.6 —
+  the published overshoot of each capacity mode; §13 — multi-node operation and the drain.
