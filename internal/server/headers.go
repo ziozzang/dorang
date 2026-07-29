@@ -252,7 +252,12 @@ func stampLegacyHeaders(h http.Header, rq *Request, r *Result, costDeferred bool
 	setMillis(h, LegacyHeaderResponseDuration, r.LatencyNS)
 	if r.Priced {
 		var b [32]byte
-		h.Set(LegacyHeaderKeySpend, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
+		// The mirror follows the original: a spend nobody looked up is absent
+		// here too. A dashboard reading the legacy spelling would otherwise get
+		// the flat zero the dorang spelling stopped claiming.
+		if r.SpendKnown {
+			h.Set(LegacyHeaderKeySpend, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
+		}
 		if r.BudgetNanoUSD > 0 {
 			h.Set(LegacyHeaderKeyMaxBudget, string(appendNanoUSD(b[:0], r.BudgetNanoUSD)))
 		}
@@ -384,14 +389,31 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	}
 	if r.Priced {
 		var b [32]byte
-		h.Set(HeaderSpendUSD, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
+		// SpendKnown, not Priced. The two are separate questions and this pair
+		// answered the wrong one: the budget hold is hydrated from the durable
+		// counter by the RESERVATION, and a request whose estimated cost is zero
+		// takes no reservation, so on the first zero-rated request after a
+		// process start these read a spend of 0 against a full budget for a key
+		// that had already spent most of its ceiling. "Not loaded" is not "zero"
+		// — the same rule [setInt] applies to a token count and DESIGN §8.5
+		// applies to the notional figure, and the streamed cost header answers
+		// it the same way: absent rather than a number nobody looked up.
+		//
+		// The CEILING is still emitted, because that one is known: it comes from
+		// the authorization snapshot, not from the counter. What goes with the
+		// spend is the REMAINING, which is derived from it.
+		if r.SpendKnown {
+			h.Set(HeaderSpendUSD, string(appendNanoUSD(b[:0], r.SpendNanoUSD)))
+		}
 		if r.BudgetNanoUSD > 0 {
 			h.Set(HeaderBudgetUSD, string(appendNanoUSD(b[:0], r.BudgetNanoUSD)))
-			rem := r.BudgetNanoUSD - r.SpendNanoUSD
-			if rem < 0 {
-				rem = 0
+			if r.SpendKnown {
+				rem := r.BudgetNanoUSD - r.SpendNanoUSD
+				if rem < 0 {
+					rem = 0
+				}
+				h.Set(HeaderBudgetRemainingUSD, string(appendNanoUSD(b[:0], rem)))
 			}
-			h.Set(HeaderBudgetRemainingUSD, string(appendNanoUSD(b[:0], rem)))
 		}
 	}
 	for window, pct := range r.QuotaUsedPct {

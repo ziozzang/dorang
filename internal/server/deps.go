@@ -418,10 +418,31 @@ type Result struct {
 
 	Tokens Usage
 
-	CostNanoUSD     int64
-	NotionalNanoUSD int64
-	SpendNanoUSD    int64
-	BudgetNanoUSD   int64
+	CostNanoUSD int64
+	// MarginalNanoUSD and SubscriptionNanoUSD are CostNanoUSD's decomposition by
+	// pricing class (DESIGN §8.1). They reach the ledger's `marginal_cost_nano`
+	// and `subscription_cost_nano` columns, which /spend/logs reports as
+	// `marginal_spend` and `subscription_spend`.
+	//
+	// They are carried rather than derived because neither can be recovered from
+	// the total, and because §8.1 requires them to be separate figures: routing
+	// compares the marginal one alone, so that a sunk plan cost cannot make a
+	// saturated plan look cheap. They do not have to sum to CostNanoUSD — an
+	// `adjustment` rule is a third class applied on top of both.
+	MarginalNanoUSD     int64
+	SubscriptionNanoUSD int64
+	NotionalNanoUSD     int64
+	SpendNanoUSD        int64
+	BudgetNanoUSD       int64
+	// SpendKnown says whether SpendNanoUSD was looked up or merely defaulted.
+	//
+	// A request whose estimated cost is zero takes no reservation, so nothing
+	// hydrates the budget hold from the durable counter and the figure behind it
+	// is an empty block rather than this subject's spend. That is "not loaded",
+	// not "zero", and the two must not read alike on the wire — the same
+	// absent-versus-zero rule [setInt] applies to the token counters and DESIGN
+	// §8.5 applies to the notional figure.
+	SpendKnown bool
 	// Priced marks the cost fields as meaningful. An unpriced request must not
 	// claim to have cost zero.
 	Priced bool

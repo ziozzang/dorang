@@ -151,6 +151,11 @@ func jsonDispatcher(body string) Dispatcher {
 		rq.Result.Tokens = Usage{Input: 11, Output: 22, Total: 33}
 		rq.Result.CostNanoUSD = 123456
 		rq.Result.Priced = true
+		// A dispatcher that took a reservation knows the spend. The fixture says
+		// so explicitly, because Priced and SpendKnown are separate questions:
+		// see [Result.SpendKnown].
+		rq.Result.SpendNanoUSD = 7_000
+		rq.Result.SpendKnown = true
 		rq.Result.LatencyNS = 5_000_000
 		w.Header().Set("Content-Type", "application/json")
 		_, err := io.WriteString(w, body)

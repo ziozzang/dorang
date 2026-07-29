@@ -267,6 +267,7 @@ func (c *Config) validateStorage(col *collector) {
 
 func (c *Config) validateCluster(col *collector) {
 	mustBeOneOf(col, "cluster.capacity_mode", c.Cluster.CapacityMode, capacityModes)
+	c.validateNodeID(col)
 
 	// A mode this build cannot honour is refused where it is written down, not
 	// quietly downgraded at construction. dorang ships the shared-redis
@@ -314,6 +315,84 @@ func (c *Config) validateCluster(col *collector) {
 	// rather than failing on an unknown field.
 	if c.Cluster.MinLeasable <= 0 {
 		col.add("cluster.min_leasable", "must be greater than zero")
+	}
+}
+
+// nodeIDMaxLen bounds cluster.node_id.
+//
+// 64 is a DNS label plus one: the identifiers this field is actually set from —
+// a hostname, a StatefulSet pod name, a container id — are all bounded by 63,
+// and a value longer than that is a value that came from somewhere else. The
+// id travels into every log line, every metric label and the registry row, so
+// an unbounded one is a paper cut in a dozen places rather than a failure in
+// one.
+const nodeIDMaxLen = 64
+
+// nodeIDPlaceholders are the ways an un-interpolated template reaches a
+// configuration file: shell and envsubst, Helm and Jinja, and the angle
+// brackets documentation uses to mean "put your own value here".
+//
+// This is the one duplicate-id case a validator can prove. It cannot see the
+// other nodes' files, so it cannot tell that two of them say "dorang-a"; but a
+// file whose id is still `${HOSTNAME}` is a file that was MEANT to differ per
+// node and does not, and every node in the deployment carries the same literal.
+// That is the rushed-deploy shape exactly, and it is the reason this field's
+// safety must not rest on validation: see [cluster.ErrDuplicateNodeID], which
+// catches at run time the cases nothing here can reach.
+var nodeIDPlaceholders = []string{"${", "{{", "<"}
+
+// validateNodeID checks the shape of cluster.node_id.
+//
+// Empty is not an error and is not discouraged. An empty value derives an id
+// PER PROCESS, and a random per-process id is the one setting that cannot
+// collide however the configuration was copied; what it costs is that a
+// restarted node cannot recognise its own leases and waits out their TTL. So
+// the safe value is the default, the useful value is a distinct stable one, and
+// the dangerous value is a stable one that is not distinct — which is what the
+// checks below are about.
+func (c *Config) validateNodeID(col *collector) {
+	id := c.Cluster.NodeID
+	if id == "" {
+		return
+	}
+	const path = "cluster.node_id"
+
+	if strings.TrimSpace(id) != id {
+		col.add(path, "must not begin or end with whitespace: %q and %q are two "+
+			"different nodes to every lease keyed by this value, and indistinguishable "+
+			"in every log line that reports one", id, strings.TrimSpace(id))
+		return
+	}
+	// Placeholders are diagnosed BEFORE the charset, because a template usually
+	// fails both -- `{{ .Values.nodeId }}` holds spaces -- and "this did not
+	// expand" is the finding, while "this holds a space" is a symptom of it.
+	for _, p := range nodeIDPlaceholders {
+		if !strings.Contains(id, p) {
+			continue
+		}
+		col.add(path, "looks like an un-substituted template (%q contains %q). This "+
+			"value must be DISTINCT on every node: a template that did not expand "+
+			"gives every node in the deployment the same literal id, and to the store "+
+			"they are then one node — one registry row, one leadership lease, one "+
+			"share of every leased limit. Every leader-only job then runs on each of "+
+			"them: retention, the capacity and budget reservation sweeps, batch "+
+			"assignment. §9.2 is explicit that two nodes picking up the same batch "+
+			"pays for every finished row twice. Substitute it in the orchestrator, or "+
+			"leave node_id empty and let one be derived per process", id, p)
+		return
+	}
+	if len(id) > nodeIDMaxLen {
+		col.add(path, "is %d bytes; the limit is %d, which is a DNS label plus one "+
+			"(a hostname or a pod name, the two things this is usually set from)",
+			len(id), nodeIDMaxLen)
+	}
+	for i := 0; i < len(id); i++ {
+		if ch := id[i]; ch <= ' ' || ch > '~' {
+			col.add(path, "must be printable ASCII with no spaces; %q holds a byte "+
+				"(0x%02x at offset %d) that renders differently in a log line, a metric "+
+				"label and a registry row, so the same node reads as several", id, ch, i)
+			return
+		}
 	}
 }
 

@@ -2431,6 +2431,22 @@ invoice. Two normalizations are mandatory:
    > arithmetic is worth less than the arithmetic: the rule is now stated as the formula the
    > encoder implements, and a round-trip test in each adapter asserts it, so the next
    > inversion fails a test instead of an audit.
+   > **`input_tokens` does not identify a family.** Two of the three columns above spell the
+   > prompt count that way and mean opposite things by it: `messages` excludes the cached
+   > prefix, `responses` includes it. A decoder that reads the wire without knowing which
+   > endpoint produced the body — the passthrough relay of §10.6 step 5 is the one that does —
+   > therefore cannot settle the convention from the input key. What settles it is the
+   > breakdown object, whose spelling the three families do **not** share:
+   > `prompt_tokens_details` (inclusive), `input_tokens_details` (inclusive),
+   > `cache_read_input_tokens` beside `input_tokens` (exclusive). The breakdown outranks the
+   > input key, in either order, because JSON members are unordered.
+   >
+   > The cost of not knowing the third spelling is the same wrong invoice, arriving by
+   > omission: a Responses body whose `input_tokens_details.cached_tokens` is dropped decodes
+   > with `CacheReadTokens = 0`, and §8.5 prices a declared sub-rate by carving its quantity out
+   > of the parent's — so the whole inclusive prompt is charged at the full **uncached** input
+   > rate. Measured on the rate card of §8.5, a 120/15 request with a 40-token cached prefix and
+   > 8 reasoning tokens was charged $0.000153_0 against the vendor's $0.000153_8.
 2. **Reasoning tokens are billed as output.** One family breaks them out, another folds them
    in. `ReasoningTokens` is reported separately *and* is already contained in
    `OutputTokens`, so cost never adds them twice. A test asserts
@@ -3054,6 +3070,36 @@ one lookup.
 The leader — elected through a store lock — owns rollup compaction, partition maintenance,
 expiry sweeps (capacity reservations §5.3 **and** budget reservations §6.4), batch
 assignment, and lease rebalancing.
+
+### Node identity
+
+`cluster.node_id` names a node in the `nodes` registry, in the leadership lease, in every
+`quota_leases` row and in the ledger's budget draw. Those are four different things keyed by one
+value, which is why the value has to be **distinct per node** and why getting it wrong is not
+confined to leadership.
+
+Two processes carrying the same id are one node to all four. One registry row, so neither is ever
+declared dead and neither one's leases are reclaimed; one share of every leased limit, drawn down
+by two; and one leadership lease that **both** hold — because the store sees the second acquire as
+the incumbent renewing. The fencing token does not move, so both processes carry a token equal to
+the row's and both pass the fence check. Every mechanism in this section works as specified and
+there are two leaders, running every leader-only job twice, including the batch assignment §9.2
+prices at *every finished row paid for twice*.
+
+The refusal is therefore in the registry and not in the lease, and it is a refusal to **start**:
+
+- `Register` is a compare-and-swap on a per-process incarnation, so a process cannot take an id
+  another process is still beating on. The loser does not join, lead, or run a leader job.
+- `Heartbeat` carries the same incarnation, so a process that was frozen past the node TTL and
+  legitimately superseded learns it from the row, stops leading, and stays out. This is the
+  identity analogue of the fencing token's argument about terms.
+- A restart is not a duplicate: a lapsed row is adopted, a cleanly drained node left none.
+- An **empty** `node_id` derives one per process. That is the only setting that cannot collide,
+  and its whole cost is that a restarted process cannot recognise its own leases.
+
+A configuration file cannot prove the id is unique — it only ever describes one node — so
+validation catches the one shape that is provably shared, an un-substituted template
+(`${HOSTNAME}`, `{{ … }}`, `<…>`), and the run-time check catches the rest.
 
 ### Draining
 

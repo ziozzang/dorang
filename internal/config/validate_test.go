@@ -46,6 +46,58 @@ func TestValidationRules(t *testing.T) {
 			path: "cluster.capacity_mode",
 			want: "not a known value",
 		},
+		// cluster.node_id. A validator sees one file at a time, so it cannot
+		// prove that two nodes were given the same id -- that is caught at run
+		// time by the registry (cluster.ErrDuplicateNodeID). What it CAN prove is
+		// that a value was meant to differ per node and does not, which is the
+		// un-substituted template below, and shapes under which one node reads as
+		// several.
+		{
+			name: "an empty node_id is the safe default, not a problem",
+			f:    fragments{top: "cluster: {enabled: true, capacity_mode: shared-pg}\n"},
+		},
+		{
+			name: "a distinct node_id is fine",
+			f: fragments{top: "cluster: {enabled: true, capacity_mode: shared-pg, " +
+				"node_id: dorang-0}\n"},
+		},
+		{
+			name: "an un-substituted shell template gives every node the same id",
+			f:    fragments{top: "cluster: {node_id: \"${HOSTNAME}\"}\n"},
+			path: "cluster.node_id",
+			want: "un-substituted template",
+		},
+		{
+			name: "an un-substituted Helm template does too",
+			f:    fragments{top: "cluster: {node_id: \"{{ .Values.nodeId }}\"}\n"},
+			path: "cluster.node_id",
+			want: "un-substituted template",
+		},
+		{
+			name: "documentation's angle brackets, copied through",
+			f:    fragments{top: "cluster: {node_id: \"node-<ordinal>\"}\n"},
+			path: "cluster.node_id",
+			want: "un-substituted template",
+		},
+		{
+			name: "surrounding whitespace makes one node read as two",
+			f:    fragments{top: "cluster: {node_id: \"dorang-0 \"}\n"},
+			path: "cluster.node_id",
+			want: "must not begin or end with whitespace",
+		},
+		{
+			name: "an interior space is the same hazard",
+			f:    fragments{top: "cluster: {node_id: \"dorang 0\"}\n"},
+			path: "cluster.node_id",
+			want: "printable ASCII",
+		},
+		{
+			name: "a node_id longer than a DNS label",
+			f: fragments{top: "cluster: {node_id: \"" +
+				strings.Repeat("n", 65) + "\"}\n"},
+			path: "cluster.node_id",
+			want: "the limit is 64",
+		},
 		{
 			name: "leased mode rejects a limit below min_leasable",
 			f: fragments{top: "cluster: {enabled: true, capacity_mode: leased}\n" +

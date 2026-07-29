@@ -807,8 +807,24 @@ terminationGracePeriodSeconds: 80       # pre_stop_delay + 2 × shutdown_grace +
 
 **클러스터에서는** 리더의 일 — 롤업 압축, 파티션 유지보수, capacity·예산 예약 sweep, batch 할당, 리스
 재분배 — 이 리더가 떠날 때 선출로 옮겨간다. 리스와 예약은 드레인의 일부로 반환된다. `cluster.node_id`가
-안정적인 노드는 재시작 시 만료를 기다리는 대신 자기 리스를 회수하며, 그것이 CONFIG §4가 그 설정을 고집하는
+안정적인 노드는 재시작 시 만료를 기다리는 대신 자기 리스를 회수하며, 그것이 CONFIG §4가 그 설정을 다루는
 이유다.
+
+안정적인 id는 **구별되는** id여야 한다. 하나의 `cluster.node_id`를 쓰는 두 프로세스는 레지스트리에도,
+리더십 리스에도, 리스된 모든 상한에도 하나의 노드이며, 그러면 리더 전용 작업이 양쪽에서 전부 돈다 —
+batch 할당 포함이고, DESIGN §9.2는 두 노드가 같은 batch를 집으면 완료된 행마다 두 번 지불한다고
+기록한다. 두 번째 프로세스는 기동을 거부한다:
+
+```
+cluster: node id dorang-0 is in use by another process; this node will not join, lead or run any
+leader job.
+```
+
+이 줄이 보이면 두 pod·호스트·컨테이너가 같은 id를 들고 있다 — 치환되지 않은 StatefulSet 템플릿, 이미지에
+구워진 id, 두 번째 호스트로 복사된 설정 파일. id를 고칠 것이지, 그대로 재시작하지 말 것. 유일하게
+양성인 경우는 설정된 id로 30초 하트비트 TTL 안에 일어난 **비정상** 재시작이고, 이전 행이 만료되면 스스로
+풀린다. 유일성을 보장할 수 없다면 `cluster.node_id`를 비워 둘 것: 파생된 프로세스별 id는 충돌할 수 없고,
+대가는 재시작 시의 그 리스 TTL 하나뿐이다.
 
 ---
 

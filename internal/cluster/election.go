@@ -31,7 +31,7 @@ const DefaultTick = 5 * time.Second
 // The hard part is not electing a leader; it is un-electing one. A node that
 // still believes it leads while another node has taken the lease will run the
 // same retention pass, the same sweep and the same batch assignment as its
-// successor, concurrently. Three things prevent that, and all three are needed:
+// successor, concurrently. Four things prevent that, and all four are needed:
 //
 //  1. Every promotion opens a leader-scoped context, and every demotion cancels
 //     it with [ErrLeadershipLost]. A leader job takes that context, so losing
@@ -68,6 +68,18 @@ const DefaultTick = 5 * time.Second
 //     assertion inside a caller's own transaction. What the token cannot reach
 //     is a job that writes through some other package's transaction -- see
 //     [Fence].
+//
+// # What none of the four reaches
+//
+// All four are arguments about TERMS: which holder is current, and for how long
+// this one can prove it is. None of them is an argument about WHO, and there is
+// a way to get two leaders that never disagrees about a term at all. Two
+// processes configured with the same node id are, to the lock, one holder
+// renewing: the second [Lock.Acquire] matches on node_id, succeeds, and leaves
+// the token where it was, so both processes hold a token equal to the row's and
+// both pass [Election.Fenced]. Every mechanism above is working, and there are
+// two leaders. That is caught in the registry instead, at the moment a process
+// joins -- see [ErrDuplicateNodeID].
 type Election struct {
 	lock   Lock
 	nodeID string
@@ -384,6 +396,31 @@ func (e *Election) Resign(ctx context.Context) error {
 		fn()
 	}
 	return e.lock.Release(ctx)
+}
+
+// Disqualify ends this node's participation permanently: it stops leading now,
+// and every later campaign is refused with [ErrClosed].
+//
+// It differs from [Election.Resign] in the one way that matters when the reason
+// is [ErrDuplicateNodeID]: the lease is NOT released. Release is scoped by node
+// id, and under a duplicated id that is precisely the other process's lease as
+// well -- so a node that discovered it shares an identity and then released
+// "its" lease would take leadership away from the process that legitimately
+// holds it, on the way out. Letting the lease lapse on its TTL is slower and is
+// the only ending that cannot hurt somebody else.
+//
+// It is one-way. A node whose id turned out to belong to another process does
+// not get it back by waiting: the condition is a deployment mistake, not a
+// transient, and a node that resumed campaigning on the next pass would be two
+// leaders again one tick later.
+func (e *Election) Disqualify(cause error) {
+	e.mu.Lock()
+	e.closed = true
+	notify := e.demoteLocked(cause)
+	e.mu.Unlock()
+	for _, fn := range notify {
+		fn()
+	}
 }
 
 // Close resigns and refuses further campaigns.

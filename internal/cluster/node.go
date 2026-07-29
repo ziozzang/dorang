@@ -17,8 +17,14 @@ type Config struct {
 	// ([ErrLocalInCluster]).
 	Enabled bool
 	// NodeID mirrors cluster.node_id. Empty means one is generated, which is
-	// per process rather than per host: two processes sharing an id are one
-	// node as far as every lease here is concerned.
+	// per process rather than per host.
+	//
+	// The empty default is the only setting that cannot collide however the
+	// configuration was copied, and what it costs is that a restarted process
+	// cannot recognise its own leases and waits out their TTL. A configured id
+	// buys that back and can be got wrong; a second process arriving under an
+	// id somebody is already using is refused with [ErrDuplicateNodeID] rather
+	// than quietly counted as the same node.
 	NodeID string
 	// Address and Version are published in the registry so that a mixed
 	// deployment is visible rather than inferred.
@@ -117,8 +123,13 @@ type Node struct {
 	registered bool
 	started    bool
 	closed     bool
-	stop       chan struct{}
-	stopped    chan struct{}
+	// conflict is set once another process is observed running under this
+	// node's id, and is never cleared. Every later [Node.Tick] returns it
+	// without heartbeating, campaigning or dispatching a job. See
+	// [ErrDuplicateNodeID].
+	conflict error
+	stop     chan struct{}
+	stopped  chan struct{}
 }
 
 // New builds a node.
@@ -330,17 +341,65 @@ func (n *Node) Coordinator(cfg quota.CoordinatorConfig) (quota.Coordinator, erro
 }
 
 // Register records this node and beats once.
+//
+// It returns [ErrDuplicateNodeID] when another process is already running under
+// this node's id, and this node then holds nothing: no registry row, no term,
+// and -- because `registered` stays false -- nothing for [Node.Close] to take
+// away from the process that does hold the id.
 func (n *Node) Register(ctx context.Context) error {
 	err := n.reg.Register(ctx, NodeInfo{
 		ID: n.id, Address: n.address, Version: n.version, StartedAt: n.startedAt,
 	})
 	if err != nil {
+		if errors.Is(err, ErrDuplicateNodeID) {
+			n.disqualify(err)
+		}
 		return err
 	}
 	n.mu.Lock()
 	n.registered = true
 	n.mu.Unlock()
 	return nil
+}
+
+// disqualify records that this node's identity is not its own, stops it
+// leading, and says so as loudly as this package can.
+//
+// The log line is the point as much as the demotion is. DESIGN 9.2 makes this
+// the one condition under which every leader-only job runs twice -- two nodes
+// picking up the same batch pays for every finished row twice -- and it is
+// invisible from every other signal: the registry shows one node because the two
+// processes share its row, the election shows one leader because they share its
+// lease, and both processes' own metrics look like a healthy single node.
+func (n *Node) disqualify(cause error) {
+	n.mu.Lock()
+	first := n.conflict == nil
+	if first {
+		n.conflict = cause
+	}
+	n.mu.Unlock()
+	if !first {
+		return
+	}
+	n.logf("cluster: node id %s is in use by another process; this node will not "+
+		"join, lead or run any leader job. Every leader-only job -- retention, the "+
+		"capacity and budget reservation sweeps, batch assignment, lease reclaim -- "+
+		"runs once per cluster, and two processes sharing an id runs each of them "+
+		"twice (DESIGN 9.2). Give every node a distinct cluster.node_id, or leave it "+
+		"empty and let one be derived per process: %v", n.id, cause)
+	n.el.Disqualify(cause)
+}
+
+// Conflict returns the reason this node was disqualified, or nil.
+//
+// It is what a caller reads to decide whether to keep the process alive. A
+// duplicate id is not a condition a node recovers from, so a gateway that
+// treats this as fatal is behaving correctly; see [ErrDuplicateNodeID] for why
+// declining to lead is not enough on its own.
+func (n *Node) Conflict() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.conflict
 }
 
 // Tick is one pass of the node loop: heartbeat, campaign, renew this node's
@@ -350,10 +409,17 @@ func (n *Node) Register(ctx context.Context) error {
 // is what the tests do. Nothing in it blocks for longer than the store takes.
 func (n *Node) Tick(ctx context.Context) error {
 	n.mu.Lock()
-	closed := n.closed
+	closed, conflict := n.closed, n.conflict
 	n.mu.Unlock()
 	if closed {
 		return ErrClosed
+	}
+	// A node whose id belongs to another process does not beat, does not
+	// campaign and does not dispatch. Beating would keep the other process's row
+	// alive under this process's clock, which is how neither of them is ever
+	// declared dead and neither one's leases are ever reclaimed.
+	if conflict != nil {
+		return conflict
 	}
 
 	var errs []error
@@ -362,11 +428,22 @@ func (n *Node) Tick(ctx context.Context) error {
 	// no business claiming leadership, and re-registering here is what lets a
 	// node whose row was pruned rejoin instead of quietly ceasing to exist.
 	if err := n.reg.Heartbeat(ctx, n.el.IsLeader()); err != nil {
-		if errors.Is(err, ErrNotRegistered) {
+		switch {
+		case errors.Is(err, ErrDuplicateNodeID):
+			// Superseded while this process was away, and it has already been
+			// demoted by [Node.disqualify]. Returning immediately rather than
+			// collecting the error: campaigning after this would be campaigning
+			// for a lease held under an id this process no longer owns.
+			n.disqualify(err)
+			return err
+		case errors.Is(err, ErrNotRegistered):
 			if rerr := n.Register(ctx); rerr != nil {
+				if errors.Is(rerr, ErrDuplicateNodeID) {
+					return rerr
+				}
 				errs = append(errs, rerr)
 			}
-		} else {
+		default:
 			errs = append(errs, err)
 		}
 	}
@@ -469,6 +546,11 @@ func (n *Node) Fence() *Fence { return n.el.Fence() }
 // [Node.Close]. Calling it twice, or after Close, is refused rather than
 // quietly starting a second loop that would heartbeat and campaign as the same
 // node.
+//
+// It returns [ErrDuplicateNodeID] when another process is already running under
+// this node's id. That is a refusal to JOIN, and a caller that keeps the process
+// running past it has a gateway drawing budget and quota under an identity the
+// cluster attributes to somebody else; see [ErrDuplicateNodeID].
 func (n *Node) Start(ctx context.Context) error {
 	n.mu.Lock()
 	switch {
@@ -483,6 +565,13 @@ func (n *Node) Start(ctx context.Context) error {
 	n.mu.Unlock()
 
 	if err := n.Register(ctx); err != nil {
+		// The flag goes back. It is held across Register so that two concurrent
+		// Starts cannot both register, and released on failure because no loop
+		// was launched: leaving it set would make [Node.Close] wait forever on
+		// `stopped`, which only [Node.loop]'s deferred close ever closes.
+		n.mu.Lock()
+		n.started = false
+		n.mu.Unlock()
 		return err
 	}
 	go n.loop(ctx)

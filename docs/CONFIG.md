@@ -320,7 +320,7 @@ cluster:
 | Key | Type | Default | What it does | What breaks if it is wrong |
 |---|---|---|---|---|
 | `enabled` | bool | `false` | Turns on multi-node behaviour: leader election, leased coordination, and the §1.1 guard | Leaving it `false` on a fleet gives you N independent gateways each counting its own ceilings — the exact overshoot §1.1 refuses, arrived at by omission instead of by configuration |
-| `node_id` | string | `""` | Names this process in its lease rows | Empty derives one **per process**. A restarted node then cannot reclaim its own leases and must wait for them to expire. Set it on every clustered node |
+| `node_id` | string | `""` | Names this process in its lease rows | Empty derives one **per process**, which is the only value that cannot collide however the file was copied; the cost is that a restarted node cannot reclaim its own leases and waits for them to expire. If you set it, it must be **distinct on every node** — see below |
 | `redis_url_env` | string | `DORANG_REDIS_URL` | Names the variable holding the Redis URL | Nothing dials it. The only mode that would read it is refused at load (below), and the key is kept loadable so an imported LiteLLM configuration still parses |
 | `capacity_mode` | `local` \| `shared-redis` \| `shared-pg` \| `leased` | `local` | How capacity **and quota** are coordinated across nodes. One accuracy vocabulary, not two | See §1.1. `local` with `enabled: true` refuses to start. `shared-redis` is refused outright: this build ships the mode's protocol and no Redis client, and accepting it would give you a coordinator that reports `shared-redis` and its published accuracy while coordinating through the store. Use `shared-pg`, which is also exact |
 | `min_leasable` | int | `16` | The smallest ceiling `leased` mode will divide across nodes | Zero or negative is refused. Any `max_concurrency` below this value, anywhere in the file, is rejected under `leased` — a single-digit limit cannot be usefully divided, and pretending it can produces a fleet where most nodes hold a block of zero |
@@ -329,6 +329,54 @@ Under `leased`, the validator checks `min_leasable` against `providers[].max_con
 `capacity.provider_groups[].max_concurrency`, `capacity.credential_groups[].max_concurrency`,
 `capacity.models[].max_concurrency` and `key_rotation.providers[].keys[].max_concurrency`. Each
 violation names the path and the value.
+
+### `node_id` must be distinct on every node
+
+The node id is not only the leader lease's owner. It keys this process's row in the `nodes`
+registry — whose heartbeat is what tells the cluster the node is alive, and what the leader walks
+to reclaim a dead node's leases — it keys this node's share of every leased limit, and it keys the
+budget draw from the ledger. Two processes carrying the same id are **one node** to all of it: one
+registry row, one lease, one share.
+
+What that costs is stated in §9.2 of the design: every leader-only job runs twice. Retention,
+partition pre-creation, the capacity and budget reservation sweeps, lease reclaim — and batch
+assignment, where two nodes picking up the same batch pays for every finished row twice. The
+published overshoot of §1.1 is `something × (nodes − 1)` computed from the number of *live* rows,
+so it is also wrong, understated by exactly the node that is invisible.
+
+The fencing token does not catch it. It advances when the lock changes **holder**, and two
+processes claiming one id are one holder renewing — the second acquire is accepted as a renewal,
+the token does not move, and both processes then pass the fence check with the same token. It is
+a mechanism about *terms*, and this is a question about *who*.
+
+dorang catches it in the registry instead, and **refuses to start**:
+
+```
+cluster: another process is already running under this node id: node id "dorang-0" is held by
+another process ...
+```
+
+- **A second process that finds the id in use will not join, lead, or run any leader job.** It
+  exits the cluster layer rather than running on with an identity that is not its own.
+- **A node that is superseded while it is away** — frozen past its heartbeat TTL by a long GC
+  pause or a suspended container, so a successor legitimately adopted its row — discovers it on
+  its next heartbeat, stops leading, and stays out.
+- **A restart is not a duplicate.** A node that died left a row whose heartbeat lapses within
+  `cluster` node TTL (30 s); the restart adopts it and reclaims its own leases. A node that
+  drained cleanly removed its row, and its replacement starts at once. Only an *unclean* restart
+  under a configured id waits out the TTL — deliberately, because within that window the cluster
+  still attributes the previous process's leases to that id.
+
+Two shapes are refused at load, because they are the ones a file can prove on its own:
+
+| Value | Why |
+|---|---|
+| `node_id: "${HOSTNAME}"`, `"{{ .Values.nodeId }}"`, `"node-<ordinal>"` | An un-substituted template gives **every** node the same literal id. Substitute it in the orchestrator |
+| `node_id: "dorang-0 "`, `"dorang 0"` | Surrounding or interior whitespace: `"a"` and `"a "` are two nodes to every lease and indistinguishable in every log line that reports one |
+
+Everything else about distinctness is beyond a validator, which only ever sees one node's file.
+If you cannot guarantee the id is unique per node, **leave it empty** — the derived per-process id
+is collision-proof by construction, and the only thing it costs is a lease TTL on restart.
 
 > **Rolling windows are exact only in `local` mode.** A rolling 5-hour allowance has no natural
 > period boundary, so the shared and leased modes key it to an epoch-aligned grid. That is a
@@ -1894,7 +1942,9 @@ storage:
 
 cluster:
   enabled: true
-  node_id: ""                    # set per node from the orchestrator, e.g. the pod name
+  node_id: ""                    # set per node from the orchestrator, e.g. the pod name, or
+                                 # leave empty: a derived id cannot collide. A second process
+                                 # under an id already in use refuses to start.
   redis_url_env: DORANG_REDIS_URL
   capacity_mode: shared-pg       # exact; +1 RTT on the hot path, deliberately
   min_leasable: 16
@@ -1960,7 +2010,10 @@ priority_mapping:
 Notes that matter at this tier:
 
 - **`node_id` must be distinct and stable per node.** An empty value derives one per *process*,
-  so a restarted node cannot reclaim its own leases and waits for them to expire instead.
+  so a restarted node cannot reclaim its own leases and waits for them to expire instead — but it
+  cannot collide, and a colliding id is much the worse failure: a second process under an id
+  already in use **refuses to start**, and before that refusal existed both processes led and
+  every leader-only job ran twice (§4, `node_id` must be distinct on every node).
 - `capacity_mode: shared-pg` costs one round trip on the hot path, against a p99 target of
   5 ms for that profile. It is the price of exact accounting; `leased` trades it for a published
   overshoot of `block × (nodes − 1)`. `shared-redis` would be cheaper per round trip and is

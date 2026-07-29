@@ -10,6 +10,10 @@ import (
 	"github.com/ziozzang/dorang/internal/store"
 )
 
+// This file also owns the identity half of DESIGN 13, which is not the same
+// question as the leadership half and is not answered by the same mechanism.
+// See [ErrDuplicateNodeID] for why a fencing token cannot reach it.
+
 // DefaultNodeTTL is how long a node may go without a heartbeat before it is
 // considered gone and its leases become reclaimable.
 //
@@ -21,9 +25,15 @@ const DefaultNodeTTL = 30 * time.Second
 
 // NodeInfo is one row of the node registry (DESIGN 9.2, table `nodes`).
 type NodeInfo struct {
-	// ID is the node's stable identity. Two processes sharing an ID are one
-	// node as far as every lease in this package is concerned, which is why a
-	// generated ID is per process, not per host.
+	// ID is the node's stable identity, and it is the only field here that is
+	// an identity: address and version describe a node, this one names it.
+	//
+	// Two processes sharing an ID would be one node to every lease in this
+	// package -- one row here, one leadership lease, one share of every leased
+	// limit -- so the second one is refused rather than accommodated. See
+	// [ErrDuplicateNodeID], and [Registry.Incarnation] for what "second" is
+	// decided by. A generated ID is per process, not per host, which is why the
+	// default cannot produce this at all.
 	ID string
 	// Address is where other nodes and operators can reach this one.
 	Address string
@@ -53,10 +63,11 @@ func (n NodeInfo) Alive(now time.Time, ttl time.Duration) bool {
 // its configuration, so every answer it gives comes from the store and is
 // therefore the same answer every node gets.
 type Registry struct {
-	c      conn
-	nodeID string
-	ttl    time.Duration
-	now    func() time.Time
+	c           conn
+	nodeID      string
+	incarnation string
+	ttl         time.Duration
+	now         func() time.Time
 }
 
 // NewRegistry builds a registry for one node. ttl zero means [DefaultNodeTTL].
@@ -70,35 +81,82 @@ func NewRegistry(s *store.Store, nodeID string, ttl time.Duration, now func() ti
 	if now == nil {
 		now = time.Now
 	}
-	return &Registry{c: newConn(s), nodeID: nodeID, ttl: orDuration(ttl, DefaultNodeTTL), now: now}, nil
+	return &Registry{
+		c:           newConn(s),
+		nodeID:      nodeID,
+		incarnation: `{"incarnation":"` + store.NewID() + `"}`,
+		ttl:         orDuration(ttl, DefaultNodeTTL),
+		now:         now,
+	}, nil
 }
 
 // NodeTTL reports the heartbeat lapse after which a node is considered gone.
 func (r *Registry) NodeTTL() time.Duration { return r.ttl }
 
+// Incarnation is this PROCESS's identity, as distinct from its node id.
+//
+// It is generated per Registry and never configured, so no two processes can
+// carry the same one however their configuration was written. It is what makes
+// "another process is running under my id" an observation rather than an
+// inference: the node id says which node a row is about, and this says which
+// process wrote it.
+//
+// It lives in `nodes.metadata`, a column nothing else reads, and the choice is
+// documented here rather than inferred -- the same arrangement, for the same
+// reason, as [leaseLock]'s use of `capacity_leases.used` for the fencing token.
+// The value is a canonical one-key JSON object so the column keeps holding what
+// its type says it holds, and so that comparing two of them is string equality
+// with no parsing in the hot statement.
+func (r *Registry) Incarnation() string { return r.incarnation }
+
 // Register records this node and beats once, so that a node is visible from the
 // instant it starts rather than from its first tick.
 //
-// Registration is an upsert on the node id: a restarted node reclaims its own
-// row and updates started_at, which is what lets [NodeInfo.StartedAt]
-// distinguish a restart from an uninterrupted run.
+// It is a compare-and-swap, not an upsert, and the difference is the whole of
+// [ErrDuplicateNodeID]. The row is taken when it is free, when its heartbeat has
+// lapsed, or when it is already this process's own; it is NOT taken from a
+// process that is still beating on it. Two nodes deployed with one id therefore
+// produce one registered node and one refusal, rather than two nodes the cluster
+// counts as one -- which is the state in which every leader-only job runs twice
+// and every leased limit is divided by a node count that is short by one.
+//
+// The decision is one statement. An implementation that read the row and then
+// wrote it would elect two holders under exactly the condition that makes this
+// matter, which is two processes starting at the same moment.
+//
+// A restart is not a duplicate. A node that died left a row whose heartbeat
+// lapses within [Registry.NodeTTL]; the restart adopts it, updates started_at,
+// and reclaims its own leases instead of waiting out theirs -- which is the
+// reason to configure a stable `cluster.node_id` at all. A node that drained
+// cleanly deregistered, so its replacement starts at once.
 func (r *Registry) Register(ctx context.Context, info NodeInfo) error {
 	now := r.now()
 	if info.StartedAt.IsZero() {
 		info.StartedAt = now
 	}
-	_, err := r.c.exec(ctx, `
+	var got string
+	err := r.c.queryRow(ctx, `
 		INSERT INTO nodes (node_id, address, version, started_at, last_heartbeat, is_leader, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, '{}')
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (node_id) DO UPDATE SET
 		    address        = excluded.address,
 		    version        = excluded.version,
 		    started_at     = excluded.started_at,
 		    last_heartbeat = excluded.last_heartbeat,
-		    is_leader      = excluded.is_leader`,
+		    is_leader      = excluded.is_leader,
+		    metadata       = excluded.metadata
+		WHERE nodes.metadata = excluded.metadata
+		   OR nodes.last_heartbeat <= ?
+		RETURNING metadata`,
 		r.nodeID, info.Address, info.Version,
-		store.Micros(info.StartedAt), store.Micros(now), false)
-	if err != nil {
+		store.Micros(info.StartedAt), store.Micros(now), false, r.incarnation,
+		store.Micros(now.Add(-r.ttl))).Scan(&got)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// The row exists, it is not this process's, and it is still being beaten
+		// on. Somebody else is this node.
+		return r.duplicate(ctx)
+	case err != nil:
 		return fmt.Errorf("cluster: register node %s: %w", r.nodeID, err)
 	}
 	return nil
@@ -112,10 +170,19 @@ func (r *Registry) Register(ctx context.Context, info NodeInfo) error {
 // that finds no row means the row was pruned while this node believed itself
 // alive, and continuing as if nothing happened is how a node that the cluster
 // has already written off keeps holding leases.
+//
+// It is scoped by incarnation as well as by id, so it also answers the half
+// [Registry.Register] cannot reach. A process frozen past the TTL -- a long GC
+// pause, a suspended container, a paused debugger -- is indistinguishable from a
+// dead one, so a successor may legitimately have adopted its row while it was
+// away. It is not the one refusing to start; it is the one already running, and
+// it learns here, from the row, that its identity is no longer its own. That is
+// the same argument [Fence] makes about elapsed time, applied to who rather than
+// to when.
 func (r *Registry) Heartbeat(ctx context.Context, leader bool) error {
 	res, err := r.c.exec(ctx,
-		`UPDATE nodes SET last_heartbeat = ?, is_leader = ? WHERE node_id = ?`,
-		store.Micros(r.now()), leader, r.nodeID)
+		`UPDATE nodes SET last_heartbeat = ?, is_leader = ? WHERE node_id = ? AND metadata = ?`,
+		store.Micros(r.now()), leader, r.nodeID, r.incarnation)
 	if err != nil {
 		return fmt.Errorf("cluster: heartbeat %s: %w", r.nodeID, err)
 	}
@@ -124,17 +191,52 @@ func (r *Registry) Heartbeat(ctx context.Context, leader bool) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("%w: %s", ErrNotRegistered, r.nodeID)
+		return r.duplicate(ctx)
 	}
 	return nil
+}
+
+// duplicate says which of the two ways a write scoped by incarnation can match
+// nothing actually happened: the row is gone, or it belongs to somebody else.
+//
+// They are reported apart because the responses differ and are close to
+// opposite. A missing row is recovered from by registering again -- it is what a
+// node does when a [Registry.Prune] raced it. A row held by another process is
+// not recoverable at all, and registering again would take the id from a process
+// that is using it.
+func (r *Registry) duplicate(ctx context.Context) error {
+	var meta string
+	err := r.c.queryRow(ctx, `SELECT metadata FROM nodes WHERE node_id = ?`, r.nodeID).Scan(&meta)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: %s", ErrNotRegistered, r.nodeID)
+	case err != nil:
+		return fmt.Errorf("cluster: read node %s: %w", r.nodeID, err)
+	case meta == r.incarnation:
+		// The row is this process's after all, so the write matched nothing for
+		// some other reason. Nothing here can say what, and claiming a duplicate
+		// on this evidence would stop a healthy node.
+		return fmt.Errorf("%w: %s", ErrNotRegistered, r.nodeID)
+	}
+	return fmt.Errorf("%w: node id %q is held by another process (this process is %s, "+
+		"the row is %s). Give every node a distinct cluster.node_id, or leave it empty "+
+		"and let one be derived per process (DESIGN 9.2)",
+		ErrDuplicateNodeID, r.nodeID, r.incarnation, meta)
 }
 
 // Deregister removes this node's row. It is the draining path of DESIGN 13:
 // readiness off, in-flight requests finish, leases and reservations released,
 // then exit -- and a node that left on purpose should not have to wait out a
 // heartbeat TTL before the cluster stops counting it.
+//
+// Scoped by incarnation, because `nodes` is keyed by node id and a DELETE by id
+// alone deletes whoever holds it. A process that was superseded while it was
+// away would otherwise remove, on its way out, the row of the process that
+// legitimately took the id over -- and that node then looks dead to
+// [LeaseReclaimJob] while it is serving.
 func (r *Registry) Deregister(ctx context.Context) error {
-	_, err := r.c.exec(ctx, `DELETE FROM nodes WHERE node_id = ?`, r.nodeID)
+	_, err := r.c.exec(ctx,
+		`DELETE FROM nodes WHERE node_id = ? AND metadata = ?`, r.nodeID, r.incarnation)
 	return err
 }
 

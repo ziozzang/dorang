@@ -49,7 +49,11 @@ storage:
 
 cluster:
   enabled: false
-  node_id: ""                     # empty derives one at start-up
+  node_id: ""                     # empty derives one per PROCESS, which cannot collide. A
+                                  # configured id must be distinct on every node: two processes
+                                  # sharing one are a single node to the registry, the leadership
+                                  # lease and every leased limit, so every leader-only job runs
+                                  # twice. The second process refuses to start (CONFIG §4).
   redis_url_env: DORANG_REDIS_URL
   # local is exact on one node and overshoots N-fold on N nodes, so
   # `enabled: true` with `capacity_mode: local` refuses to start (§5.6).

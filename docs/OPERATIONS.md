@@ -946,7 +946,24 @@ on every restart** — it is not something a longer grace or a larger `pre_stop_
 budget reservation sweeps, batch assignment, lease rebalancing — moves on election when the
 leader leaves. Leases and reservations are released as part of the drain. A node with a stable
 `cluster.node_id` reclaims its own leases on restart instead of waiting for them to expire, which
-is why §CONFIG 4 insists on setting it.
+is why §CONFIG 4 covers setting it.
+
+A stable id has to be a **distinct** id. Two processes under one `cluster.node_id` are one node to
+the registry, to the leadership lease and to every leased limit, and every leader-only job then
+runs on both — including batch assignment, where §DESIGN 9.2 records that two nodes picking up the
+same batch pays for every finished row twice. The second process refuses to start:
+
+```
+cluster: node id dorang-0 is in use by another process; this node will not join, lead or run any
+leader job.
+```
+
+If you see that line, two pods, hosts or containers are carrying the same id — a StatefulSet
+template that did not substitute, an id baked into an image, a configuration file copied to a
+second host. Fix the id; do not restart into it. The one benign case is an **unclean** restart
+under a configured id within the 30-second heartbeat TTL, which clears itself once the previous
+row lapses. If you cannot guarantee uniqueness, leave `cluster.node_id` empty: the derived
+per-process id cannot collide, and it costs only that lease TTL on restart.
 
 ---
 

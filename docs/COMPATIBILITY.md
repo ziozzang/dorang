@@ -136,8 +136,8 @@ anyone can perform if taking over quietly zeroes the numbers.
 | `x-litellm-call-id` | `x-dorang-request-id` | yes |
 | `x-dorang-real-model` | `x-dorang-upstream-model` | yes |
 | `x-litellm-model-id` | `x-dorang-deployment` | yes |
-| `x-litellm-response-cost` | `x-dorang-cost-usd`, **and `0` when nothing is priced** | yes, always |
-| `x-litellm-key-spend` | `x-dorang-spend-usd` | detail only (§10.4) |
+| `x-litellm-response-cost` | `x-dorang-cost-usd`, **and `0` when nothing is priced** | on every non-streamed answer; **absent on a stream** — see the pair table below |
+| `x-litellm-key-spend` | `x-dorang-spend-usd` | detail only (§10.4), and only once the spend has been looked up |
 | `x-litellm-key-max-budget` | `x-dorang-budget-usd` | detail only |
 | `x-litellm-attempted-retries` | `x-dorang-attempt`, **less one** | detail only |
 | `x-litellm-response-duration-ms` | `x-dorang-latency-ms` | detail only |
@@ -147,6 +147,13 @@ a mirror arriving when its source did not would be a second, disagreeing answer 
 always on". `attempted-retries` is deliberately not a copy — dorang counts attempts from 1 and
 the reference proxy counts retries from 0, so copying the number across would report one retry
 for every request that never retried.
+
+> The cost row read **"yes, always"** while the pair table three paragraphs below said the same
+> header is absent on a stream, and the test named there asserts the absence. Both could not be
+> true, and the one that was wrong was the one an exporter reads first. The column now says what
+> the table says. The `key-spend` row moved for a related reason and is stated once here: the
+> spend is read from the budget hold, a request that reserves nothing never hydrates one, and a
+> figure nobody looked up is absent rather than `0` — the same rule this whole section is about.
 
 **`x-litellm-response-cost` is the one mirror that is not a straight copy, and it is on
 purpose.** `x-dorang-cost-usd` is *absent* when no price rule matched, because dorang's own

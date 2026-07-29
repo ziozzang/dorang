@@ -66,6 +66,26 @@ func scanUsage(b []byte) (Usage, bool) {
 // while Anthropic's input_tokens EXCLUDES cache_read_input_tokens and
 // cache_creation_input_tokens, which are counted beside it. Adding the cache
 // counts to the wrong one either double-counts the prefix or loses it.
+//
+// # Why an input count alone does not settle it
+//
+// There are three spellings on this deployment, not two, and the third shares a
+// key with the second while meaning what the first means. The OpenAI Responses
+// API spells its prompt count `input_tokens` — the Anthropic spelling — and it
+// is INCLUSIVE of the cached prefix, the OpenAI convention. internal/wire's
+// ResponsesUsage says so and records the cost of getting it backwards: reading
+// that count as exclusive bills a cached request about 1.8x over.
+//
+// So `input_tokens` is EVIDENCE and not proof, and what settles it is the
+// breakdown object's own spelling, which the three families do not share:
+//
+//	prompt_tokens / prompt_tokens_details     OpenAI chat       inclusive
+//	input_tokens  / input_tokens_details      OpenAI Responses  inclusive
+//	input_tokens  + cache_read_input_tokens   Anthropic         exclusive
+//
+// A detail object therefore outranks a bare input count, in either key order:
+// JSON members are unordered, and a family decided by whichever key the scanner
+// reached first is a family decided by the upstream's serializer.
 type usageShape uint8
 
 const (
@@ -76,6 +96,26 @@ const (
 	// shapeExclusive is the Anthropic family: input_tokens is cache-exclusive.
 	shapeExclusive
 )
+
+// mergeDetails harvests the cached and reasoning counts from a nested breakdown
+// object.
+//
+// One level down is worth reading; deeper is not. The nested object never
+// carries an input count, so its own shape is not consulted -- the enclosing
+// object's spelling decides, and the caller has already recorded it.
+func mergeDetails(b []byte, i int, u Usage, found bool) (Usage, bool) {
+	sub, _, ok := parseUsageObject(b, i)
+	if !ok {
+		return u, found
+	}
+	if sub.CacheRead > 0 {
+		u.CacheRead, found = sub.CacheRead, true
+	}
+	if sub.Reasoning > 0 {
+		u.Reasoning, found = sub.Reasoning, true
+	}
+	return u, found
+}
 
 // normalizeUsage converts a scanned usage object into dorang's own convention —
 // Input inclusive of both cache counts, Total = Input + Output — so that a
@@ -119,6 +159,11 @@ func normalizeUsage(u Usage, shape usageShape) Usage {
 func parseUsageObject(b []byte, i int) (Usage, usageShape, bool) {
 	var u Usage
 	shape := shapeUnknown
+	// family is the shape a breakdown object's own spelling PROVED, which
+	// outranks the one an input count merely suggested. See [usageShape]: three
+	// families share two input spellings, and `input_tokens` is the one they
+	// collide on.
+	family := shapeUnknown
 	found := false
 	i++
 	for {
@@ -127,6 +172,9 @@ func parseUsageObject(b []byte, i int) (Usage, usageShape, bool) {
 			return u, shape, false
 		}
 		if b[i] == '}' {
+			if family != shapeUnknown {
+				shape = family
+			}
 			return u, shape, found
 		}
 		if b[i] == ',' {
@@ -165,6 +213,12 @@ func parseUsageObject(b []byte, i int) (Usage, usageShape, bool) {
 		case "input_tokens":
 			if isNum {
 				u.Input, found = n, true
+				// EVIDENCE, not proof: the Anthropic family and the OpenAI
+				// Responses family both spell it this way and disagree about
+				// whether it contains the cached prefix. A breakdown object
+				// under this family's own spelling overrides this at the end of
+				// the loop; with none, exclusive is the reading that has always
+				// applied here.
 				shape = shapeExclusive
 			}
 		case "completion_tokens", "output_tokens":
@@ -188,18 +242,29 @@ func parseUsageObject(b []byte, i int) (Usage, usageShape, bool) {
 				u.Reasoning, found = n, true
 			}
 		case "prompt_tokens_details", "completion_tokens_details":
-			// Nested detail objects carry cached and reasoning counts on the
-			// OpenAI surface. One level down is worth reading; deeper is not.
-			// The nested object never carries an input count, so its shape is
-			// not consulted — the enclosing object's spelling decides.
-			if sub, _, ok := parseUsageObject(b, valStart); ok {
-				if sub.CacheRead > 0 {
-					u.CacheRead, found = sub.CacheRead, true
-				}
-				if sub.Reasoning > 0 {
-					u.Reasoning, found = sub.Reasoning, true
-				}
-			}
+			// The OpenAI CHAT family's breakdown objects. They prove the
+			// inclusive shape, and so does prompt_tokens beside them, so
+			// recording it here settles nothing new — it is recorded anyway,
+			// because a body that sends the breakdown and omits the count is
+			// still this family's body and should not be told apart from one
+			// that sends both.
+			family = shapeInclusive
+			u, found = mergeDetails(b, valStart, u, found)
+		case "input_tokens_details", "output_tokens_details":
+			// The OpenAI RESPONSES family's breakdown objects, and the only
+			// thing that tells this family from Anthropic: the two spell the
+			// prompt count identically and mean opposite things by it
+			// ([usageShape]).
+			//
+			// Without this case a relayed Responses answer decoded with
+			// CacheRead = 0 and Reasoning = 0, and §8.5 prices a declared
+			// sub-rate by CARVING its quantity out of the parent's rate — so
+			// the whole inclusive prompt was charged at the full uncached input
+			// rate. That is the same overcharge closed for the chat family,
+			// still live here because it arrived under the one spelling this
+			// scanner did not know.
+			family = shapeInclusive
+			u, found = mergeDetails(b, valStart, u, found)
 		}
 	}
 }

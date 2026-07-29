@@ -53,6 +53,52 @@ var (
 	// ErrNotRegistered reports a heartbeat from a node with no registry row.
 	ErrNotRegistered = errors.New("cluster: node is not registered")
 
+	// ErrDuplicateNodeID reports that another live process is running under this
+	// node's id. It refuses to start, and an incumbent that observes it stops
+	// leading.
+	//
+	// # Why this is not something the lease can catch
+	//
+	// The fencing token closes the TIMING case: a superseded holder is
+	// recognisable because the token advances every time the lock changes
+	// HOLDER. Two processes claiming one id are not a change of holder. The
+	// second acquire satisfies `capacity_leases.node_id = excluded.node_id`, so
+	// the store reads it as the incumbent renewing: it succeeds, the token does
+	// not move, and both processes then hold a token equal to the row's and both
+	// pass [Fence.Check]. No amount of fencing helps, because fencing is an
+	// argument about terms and this is an argument about who.
+	//
+	// # Why it refuses to start rather than merely refusing to lead
+	//
+	// The node id keys more than the leader lease. It keys this process's row in
+	// `nodes`, whose heartbeat is what tells the cluster the node is alive and
+	// what [LeaseReclaimJob] walks to return a dead node's leases; it keys this
+	// node's share of every leased limit in `quota_leases`; and it keys the
+	// budget draw in [Ledger]. A second process that started and declined to
+	// lead would still be drawing budget from the first one's lease block,
+	// consuming its slice of every ceiling, and beating on its row so that
+	// neither process is ever declared dead and neither one's leases are ever
+	// reclaimed. DESIGN 5.6 publishes an overshoot of `something x (nodes - 1)`
+	// computed from [Registry.Count], and two processes behind one row make that
+	// figure wrong by the one thing it exists to keep honest.
+	//
+	// Refusing to start is also the loud failure, which DESIGN 9.2 asks for
+	// here: two nodes picking up the same batch pays for every finished row
+	// twice. A process that will not come up halts a rollout and appears in
+	// every orchestrator's own alerting; a process that quietly never leads is
+	// discovered when a sweep is missed.
+	//
+	// # What it costs
+	//
+	// A node whose row is still being beaten on cannot take the id, so an
+	// UNCLEAN restart under a configured id waits out the heartbeat TTL
+	// ([DefaultNodeTTL]) before it can start. That is deliberate: within that
+	// window the cluster still believes the previous process is alive and still
+	// attributes its leases to it, so adopting the id early is precisely the
+	// defect. A clean drain deregisters ([Node.Close]) and its replacement
+	// starts at once.
+	ErrDuplicateNodeID = errors.New("cluster: another process is already running under this node id")
+
 	// ErrClosed reports use of a closed node, ledger or lease store.
 	ErrClosed = errors.New("cluster: closed")
 
