@@ -254,7 +254,70 @@ type geminiUsage struct {
 // Request
 // ---------------------------------------------------------------------------
 
+// GeminiCapabilities is what this adapter can express (DESIGN §10.1).
+//
+// It is declared HERE, beside [encodeGemini], and the placement is the whole
+// reason it exists. Until it did, a Gemini deployment was handed
+// openai.DefaultCapabilities — the routing table's answer for every wire shape
+// that is not Messages — while this file read no capability set at all. Both
+// §10.1 gates therefore cleared requests against a set nothing in this file has
+// ever honoured, and every construct listed below left as a `200` with no header
+// and no field on the wire. That is the exact failure the x-dorang-downgraded
+// work exists to close, still shipping on the one adapter nobody had checked.
+//
+// Absent here means THIS ENCODER has no field for it, not that the vendor has
+// none. The distinction is load-bearing for three of them — generationConfig
+// does define frequencyPenalty, presencePenalty and responseLogprobs, and
+// [geminiGenConfig] carries none of the three — because the set has to describe
+// the code that converts, not the protocol somebody could convert to. Adding the
+// field is what earns the bit, in that order.
+//
+// Cannot be expressed at all:
+//
+//   - CapCacheBreakpoints — there is no per-block cache_control on this
+//     protocol. Explicit caching is a separate cachedContents resource addressed
+//     by handle, which is a different request, not a member of this one. §10.1
+//     uses a lost breakpoint as its own example of a loss that changes the BILL.
+//   - CapThinkingBlocks — [geminiParts] drops a thinking block outright: a
+//     reasoning part here carries a signature dorang did not receive and must not
+//     fabricate (§10.2).
+//   - CapStructuredSystem — [systemText] flattens the system prompt into one
+//     text part, so per-block attributes have nowhere to land.
+//   - CapMultiBlockToolResult — a functionResponse is one JSON object, and
+//     [toolResultObject] flattens a block list into text under "output".
+//   - CapServiceTier — this family has no tier and no price band to select.
+//
+// Expressible by the protocol, not by this encoder:
+//
+//   - CapLogprobs — generationConfig.responseLogprobs exists; nothing here
+//     writes it.
+//   - CapPenalties — generationConfig.frequencyPenalty/presencePenalty exist;
+//     nothing here writes them.
+//   - CapLogitBias, CapUser, CapMetadata, CapPriority, CapParallelToolCalls —
+//     no field, in the protocol or here.
+//
+// CapLogprobs and CapServiceTier are [canonical.Material]: their absence changes
+// what the caller receives or is charged, so they are refused by name with the
+// x-dorang-allow-lossy retry rather than dropped. The rest of that second group
+// is droppable and is now named in x-dorang-dropped-params instead of vanishing.
+const GeminiCapabilities = canonical.CapMultiBlockContent | // parts[]
+	canonical.CapImageBlocks | // inlineData, fileData
+	canonical.CapDocumentBlocks | // the same two parts, by mimeType
+	canonical.CapToolCalls | // functionDeclarations, toolConfig
+	canonical.CapJSONSchema | // responseSchema
+	canonical.CapRichStopReasons | // SAFETY, RECITATION and friends survive as NativeStopReason
+	canonical.CapReasoningControl | // thinkingConfig
+	canonical.CapSeed | // generationConfig.seed
+	canonical.CapTopK | // generationConfig.topK
+	canonical.CapMultipleChoices | // candidateCount
+	canonical.CapStopSequences // stopSequences
+
 // encodeGemini converts the neutral request.
+//
+// It reads no capability set, and that is correct rather than an omission: every
+// construct [GeminiCapabilities] withholds is refused or reported before this
+// runs, by the two gates that share that constant. What this function must not
+// do is claim a field it does not write — see the constant's second group.
 func encodeGemini(req *canonical.Request) (*geminiRequest, error) {
 	if req == nil {
 		return nil, errNilRequest
@@ -308,9 +371,13 @@ func encodeGemini(req *canonical.Request) (*geminiRequest, error) {
 // systemText flattens the neutral system prompt.
 //
 // The per-block attributes of a structured system prompt — cache breakpoints
-// above all — have no expression here. That is a structural downgrade
-// (CapStructuredSystem), and it is recorded by the capability filter during
-// routing rather than invented here.
+// above all — have no expression here. That is a structural downgrade, and it is
+// recorded by the §10.1 gates rather than invented here — which is only true
+// because [GeminiCapabilities] withholds CapStructuredSystem and
+// CapCacheBreakpoints. The earlier version of this comment said the same thing
+// about a filter that CLAIMED both bits, so the flattening was reported by
+// nobody: a structured system prompt arrived here, left as one text part, and
+// the caller got a 200.
 func systemText(req *canonical.Request) string {
 	var b strings.Builder
 	for i := range req.System {
@@ -367,7 +434,9 @@ func geminiParts(m *canonical.Message, names map[string]string) []geminiPart {
 		case canonical.KindThinking:
 			// Not re-sent. This protocol's reasoning parts carry a signature
 			// dorang cannot produce for text that came from somewhere else, and
-			// §10.2 forbids fabricating one.
+			// §10.2 forbids fabricating one. [GeminiCapabilities] withholds
+			// CapThinkingBlocks for this line, so the drop is refused or reported
+			// upstream of here instead of happening in silence.
 		case canonical.KindImage, canonical.KindDocument:
 			if b.Source == nil {
 				continue

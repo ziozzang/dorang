@@ -51,6 +51,12 @@ func (anthropicAdapter) encode(x *exchange) ([]byte, error) {
 		// The count endpoint takes the same request shape and ignores the
 		// output ceiling, so the smallest legal value satisfies a field this
 		// family makes mandatory without capping anything.
+		//
+		// No Loss, deliberately. The ceiling of 1 is dorang's, not the caller's,
+		// and it puts every reasoning budget below MinThinkingBudget — so a report
+		// from this call would tell a caller their reasoning was disabled on a
+		// route that generates nothing and bills no generation. Same reasoning as
+		// [refuseMaterialLoss]'s exemption for this operation.
 		return anthropic.MarshalRequest(x.req, &anthropic.EncodeOptions{
 			Model:            x.target.UpstreamModel,
 			DefaultMaxTokens: 1,
@@ -62,7 +68,13 @@ func (anthropicAdapter) encode(x *exchange) ([]byte, error) {
 		// encoder fall back to its own family default instead would mean a
 		// deployment that expresses LESS than its family is refused on one set
 		// and encoded against another.
-		Capabilities:     x.capabilities(),
+		Capabilities: x.capabilities(),
+		// Where the located losses go. Passing nothing here is what left §10.2's
+		// budget collapse — "reasoning is disabled for this request, and
+		// x-dorang-dropped-params says so" — with no writer at all: encodeThinking
+		// has recorded the drop since it was written, into a report the adapter
+		// threw away.
+		Loss:             x.loss,
 		AllowLossy:       x.call.AllowLossy,
 		DefaultMaxTokens: x.call.DefaultMaxTokens,
 	})

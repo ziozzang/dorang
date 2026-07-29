@@ -25,8 +25,6 @@ import (
 	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
-	"github.com/ziozzang/dorang/internal/wire/anthropic"
-	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -314,9 +312,9 @@ func deploymentID(group, provider, upstream string) string {
 //
 // # It is the only answer, and it used to be one of two
 //
-// internal/backend had its own wireCapabilities computing this from the same two
-// constants and the same wire shape, because the encoder needed the number and
-// nothing handed it one. The two agreed, but by coincidence: both spelled the
+// internal/backend had its own computation of this, from the same two constants
+// and the same wire shape, because the encoder needed the number and nothing
+// handed it one. The two agreed, but by coincidence: both spelled the
 // same switch over the same catalog-resolved `api`, and nothing made them. That
 // is the arrangement DESIGN §10.1's last paragraph names as the failure — routing
 // answers "does any deployment express this" on one set and the encoder converts
@@ -335,18 +333,23 @@ func capabilitiesFor(cat *catalog.Catalog, kind string) canonical.Capability {
 // capabilitiesForAPI is [capabilitiesFor] for a wire shape that is already
 // resolved.
 //
-// The batch executor is the caller: it holds a [backend.Provider], which carries
-// the api it was built with, and going back to the catalog to derive the same
-// value from the kind would be the second derivation this whole change removes.
-// It is also the only path where the catalog can be absent, and a capability set
-// guessed from a nil lookup is not a set anyone should encode against.
+// The batch executor is the second caller: it holds a [backend.Provider], which
+// carries the api it was built with, and going back to the catalog to derive the
+// same value from the kind would be the second derivation this whole change
+// removes. It is also the only path where the catalog can be absent, and a
+// capability set guessed from a nil lookup is not a set anyone should encode
+// against.
+//
+// The switch itself is [backend.CapabilitiesForAPI] and is deliberately not
+// restated here. Unifying the two computations at this seam was only half the
+// job: both halves still read the same two wire-package constants, so both were
+// wrong together for the one wire shape whose encoder lives in internal/backend
+// and had no constant at all. A Gemini deployment was routed and encoded against
+// the OpenAI wire shape's set while its encoder wrote no cache_control, no
+// logprobs and no thinking block — agreement is not correctness when both
+// answers come from the same missing case.
 func capabilitiesForAPI(api catalog.API) canonical.Capability {
-	switch api {
-	case catalog.APIAnthropicMessages:
-		return anthropic.DefaultCapabilities
-	default:
-		return openai.DefaultCapabilities
-	}
+	return backend.CapabilitiesForAPI(api)
 }
 
 // suppressedFor is what dorang declines to send to a deployment of this kind

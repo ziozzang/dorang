@@ -87,6 +87,11 @@ func (openaiAdapter) encode(x *exchange) ([]byte, error) {
 			// The set the §10.1 gate cleared this request against; see the same
 			// line in the anthropic adapter.
 			Capabilities: x.capabilities(),
+			// Where the located losses go. Passing nothing here is what left a
+			// thinking block's SIGNATURE dropped in silence on every crossing into
+			// this family: the encoder raises that downgrade while HOLDING
+			// CapThinkingBlocks, so no capability mask outside can reconstruct it.
+			Loss: x.loss,
 			// The SAME registry the decoders read. Shortening into a mapping
 			// nobody keeps is what turns COMPATIBILITY 5.3 into a one-way
 			// destruction of any tool name over 64 bytes.

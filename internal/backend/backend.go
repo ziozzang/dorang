@@ -120,9 +120,9 @@ type Target struct {
 	// of configuration; see selfhosted.go.
 	PriorityTier string
 	// Capabilities is what THIS deployment can express (§10.1). Zero means the
-	// wire shape's own set, which is what [wireCapabilities] answers and what
-	// internal/app puts in the routing table today, so leaving it unset keeps
-	// the two layers in agreement.
+	// wire shape's own set, which is what [CapabilitiesForAPI] answers — and
+	// internal/app builds the routing table by calling that same function, so
+	// leaving it unset cannot put the two layers out of agreement.
 	//
 	// It is on the Target rather than the Call because it is a property of the
 	// deployment, and a fail-back hop lands on a different one. It exists so a
@@ -218,7 +218,19 @@ type Call struct {
 	// them before the call would be describing an attempt that had not happened
 	// yet; one that filled them afterwards would be writing into a header block
 	// the client can no longer see.
-	Accepted func()
+	//
+	// It receives the conversion's loss report for exactly that reason. [Result]
+	// looks like the obvious carrier and is the wrong one: a stream's headers are
+	// already on the wire by the time Do returns, so a loss delivered there would
+	// reach x-dorang-downgraded on buffered answers and nowhere on streamed ones —
+	// which is a report that is present or absent depending on a property of the
+	// response the caller did not ask about. This callback is the last moment both
+	// kinds of answer still have a header block.
+	//
+	// The report is nil for an operation with no neutral request, and empty for a
+	// conversion that lost nothing; both are ordinary, and every LossReport method
+	// tolerates a nil receiver.
+	Accepted func(*canonical.LossReport)
 }
 
 // Transform is the response side of DESIGN §10.5b, held by the caller.
@@ -318,6 +330,11 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 
 	x := &exchange{call: c, target: &t, prov: p, attempt: 1}
 	if c.Op.ChatShaped() {
+		// Allocated before the encoder runs, per exchange rather than per call: a
+		// fail-back hop lands on a different deployment and loses different things,
+		// and a report carried over from the previous one would describe a
+		// conversion this response is not the result of.
+		x.loss = &canonical.LossReport{}
 		x.req = prepareRequest(x)
 		if err := refuseMaterialLoss(x); err != nil {
 			res.Err = err
@@ -520,7 +537,7 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	// are stamped on the first write, and for a stream the first write is three
 	// lines below (DESIGN §10.4).
 	if x.call.Accepted != nil {
-		x.call.Accepted()
+		x.call.Accepted(x.loss)
 	}
 
 	if x.call.Stream {

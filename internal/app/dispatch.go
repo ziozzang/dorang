@@ -650,8 +650,9 @@ func (d *dispatcher) backendCall(st *dispatchState, c *call, dec *router.Decisio
 		// The extension headers are stamped on the first write and anything set
 		// afterwards is invisible (DESIGN §10.4). For a stream the first write
 		// happens inside the backend, so this is the last moment the routing
-		// decision can still reach the client.
-		Accepted: func() { fillRouteResult(rq, dec, c) },
+		// decision — and the encoder's own loss report, which is why the callback
+		// carries one — can still reach the client.
+		Accepted: func(loss *canonical.LossReport) { fillRouteResult(rq, dec, c, loss) },
 	}
 }
 
@@ -913,8 +914,10 @@ func billedUnit(u canonical.BilledUnit) pricing.BilledUnit {
 //
 // c carries the decoded request, which the §10.1 downgrade report needs: the
 // neutral form, and the opt-in already parsed onto the routing request rather
-// than read off the headers a second time.
-func fillRouteResult(rq *server.Request, dec *router.Decision, c *call) {
+// than read off the headers a second time. loss is what the ENCODER removed,
+// handed over by internal/backend at the one moment the header block is still
+// writable; it is nil for an operation with no neutral request.
+func fillRouteResult(rq *server.Request, dec *router.Decision, c *call, loss *canonical.LossReport) {
 	// The deployment still on the Result is the one the previous attempt used,
 	// which is the only moment it is knowable — one line later it is gone.
 	prev := rq.Result.Deployment
@@ -928,8 +931,8 @@ func fillRouteResult(rq *server.Request, dec *router.Decision, c *call) {
 		rq.Result.FallbackFrom = dec.Reason
 		rq.Result.FallbackFromDeployment = prev
 	}
-	rq.Result.DroppedParams = droppedParams(dec, c)
-	rq.Result.Downgraded = downgraded(c, dec)
+	rq.Result.DroppedParams = droppedParams(dec, c, loss)
+	rq.Result.Downgraded = downgraded(c, dec, loss)
 }
 
 // downgraded is what x-dorang-downgraded carries: the structural constructs this
@@ -943,49 +946,68 @@ func fillRouteResult(rq *server.Request, dec *router.Decision, c *call) {
 // question, about ONE response. Consent says a PDF may be dropped. This says it
 // was.
 //
-// It is computed from the capability masks rather than from the encoders' own
-// [canonical.LossReport], because nothing on the request path collects one: the
-// backend adapters pass no Loss to either encoder, so the located detail those
-// encoders build is discarded where it is produced. The mask answers the same
-// question at construct granularity — a construct the target lacks and the
-// request uses IS lost — and it is one subtraction rather than a second walk over
-// the request. The one thing it cannot see is a loss the encoder raises while
-// holding the bit: crossing a thinking block's SIGNATURE into the OpenAI family
-// is reported as a downgrade even though CapThinkingBlocks is present, because
-// no field there carries integrity material. That case needs the encoder's own
-// report to travel out of internal/backend, and it is the only one.
+// Two sources, and both are needed because neither sees the other's cases.
 //
-// The opt-in is intersected deliberately. A structural loss the caller did NOT
-// consent to is a 400 from routing or from the material gate and never reaches a
-// response at all, so a header naming one would be describing a request that was
-// refused.
-func downgraded(c *call, dec *router.Decision) string {
-	if c == nil || c.creq == nil || dec.Capabilities == 0 || c.rreq.AllowLossy == 0 {
+// The MASK half subtracts the deployment's capability set from what the request
+// uses. It is the only source for a wire shape whose adapter builds no loss
+// report — the Gemini adapter converts without one — and it is one subtraction
+// rather than a second walk over the request. What it cannot see is a loss the
+// encoder raises while HOLDING the bit: crossing a thinking block's SIGNATURE
+// into the OpenAI family is a downgrade even though CapThinkingBlocks is
+// present, because no field there carries integrity material and §10.2 forbids
+// fabricating one.
+//
+// The ENCODER half is that report, threaded out of internal/backend on
+// [backend.Call.Accepted]. It used to exist and reach nobody: the adapters
+// passed no Loss to either MarshalRequest, so a signature dropped on the second
+// turn of an agentic flow — the worst possible place to discover it, per §10.2 —
+// left with a 200 and no header.
+//
+// The opt-in is intersected into the mask half deliberately. A structural loss
+// the caller did NOT consent to is a 400 from routing or from the material gate
+// and never reaches a response at all, so a header naming one would be describing
+// a request that was refused. It is NOT intersected into the encoder half, for
+// the same reason that half exists: nothing refused the signature loss, because
+// no gate could see it, so gating the report on a consent that was never asked
+// for would reproduce the silence exactly.
+func downgraded(c *call, dec *router.Decision, loss *canonical.LossReport) string {
+	var names []string
+	if c != nil && c.creq != nil && dec.Capabilities != 0 && c.rreq.AllowLossy != 0 {
+		lost := dec.Capabilities.Missing(c.creq.RequiredCapabilities()).Structural() & c.rreq.AllowLossy
+		names = lost.Names()
+	}
+	names = appendUnique(names, loss.Constructs()...)
+	if len(names) == 0 {
 		return ""
 	}
-	lost := dec.Capabilities.Missing(c.creq.RequiredCapabilities()).Structural() & c.rreq.AllowLossy
-	if lost == 0 {
-		return ""
-	}
-	return strings.Join(lost.Names(), ",")
+	return strings.Join(names, ",")
 }
 
 // droppedParams is what x-dorang-dropped-params carries: everything the caller
 // sent that dorang did not apply.
 //
-// Three sources, and they belong together because a caller asking "was what I
+// Four sources, and they belong together because a caller asking "was what I
 // sent used" does not care which layer decided otherwise:
 //
 //   - the capability conversion removed, and the constructs this deployment is
 //     ABLE to carry that §4.4 declines to send it ([router.Decision.Dropped]);
 //   - the client priority hint, when this principal has no §10.5 grant;
-//   - the caller's service_tier, when §10.5's fold sent a different one.
+//   - the caller's service_tier, when §10.5's fold sent a different one;
+//   - what the ENCODER dropped for a reason no capability mask states.
 //
-// All three are here for the reason §10.3 gives — silently discarding something
+// The fourth is §10.2's, and until the loss report travelled out of
+// internal/backend it had no writer: "if budget < min_thinking_budget: reasoning
+// is disabled for this request, and x-dorang-dropped-params says so". The
+// collapse depends on the caller's own max_tokens, so it is not a property of the
+// deployment and the first source cannot contain it — internal/wire/anthropic's
+// encodeThinking has recorded it since it was written, into a report the adapter
+// discarded.
+//
+// All four are here for the reason §10.3 gives — silently discarding something
 // a caller sent leaves them believing it took effect — and §10.5 names this
 // header specifically. Each of them was, at some point, discarded in complete
 // silence, and each was easy to miss because the value was also never read.
-func droppedParams(dec *router.Decision, c *call) string {
+func droppedParams(dec *router.Decision, c *call, loss *canonical.LossReport) string {
 	names := dec.Dropped.Params()
 	if dec.PriorityHintDropped {
 		names = append(names, HeaderClientPriority)
@@ -993,10 +1015,38 @@ func droppedParams(dec *router.Decision, c *call) string {
 	if tierOverridden(dec, c) {
 		names = append(names, canonical.ConstructServiceTier)
 	}
+	if loss != nil {
+		// Deduplicated rather than concatenated: the encoder computes the same
+		// droppable subtraction the router does, so every knob this deployment
+		// lacks is named by both and a caller would read `top_k,top_k`.
+		names = appendUnique(names, loss.Dropped...)
+	}
 	if len(names) == 0 {
 		return ""
 	}
 	return strings.Join(names, ",")
+}
+
+// appendUnique appends the names not already in dst, preserving the order they
+// were first seen in. Empty names are skipped: a header entry with no name is a
+// comma a client has to parse around.
+func appendUnique(dst []string, names ...string) []string {
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		dup := false
+		for _, have := range dst {
+			if have == n {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, n)
+		}
+	}
+	return dst
 }
 
 // tierOverridden reports that the caller named a service tier and dorang sent a

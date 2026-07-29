@@ -61,6 +61,31 @@ func prepareRequest(x *exchange) *canonical.Request {
 		// Only the absent case is filled. "none" is left alone: on SGLang it
 		// strips the schemas from the prompt entirely, which is a real semantic
 		// difference a caller may be relying on.
+		//
+		// # It is not reported, and that is a decision rather than an oversight
+		//
+		// This is dorang altering the request the caller sent, which §10.3 says is
+		// reported. It is deliberately absent from x-dorang-dropped-params, on the
+		// grounds that header answers one question — "was what I sent used" — and
+		// there are two reasons the answer here is yes:
+		//
+		//   - Nothing the caller sent was dropped. The field was ABSENT, and the
+		//     header names parameters, so reporting would mean naming `tool_choice`
+		//     to a caller who never wrote it — which reads as "your tool_choice was
+		//     ignored", the opposite of what happened.
+		//   - The value is what the absent field already means on both engines.
+		//     vLLM's own auto-injection sets "auto" for this input and SGLang
+		//     normalizes to it (SGLANG.md §6.9); the wire is made to say what the
+		//     protocol says by omission, and no other value is reachable from here.
+		//
+		// The capability set is unmoved by it too: a non-nil ToolChoice raises
+		// CapToolCalls, which len(req.Tools) > 0 has already raised, and
+		// DisableParallel stays nil. So neither §10.1 gate sees a different request
+		// than the one the caller sent.
+		//
+		// Anything that made this fill a value the omission does NOT already mean —
+		// "required", a named tool, a different default per engine — stops being
+		// covered by the second bullet and has to be reported.
 		if len(req.Tools) > 0 && req.ToolChoice == nil {
 			req.ToolChoice = &canonical.ToolChoice{Mode: canonical.ToolChoiceAuto}
 		}

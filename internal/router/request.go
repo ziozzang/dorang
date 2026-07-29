@@ -214,12 +214,14 @@ type Decision struct {
 	// can be the set the request is ENCODED against (§10.1).
 	//
 	// It exists because those were two separate computations of one fact —
-	// internal/app's, which built the routing table, and internal/backend's
-	// wireCapabilities, which the encoder fell back to when a target declared
-	// nothing. The two agreeing was a property of both spelling the same switch,
-	// and the failure mode when they stop is silent: routing admits a request on
-	// one set and the encoder drops a construct against the other, which is the
-	// exact outcome §10.1 is written to prevent.
+	// internal/app's, which built the routing table, and internal/backend's own,
+	// which the encoder fell back to when a target declared nothing. The two
+	// agreeing was a property of both spelling the same switch, and the failure
+	// mode when they stop is silent: routing admits a request on one set and the
+	// encoder drops a construct against the other, which is the exact outcome
+	// §10.1 is written to prevent. There is now one function,
+	// [backend.CapabilitiesForAPI], and this field is how its answer reaches the
+	// encoder.
 	Capabilities canonical.Capability
 	// Dropped names what this deployment will not apply: the droppable
 	// parameters it cannot express, and the constructs dorang declines to send

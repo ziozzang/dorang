@@ -37,6 +37,21 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ### Correctness
 
+- A Gemini deployment was routed *and* encoded against the OpenAI wire shape's
+  capability set, while its encoder has no field for `cache_control`, `logprobs`,
+  `service_tier`, a thinking block or a structured system prompt. Both §10.1
+  gates admitted the request, the encoder dropped the construct, and the client
+  got a `200` with no header. Unifying the two capability computations had proved
+  only that they agreed — both switched on the same resolved `api` and returned
+  one of the same two constants, so no configuration could separate them, and
+  both were wrong together for the one wire shape with no constant of its own.
+  A capability set is now declared beside the encoder that honours it.
+- The backend adapters passed no `Loss` to either encoder, so every located
+  downgrade was discarded where it was produced, and two documented promises had
+  no writer at all: §10.2's "reasoning is disabled … and `x-dorang-dropped-params`
+  says so", and the thinking-block *signature* dropped crossing into the OpenAI
+  family — which no capability mask can see, because the bit is held while the
+  encoder drops the signature.
 - Pricing charged the cached prefix and reasoning tokens twice, 27% over on the
   design's own example card and 5.7× on a 90%-cached workload. Neither
   verification harness could see it, because both priced everything at zero.

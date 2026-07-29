@@ -53,6 +53,21 @@ type exchange struct {
 	// before it reaches a client (DESIGN §10.6 rule 4). It is never logged, never
 	// compared, and never leaves this package.
 	secrets []string
+	// loss is what the encoder removed on the way to this deployment's wire
+	// shape, filled during encode and handed to [Call.Accepted].
+	//
+	// It exists because the encoders already computed it and nobody took it: the
+	// adapters passed no Loss to MarshalRequest, so every located downgrade was
+	// discarded at the point it was produced. Two documented promises had no
+	// writer as a direct result — §10.2's "reasoning is disabled … and
+	// x-dorang-dropped-params says so", and the thinking-signature downgrade
+	// crossing into the OpenAI family, which no capability mask can see because
+	// the bit is HELD while the encoder drops the signature.
+	//
+	// It is nil for an operation with no neutral request, which is the same
+	// condition [Call.Request] is nil under. Every LossReport method tolerates a
+	// nil receiver, so the encoders need no branch for it.
+	loss *canonical.LossReport
 }
 
 // toolNames returns the shared tool-name registry, allocating it on first use.
@@ -78,7 +93,7 @@ func (x *exchange) capabilities() canonical.Capability {
 	if x.target.Capabilities != 0 {
 		return x.target.Capabilities
 	}
-	return wireCapabilities(x.prov.api)
+	return CapabilitiesForAPI(x.prov.api)
 }
 
 // boundary returns this exchange's multipart boundary, generating it on first
@@ -175,20 +190,52 @@ func adapterFor(api catalog.API, kind string) (adapter, error) {
 	return nil, errors.New("backend: no adapter for wire shape " + string(api))
 }
 
-// wireCapabilities is what a deployment of this wire shape can express
-// (DESIGN §10.1). It answers the same question internal/app answers when it
-// builds a routing table, from the same two constants, and it has to: routing
-// PREFERS a deployment that can express the request, and this is the gate that
-// runs once one has been chosen. Two answers to one question is how a request
-// gets routed on one capability set and encoded against another.
+// CapabilitiesForAPI is what a deployment of this wire shape can express
+// (DESIGN §10.1).
 //
-// The default is deliberately the permissive set. A shape whose real
-// capabilities are unknown must not acquire refusals it never had — an
-// overstated capability drops a knob and says so, which is the old behaviour,
-// while an understated one turns working traffic into 400s.
-func wireCapabilities(api catalog.API) canonical.Capability {
-	if api == catalog.APIAnthropicMessages {
+// # One function, and it used to be two
+//
+// This answers the same question internal/app answers when it builds a routing
+// table, and for a while both spelled it: routing PREFERS a deployment that can
+// express the request, and [exchange.capabilities] is the gate that runs once one
+// has been chosen. Two answers to one question is how a request gets routed on
+// one capability set and encoded against another, so internal/app now CALLS this
+// rather than restating it, and the value it computes travels onto the router's
+// Deployment, out on its Decision, and back in on [Target.Capabilities].
+//
+// Each answer is a constant declared beside the encoder that has to honour it —
+// [anthropic.DefaultCapabilities], [openai.DefaultCapabilities],
+// [GeminiCapabilities] — because a set kept anywhere else drifts from the code
+// that converts against it. Gemini is the proof: it had no constant, fell to the
+// default arm below, and was handed the OpenAI set while [encodeGemini] wrote no
+// cache_control, no logprobs, no service_tier and no thinking block.
+//
+// # cohere and jina
+//
+// Both resolve through the default arm and therefore claim the OpenAI set, and
+// both claims are cosmetic rather than wrong: [cohereAdapter.endpoint] and
+// [jinaAdapter.endpoint] refuse OpChat outright, and [Backend.Do] resolves the
+// endpoint BEFORE the capability gate — so a chat request to either is a named
+// 501 and no capability of theirs is ever consulted. Rerank and embeddings carry
+// no [canonical.Request] and raise no capability bits at all. The set is left at
+// the permissive default rather than zeroed because the routing table reads it
+// for every kind, and an empty set there refuses every structural request instead
+// of expressing none.
+//
+// # Why the default is permissive
+//
+// A shape whose real capabilities are unknown must not acquire refusals it never
+// had: an overstated capability drops a knob and says so, while an understated
+// one turns working traffic into 400s. That argument covers an unlisted
+// OpenAI-compatible server, which is what the default arm is for. It never
+// covered a shape dorang has an encoder for — there, the encoder is the evidence,
+// and Gemini is what the argument's absence cost.
+func CapabilitiesForAPI(api catalog.API) canonical.Capability {
+	switch api {
+	case catalog.APIAnthropicMessages:
 		return anthropic.DefaultCapabilities
+	case catalog.APIGemini:
+		return GeminiCapabilities
 	}
 	return openai.DefaultCapabilities
 }

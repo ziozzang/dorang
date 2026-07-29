@@ -30,7 +30,15 @@ const (
 	anthropicAnswer = `{"id":"msg_1","type":"message","role":"assistant","model":"m1-upstream",` +
 		`"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",` +
 		`"usage":{"input_tokens":1,"output_tokens":1}}`
+	geminiAnswer = `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},` +
+		`"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":1,` +
+		`"candidatesTokenCount":1,"totalTokenCount":2}}`
 )
+
+// geminiKind is the catalogued kind whose `api` is gemini and that has an
+// adapter in this build. `vertex` also names the gemini api and is refused by
+// name, because the real surface is a project-scoped path with Google OAuth.
+const geminiKind = "google"
 
 // lossApp assembles a gateway with one deployment of one kind in front of a
 // spy upstream, so every assertion below can read both what the client received
@@ -82,7 +90,16 @@ models:
 
 // chatRequest posts a chat completion with the given extra headers.
 func chatRequest(a *App, secret, body string, header http.Header) *httptest.ResponseRecorder {
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	return postRequest(a, "/v1/chat/completions", secret, body, header)
+}
+
+// postRequest posts to any inference route. Two of the constructs below reach
+// the neutral form only through the Messages frontend — a structured system
+// prompt is a top-level field there and one more message on the OpenAI wire, and
+// a thinking block's SIGNATURE has no OpenAI spelling at all — so the frontend
+// has to be a parameter rather than a constant.
+func postRequest(a *App, path, secret, body string, header http.Header) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer "+secret)
 	for k, vs := range header {
 		for _, v := range vs {
@@ -292,11 +309,16 @@ func TestServiceTierOverriddenByThePriorityFoldIsReported(t *testing.T) {
 //
 // The failure mode the unification prevents is specific: ROUTING ADMITS WHAT
 // ENCODING THEN DROPS. Routing filters candidates on internal/app's answer;
-// internal/backend used to fall back to its own wireCapabilities when a target
+// internal/backend used to fall back to a switch of its own when a target
 // declared nothing, which it always did. The two agreed — both spelled the same
 // switch over the same catalog-resolved wire shape — but nothing made them, and
 // the day they diverge the divergence is invisible: a 200 with the construct
 // gone.
+//
+// Agreement was not correctness, and this test could not have caught that: both
+// answers came from the same missing case for the Gemini shape, which
+// TestGeminiRefusesOrReportsEveryConstructItCannotEncode is the assertion for.
+// What this one pins is the seam.
 //
 // The test drives both gates from the client side and asserts they decide the
 // same way. A construct the deployment's set lacks is refused BY NAME before
@@ -425,5 +447,298 @@ func TestDowngradeHeaderNamesOnlyWhatWasLost(t *testing.T) {
 	}
 	if _, ok := body["logprobs"]; !ok {
 		t.Errorf("logprobs did not reach a deployment that expresses it: %s", lastUpstreamBody(up))
+	}
+}
+
+// TestGeminiRefusesOrReportsEveryConstructItCannotEncode is the fourth gap, and
+// the one that was live.
+//
+// Unifying the capability computation proved the two computations agreed; it did
+// not prove either agreed with an ENCODER. A Gemini deployment was handed
+// openai.DefaultCapabilities by that unified path — the routing table's answer
+// for every wire shape that is not Messages — while backend.encodeGemini reads no
+// capability set at all and has no field for a single construct below. So both
+// §10.1 gates admitted the request, the encoder silently dropped the construct,
+// and the client got a 200 with no header: the exact failure the
+// x-dorang-downgraded work exists to close, still shipping on one adapter.
+//
+// Every case is asserted twice, from the client side, because the two halves are
+// what §10.1 actually promises:
+//
+//   - with no opt-in the request is REFUSED, the construct is named, and the
+//     retry the caller is told to make is spelled out. Nothing reaches upstream.
+//   - with the opt-in it is SERVED, x-dorang-downgraded names the construct, and
+//     the loss is real — the construct is not on the wire.
+//
+// A test that asserted GeminiCapabilities has a particular value would prove
+// nothing here. That is precisely the shape of assertion under which routing and
+// encoding drifted apart in the first place.
+func TestGeminiRefusesOrReportsEveryConstructItCannotEncode(t *testing.T) {
+	const chatUser = `{"model":"m1","messages":[{"role":"user","content":"hi"}]`
+
+	cases := []struct {
+		name      string
+		path      string
+		body      string
+		construct string
+		// absent is a substring that must NOT appear in the upstream body once the
+		// caller has consented. It is what separates a header describing a loss
+		// from a header describing something that survived.
+		absent string
+		verify func(t *testing.T, upstream string)
+	}{
+		{
+			// §10.1 uses a lost cache breakpoint as its own example of a loss that
+			// changes the BILL. This protocol has no per-block cache_control at
+			// all; its explicit caching is a separate cachedContents resource.
+			name:      "cache_control",
+			path:      "/v1/chat/completions",
+			body:      `{"model":"m1","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`,
+			construct: canonical.ConstructCacheBreakpoints,
+			absent:    "cache_control",
+		},
+		{
+			// geminiParts drops a thinking block outright: a reasoning part here
+			// carries a signature dorang did not receive and must not fabricate.
+			name:      "thinking_block",
+			path:      "/v1/chat/completions",
+			body:      `{"model":"m1","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok","reasoning_content":"deliberation"}]}`,
+			construct: canonical.ConstructThinkingBlock,
+			absent:    "deliberation",
+		},
+		{
+			// Material since the capability pass: the body comes back without the
+			// member it asked for, under a 200 saying it went well.
+			name:      "logprobs",
+			path:      "/v1/chat/completions",
+			body:      chatUser + `,"logprobs":true}`,
+			construct: canonical.ConstructLogprobs,
+			absent:    "logprobs",
+		},
+		{
+			// Material because it selects a PRICE BAND. This family has no tier
+			// and no band, so the caller is billed in one they did not choose.
+			name:      "service_tier",
+			path:      "/v1/chat/completions",
+			body:      chatUser + `,"service_tier":"flex"}`,
+			construct: canonical.ConstructServiceTier,
+			absent:    "service_tier",
+		},
+		{
+			// systemText flattens the prompt into one text part, so per-block
+			// attributes have nowhere to land. The blocks' TEXT survives, which is
+			// why the loss is checked by counting parts rather than by absence.
+			name: "structured_system",
+			path: "/v1/messages",
+			body: `{"model":"m1","max_tokens":16,"system":[{"type":"text","text":"alpha"},` +
+				`{"type":"text","text":"beta"}],"messages":[{"role":"user","content":"hi"}]}`,
+			construct: canonical.ConstructStructuredSystem,
+			verify: func(t *testing.T, upstream string) {
+				t.Helper()
+				var body struct {
+					SystemInstruction *struct {
+						Parts []json.RawMessage `json:"parts"`
+					} `json:"systemInstruction"`
+				}
+				if err := json.Unmarshal([]byte(upstream), &body); err != nil {
+					t.Fatalf("upstream body: %v", err)
+				}
+				if body.SystemInstruction == nil || len(body.SystemInstruction.Parts) != 1 {
+					t.Fatalf("the caller sent two system blocks and the wire carries %s; the "+
+						"downgrade header claims they were flattened", upstream)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh gateway per case, so "the upstream was never called" is a
+			// claim about THIS request rather than about the order of the table.
+			a, up, secret := lossApp(t, geminiKind, geminiAnswer)
+
+			w := postRequest(a, tc.path, secret, tc.body, nil)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("a Gemini deployment cannot encode %s and answered %d. A 200 here is "+
+					"the gates admitting what encodeGemini then drops, with no header to say so\n%s",
+					tc.construct, w.Code, w.Body)
+			}
+			msg := strings.ToLower(w.Body.String())
+			if !strings.Contains(msg, tc.construct) {
+				t.Errorf("§10.1 requires a machine-readable body naming the unsupported "+
+					"construct; the refusal said %s", w.Body)
+			}
+			if !strings.Contains(msg, strings.ToLower(HeaderAllowLossy)+": "+tc.construct) {
+				t.Errorf("the refusal has to carry the retry, not just the diagnosis: %s", w.Body)
+			}
+			if got := lastUpstreamBody(up); got != "" {
+				t.Errorf("the request was refused and the upstream was called anyway: %s", got)
+			}
+			if got := w.Header().Get(server.HeaderDowngraded); got != "" {
+				t.Errorf("%s = %q on a refused request; nothing was downgraded because "+
+					"nothing was sent", server.HeaderDowngraded, got)
+			}
+
+			// Consented to: served, applied, and named.
+			w = postRequest(a, tc.path, secret, tc.body,
+				http.Header{HeaderAllowLossy: []string{tc.construct}})
+			if w.Code != http.StatusOK {
+				t.Fatalf("the opt-in did not admit the request: %d\n%s", w.Code, w.Body)
+			}
+			if got := w.Header().Get(server.HeaderDowngraded); !strings.Contains(got, tc.construct) {
+				t.Fatalf("the caller consented to losing %q, dorang lost it, and %s = %q. "+
+					"Consenting to a loss is not the same as being told it happened",
+					tc.construct, server.HeaderDowngraded, got)
+			}
+			upstream := lastUpstreamBody(up)
+			if upstream == "" {
+				t.Fatal("the upstream was never called")
+			}
+			if tc.absent != "" && strings.Contains(upstream, tc.absent) {
+				t.Errorf("the upstream request still carries %q, so the header reports a loss "+
+					"that did not happen: %s", tc.absent, upstream)
+			}
+			if tc.verify != nil {
+				tc.verify(t, upstream)
+			}
+		})
+	}
+}
+
+// TestGeminiNamesTheKnobsItCannotApply is the droppable half of the same defect.
+//
+// None of these changes what the caller receives, so none of them is a refusal —
+// but every one of them was discarded in complete silence, because the capability
+// set this deployment was given CLAIMED all four and encodeGemini writes none of
+// them. §10.3's rule is the whole reason x-dorang-dropped-params exists: silently
+// discarding something a caller sent leaves them believing it took effect.
+//
+// Three of the four are expressible by the vendor's own generationConfig and not
+// by this encoder, which is the distinction the capability constant has to
+// record: the set describes the code that converts, not the protocol somebody
+// could convert to.
+func TestGeminiNamesTheKnobsItCannotApply(t *testing.T) {
+	a, up, secret := lossApp(t, geminiKind, geminiAnswer)
+
+	w := chatRequest(a, secret, `{"model":"m1","messages":[{"role":"user","content":"hi"}],`+
+		`"logit_bias":{"1234":50},"frequency_penalty":0.5,"presence_penalty":0.25,"user":"u-1"}`, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("a droppable knob is not a refusal; status %d\n%s", w.Code, w.Body)
+	}
+	dropped := w.Header().Get(server.HeaderDroppedParams)
+	for _, name := range []string{"logit_bias", "frequency_penalty", "presence_penalty", "user"} {
+		if !strings.Contains(dropped, name) {
+			t.Errorf("the caller sent %s, this adapter has no field for it, and %s = %q",
+				name, server.HeaderDroppedParams, dropped)
+		}
+		// As a KEY. `user` is also the role every turn of this protocol carries,
+		// and a bare substring test reports the request's own role as a leaked
+		// parameter.
+		if body := lastUpstreamBody(up); strings.Contains(body, `"`+name+`":`) {
+			t.Errorf("%s reached a wire shape with no field for it: %s", name, body)
+		}
+	}
+}
+
+// TestReasoningDisabledByABudgetCollapseIsReported drives DESIGN §10.2's own
+// promise, which had no writer at all:
+//
+//	if budget < min_thinking_budget:  reasoning is disabled for this request,
+//	                                  and `x-dorang-dropped-params` says so
+//
+// internal/wire/anthropic's encodeThinking has recorded that drop since it was
+// written. Nothing collected it: the backend adapters passed no Loss to
+// MarshalRequest, so the report was allocated, filled and discarded inside one
+// function call. The promise is not a capability question and no mask can answer
+// it — the collapse depends on the CALLER's max_tokens, so it is not a property
+// of the deployment and the routing table cannot know it.
+//
+// Both directions, because a report that fires when nothing was taken is the
+// failure mode of a report: the same effort under a ceiling the budget fits
+// under reaches the wire and is named nowhere.
+func TestReasoningDisabledByABudgetCollapseIsReported(t *testing.T) {
+	a, up, secret := lossApp(t, "anthropic", anthropicAnswer)
+
+	call := func(maxTokens string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := chatRequest(a, secret, `{"model":"m1","messages":[{"role":"user","content":"hi"}],`+
+			`"max_tokens":`+maxTokens+`,"reasoning_effort":"low"}`, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("max_tokens %s answered %d — a collapsed budget is a report, not a "+
+				"refusal\n%s", maxTokens, w.Code, w.Body)
+		}
+		return w
+	}
+
+	// effort `low` asks for 2048 thinking tokens and the ceiling leaves 63, which
+	// is below the 1024 this family accepts. dorang does not raise the caller's
+	// max_tokens to make a budget fit, so reasoning is turned off.
+	w := call("64")
+	if got := w.Header().Get(server.HeaderDroppedParams); !strings.Contains(got, "thinking") {
+		t.Fatalf("the caller asked for reasoning, the budget collapsed below the minimum, "+
+			"dorang disabled it, and %s = %q. §10.2 promises this header says so",
+			server.HeaderDroppedParams, got)
+	}
+	if body := lastUpstreamBody(up); strings.Contains(body, "thinking") {
+		t.Errorf("the header reports a drop that did not happen: %s", body)
+	}
+
+	// A ceiling the budget fits under: reasoning is applied and nothing is
+	// reported.
+	w = call("4096")
+	if got := w.Header().Get(server.HeaderDroppedParams); strings.Contains(got, "thinking") {
+		t.Errorf("%s = %q for a budget that was applied", server.HeaderDroppedParams, got)
+	}
+	if body := lastUpstreamBody(up); !strings.Contains(body, `"thinking":`) {
+		t.Errorf("the reasoning control did not reach a deployment that expresses it: %s", body)
+	}
+}
+
+// TestThinkingSignatureLostCrossingIntoOpenAIIsReported is the loss no capability
+// mask can see, and the reason threading the report out was worth doing at all.
+//
+// x-dorang-downgraded is otherwise computed by subtracting the deployment's
+// capability set from what the request uses. This case escapes that subtraction
+// in the one direction the subtraction cannot represent: the target HOLDS
+// CapThinkingBlocks — the OpenAI family carries reasoning text perfectly well —
+// and the encoder raises a downgrade anyway, because no field there carries
+// integrity material and §10.2 forbids fabricating one. The bit is present and
+// the construct is lost.
+//
+// §10.2 also says where the cost lands: on the SECOND turn of an agentic flow,
+// which is the worst possible place to discover it. The caller replays a signed
+// block, dorang forwards the text without the signature, and the answer is a 200.
+//
+// The opt-in is deliberately not sent. Nothing refused this loss — no gate could
+// see it — so gating the report on a consent the caller was never asked for would
+// reproduce the silence exactly.
+func TestThinkingSignatureLostCrossingIntoOpenAIIsReported(t *testing.T) {
+	a, up, secret := lossApp(t, "openai", openaiAnswer)
+
+	w := postRequest(a, "/v1/messages", secret,
+		`{"model":"m1","max_tokens":16,"messages":[{"role":"user","content":"hi"},`+
+			`{"role":"assistant","content":[`+
+			`{"type":"thinking","thinking":"deliberation","signature":"sig-abcdef"},`+
+			`{"type":"text","text":"ok"}]}]}`, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("the OpenAI family carries reasoning text; status %d\n%s", w.Code, w.Body)
+	}
+	if got := w.Header().Get(server.HeaderDowngraded); got != canonical.ConstructThinkingBlock {
+		t.Fatalf("a signed reasoning block crossed into a family with no field for the "+
+			"signature and %s = %q. The capability mask cannot see this one — the bit is "+
+			"HELD while the encoder drops the signature — so it is the encoder's own report "+
+			"or nothing (want %q)",
+			server.HeaderDowngraded, got, canonical.ConstructThinkingBlock)
+	}
+	upstream := lastUpstreamBody(up)
+	if strings.Contains(upstream, "sig-abcdef") {
+		t.Errorf("dorang forwarded integrity material into a field that does not carry "+
+			"one: %s", upstream)
+	}
+	// The TEXT survives, which is what makes the loss narrow enough to report
+	// rather than refuse: it is the signature alone that could not cross.
+	if !strings.Contains(upstream, "deliberation") {
+		t.Errorf("the reasoning text was lost as well, which is a different and larger "+
+			"claim than the header makes: %s", upstream)
 	}
 }

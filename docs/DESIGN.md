@@ -1853,6 +1853,23 @@ then drops**, which is a `200` with the construct gone. So the set now travels �
 `backend.Target.Capabilities` — and the deployment that is *refused* for a capability and the
 deployment that is *encoded* for it are decided by the same bits.
 
+**Agreement is not correctness, and unification proved only the first.** Both computations
+switched on the same resolved `api` and returned one of the same two wire-package constants,
+so no configuration could separate them — and both were wrong together for the one wire shape
+that had no constant of its own. A Gemini deployment fell to the default arm and was routed
+and encoded against `openai.DefaultCapabilities`, while `backend.encodeGemini` reads no
+capability set at all and has no field for `cache_control`, `logprobs`, `service_tier`, a
+thinking block or a structured system prompt. Both gates admitted the request, the encoder
+dropped the construct, and the client got a `200` with no header: the failure this section
+describes, arriving from inside the fix for it.
+
+So a capability set is declared **beside the encoder that has to honour it** —
+`anthropic.DefaultCapabilities`, `openai.DefaultCapabilities`, `backend.GeminiCapabilities` —
+and `backend.CapabilitiesForAPI` is the one function that maps a wire shape onto one. What a
+set may claim is what the encoder *writes*, not what the protocol *defines*: Gemini's
+`generationConfig` has `frequencyPenalty`, `presencePenalty` and `responseLogprobs`, dorang's
+encoder emits none of the three, and the bit is earned by adding the field.
+
 Two gates, one vocabulary: both refusals name the construct in the body and, for the material
 half, fill `param` with the wire field. The routing gate used to name neither, which is the
 wrong way round — a caller who trips it is the one who has never seen the construct
@@ -1872,20 +1889,41 @@ It is absent on the overwhelming majority of responses, because a structural los
 did *not* consent to is a `400` and never reaches a response body at all. That is what makes
 it safe to attach: its presence always means the mechanism fired.
 
-Two bounded omissions, stated rather than left to be discovered:
+Three bounded omissions, stated rather than left to be discovered:
 
 - **The per-instance location is not in it.** `messages[2].content[1]: application/pdf` is in
   the `400` body, which is what a caller who did not consent receives. A header is not a
   place for an unbounded list of positions.
-- **A loss an encoder raises while HOLDING the capability is not in it.** The header is
-  computed from the capability masks, and one case escapes them: crossing a thinking block's
-  *signature* into the OpenAI family is a downgrade even though `CapThinkingBlocks` is
-  present, because no field there carries integrity material and §10.2 forbids fabricating
-  one. Covering it needs the encoders' own `canonical.LossReport` to travel out of
-  `internal/backend`, and today nothing collects one — the adapters pass no `Loss` to either
-  encoder, so the located detail those encoders build is discarded where it is produced.
-  §10.2's "reported in `x-dorang-dropped-params`" for a reasoning budget that collapsed below
-  the minimum has no writer for the same reason.
+- **A loss an encoder raises while HOLDING the capability is now in it, and it took a second
+  source.** The mask half cannot see one: crossing a thinking block's *signature* into the
+  OpenAI family is a downgrade even though `CapThinkingBlocks` is present, because no field
+  there carries integrity material and §10.2 forbids fabricating one — the bit is held and
+  the construct is lost. So the encoders' own `canonical.LossReport` travels out of
+  `internal/backend` on `backend.Call.Accepted` and is merged in. It rides the callback and
+  not `backend.Result` because a stream's headers are already on the wire by the time `Do`
+  returns, and a report that reached buffered answers and not streamed ones would be present
+  or absent by a property of the response the caller never asked about. §10.2's "reported in
+  `x-dorang-dropped-params`" for a reasoning budget that collapsed below the minimum arrives
+  on the same path: `internal/wire/anthropic` had recorded that drop all along, into a report
+  the adapter discarded.
+
+  The mask half stays, because it is the only source for a wire shape whose adapter builds no
+  report — the Gemini adapter converts without one. The opt-in is intersected into the mask
+  half and *not* into the encoder half: nothing refused the signature loss, because no gate
+  could see it, so gating the report on a consent that was never asked for would reproduce
+  the silence exactly.
+
+- **The RESPONSE direction is still not in it, and it is the mirror of the case above.**
+  `backend.encodeClient` and `encodeT1Client` pass no `Loss` either, so what the *answer*
+  encoders compute is discarded the same way the request encoders' was: an Anthropic
+  upstream's signed reasoning block rendered for an OpenAI client loses the signature
+  (`internal/wire/openai`'s `encodeAssistantMessage`), `n > 1` collapses rendering into
+  Messages, and a Responses client's `stop`, `seed` and `top_k` are dropped on the way back.
+  It is left open rather than half-closed: the answer is encoded *after* `Call.Accepted`
+  fires, so on the callback it does not exist yet and on `backend.Result` it would reach
+  buffered answers and not streamed ones — the asymmetry the request half is routed around
+  the callback specifically to avoid. Closing it needs the stamp point to move, not another
+  carrier.
 
 #### A deployment can also express a construct and not be sent it
 
