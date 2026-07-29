@@ -116,6 +116,23 @@ type TranscriptionResponse struct {
 	Words    []TranscriptionWord
 	Usage    *Usage
 
+	// UsageUnit is what the backend billed this transcript IN — "tokens" or
+	// "duration" — and UsageSeconds the quantity when it is the latter. They are
+	// separate from Duration, which is how long the audio was: a model can bill
+	// a rounded minute for a 12.5-second clip, and only one of the two numbers
+	// is on the invoice. Empty means the backend named no unit.
+	//
+	// A duration is never folded into a token count (DESIGN §10.7). dorang prices
+	// per_second rules on wall time, so these two are carried for the client
+	// rather than metered — but a transcript that leaves stating a unit it was
+	// not billed in is wrong whether or not this gateway prices it.
+	UsageUnit    string
+	UsageSeconds float64
+	// UsageExtra carries the members of the upstream usage object that no
+	// canonical counter names, above all its `input_token_details` breakdown —
+	// text and audio tokens, priced apart by the models that report them.
+	UsageExtra map[string]json.RawMessage
+
 	// Raw is the verbatim body for a non-JSON response format, with the media
 	// type the backend labelled it.
 	Raw *Binary

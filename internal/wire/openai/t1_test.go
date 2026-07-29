@@ -344,9 +344,18 @@ func TestImageResponseGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The breakdown crosses. It did not until the decode block was taught to read
+	// it, and this literal pinned the loss: text_tokens and image_tokens are the
+	// two halves of an image prompt, priced apart by every vendor that reports
+	// them, and they were deleted between the upstream and the client because
+	// dorang has no counter of its own for either. `cached_tokens` joins them
+	// because the backend sent a prompt breakdown and none of it was cached —
+	// the same measured zero the chat family's prompt_tokens_details carries, for
+	// the same reason (see [Usage]).
 	want := `{"created":1753660800,"data":[{"b64_json":"AAA","revised_prompt":"a cat, sitting"}],` +
 		`"output_format":"png","size":"1024x1024",` +
-		`"usage":{"input_tokens":9,"output_tokens":1500,"total_tokens":1509}}`
+		`"usage":{"input_tokens":9,"output_tokens":1500,"total_tokens":1509,` +
+		`"input_tokens_details":{"cached_tokens":0,"image_tokens":0,"text_tokens":9}}}`
 	if string(got) != want {
 		t.Fatalf("response bytes\n got: %s\nwant: %s", got, want)
 	}

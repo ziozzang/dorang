@@ -217,19 +217,47 @@ type Usage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 
+	// InputTokens and OutputTokens are the other two families' spelling of the
+	// same two counts, read here because a body in this envelope does not always
+	// come from a host that speaks this envelope's usage block. A Responses-API
+	// answer and an Anthropic answer rendered into a chat envelope by a
+	// translating proxy both arrive with these names, and reading neither meant
+	// the whole request metered as zero: not a wrong invoice but no invoice.
+	//
+	// They are POINTERS because absence is a distinct fact from zero on the way
+	// in, and because dorang's own encoder never sets them — this envelope's
+	// outbound spelling is prompt_tokens/completion_tokens, and omitempty keeps
+	// the two new members off every answer dorang writes.
+	//
+	// What they do NOT settle is the convention: see [usageToCanonical].
+	InputTokens  *int `json:"input_tokens,omitempty"`
+	OutputTokens *int `json:"output_tokens,omitempty"`
+
 	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 
-	// CacheCreationInputTokens is the widely-read cache-write extension
-	// (COMPATIBILITY 3.5). OpenAI has no such field; the clients that care about
-	// cache cost read this name.
+	// InputTokensDetails and OutputTokensDetails are the Responses family's
+	// breakdown objects. They carry the same two counts as the pair above under
+	// this family's own spelling, and they are the ONE member of a usage object
+	// that tells the Responses family from the Anthropic one ([usageToCanonical]).
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
+
+	// CacheReadInputTokens and CacheCreationInputTokens are the widely-read
+	// cache extensions (COMPATIBILITY 3.5). OpenAI has no such fields; the
+	// clients that care about cache cost read these names, and they are the
+	// Anthropic family's proof that its input count EXCLUDES what they carry.
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens,omitempty"`
 
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
 var usageKnown = knownKeys("prompt_tokens", "completion_tokens", "total_tokens",
-	"prompt_tokens_details", "completion_tokens_details", "cache_creation_input_tokens")
+	"input_tokens", "output_tokens",
+	"prompt_tokens_details", "completion_tokens_details",
+	"input_tokens_details", "output_tokens_details",
+	"cache_read_input_tokens", "cache_creation_input_tokens")
 
 // MarshalJSON implements [encoding/json.Marshaler].
 func (u Usage) MarshalJSON() ([]byte, error) {

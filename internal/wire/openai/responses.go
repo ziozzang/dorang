@@ -419,16 +419,100 @@ type ResponsesUsage struct {
 	OutputTokens        int                  `json:"output_tokens"`
 	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
 	TotalTokens         int                  `json:"total_tokens"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var responsesUsageKnown = knownKeys("input_tokens", "input_tokens_details",
+	"output_tokens", "output_tokens_details", "total_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u ResponsesUsage) MarshalJSON() ([]byte, error) {
+	type alias ResponsesUsage
+	return marshalWithExtra(alias(u), u.Extra, responsesUsageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *ResponsesUsage) UnmarshalJSON(b []byte) error {
+	type alias ResponsesUsage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, responsesUsageKnown)
+	if err != nil {
+		return err
+	}
+	*u = ResponsesUsage(a)
+	u.Extra = extra
+	return nil
 }
 
 // InputTokensDetails breaks the prompt count down.
+//
+// CachedTokens has NO omitempty. A zero here is a measurement — see [Usage].
 type InputTokensDetails struct {
 	CachedTokens int `json:"cached_tokens"`
+
+	// Extra carries text_tokens, image_tokens, audio_tokens and every other
+	// breakdown member dorang does not model. They are counts on somebody's
+	// invoice, not decoration.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var inputDetailsKnown = knownKeys("cached_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (d InputTokensDetails) MarshalJSON() ([]byte, error) {
+	type alias InputTokensDetails
+	return marshalWithExtra(alias(d), d.Extra, inputDetailsKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (d *InputTokensDetails) UnmarshalJSON(b []byte) error {
+	type alias InputTokensDetails
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, inputDetailsKnown)
+	if err != nil {
+		return err
+	}
+	*d = InputTokensDetails(a)
+	d.Extra = extra
+	return nil
 }
 
 // OutputTokensDetails breaks the completion count down.
 type OutputTokensDetails struct {
 	ReasoningTokens int `json:"reasoning_tokens"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var outputDetailsKnown = knownKeys("reasoning_tokens")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (d OutputTokensDetails) MarshalJSON() ([]byte, error) {
+	type alias OutputTokensDetails
+	return marshalWithExtra(alias(d), d.Extra, outputDetailsKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (d *OutputTokensDetails) UnmarshalJSON(b []byte) error {
+	type alias OutputTokensDetails
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, outputDetailsKnown)
+	if err != nil {
+		return err
+	}
+	*d = OutputTokensDetails(a)
+	d.Extra = extra
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +759,47 @@ func ItemsToMessages(items []ResponseItem) []canonical.Message {
 	return itemsToMessages(ResponseInput{Items: items})
 }
 
+// IsResponsesAnswer reports whether raw response bytes are an answer of the
+// Responses family rather than a chat completion.
+//
+// It exists because both shapes arrive on the same route. internal/backend
+// addresses OpResponses at /v1/chat/completions today — a caller's Responses
+// request is already in the neutral form by then, and the chat route reaches
+// every deployment while the Responses route reaches some — but the answer's
+// shape is the HOST's choice, not that route's: a host that serves both APIs may
+// answer either, and switching the operation to /v1/responses the day a stream
+// decoder exists makes this shape the ordinary one.
+//
+// Read by the chat decoder, a Responses answer is not merely mis-metered. Its
+// assistant turn is in `output` rather than `choices` and its counts are in
+// `input_tokens` rather than `prompt_tokens`, so it decodes to a successful
+// response with no content and no usage at all — the shape [ErrNotAResponse]
+// exists to refuse, arriving through a decoder that accepted it.
+//
+// The test is a discriminator OR a payload member, the same either-ground rule
+// [IsChatCompletion] states, with one addition: a `choices` array REFUSES. Chat
+// is this package's default shape and the one every OpenAI-compatible host
+// emits; a body carrying `choices` is a chat completion whatever else it also
+// carries, and the usage-block half of the same disagreement is settled inside
+// [usageToCanonical] where it belongs.
+func IsResponsesAnswer(b []byte) bool {
+	if !isJSONObject(b) {
+		return false
+	}
+	var probe struct {
+		Object  string          `json:"object"`
+		Choices json.RawMessage `json:"choices"`
+		Output  json.RawMessage `json:"output"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return false
+	}
+	if probe.Choices != nil {
+		return false
+	}
+	return probe.Object == ObjectResponse || probe.Output != nil
+}
+
 // DecodeResponsesResponse parses a Responses answer into the neutral form.
 //
 // json.Unmarshal and not the strict filter: these bytes are a backend's, not a
@@ -715,6 +840,7 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 			u.Report(canonical.UsageReasoning)
 		}
 		out.Usage = u
+		out.UsageExtra = responsesUsageExtra(w.Usage)
 	}
 
 	msg := canonical.Message{Role: canonical.RoleAssistant}
@@ -743,6 +869,31 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 	choice.StopReason, choice.NativeStopReason = responsesStopReason(w, msg)
 	out.Choices = []canonical.Choice{choice}
 	return out, nil
+}
+
+// responsesUsageExtra collects the members of a Responses usage object, and of
+// its two breakdown sub-objects, that no canonical counter names.
+//
+// It fills the SAME two maps [usageExtraOf] does. The families spell the
+// breakdown differently and mean the same level of the same concept by it, so a
+// member that arrived under one spelling must be readable by an encoder for the
+// other; keeping a third pair of maps would only record which vendor's word for
+// "details" the upstream happened to use.
+func responsesUsageExtra(u *ResponsesUsage) *canonical.UsageExtra {
+	if u == nil {
+		return nil
+	}
+	out := &canonical.UsageExtra{Usage: u.Extra}
+	if u.InputTokensDetails != nil {
+		out.PromptDetails = u.InputTokensDetails.Extra
+	}
+	if u.OutputTokensDetails != nil {
+		out.CompletionDetails = u.OutputTokensDetails.Extra
+	}
+	if out.Empty() {
+		return nil
+	}
+	return out
 }
 
 // responsesStopReason maps status + incomplete_details.reason onto the neutral
@@ -1087,6 +1238,9 @@ func EncodeResponsesResponse(r *canonical.Response, opt *ResponsesOptions) (*Res
 			OutputTokens: r.Usage.OutputTokens,
 			TotalTokens:  r.Usage.TotalTokens(),
 		}
+		if r.UsageExtra != nil {
+			u.Extra = r.UsageExtra.Usage
+		}
 		// Reported, not `> 0`: a breakdown the backend stated is emitted as
 		// stated, zero included, and one dorang synthesized is still omitted.
 		// The same rule as [EncodeUsage], for the same billing reason — this
@@ -1094,9 +1248,15 @@ func EncodeResponsesResponse(r *canonical.Response, opt *ResponsesOptions) (*Res
 		// way a chat client reads prompt_tokens_details.cached_tokens.
 		if r.Usage.CacheReadTokens > 0 || r.Usage.Reports(canonical.UsageCacheRead) {
 			u.InputTokensDetails = &InputTokensDetails{CachedTokens: r.Usage.CacheReadTokens}
+			if r.UsageExtra != nil {
+				u.InputTokensDetails.Extra = r.UsageExtra.PromptDetails
+			}
 		}
 		if r.Usage.ReasoningTokens > 0 || r.Usage.Reports(canonical.UsageReasoning) {
 			u.OutputTokensDetails = &OutputTokensDetails{ReasoningTokens: r.Usage.ReasoningTokens}
+			if r.UsageExtra != nil {
+				u.OutputTokensDetails.Extra = r.UsageExtra.CompletionDetails
+			}
 		}
 		out.Usage = u
 	}

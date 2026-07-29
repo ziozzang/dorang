@@ -356,11 +356,23 @@ func marshalWithModel(obj map[string]json.RawMessage, model string) ([]byte, err
 //
 // prompt_tokens wins whenever it is non-zero: a vendor that states both and
 // means different things by them is stating the prompt count in the field named
-// for it.
+// for it. input_tokens is read for the same reason total_tokens is — it is a
+// third real spelling of the one count this shape has, used by the Anthropic
+// family and by the OpenAI Responses generation, and a host that answers
+// embeddings in it metered as zero under a reader that knew only the other two.
+//
+// The three-family ambiguity DESIGN §10.7 records does not reach here. What
+// makes `input_tokens` undecidable elsewhere is whether it CONTAINS the cached
+// prefix, and an embeddings answer states no cache breakdown under any spelling
+// — there is nothing to place inside or beside the count, so both readings give
+// the same number. If this shape ever grows one, the breakdown object settles
+// the family, exactly as it does in internal/wire/openai's usageToCanonical and
+// internal/server's scanUsage.
 func scanRelayUsage(body []byte) (canonical.Usage, bool) {
 	var shape struct {
 		Usage *struct {
 			PromptTokens int `json:"prompt_tokens"`
+			InputTokens  int `json:"input_tokens"`
 			TotalTokens  int `json:"total_tokens"`
 		} `json:"usage"`
 	}
@@ -368,6 +380,9 @@ func scanRelayUsage(body []byte) (canonical.Usage, bool) {
 		return canonical.Usage{}, false
 	}
 	in := shape.Usage.PromptTokens
+	if in == 0 {
+		in = shape.Usage.InputTokens
+	}
 	if in == 0 {
 		in = shape.Usage.TotalTokens
 	}

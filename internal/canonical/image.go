@@ -73,6 +73,13 @@ type ImageResponse struct {
 	Quality      string
 	Size         string
 	Extra        map[string]json.RawMessage
+	// UsageExtra carries the members of the upstream usage object, and of its
+	// breakdown sub-object, that no canonical counter names — text_tokens and
+	// image_tokens above all, which are the two halves of an image prompt and are
+	// priced apart by every vendor that reports them. Same type and same reason
+	// as [Response.UsageExtra]; dropping them because dorang cannot price them
+	// deletes a line item from somebody's invoice.
+	UsageExtra *UsageExtra
 }
 
 // ImageData is one rendered image.

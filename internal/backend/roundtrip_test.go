@@ -243,8 +243,15 @@ func TestGeminiRoundTrip(t *testing.T) {
 	}
 
 	// The usage normalization of §10.7: thoughts are output and are billed as
-	// output, prompt already includes the cached prefix.
-	want := canonical.Usage{InputTokens: 10, OutputTokens: 7, CacheReadTokens: 6, ReasoningTokens: 3}
+	// output, prompt already includes the cached prefix. Reported names the four
+	// counters this body stated — the fifth, cache write, has no member in this
+	// family — so a measured zero on any of them survives to the client's
+	// breakdown instead of being omitted as unmeasured.
+	want := canonical.Usage{
+		InputTokens: 10, OutputTokens: 7, CacheReadTokens: 6, ReasoningTokens: 3,
+		Reported: canonical.UsageInput | canonical.UsageOutput |
+			canonical.UsageCacheRead | canonical.UsageReasoning,
+	}
 	if res.Usage != want {
 		t.Errorf("usage = %+v, want %+v", res.Usage, want)
 	}

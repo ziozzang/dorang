@@ -232,12 +232,22 @@ type geminiCandidate struct {
 	Index        int            `json:"index"`
 }
 
+// geminiUsage is this family's usage object.
+//
+// The two breakdowns are POINTERS and the two totals are not, because this
+// vendor OMITS a breakdown it has nothing to say about: a turn with no cache hit
+// carries no cachedContentTokenCount at all, and a non-thinking model carries no
+// thoughtsTokenCount. Absence and a measured zero are different facts and a
+// billing integration prices them differently (see [canonical.UsageField]), so
+// the difference has to survive the decode — an int would collapse it, and then
+// [geminiUsageToCanonical] would have to choose between losing every measured
+// zero and inventing one on every deployment that has no cache.
 type geminiUsage struct {
-	PromptTokenCount        int `json:"promptTokenCount"`
-	CandidatesTokenCount    int `json:"candidatesTokenCount"`
-	CachedContentTokenCount int `json:"cachedContentTokenCount"`
-	ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
-	TotalTokenCount         int `json:"totalTokenCount"`
+	PromptTokenCount        int  `json:"promptTokenCount"`
+	CandidatesTokenCount    int  `json:"candidatesTokenCount"`
+	CachedContentTokenCount *int `json:"cachedContentTokenCount"`
+	ThoughtsTokenCount      *int `json:"thoughtsTokenCount"`
+	TotalTokenCount         int  `json:"totalTokenCount"`
 }
 
 // ---------------------------------------------------------------------------
@@ -610,16 +620,33 @@ func geminiStopReason(native string, sawTool bool) (canonical.StopReason, string
 //     is billed as output. So OutputTokens is the sum and ReasoningTokens is
 //     the part of it that was reasoning — which keeps the invariant that
 //     OutputTokens >= ReasoningTokens and that cost never adds them twice.
+//
+// A third was missing: which counters the backend actually STATED. This decoder
+// recorded none, alone among the adapters, and the cost of that is the defect
+// closed for the chat family arriving by another road — internal/wire/openai's
+// EncodeUsage emits prompt_tokens_details only for a cache count that is
+// positive or reported, so a Gemini turn that served nothing from cache reached
+// an OpenAI client with no cache row at all, which reads as "this deployment has
+// no cache" rather than "the cache returned nothing this time".
 func geminiUsageToCanonical(u *geminiUsage) *canonical.Usage {
 	if u == nil {
 		return nil
 	}
-	return &canonical.Usage{
-		InputTokens:     u.PromptTokenCount,
-		OutputTokens:    u.CandidatesTokenCount + u.ThoughtsTokenCount,
-		CacheReadTokens: u.CachedContentTokenCount,
-		ReasoningTokens: u.ThoughtsTokenCount,
+	out := &canonical.Usage{
+		InputTokens:  u.PromptTokenCount,
+		OutputTokens: u.CandidatesTokenCount,
+		Reported:     canonical.UsageInput | canonical.UsageOutput,
 	}
+	if u.CachedContentTokenCount != nil {
+		out.CacheReadTokens = *u.CachedContentTokenCount
+		out.Report(canonical.UsageCacheRead)
+	}
+	if u.ThoughtsTokenCount != nil {
+		out.ReasoningTokens = *u.ThoughtsTokenCount
+		out.OutputTokens += *u.ThoughtsTokenCount
+		out.Report(canonical.UsageReasoning)
+	}
+	return out
 }
 
 // rawObject returns a JSON object, substituting an empty one for nothing.

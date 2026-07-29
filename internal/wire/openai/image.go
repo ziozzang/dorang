@@ -332,19 +332,49 @@ type ImageData struct {
 }
 
 // ImageUsage is the image surface's usage block. Its input detail splits text
-// from image tokens, and both are already inside input_tokens — the same
-// inclusive rule as everywhere else (DESIGN §10.7).
+// from image tokens and names the part served from cache, and all of them are
+// already inside input_tokens — the same inclusive rule as everywhere else
+// (DESIGN §10.7).
+//
+// The breakdown is [InputTokensDetails], the same type the Responses family
+// uses, because it is the same object under the same name: dorang models the one
+// member it has a counter for, `cached_tokens`, and carries the rest. Declaring
+// a private struct that named only text_tokens/image_tokens made this surface
+// look like it already knew the Responses breakdown while giving a cached count
+// nowhere to land — and §8.5 carves a declared sub-rate's quantity out of its
+// parent, so a cached image prompt was charged in full at the uncached rate.
 type ImageUsage struct {
-	InputTokens        int                     `json:"input_tokens"`
-	OutputTokens       int                     `json:"output_tokens"`
-	TotalTokens        int                     `json:"total_tokens"`
-	InputTokensDetails *ImageInputTokenDetails `json:"input_tokens_details,omitempty"`
+	InputTokens        int                 `json:"input_tokens"`
+	OutputTokens       int                 `json:"output_tokens"`
+	TotalTokens        int                 `json:"total_tokens"`
+	InputTokensDetails *InputTokensDetails `json:"input_tokens_details,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
-// ImageInputTokenDetails breaks the prompt count down.
-type ImageInputTokenDetails struct {
-	TextTokens  int `json:"text_tokens"`
-	ImageTokens int `json:"image_tokens"`
+var imageUsageKnown = knownKeys("input_tokens", "output_tokens", "total_tokens",
+	"input_tokens_details")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u ImageUsage) MarshalJSON() ([]byte, error) {
+	type alias ImageUsage
+	return marshalWithExtra(alias(u), u.Extra, imageUsageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *ImageUsage) UnmarshalJSON(b []byte) error {
+	type alias ImageUsage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, imageUsageKnown)
+	if err != nil {
+		return err
+	}
+	*u = ImageUsage(a)
+	u.Extra = extra
+	return nil
 }
 
 // ErrNotAnImageResponse is a JSON object that parsed cleanly and is not an
@@ -399,12 +429,46 @@ func DecodeImageResponse(b []byte) (*canonical.ImageResponse, error) {
 		out.Data = append(out.Data, canonical.ImageData(w.Data[i]))
 	}
 	if w.Usage != nil {
-		out.Usage = &canonical.Usage{
+		// Reported, not merely counted: `cached_tokens: 0` says the cache
+		// returned nothing on this render and an absent breakdown says nothing
+		// about a cache at all, and a billing integration prices those
+		// differently (see [canonical.UsageField]). This decoder recorded
+		// neither, which made every count it produced look invented.
+		u := &canonical.Usage{
 			InputTokens:  w.Usage.InputTokens,
 			OutputTokens: w.Usage.OutputTokens,
+			Reported:     canonical.UsageInput | canonical.UsageOutput,
 		}
+		if w.Usage.InputTokensDetails != nil {
+			u.CacheReadTokens = w.Usage.InputTokensDetails.CachedTokens
+			u.Report(canonical.UsageCacheRead)
+		}
+		out.Usage = u
+		out.UsageExtra = imageUsageExtra(w.Usage)
 	}
 	return out, nil
+}
+
+// imageUsageExtra collects the members of an image usage object, and of its
+// breakdown sub-object, that no canonical counter names.
+//
+// text_tokens and image_tokens are the two it always carries. They are line
+// items on somebody's invoice — the two halves of an image prompt are priced
+// apart by every vendor that reports them — and dorang has no counter for
+// either, which is precisely the case Extra exists for rather than a reason to
+// delete them.
+func imageUsageExtra(u *ImageUsage) *canonical.UsageExtra {
+	if u == nil {
+		return nil
+	}
+	out := &canonical.UsageExtra{Usage: u.Extra}
+	if u.InputTokensDetails != nil {
+		out.PromptDetails = u.InputTokensDetails.Extra
+	}
+	if out.Empty() {
+		return nil
+	}
+	return out
 }
 
 // MarshalImageResponse encodes a neutral image answer.
@@ -429,6 +493,21 @@ func MarshalImageResponse(r *canonical.ImageResponse) ([]byte, error) {
 			InputTokens:  r.Usage.InputTokens,
 			OutputTokens: r.Usage.OutputTokens,
 			TotalTokens:  r.Usage.TotalTokens(),
+		}
+		if r.UsageExtra != nil {
+			w.Usage.Extra = r.UsageExtra.Usage
+		}
+		// Reported, not `> 0`, for the reason [EncodeUsage] gives on the chat
+		// surface: a breakdown the backend stated is emitted as stated, zero
+		// included, and one dorang synthesized is still omitted.
+		if r.Usage.CacheReadTokens > 0 || r.Usage.Reports(canonical.UsageCacheRead) {
+			w.Usage.InputTokensDetails = &InputTokensDetails{CachedTokens: r.Usage.CacheReadTokens}
+		}
+		if r.UsageExtra != nil && len(r.UsageExtra.PromptDetails) > 0 {
+			if w.Usage.InputTokensDetails == nil {
+				w.Usage.InputTokensDetails = &InputTokensDetails{}
+			}
+			w.Usage.InputTokensDetails.Extra = r.UsageExtra.PromptDetails
 		}
 	}
 	return Marshal(w)

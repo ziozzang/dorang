@@ -348,7 +348,14 @@ func splitDataURL(s string) (mediaType, data string, ok bool) {
 // It returns [ErrNotAResponse] for a JSON object that is not a chat completion.
 // Parsing without error is not the same fact as "this is an answer"; see
 // [ErrNotAResponse] and [IsChatCompletion].
+// It dispatches on the body's own shape rather than on the caller's
+// expectation, because the two OpenAI answer shapes travel the same route. The
+// operation that asks for one of them is decided before the request leaves;
+// which one comes back is decided by the host. See [IsResponsesAnswer].
 func DecodeResponse(b []byte, opt *DecodeOptions) (*canonical.Response, error) {
+	if IsResponsesAnswer(b) {
+		return DecodeResponsesResponse(b, opt)
+	}
 	var w Response
 	if err := json.Unmarshal(b, &w); err != nil {
 		return nil, err
@@ -481,23 +488,81 @@ func stopReasonOfChoice(finish *string, psf map[string]json.RawMessage, warn War
 // cache — and an encoder with only the integer to look at cannot tell them
 // apart, so it omits the measured zero and a customer's cache accounting loses
 // the row that says the cache was consulted.
+//
+// # Which family's arithmetic the counts are in
+//
+// Three families reach this decoder and they use two spellings for the prompt
+// count, so the spelling does not identify the family (DESIGN §10.7):
+//
+//	prompt_tokens / prompt_tokens_details     OpenAI chat       INCLUSIVE
+//	input_tokens  / input_tokens_details      OpenAI Responses  INCLUSIVE
+//	input_tokens  + cache_read_input_tokens   Anthropic         EXCLUSIVE
+//
+// The middle and the bottom row spell the prompt count identically and mean
+// opposite things by it: one counts the cached prefix inside it and the other
+// counts it beside. dorang normalizes to inclusive, so reading the wrong one
+// either loses the whole cached prefix from the prompt or bills it twice —
+// about 1.8x over on a cached request, with no error anywhere.
+//
+// What settles it is the BREAKDOWN OBJECT, whose spelling the three families do
+// not share. It outranks the input key in either key order, because JSON members
+// are unordered and a family decided by whichever key was read first is a family
+// decided by the upstream's serializer. With no breakdown object at all there is
+// no cache count to place, so the two readings coincide and the count is taken
+// as it stands.
+//
+// This is the same rule internal/server's scanUsage applies to a relayed body,
+// deliberately: a request must not be priced differently for having crossed a
+// converting path instead of a passthrough one.
 func usageToCanonical(u *Usage) *canonical.Usage {
 	out := &canonical.Usage{
 		InputTokens:  u.PromptTokens,
 		OutputTokens: u.CompletionTokens,
 		Reported:     canonical.UsageInput | canonical.UsageOutput,
 	}
+	// exclusive is only ever set by an input_tokens with no inclusive-family
+	// breakdown beside it. prompt_tokens is unambiguous and wins outright, which
+	// is what keeps this function's behaviour on a chat answer byte-identical to
+	// what it was before the other two spellings were understood.
+	exclusive := false
+	if u.PromptTokens == 0 && u.InputTokens != nil {
+		out.InputTokens = *u.InputTokens
+		exclusive = true
+	}
+	if u.CompletionTokens == 0 && u.OutputTokens != nil {
+		out.OutputTokens = *u.OutputTokens
+	}
 	if u.PromptTokensDetails != nil {
 		out.CacheReadTokens = u.PromptTokensDetails.CachedTokens
 		out.Report(canonical.UsageCacheRead)
+		exclusive = false
 	}
 	if u.CompletionTokensDetails != nil {
 		out.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
 		out.Report(canonical.UsageReasoning)
 	}
+	if u.InputTokensDetails != nil {
+		out.CacheReadTokens = u.InputTokensDetails.CachedTokens
+		out.Report(canonical.UsageCacheRead)
+		exclusive = false
+	}
+	if u.OutputTokensDetails != nil {
+		out.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens
+		out.Report(canonical.UsageReasoning)
+	}
+	if u.CacheReadInputTokens != nil {
+		out.CacheReadTokens = *u.CacheReadInputTokens
+		out.Report(canonical.UsageCacheRead)
+	}
 	if u.CacheCreationInputTokens != nil {
 		out.CacheWriteTokens = *u.CacheCreationInputTokens
 		out.Report(canonical.UsageCacheWrite)
+	}
+	if exclusive {
+		// The Anthropic reading, and the only one under which a cache count
+		// beside a bare input_tokens is not already inside it. DESIGN §10.7:
+		// InputTokens is the FULL prompt, cache reads and writes included.
+		out.InputTokens += out.CacheReadTokens + out.CacheWriteTokens
 	}
 	return out
 }
@@ -514,6 +579,17 @@ func usageExtraOf(u *Usage) *canonical.UsageExtra {
 	}
 	if u.CompletionTokensDetails != nil {
 		out.CompletionDetails = u.CompletionTokensDetails.Extra
+	}
+	// The Responses family's breakdown objects are the same level of the same
+	// concept under a different spelling, so their unmodelled members belong in
+	// the same two maps. A body carries one family's pair or the other's, never
+	// both, so nothing is overwritten in practice — and if one ever did, the
+	// modelled pair is the one this envelope's encoder re-emits.
+	if u.InputTokensDetails != nil && len(out.PromptDetails) == 0 {
+		out.PromptDetails = u.InputTokensDetails.Extra
+	}
+	if u.OutputTokensDetails != nil && len(out.CompletionDetails) == 0 {
+		out.CompletionDetails = u.OutputTokensDetails.Extra
 	}
 	if out.Empty() {
 		return nil

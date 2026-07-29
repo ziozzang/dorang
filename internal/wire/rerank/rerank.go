@@ -172,14 +172,30 @@ func (r *Response) UnmarshalJSON(b []byte) error {
 }
 
 // Usage is the token-billing block.
+//
+// Four spellings reach this one block, because "rerank" is served by three
+// vendor dialects and by every OpenAI-compatible engine that bolted the route
+// on. prompt_tokens and total_tokens are the two this type always read;
+// input_tokens and output_tokens are the pair [BilledUnits] names as arriving
+// here unmodelled, and a backend that used them metered as ZERO tokens — priced
+// at nothing, and invisible to §11.6's token guard, which triggers on a positive
+// total.
+//
+// The pointers carry absence: dorang's own encoder emits prompt_tokens and
+// total_tokens, so omitempty keeps the two read-only spellings off every answer
+// it writes, and a nil is what says the backend used the other pair.
 type Usage struct {
 	TotalTokens  int `json:"total_tokens"`
 	PromptTokens int `json:"prompt_tokens,omitempty"`
 
+	InputTokens  *int `json:"input_tokens,omitempty"`
+	OutputTokens *int `json:"output_tokens,omitempty"`
+
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-var usageKnown = wirejson.KnownKeys("total_tokens", "prompt_tokens")
+var usageKnown = wirejson.KnownKeys("total_tokens", "prompt_tokens",
+	"input_tokens", "output_tokens")
 
 // MarshalJSON implements [encoding/json.Marshaler].
 func (u Usage) MarshalJSON() ([]byte, error) {
@@ -244,6 +260,13 @@ func (m *Meta) UnmarshalJSON(b []byte) error {
 // modelled. The rest — input_tokens, output_tokens, classifications, whatever
 // the vendor adds — are equally real line items and ride through Extra rather
 // than being deleted for not being interesting to the router.
+//
+// That is deliberate and it is NOT the same decision as [Usage], which does read
+// input_tokens. A vendor that fills this block bills in search units, and dorang
+// prices the search units; reading a token count out of the same block and
+// pricing that too would charge one call twice, in two units. The counts here
+// are carried for the client to reconcile against, not for the router to bill
+// from. TestRerankAnswerDropsNothing asserts they arrive.
 type BilledUnits struct {
 	SearchUnits int `json:"search_units"`
 
@@ -385,14 +408,36 @@ func ResponseToCanonical(w *Response, flavor Flavor, model string) (*canonical.R
 	}
 	if w.Usage != nil {
 		// Inclusive input accounting, like every other surface (DESIGN §10.7).
-		// A rerank backend reports one number; it is the whole prompt, so it is
-		// InputTokens and the total derives from it rather than the other way
-		// round.
-		in := w.Usage.PromptTokens
-		if in == 0 {
-			in = w.Usage.TotalTokens
+		// A rerank backend usually reports one number; it is the whole prompt, so
+		// it is InputTokens and the total derives from it rather than the other
+		// way round.
+		//
+		// The total is the FALLBACK and not the first choice, and it is taken net
+		// of any stated output half. A host that reports 400 in, 7 out and 407
+		// total was charging 400 at the prompt rate and 7 at a generation rate,
+		// and reading the total as the prompt count bills all 407 as prompt —
+		// the same class of error as folding a cache count into the number it is
+		// a breakdown of.
+		out.Usage = &canonical.Usage{Reported: canonical.UsageInput}
+		if w.Usage.OutputTokens != nil {
+			out.Usage.OutputTokens = *w.Usage.OutputTokens
+			out.Usage.Report(canonical.UsageOutput)
 		}
-		out.Usage = &canonical.Usage{InputTokens: in, Reported: canonical.UsageInput}
+		switch {
+		case w.Usage.PromptTokens != 0:
+			out.Usage.InputTokens = w.Usage.PromptTokens
+		case w.Usage.InputTokens != nil && *w.Usage.InputTokens != 0:
+			out.Usage.InputTokens = *w.Usage.InputTokens
+		default:
+			out.Usage.InputTokens = w.Usage.TotalTokens - out.Usage.OutputTokens
+			if out.Usage.InputTokens < 0 {
+				// A total smaller than the output half it is supposed to contain
+				// is a contradiction dorang cannot attribute. Zero, never a
+				// negative: a negative count hands back budget and quota nobody
+				// paid for (internal/pricing's clamp, same rule).
+				out.Usage.InputTokens = 0
+			}
+		}
 		out.UsageExtra = w.Usage.Extra
 	}
 	if w.Meta != nil {
@@ -505,9 +550,20 @@ func EncodeResponse(r *canonical.RerankResponse) (*Response, error) {
 	// nothing and is still omitted.
 	if r.Usage != nil && (r.Usage.InputTokens > 0 || r.Usage.Reports(canonical.UsageInput)) {
 		out.Usage = &Usage{
-			TotalTokens:  r.Usage.InputTokens,
+			// ONE definition of "total tokens" in the binary: input plus output,
+			// with every breakdown field a subset of one of them. The same
+			// function as canonical.Usage.TotalTokens, deliberately — a rerank
+			// answer that stated an output half and a total excluding it is a
+			// total two readers would disagree about.
+			TotalTokens:  r.Usage.TotalTokens(),
 			PromptTokens: r.Usage.InputTokens,
 			Extra:        r.UsageExtra,
+		}
+		if r.Usage.OutputTokens > 0 || r.Usage.Reports(canonical.UsageOutput) {
+			// Only when the backend stated one. A reranker that scores rather
+			// than generates reports no output half at all, and inventing a zero
+			// would tell the client this vendor measured something it did not.
+			out.Usage.OutputTokens = ptrInt(r.Usage.OutputTokens)
 		}
 	}
 	if r.SearchUnits > 0 || r.SearchUnitsReported {
@@ -523,3 +579,7 @@ func EncodeResponse(r *canonical.RerankResponse) (*Response, error) {
 	}
 	return out, nil
 }
+
+// ptrInt is the address of a count, used where absence and zero are different
+// facts on the wire (see [Usage]).
+func ptrInt(v int) *int { return &v }

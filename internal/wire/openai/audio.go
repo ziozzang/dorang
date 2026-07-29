@@ -409,16 +409,55 @@ func (s *TranscriptionSegment) UnmarshalJSON(b []byte) error {
 
 // TranscriptionUsage is the audio surface's own usage block.
 //
-// It is a third spelling of the same concept: tokens for a token-billed model,
-// seconds for a duration-billed one. Both are read; a duration is not a token
-// count and is never folded into one (DESIGN §10.7's rule that a mis-mapped
-// count produces a wrong invoice rather than an error).
+// It is a third spelling of the same concept, and it carries two different
+// BILLING UNITS: tokens for a token-billed model, seconds for a duration-billed
+// one, discriminated by `type`. Both are read; a duration is not a token count
+// and is never folded into one (DESIGN §10.7's rule that a mis-mapped count
+// produces a wrong invoice rather than an error).
+//
+// "Both are read" is what this comment said while neither `type` nor `seconds`
+// was read on the way in and the encoder wrote `"type":"tokens"` on the way out
+// unconditionally. A duration-billed transcript therefore reached the client
+// relabelled as token-billed, with a token count of zero and the billed duration
+// deleted — a bill stating a unit it was not charged in.
+//
+// Extra is the fourth spelling this surface has to survive: its breakdown object
+// is `input_token_details` — singular `token` — splitting an audio prompt into
+// text and audio tokens, which are priced apart. dorang counts neither, so they
+// ride rather than being deleted.
 type TranscriptionUsage struct {
 	Type         string  `json:"type,omitempty"`
 	InputTokens  int     `json:"input_tokens,omitempty"`
 	OutputTokens int     `json:"output_tokens,omitempty"`
 	TotalTokens  int     `json:"total_tokens,omitempty"`
 	Seconds      float64 `json:"seconds,omitempty"`
+
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var transcriptionUsageKnown = knownKeys("type", "input_tokens", "output_tokens",
+	"total_tokens", "seconds")
+
+// MarshalJSON implements [encoding/json.Marshaler].
+func (u TranscriptionUsage) MarshalJSON() ([]byte, error) {
+	type alias TranscriptionUsage
+	return marshalWithExtra(alias(u), u.Extra, transcriptionUsageKnown)
+}
+
+// UnmarshalJSON implements [encoding/json.Unmarshaler].
+func (u *TranscriptionUsage) UnmarshalJSON(b []byte) error {
+	type alias TranscriptionUsage
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, transcriptionUsageKnown)
+	if err != nil {
+		return err
+	}
+	*u = TranscriptionUsage(a)
+	u.Extra = extra
+	return nil
 }
 
 // ErrNotATranscriptionResponse is a JSON object that parsed cleanly and is not a
@@ -510,14 +549,28 @@ func DecodeTranscriptionResponse(b []byte, mediaType string) (*canonical.Transcr
 		})
 	}
 	if w.Usage != nil {
+		// Reported, like every other decoder in this package and unlike this one
+		// until now. A backend that says a transcript cost zero tokens has
+		// MEASURED; one that sends no usage object has not, and an encoder with
+		// only the integer to look at cannot tell the two apart (see
+		// [canonical.UsageField]). That distinction was the whole of the
+		// cached_tokens defect closed on the chat surface.
 		u := &canonical.Usage{
 			InputTokens:  w.Usage.InputTokens,
 			OutputTokens: w.Usage.OutputTokens,
+			Reported:     canonical.UsageInput | canonical.UsageOutput,
 		}
 		if u.InputTokens == 0 && u.OutputTokens == 0 && w.Usage.TotalTokens > 0 {
+			// A transcript has no completion half on a duration-billed model and
+			// on several token-billed ones, so a stated total IS the prompt count
+			// — the same reading internal/backend's scanRelayUsage applies to an
+			// embedding.
 			u.InputTokens = w.Usage.TotalTokens
 		}
 		out.Usage = u
+		out.UsageUnit = w.Usage.Type
+		out.UsageSeconds = w.Usage.Seconds
+		out.UsageExtra = w.Usage.Extra
 	}
 	return out, nil
 }
@@ -555,10 +608,20 @@ func MarshalTranscriptionResponse(r *canonical.TranscriptionResponse) ([]byte, s
 	}
 	if r.Usage != nil {
 		w.Usage = &TranscriptionUsage{
-			Type:         "tokens",
+			// The unit the backend named, never one this encoder chose. "tokens"
+			// is the fallback because it is what a token count means and what
+			// every model that reports one calls it — but a model that billed by
+			// the second said so, and overwriting that told the client it was
+			// charged in a unit nobody charged it in.
+			Type:         r.UsageUnit,
 			InputTokens:  r.Usage.InputTokens,
 			OutputTokens: r.Usage.OutputTokens,
 			TotalTokens:  r.Usage.TotalTokens(),
+			Seconds:      r.UsageSeconds,
+			Extra:        r.UsageExtra,
+		}
+		if w.Usage.Type == "" {
+			w.Usage.Type = "tokens"
 		}
 	}
 	b, err := Marshal(w)
