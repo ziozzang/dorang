@@ -207,6 +207,10 @@ type App struct {
 	// computed against, refreshed on the node's heartbeat rather than read per
 	// scrape. Zero — the unclustered case — reads back as one node.
 	nodes liveNodes
+	// disqualified latches once this node's id turns out to belong to another
+	// process. It is what makes readiness go false exactly once rather than on
+	// every tick; see [App.noteConflict] for why readiness and not exit.
+	disqualified atomic.Bool
 	// rates is the rolling-minute observation every subject's rpm_limit and
 	// tpm_limit are enforced against (DESIGN §11.2). It is not rebuilt by a
 	// reload: the window is live state, and rebuilding it would hand every
@@ -543,7 +547,16 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	a.Server = srv
 	a.Metrics.Register(metrics.NewServerCollector(srv))
 
-	a.startBackground()
+	// 9. The background loops, and with them the cluster join — the one step of
+	//    the assembly that can decide this process must not run at all (§13).
+	//    Close, rather than a bare return: everything above is built, several
+	//    subsystems have already started goroutines, and a refused start-up that
+	//    leaked the store's connection pool would be a second defect wearing the
+	//    first one's message.
+	if err := a.startBackground(); err != nil {
+		_ = a.Close(ctx)
+		return nil, err
+	}
 	return a, nil
 }
 
@@ -804,7 +817,15 @@ func (a *App) checkpointPricingState(ctx context.Context, ahead time.Duration) {
 // startBackground runs the periodic sweeps that are nobody's request path:
 // expired sticky pins, expired capacity reservations, budget-lease renewal, and
 // — on PostgreSQL — tomorrow's ledger partitions.
-func (a *App) startBackground() {
+//
+// It returns an error for exactly one thing: a cluster join this process must
+// not run without ([App.joinError]). Everything else here is best-effort and
+// says so by logging — a credential reload that failed leaves the node reading
+// per key from the store, and a poller that could not start is a slower
+// revocation, not a wrong one. A refused JOIN is different in kind: the process
+// would keep serving under an identity the cluster has given to somebody else,
+// or serve as a cluster member that is not in the cluster.
+func (a *App) startBackground() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.bgCancel = cancel
 	a.bgDone = make(chan struct{})
@@ -869,7 +890,18 @@ func (a *App) startBackground() {
 	// ticker below is never created and `accuracy` stays nil. A nil channel
 	// blocks forever in a select, so the notebook tier pays one dead case in a
 	// loop it already runs — no goroutine, no ticker, no query.
-	clustered := a.joinCluster(ctx)
+	//
+	// A refused join stops the assembly here. Everything this function has
+	// already started is unwound first — the invalidation poller and the OAuth
+	// refresh loops both hang off ctx — and `bgDone` is closed so that
+	// [App.Close], which waits on it, is not waiting on a goroutine that was
+	// never launched.
+	clustered, err := a.joinCluster(ctx)
+	if err != nil {
+		cancel()
+		close(a.bgDone)
+		return err
+	}
 
 	go func() {
 		defer close(a.bgDone)
@@ -894,6 +926,10 @@ func (a *App) startBackground() {
 			case <-ctx.Done():
 				return
 			case <-accuracy:
+				// Conflict first. A node that has been superseded is not going
+				// to lead again and should stop being routed to; refreshing the
+				// count it publishes matters less than that.
+				a.noteConflict()
 				a.refreshAccuracy(ctx)
 			case <-r.C:
 				if a.Auth != nil && a.KeyLoader != nil {
@@ -961,6 +997,7 @@ func (a *App) startBackground() {
 			}
 		}
 	}()
+	return nil
 }
 
 // nodeID names this process in its lease rows.

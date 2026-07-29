@@ -603,6 +603,10 @@ func (n *Node) loop(ctx context.Context) {
 // The order is the draining order of DESIGN 13, and each step depends on the
 // one before it. Resigning after returning the leases would leave a window in
 // which this node still leads with nothing to lead with.
+//
+// A node that has been disqualified ([Node.Conflict]) releases nothing: every
+// release here is scoped by node id, which under a duplicated id is the other
+// process's, so the drain is skipped rather than performed on its behalf.
 func (n *Node) Close(ctx context.Context) error {
 	n.mu.Lock()
 	if n.closed {
@@ -612,6 +616,7 @@ func (n *Node) Close(ctx context.Context) error {
 	n.closed = true
 	started := n.started
 	registered := n.registered
+	conflict := n.conflict
 	close(n.stop)
 	n.mu.Unlock()
 
@@ -629,11 +634,32 @@ func (n *Node) Close(ctx context.Context) error {
 	if err := n.el.Close(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	if err := n.ledger.Close(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	if err := n.leases.Close(ctx); err != nil {
-		errs = append(errs, err)
+	// A node whose id turned out to belong to another process releases NOTHING
+	// keyed by that id, and the drain below is the last place that rule has to
+	// hold. Every release in this function is scoped by node id and by nothing
+	// else -- `DELETE FROM quota_leases WHERE ... node_id = ?` in
+	// [LeaseStore.Close], and a [ledgerBlock] row id derived from the key and
+	// the node id in [Ledger.Close] -- so under a duplicated id they are the
+	// INCUMBENT's rows. A disqualified process that drained normally would
+	// therefore empty the running node's share of every leased limit and hand
+	// its budget blocks back, on the way out, as its parting act.
+	//
+	// [Election.Close] needs no guard: [Election.Disqualify] already closed it,
+	// for the same reason and argued at length there. The registry row needs
+	// none either: [Registry.Deregister] is scoped by incarnation, so it can
+	// only ever delete a row this process wrote. These two are the pair that was
+	// missed, and they are the two that hold money.
+	if conflict == nil {
+		if err := n.ledger.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		if err := n.leases.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	} else {
+		// Still shut the ledger down locally, so a request racing the shutdown
+		// cannot spend from a block nobody will account for. It writes nothing.
+		n.ledger.Abandon()
 	}
 	// Deregistration is LAST, and not beside the readiness flip at the top of
 	// the drain. That looks wrong -- the node advertises itself as live for the

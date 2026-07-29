@@ -143,6 +143,7 @@ func chatReply(text string) string {
 // wiring tests want.
 func newFilterApp(t *testing.T, yaml string, logs *safeLog, mut func(*config.Config)) *App {
 	t.Helper()
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(yaml))
 	if err != nil {

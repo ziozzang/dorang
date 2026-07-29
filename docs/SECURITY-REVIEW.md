@@ -1852,6 +1852,13 @@ silently would repeat the mistake that made a second audit necessary.
 Named, because a control that exists and is not called is this codebase's
 dominant defect and it has now been counted three times.
 
+**As of `8e6016d`, 2026-07-29.** This list is dated because an undated backlog
+is the thing this document was written about: every entry below was re-checked
+against that commit's blobs, and three entries that were *not* re-checked before
+had been false for days. When you read it, check the date against `git log`
+first — a backlog is a measurement of a tree, and a measurement without a stamp
+cannot be audited or trusted, only believed.
+
 1. **Store lookups for unknown keys are still unbounded** (finding 6's second
    half). One `LoadByLookup` per unauthenticated request; the negative TTL bounds
    repeats of the same key and nothing bounds distinct ones. The first pass
@@ -1864,21 +1871,73 @@ dominant defect and it has now been counted three times.
    per-subject rate ceiling is proved at the gate
    (`TestTeamRPMCountsEveryKeyUnderTheTeam`,
    `TestSettledTokensReachEverySubjectOfTheRequest`) and not over HTTP.
-3. **No range-aggregating ledger query**, so `/global/spend/report` and the three
-   daily-activity endpoints have nothing to call. **`/audit/list`**: rows are
-   written now and still cannot be read over the API.
+3. **`/audit/list`**: rows are written by every administrative mutation and still
+   cannot be read over the API. `internal/admin/routes.go` names it as the one
+   stub whose reason says "until this ships" rather than describing a refusal.
+   *(This entry said "**No range-aggregating ledger query**, so
+   `/global/spend/report` and the three daily-activity endpoints have nothing to
+   call." Both halves were false — see the fourth-pass corrections below.)*
 4. **`quota.Registry`, `internal/probe`, `pricing.Catalog` and `App.Reload`** are
    not reachable from the administrative surface, so `/admin/credentials/health`,
    `/admin/quota`, `/spend/calculate`, `/admin/pricing/preview` and
    `/admin/config/reload` have no adapter. `SIGHUP` works.
 5. **Two copies of the upstream-overflow classifier** remain, in
-   `internal/app/estimate.go` and `testing/scenario/harness.go`. Both are correct
-   today; nothing keeps them that way.
+   `internal/app/estimate.go` and `testing/scenario/harness.go` — but the
+   duplication is now near-nothing and this entry is **downgraded, not carried**:
+   both are three-line adapters delegating to the single `router.ClassifyBody`,
+   so the rule is single-sourced and only the argument shuffling differs. What
+   this entry described — two independent implementations of one classification —
+   no longer exists.
 6. **Rate ceilings are per process.** An N-node deployment enforces N times every
    `rpm_limit` and `tpm_limit`, and `tpm_limit` bounds the NEXT request because
    the token count does not exist until settlement.
-7. **`auth.Strip`, the OAuth subsystem, `internal/luaext`, `store.ImportKeys`,
-   `quota.Ranker`** — unchanged from the first pass.
+7. **`auth.Strip` and `store.ImportKeys`** — unchanged from the first pass.
+   `auth.Strip` (`internal/auth/header.go`) has only test callers; the production
+   strip is `server.StripAuthHeaders`. `store.ImportKeys` has no CLI or HTTP
+   entry point. *(This entry also named **the OAuth subsystem**, **`internal/luaext`**
+   and **`quota.Ranker`**. All three are wired — see the fourth-pass corrections
+   below. Three of the five names on one line were false.)*
 8. Everything under "## Not addressed" above that is not corrected in the list
-   before this one.
+   before this one, or in the fourth-pass corrections below.
+
+## What the third pass got wrong — 2026-07-29, at `8e6016d`
+
+The "Still open" list above has been **corrected in place**, and what each entry
+said before is quoted where it stood. This section exists for the same reason
+"## What the first two passes got wrong" does: each error is an instance of the
+defect class this review is about, and deleting one silently is the mistake that
+made the second audit necessary.
+
+The shape repeated exactly. The first two passes marked things **closed** that
+were not. The third pass marked things **open** that were. Both are the same
+error — a disposition copied forward without re-reading the code — and the second
+is not the harmless direction. A backlog carrying dead entries stops being read,
+and the live items in it go with them. Five of six documents in this repository
+were asserting something the code had closed when this pass began.
+
+| # | The third pass said | The code says | Evidence |
+|---|---|---|---|
+| 1 | "Still open" #3: **no range-aggregating ledger query**, so `/global/spend/report` has nothing to call | It exists and is wired | `store.RollupQuery` and `Store.ReadRollupRange` (`internal/store/rollup.go`); the adapter is `(*adminLedger).Report` (`internal/app/admin.go`), whose own comment says *"It answered 501 until now"*. Pinned by `TestGlobalSpendReportReadsTheRollups` |
+| 2 | Same entry, second half: the three daily-activity endpoints have **nothing to call** | **Outcome right, reason wrong** | They still refuse, but from a *live* ledger that names what is missing — `internal/app/admin.go`'s `unsupportedLedger` says the ledger has no per-user index, and `rollupPlan` refuses two non-`day` dimensions at once because §9.4 materializes purpose-built rollups and not a cube. That is a deliberate refusal with the alternative named, not an absent dependency. "Nothing to call" is false; "no cube to answer it from" is true, and that is what OPERATIONS §3.2 now says |
+| 3 | "Still open" #7: **`internal/luaext`** is unreachable, "unchanged from the first pass" | Reachable, on the request path | `go.mod` requires `github.com/yuin/gopher-lua v1.1.2` since `a0d5871`; `internal/app/extensions.go` builds the engine from configuration and `internal/app/filter.go` compiles every declared `filters.plugins[]` entry. `94de856`, `bb67140` and `241f73b` hardened the sandbox — three commits of work on a subsystem this document called a skeleton |
+| 4 | Same entry: **`quota.Ranker`** is unreachable | Constructed on the production path | `internal/app/build.go` calls `quota.NewRanker`; the join is pinned by `TestUrgencySourceIsTheQuotaRanker` (`internal/router/wiring_test.go`). Its sibling `Meter.Allowance`, named beside it in "### 3. Whole subsystems with no callers", is read by `internal/metrics/collect_quota.go` |
+| 5 | Same entry: **the OAuth subsystem** is unreachable, and "OAuth credentials cannot be configured, so §11.2b describes a feature the binary does not have" | Configured, built, started and closed | `internal/app/oauthcred.go`'s `buildOAuth` turns every `auth: oauth` credential into a refreshing one; `internal/app/app.go` calls it, starts the refresh loops and closes them. Its own doc comment records that this was §17.1's defect class and that the two halves had to land together |
+| 6 | "Still open" #5: **two copies of the upstream-overflow classifier**, nothing keeping them in step | Narrowed to argument shuffling | Both delegate to the single `router.ClassifyBody`. Downgraded above rather than deleted, because the mirror is still a mirror |
+| 7 | "## Not addressed", LOW: **route table enumerable before authentication** | Closed, in this same document | The "## `internal/admin` — mounted" section three headings above states it and names `TestTheRouteTableIsNotReadableBeforeAuthentication`. A document that closes a finding in one section and forwards it as open in another is the single-file version of the cross-file contradiction this pass found twice |
+| 8 | "### 3. Whole subsystems with no callers": **`internal/backend`** — no importer outside itself | The backend layer is the request path | Historical, and true when written; kept for the record. §17.1's "Extracting the backend layer" is the change that closed it |
+
+**Still true from that section**, re-verified rather than carried: `internal/probe`
+has zero importers (`grep` returns two comments and no import), `store.ImportKeys`
+has no non-test caller, and `quota.Budget` is deliberately superseded by the
+durable `cluster.Ledger` (DESIGN §18 W9).
+
+**One method to check the next time.** Every false entry above shares a tell: the
+disposition names a *package* rather than a symbol and a call site. "`internal/luaext`
+— skeleton, no importers" cannot be falsified by reading `internal/luaext`; it is
+a claim about the rest of the tree, and the only thing that settles it is
+`git grep` for an import outside the package, run at the commit the claim is made
+for. That is the same rule the first correction on this page states for closures —
+*a disposition that names a file or a test is only closed once that file or test
+exists on the branch it is claimed for* — applied in the other direction. An
+**open** disposition needs the same evidence a **closed** one does.
 

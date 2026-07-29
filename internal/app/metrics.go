@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -121,7 +122,63 @@ func (a *App) healthReporters() []server.HealthReporter {
 	if a.Meter != nil {
 		out = append(out, &meterHealth{m: a.Meter})
 	}
+	if a.Node != nil && a.Node.Enabled() {
+		out = append(out, &clusterHealth{a: a})
+	}
 	return out
+}
+
+// clusterHealth reports this node's membership into /health.
+//
+// It exists because [App.noteConflict] flips readiness through
+// [server.Server.StartDrain], which is the only lever internal/app has on the
+// signal a load balancer polls — and which has one word for two states. A
+// disqualified node and a node shutting down both report `draining`, and an
+// operator has to be able to tell them apart: one wants a rollback of the
+// node_id, the other wants no action at all.
+//
+// It is registered only for a clustered gateway. `cluster.enabled: false`
+// cannot produce a conflict — nothing registers, so nothing can be superseded —
+// and an object that is always `false` on the notebook tier is a field nobody
+// reads on the deployment §0.2 exists for.
+type clusterHealth struct{ a *App }
+
+// HealthName implements server.HealthReporter.
+func (h *clusterHealth) HealthName() string { return "cluster" }
+
+// Health implements server.HealthReporter.
+//
+// Like [meterHealth] it always reports, so that "this build does not say" and
+// "this node is fine" are distinguishable. Unlike it, the condition it reports
+// HAS already changed the status code, by the separate act of starting the
+// drain; this is the explanation beside it, not the mechanism.
+func (h *clusterHealth) Health(dst []byte) []byte {
+	dst = append(dst, `{"node":`...)
+	dst = appendJSONString(dst, h.a.Node.ID())
+	dst = append(dst, `,"leader":`...)
+	dst = strconv.AppendBool(dst, h.a.Node.IsLeader())
+	dst = append(dst, `,"disqualified":`...)
+	disq := h.a.Disqualified()
+	dst = strconv.AppendBool(dst, disq)
+	if disq {
+		if err := h.a.Node.Conflict(); err != nil {
+			dst = append(dst, `,"reason":`...)
+			dst = appendJSONString(dst, err.Error())
+		}
+	}
+	return append(dst, '}')
+}
+
+// appendJSONString appends a JSON string literal. internal/server has its own
+// copy for the same reason: neither package may import the other, and a health
+// body that fails to parse because a node id contained a quote is worse than no
+// body at all.
+func appendJSONString(dst []byte, s string) []byte {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return append(dst, `""`...)
+	}
+	return append(dst, b...)
 }
 
 // meterHealth reports the metering pipeline's degraded state into /health.

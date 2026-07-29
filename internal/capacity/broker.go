@@ -165,9 +165,17 @@ type Config struct {
 	WakeSlack int
 
 	// SoftReservations selects the multi-axis starvation guard (DESIGN §5.4
-	// correction 5, open risk W8). The zero value is on; see
+	// correction 5, which closed risk W8). The zero value is on; see
 	// SoftReservationMode and the "Soft reservations" section of the package
 	// documentation.
+	//
+	// NOT REACHABLE FROM CONFIGURATION. §18's W8 row promises "on by default,
+	// with an off switch", and the switch is this field and SoftReserveAfter —
+	// which no YAML key sets and nothing in internal/app or internal/config
+	// writes. So the default holds and the escape hatch does not exist: an
+	// operator who hits a pathology the guard causes has no way to turn it off
+	// short of a rebuild. Recorded in docs/CONFIG.md §8.1 rather than left as a
+	// promise the wiring does not keep.
 	SoftReservations SoftReservationMode
 	// SoftReserveAfter is how many probes a waiter must fail before the guard
 	// arms for it. Zero selects DefaultSoftReserveAfter, which documents the

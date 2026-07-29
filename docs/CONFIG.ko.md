@@ -535,10 +535,21 @@ dorang은 핀을 설정에서 신뢰하는 대신 **추론한다.** 서버측 �
 축별 FIFO에 타깃 wakeup이며, 상한 1·7·32에 대해 대기자 1000명에서 **grant당 정확히 1.00 wakeup**으로
 측정됐다. broadcast라면 release당 `O(대기자)`다. 전체 7축 acquire 경로는 455 ns, 할당 1회.
 
-⚠️ **"부분 보유 금지"의 대가는 아직 열려 있는 liveness 구멍이다.** 포화된 두 축이 필요한 대기자가 두 큐의
-head에 앉은 채 둘이 동시에 비는 순간을 영영 만나지 못할 수 있다. 데드락도 추월 문제도 아니므로 aging
-메커니즘이 닫을 수 없고, 아직 설계되지 않은 소프트 예약 프로토콜이 필요하다. 리스크 W8로 기록돼 있으며
-측정 가능하다: 두 축이 포화인 채로 절대 이기지 못하는 대기자.
+**"부분 보유 금지"의 대가는 liveness 구멍이었고, 닫혔다.** 포화된 두 축이 필요한 대기자가 두 큐의
+head에 앉은 채 둘이 동시에 비는 순간을 영영 만나지 못할 수 있었다. 데드락도 추월 문제도 아니므로 aging
+메커니즘은 닫을 수 없었다. 리스크 W8로 기록돼 있고 **정본 상태는 DESIGN §18**이다: 소프트 예약으로
+해결 — 축 키당 한 단위에 대한 prefix 순서의 청구권이며, 데드락은 §5.7의 축 순서로 배제된다. 가장 오래
+기다린 대기자는 `SoftReserveAfter + 축 수`번의 release 안에 서빙된다. 혼합 경합 벤치마크에서 +5.3%,
+단일 축에서는 0이었다.
+
+**이것을 위한 키는 없고, 이 문서가 그것에 대해 할 말은 그게 전부다.** 가드는 켜져 있고 실패한 probe
+4회 뒤에 arm한다. `capacity.Config.SoftReservations`와 `.SoftReserveAfter`는 임베더가 설정할 수 있는
+Go 옵션이지만 `internal/app`은 둘 다 설정하지 않으므로 어떤 YAML도 거기에 닿지 않는다.
+
+> **이 문단은 이번 패스 전까지 반대를 말했다.** *"아직 열려 있는 liveness 구멍 … 아직 설계되지 않은
+> 소프트 예약 프로토콜이 필요하다"*라고 적혀 있었고, 그동안 DESIGN §18은 W8을 닫힘으로 기록했으며
+> `internal/capacity/softreserve.go`가 `039c0b6`에서 그 프로토콜을 이미 배로 실었다. 영문 §8.1도
+> 같은 문장을 들고 있었으니 이것은 미러의 드리프트가 아니라 양쪽 모두의 오류였다.
 
 ### 8.2 키
 
@@ -878,23 +889,29 @@ SDK의 백오프가 `429`에서 조용히 동작을 멈춘다. dorang 자신의 
 존중된다(**fail-closed**). 훅 안의 panic은 격리된다. 어떤 훅도 비밀값을 볼 수 없다 — 훅에 건네지는 view는
 나중에 걸러내는 것이 아니라 애초에 키 자료 없이 구성된다.
 
-> ⚠️ **절 이름이 `lua`인데 Lua 인터프리터가 없다.** 그것은 결정이고, 설정 키가 그렇게 말해 주지 않으므로
-> 분명히 적어 둘 가치가 있다.
->
-> 범용 VM을 임베드하면 프로젝트의 첫 비-저장소·비-YAML 의존성이 생기고, 더 결정적으로 **약속된 세 상한 중
-> 둘이 쉬워지는 게 아니라 어려워진다**: 진지한 순수 Go 선택지는 협조적 취소는 제공하지만 state별 명령어
-> 카운터도 state별 메모리 회계도 없어서, "명령어와 메모리 상한"은 그 위에 다시 구현하거나 조용히 철회해야
-> 한다. 조용한 철회야말로 이 문서 전체가 막으려는 결과다.
->
-> 대신 도는 것: 루프도 재귀도 함수 호출도 I/O도 문자열 생성도 없는 **total 정책 언어**(`*.policy` 파일).
-> 프로그램이 구성상 종료하고 무제한으로 할당할 수 없다 — 상한은 여전히 강제되지만, 확장과 게이트웨이
-> 사이에 서 있는 유일한 것이 아니라 심층 방어로서다. 정책 언어가 표현할 수 없는 것을 위해 컴파일된 Go
-> **`Native`** 훅이 있고, 같은 watchdog·panic 격리·fail-open 규칙·비밀값 없는 view를 물려받는다
-> (`Native`에는 벽시계와 panic 격리만 적용되고, 메모리 상한은 정책 프로그램에 대해 의미를 갖는다).
->
-> **`extensions.lua.dir` 아래의 `.lua` 파일은 조용히 무시되는 파일이 아니라 로드 에러다.** 절대 돌지 않는
-> Lua를 받아들이는 설정 표면은 거부하는 표면보다 나쁘다.
->
+**확장을 쓰는 세 가지 방법, 하나의 계약.** `extensions.lua.dir`은 `*.policy` 파일을 담는다 — 루프도
+호출도 문자열 생성도 없는 total 정책 언어라 프로그램이 구성상 종료한다. Lua **플러그인**은 여기가
+아니라 [`filters.plugins`](#17-filters)에서 선언한다. §11.5가 로딩을 명시적 설정으로 요구하기
+때문이다 — 안에 나타나는 것을 무엇이든 실행하는 디렉터리는 코드 실행 프리미티브다. 컴파일된 Go
+`Native` 훅이 세 번째다. 셋 다 같은 비밀값 없는 view를 보고 같은 규칙을 따른다(`Native`에는 벽시계와
+panic 격리만 적용된다 — Go 코드이므로 메모리 상한은 의미가 없다).
+
+**상한에 대하여.** VM은 gopher-lua, 순수 Go, 바이너리 약 1.8 MB다. 벽시계는 VM이 제공하고(명령어
+사이에 context 검사가 돈다) 나머지 둘은 제공하지 않는다: state별 명령어 카운터도 state별 할당 회계도
+없다. 둘 다 그 위에 다시 구현했지 조용히 철회하지 않았다 — 로드 시점의 구문 트리 재작성으로 명령어를
+과금하고, 호스트 호출이 키우는 goroutine 스택을 위해 재귀를 10 000 프레임으로 따로 제한하며, 메모리는
+할당을 과금한다. 측정치와 남은 한 가지 잔여 위험은 DESIGN §11.5.
+
+> ⚠️ **이 자리에는 "절 이름이 `lua`인데 Lua 인터프리터가 없다"가 적혀 있었고, `a0d5871` 이후로 거짓이다.**
+> `go.mod`가 `github.com/yuin/gopher-lua v1.1.2`를 요구하고, `internal/luaext`가 샌드박스 VM이며,
+> `internal/app/extensions.go`와 `internal/app/filter.go`가 요청 경로에서 그것을 만들고 컴파일한다.
+> `94de856`·`bb67140`·`241f73b`가 굳혔다. 영문 §16은 이미 고쳐져 있었고 이 미러만 남아 있었다 — 그리고
+> 옳게 살아남은 좁은 주장은 아래의 로드 에러다: 거부의 대상은 언어가 아니라 *디렉터리를 스캔하는 것*이다.
+
+> **`extensions.lua.dir` 아래의 `.lua` 파일은 조용히 무시되는 파일이 아니라 로드 에러다**, 그리고
+> 메시지가 그 파일이 있어야 할 자리를 말해 준다. 돌리지도 않고 — 그러면 디렉터리가 코드 실행
+> 프리미티브가 된다 — 조용히 무시하지도 않는다. 후자는 운영자가 강제되고 있다고 믿는 필터를 남긴다.
+
 > 훅 지점이 의도적으로 갖지 **않는** 능력 하나: `on_route`는 선택된 배포를 보고 거부할 수 있지만 다른 것을
 > 요구할 수는 없다. 그것은 훅이 아니라 fail-back 기계의 성질이다.
 
@@ -1115,17 +1132,56 @@ priority에 의존하기 전에 알아야 할 둘:
 이 절의 모든 것은 검증되고 로드되며 아무 효과가 없다. 설정했다고 믿는데 아무 일도 하지 않는 상한은 상한이
 없는 것보다 나쁘므로 이름으로 열거한다.
 
+> ⚠️ **이 절의 두 표는 2026-07-29에 통째로 다시 유도됐다.** 그 전까지 한국어 미러는 영문 §23.1a가
+> 기록한 "지난 패스 이후 닫힌 것" 표를 아예 갖고 있지 않았고, 그래서 아래 열 개가 넘는 행이 이미 배선된
+> 설정을 무력하다고 말하고 있었다 — `key_rotation.strategy`, `observability.prometheus`,
+> `DORANG_STATE_DIR`, `capacity.*.max_queue`/`.max_queue_wait`, `quota_urgency`,
+> `client_priority`, `metering_degraded`, 인라인 `notional_rate`, 그리고 Lua 인터프리터. 무력하다고
+> 잘못 적힌 설정은 무력한 설정보다 나쁘다: 운영자가 쓸 수 있는 제어를 쓰지 않게 만든다. 지운 것이 아니라
+> 무엇이라고 적혀 있었고 무엇이 참인지 함께 남긴다. 상태의 정본은 영문 [CONFIG.md](CONFIG.md) §23.1 /
+> §23.1a이고, 이 미러는 그것을 따른다.
+
 ### 23.1 받아들여지고 무력한 것
 
 | 키 | 상태 |
 |---|---|
-| 모든 그룹과 `global`의 `capacity.*.rpm`, `.tpm`, `.max_queue` | 부호만 검증; broker는 세는 게이지만 구현한다. 토큰 버킷도 큐 상한도 존재하지 않는다 |
-| `capacity.principals.<id>.rpm`, `.tpm`, `.max_queue`, `.max_queue_wait` | 동일. `max_queue_wait`는 모든 principal에 `30s`로 기본값이 채워지고 소비자가 없다 |
 | `metric: max_concurrent` 또는 `max_queue`인 `models[].deployments[].limits[]` | `rpm`과 `tpm`만 소비되며, 크리덴셜별 쿼터로 (§10.2) |
-| `key_rotation.strategy` | 네 이름에 대해 검증; 크리덴셜은 어쨌든 설정 순서로 시도된다 |
-| `observability.prometheus` | 절대 읽히지 않음. `/metrics`는 무조건이고 **인증이 없다** |
+| `providers[].usage_probe` | §6.2의 fetcher들은 `internal/probe`에 있고, 설정에서 그것을 만드는 코드가 없다 |
+| `providers[].metrics` — `enabled`, `endpoint`, `interval` **블록 전체** | 백엔드를 스크레이프하는 것이 없다. 저장소 안의 유일한 독자는 `validate.go`뿐이고(플래그가 켜지면 endpoint를 요구한다), 어떤 HTTP 클라이언트도 가져오지 않는다. §12.4의 `least_busy`·`highest_tps`용 큐 깊이/캐시 사용률 신호에는 수집기가 없다 |
+| `providers[].params.drop`, `.drop_unsupported` | §10.3의 두 노브는 변환 경로에 닿지 않는다 — 무엇이 떨어지는지는 kind 자신의 capability 집합만 정한다 |
+| `routing.prefix.checkpoints` | 체인은 로그 간격으로 잘린다; `fixed`는 검증만 되고 아무것도 선택하지 않는다 |
+| `models[].deployments[].stream_timeout` | 비스트리밍 타임아웃만 업스트림 호출에 닿는다 |
+| `key_rotation.providers[].affinity_group` | 읽히지 않고, 검증되지도 않는다 |
+| `key_rotation.providers[].stickiness.scope` | 읽히지 않는다; 세션 키는 `routing.sticky.key`에서 온다 |
+| `cluster.redis_url_env` | 아무것도 다이얼하지 않는다. Redis 클라이언트가 어디에도 만들어지지 않으므로 `capacity_mode: shared-redis`는 로드에서 거부되고, 이 키는 LiteLLM에서 가져온 설정이 파싱되도록 남겨 둔 것뿐이다 |
 | `observability.otlp_endpoint` | exporter가 연결돼 있지 않다 |
-| `DORANG_STATE_DIR` | 컨테이너 이미지가 선언; 읽는 코드 없음. state 경로는 `storage.sqlite.path`와 `metering.spool.dir`에서 온다 |
+| `observability.log_level`, `.log_format` | 어떤 로거도 읽지 않는다; 진단은 임베더가 주는 `Logf` 훅으로 나간다 |
+
+`internal/config/consumed_test.go`가 이 목록을 산문이 아니라 실행 가능한 상태로 들고 있다: 소비자
+없는 설정을 추가하면 실패하고, 목록에서 지우지 않은 채 배선해도 실패한다. Go 필드 이름이 너무 흔해서
+검색으로 볼 수 없는 행들 — `Enabled`, `Endpoint`, `Interval`, `Drop`, `Scope`, `StreamTimeout` — 은
+보지 못하며, 그래서 그 행들은 여기에 손으로 적혀 있다. 가드가 검사할 수 없는 산문 항목은 손으로 다시
+유도해야 하고, `providers[].metrics` 행은 그렇게 되어 있지 않았다(영문 §23.1 참조).
+
+### 23.1a 지난 패스 이후 닫힌 것
+
+아래는 모두 위 표에 있던 것이다. 정본과 각 항목의 근거는 영문 [CONFIG.md](CONFIG.md) §23.1a.
+
+| 키 | 지금 하는 일 |
+|---|---|
+| `capacity.*.max_queue`, `capacity.principals.<id>.max_queue`, `.max_queue_wait` | 배선됨. `max_queue`는 축별 대기 큐를 제한하고 초과를 거부하며, `max_queue_wait`는 principal의 요청 하나가 기다릴 수 있는 시간을 제한한다 — 그것을 쓰는 것은 **핀된** 요청이다. 배치는 면제(§11.1) |
+| 모든 그룹·`global`·`models[]`·`principals`의 `capacity.*.rpm`, `.tpm` | **거부되며**, 동작하는 자리를 이름으로 알려 준다. 용량 축은 동시 예약을 세고, 레이트는 시간 윈도우가 필요하며 그것은 `internal/quota`의 것이다 |
+| `key_rotation.strategy` | 배선됨. 네 이름 모두 선호 크리덴셜을 고른다 (`internal/app/build.go`의 `router.ParseRotation`) |
+| `observability.prometheus` | 배선됨. `false`는 `/metrics` 라우트를 없애고, 그러면 다른 미서빙 라우트처럼 501을 답한다 |
+| `observability.metrics.public` | 신규. `/metrics`는 인증을 요구하며 기본적으로 master 크리덴셜을 요구한다; 이 키가 그것을 의도적으로 연다 |
+| `capacity.principals.<id>.client_priority` + `range` | 신규. §10.5의 예제가 이제 로드된다 (`GrantsClientPriority`) |
+| `routing.strategy[]`의 `quota_urgency` | 허용값이며 배선됐다. `internal/quota`의 Ranker가 `Deps.Urgency`를 먹인다 (`router/wiring_test.go`의 `TestUrgencySourceIsTheQuotaRanker`) |
+| `metering_degraded` | 배선됨. `internal/metrics/collect_meter.go`가 `dorang_metering_degraded`와 `dorang_metering_degraded_reason`을 게시한다 |
+| `pricing.rules[].class: notional_rate` (`source`·`as_of` 포함) | 신규. §8.5의 클래스가 더 이상 카탈로그 전용이 아니다 |
+| `pricing.rules[].rates.cache_read` / `.images` | 새 철자 / 조립 에러가 아니라 **로드** 에러 |
+| `providers[].prefix_ttl`, `models[].deployments[].prefix_ttl` | 신규. affinity 수명은 백엔드별이다 |
+| `DORANG_STATE_DIR` | 배선됨. 앞머리 `~`가 붙은 모든 state 경로가 여기로 해석된다 (`internal/config/secret.go`) |
+| `compat.legacy_headers`, `.usage_chunk_choices`, `.anthropic_total_tokens` | 셋 다 끝에서 끝까지 배선됨. 뒤의 둘은 그 전에는 비기본값에서 **거부**됐다. §21a |
 
 ### 23.2 설계돼 있고 스키마에 아예 없는 것
 
@@ -1133,12 +1189,8 @@ priority에 의존하기 전에 알아야 할 둘:
 |---|---|
 | §6.1 `quotas:` — `cost_usd`나 `tokens_total`에 대한 롤링 `5h`/`daily`/`weekly`/`monthly` 윈도우와 `on_exhaust` | **최상위 `quotas:` 블록이 없다.** 이 빌드가 만드는 유일한 쿼터 규칙은 `deployments[].limits[].rpm`/`.tpm`에서 파생된 롤링-분 요청·토큰 카운터다 |
 | §6.4 `budget:` — `period`/`limit_usd`/`on_exceed` 블록 | **최상위 `budget:` 블록이 없다.** 예산은 API 키별이며 `dorangctl key create --budget-usd`로 설정하고 내구 원장으로 강제된다 |
-| §7.5a `quota_urgency` | 허용되는 전략 이름이 아니다. 만료 임박 쿼터 comparator는 설계됐고 만들어지지 않았다 |
-| §10.5 `capacity.principals.<id>.client_priority` + `range` | `PrincipalLimits`에 없다. 기본값(`ignore`)은 구현됐고 부여는 아니다 |
 | §7.4a2 `stickiness.pin_on_state` | 스키마에 없고 — 그것이 옳다: 핀은 설정이 아니라 요청에서 추론된다 (§7.1) |
-| §12.1 `metering_degraded` | meter는 다섯 사유와 히스테리시스로 degradation을 추적하고 **아무것도 그것을 읽지 않는다**: 메트릭도, health 필드도, admin 필드도 없다. 설계의 "절대 조용하지 않다"는 이 빌드에서 참이 아니다. (`notifications`는 별도로 보고되는 자체 degraded 상태를 갖는다 — 다른 신호다) |
-| §11.5 "Lua 훅" | 훅 지점, 상한, fail-open/fail-closed 규칙, 비밀값 없는 view는 구축돼 있다; **Lua 인터프리터는 없고** `.lua` 파일은 로드 에러다. §16이 이유와 대신 도는 것을 설명한다 |
-| §8.5 `pricing.rules[]`의 `notional_rate` | 인라인 규칙은 세 클래스를 받는다. notional 규칙은 외부 카탈로그 파일에 있어야 한다 (§13.3) |
+| §11.5 "Lua 훅" — `extensions.lua.dir` 아래 | 훅 지점, 상한, fail-open/fail-closed 규칙, 비밀값 없는 view는 구축돼 있고, `extensions.lua.dir`이 담는 것은 total 정책 언어인 `*.policy`다. **그 디렉터리 아래의 `.lua` 파일은 여전히 로드 에러다** — 안에 나타나는 것을 무엇이든 실행하는 디렉터리는 코드 실행 프리미티브이고 §11.5는 그것을 거부한다. Lua 자체가 없는 게 아니다: 한 절 건너 `filters.plugins[].path`로, 스캔이 아니라 이름으로 선언된다. §16 |
 
 ### 23.3 `--check`가 잡지 못하는 것
 

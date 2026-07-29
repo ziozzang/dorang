@@ -51,6 +51,7 @@ pricing:
 // on purpose — it is how an operator picks up an edited external price catalog
 // or a rotated key_file secret.
 func TestReloadDoesNotRestartSubscriptionAttribution(t *testing.T) {
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(subscriptionYAML))
 	if err != nil {

@@ -1,5 +1,11 @@
 # Real-provider run — findings and their disposition
 
+**Written at `a452ee6`; the D8 work landed at `7e8e098`; dispositions re-verified 2026-07-29 at
+`8e6016d`.** This file holds two kinds of statement and they age differently. The measurements
+are a point in time and are not edited. The dispositions are claims about code that keeps
+moving, and one of them — D8's body — had gone stale and contradicted this file's own
+disposition table. See the note under D8.
+
 ## What this document is, and what it is not
 
 The harness in this directory brings dorang up against **real upstreams** — the coding-plan
@@ -212,13 +218,37 @@ Two are fixed, checked against the one or two members every real answer of that 
 | embeddings (`relayResponse`) | `data` or `usage` | `object: "list"` is omitted by some vendors, and accepting on `object` would also accept `object: "error"` |
 | `count_tokens` (`relayCountTokens`) | `input_tokens` | the count *is* the answer; there was nothing else to check |
 
-**Still open, and each needs its own discriminator:** `rerank.DecodeResponse`,
-`openai.DecodeModerationResponse`, `openai.DecodeImageResponse`,
-`openai.DecodeTranscriptionResponse`, the speech surface (which relays bytes and cannot check a
-JSON shape at all), and the Gemini and Cohere adapters. All have the same structure — unmarshal
-into an all-optional struct, use the zero value — and none was reached by this run's case
-table, so none has a reproduced failure behind it. They are listed so the next pass has a work
-list rather than a rediscovery.
+**The remaining five needed their own discriminator, and each got one.** None was reached by
+this run's case table, so none had a reproduced failure behind it; they were listed so the next
+pass had a work list rather than a rediscovery, and the next pass took it:
+
+| surface | discriminator | where |
+|---|---|---|
+| `rerank.DecodeResponse` | `Results` or `Usage` present | `rerank.IsResponse` |
+| `openai.DecodeModerationResponse` | `openai.IsModerationResponse` | `moderation.go` |
+| `openai.DecodeImageResponse` | `openai.IsImageResponse` | `image.go` |
+| `openai.DecodeTranscriptionResponse` | `openai.IsTranscriptionResponse`, applied **before** the JSON/raw split — which is the whole fix | `audio.go` |
+| speech | `openai.IsSpeechAudio` — not a JSON shape but the pair the surface does have: the upstream did not label the body as JSON, and there are bytes to play | `internal/backend/t1.go` |
+| Gemini | `errNotAResponse` on the family check | `internal/backend/gemini.go` |
+| Cohere | it *is* the rerank path — `decodeRerank(body, rerank.FlavorCohere, …)`, so `rerank.IsResponse` covers it | `internal/backend/cohere.go` |
+
+All seven are pinned by `TestUpstream200WithANonResponseBodyOnEveryRemainingSurface`
+(`internal/backend/notaresponse_test.go`), which drives the same z.ai `{"code":500,"msg":"404
+NOT_FOUND","success":false}` body at each and asserts a retryable `502 upstream_shape` with
+nothing rendered and nothing metered. Speech and transcription have named tests of their own,
+because their gates are not the JSON rule the others use.
+
+> ⚠️ **This paragraph read "Still open, and each needs its own discriminator" while the
+> disposition table at the top of this same file recorded D8 as Closed.** The table was updated
+> when the work landed and the body was not, so **one document disagreed with itself about one
+> defect**, in the direction that costs most: a reader who reaches the detail rather than the
+> summary concludes the surfaces are ungated and writes the fix a second time. Corrected
+> 2026-07-29 at `8e6016d`, against the code and the test rather than against the table — the
+> table being right was not evidence that it was right.
+>
+> This is a measurement report and the measurements above are untouched. What changed is a
+> forward-looking work list, which is not a measurement: it was a claim about the code, and it
+> had stopped being true.
 
 ---
 
@@ -341,6 +371,7 @@ same position, and is wired the same way, from `encodeClient`. The refusals in
 | D5 | dropped the cross-family mint | `TestStreamingAndNonStreamingAgreeOnIdentity` | `non-streaming id = "msg_2026" — the upstream id crossed verbatim under object:chat.completion` |
 | D6 | dropped `openRole` | `TestConvertedStreamOpensWithTheAssistantRole` | `first delta = map[content:ok], want role:assistant` |
 | D8 | — (new; no prior behaviour to revert to) | `TestUpstream200WithANonResponseBodyOnARelaySurface` | covers embeddings on both adapters and `count_tokens` |
+| D8, the other five | — (new) | `TestUpstream200WithANonResponseBodyOnEveryRemainingSurface` | rerank in all three dialects, moderations, images, transcription, speech, Gemini. Plus `TestSpeechRelaysBytesAndRefusesAnErrorEnvelope`, `TestTranscriptionRefusesAnErrorEnvelopeOnBothOfItsPaths` and the boundary pair `TestARawTranscriptIsNotCheckedForBeingEmpty` / `TestAMinimalT1OrRerankResponseIsStillAResponse` |
 
 Boundary tests, which fail if a check is tightened one notch further:
 `TestAMinimalResponseIsStillAResponse` (six legitimate minimal bodies) and
@@ -363,5 +394,7 @@ clean.
 4. **The four-cell shape comparison, on identity.** `id_prefix` and `created` are already in
    `probe.py`'s summary for the chat kinds; the 2x2 should now show `chatcmpl-` in every OpenAI
    cell and `msg_` in every Anthropic one, whatever the upstream spoke.
-5. **The surfaces D8 leaves open** — rerank, moderations, images, audio — against a wrong route,
-   which no case in the current table does.
+5. **The surfaces D8 gated but this run never reached** — rerank, moderations, images, audio —
+   against a wrong route, which no case in the current table does. Their gates are proved in
+   unit tests against a controlled upstream and have never met a real vendor's error envelope.
+   That is the same gap this whole document is about: *the harness sees what it has configured.*

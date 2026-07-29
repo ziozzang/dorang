@@ -1,5 +1,14 @@
 # LiteLLM parity, and the cutover
 
+> **Disposition note — 2026-07-29, `8e6016d`.** The verdict below is a measurement at `a8a0ca1`
+> and is not edited. Since it was taken, **all four of the defects it names as "still wrong" are
+> closed**, each with a named test: N1 (a restart re-attributing a subscription period's elapsed
+> share), N2 (`subscription_spend` with no producer), N3 (`/key/info` reporting `spend: 0`) and
+> N4 (the unhydrated first budget). The dispositions are under "What this run found" and in the
+> ranked list; §E's `fixed_subscription` warning is lifted there too. **Do not read the verdict
+> paragraph as current status** — read it as what was true when it was measured, which is the
+> only thing a measurement is ever evidence of.
+
 ## Verdict — 2026-07-29, `a8a0ca1`
 
 **Yes. dorang can replace this LiteLLM deployment.** The request surface has not moved in three
@@ -653,6 +662,29 @@ All four are only reachable through a `pricing:` block — the previous verdict'
 is why they are new — and the first two only through a `fixed_subscription` rule, which no
 configuration in this directory declares.
 
+> **Disposition, added 2026-07-29 at `8e6016d`. All four are closed.** The measurements below are
+> left exactly as they were taken at `a8a0ca1` — a measurement edited in place stops being
+> evidence, and N1's `$180.46 of a $100 plan` is the number that made the case. What follows is
+> the disposition, which is a different kind of statement and is dated on its own.
+>
+> | # | Closed by | Named test |
+> |---|---|---|
+> | N1 | The subscription accumulator is serialized across a process boundary. `pricing.SubscriptionState` is the durable form — which period is open, and how much of the plan cost it has already attributed, as exact atto-scaled digits because 100 USD is 10²⁰ atto and no 64-bit integer holds it — and `Catalog.RestoreState` adopts it at start-up | `TestARestartDoesNotRefuseAFreshKeyOnItsFirstRequest` |
+> | N2 | `internal/app/metering.go` writes `MarginalCostNano: t.MarginalCostNano` and `SubscriptionCostNano: t.SubscriptionCostNano` where it used to write the whole cost to the first. The decomposition now flows dispatch → `meter/accum.go` → `meter/types.go` → `store/ledger.go`, and both §9.4 materializations carry both columns | `TestAPlanShareIsRecordedAsSubscriptionSpend` |
+> | N3 | `/key/info` reads DESIGN §9.4's per-key rollup over the key's own `budget_duration` window instead of `api_keys.spend_nano`, so it is the same figure `/spend/logs` and `/global/spend/report` report. The durable budget counter is deliberately not the source: a node charges a whole lease block to it before spending a unit | `TestKeyInfoReportsTheSpendTheLedgerRecorded`, which asserts the **two routes agree** rather than asserting a literal — a literal would pass against a re-point to any other constant |
+> | N4 | The budget hold is hydrated whether or not the request takes a reservation | `TestTheFirstZeroCostRequestDoesNotClaimAZeroSpend`, three requests because two of them are the discriminator: a header that is simply never emitted would pass an assertion about the first one alone |
+>
+> **"N1, N2, N3 and N4 have no test. That is the point of naming them."** — the closing line of
+> this document. It was the right thing to write and it is now false: naming them is what got
+> them tested. The line is left standing at the end of the file with its correction beside it,
+> because deleting the sentence would delete the argument it was making.
+>
+> Also closed: **ranked item 7**, §7.7a's mirror table saying `x-litellm-response-cost` is
+> "always on" three rows above the table saying it is absent on a stream. COMPATIBILITY §7.7a
+> now says what its own pair table says, and records what it said before. **The Korean mirror
+> had it right all along** — `COMPATIBILITY.ko.md` §7.7 already stated the streaming absence and
+> its reason, so the English was the drifted copy, not the translation.
+
 ### N1 — a restart re-attributes the whole elapsed share of a subscription period
 
 The accumulator "lives for the life of this Catalog", and a restart builds one from nothing. There
@@ -751,8 +783,8 @@ Not defects; the checklist the runs produced. The first three lines changed with
 |---|---|
 | `compat: {legacy_headers: true}` | Off by default. Without it a dashboard reading `x-litellm-*` silently reports zero. `cutover.sh` sets it; `dorang.yaml.tmpl` deliberately does not, so the parity table measures dorang's own surface |
 | a `pricing:` block | Every model is unpriced without one. **Writing one is now mechanical**: transcribe the vendor's card, each published price under its own name, and write nothing for the components the vendor does not price separately (CONFIG §13.1a). The warning that used to be on this line is closed |
-| **no `fixed_subscription` rule yet** | N1. A restart re-attributes the period's elapsed share and books it against one request's budget. LiteLLM has no equivalent, so a faithful reproduction declares none |
-| per-key spend from `/spend/logs` or `/global/spend/report` | N3. `/key/info` reports `spend: 0` for every key. Both other routes agree with the ledger to the nano |
+| ~~**no `fixed_subscription` rule yet**~~ | N1, and **the warning is lifted at `8e6016d`**: the accumulator now crosses a process boundary, so a restart no longer re-attributes the period's elapsed share. A faithful LiteLLM reproduction still declares none, because LiteLLM has no subscription class — that is a fidelity argument, not a defect one |
+| ~~per-key spend from `/spend/logs` or `/global/spend/report`~~ | N3, **closed at `8e6016d`**: `/key/info` reads the §9.4 rollup and reports the same number the other two routes do. Any of the three now answers "what has this key spent" |
 | a cost exporter that understands an absent header | §7.7a state 4. On agent traffic every turn streams, so **every turn publishes no cost header**. Read the `dorang.usage` event, or join the ledger on `x-dorang-request-id`. Note also that this deployment emits four `x-litellm-response-cost-*` names dorang does not mirror, and does not emit the one it does |
 | `context_window` per model | A4. Without it `GET /models` drops `max_input_tokens` |
 | `server: {max_body_bytes: …}` | Raise it if a client posts bodies over 32 MiB today |
@@ -822,16 +854,22 @@ is narrowed, not closed.**
 
 # What remains, ranked
 
+**As ranked at `a8a0ca1`. Five of the thirteen are closed at `8e6016d`** — items 1, 2, 3, 7 and
+8, which is every one this run *found* plus the documentation contradiction. The ranking is left
+in its measured order rather than renumbered, so that "what the harness found and what it cost"
+stays legible; the closed rows carry their closure inline. Items 4-6 and 9-13 are unchanged and
+each is documentation, configuration, or a deliberate vendor-matching choice.
+
 | # | What | Where | Blocks a replacement? |
 |---|---|---|---|
-| 1 | A process restart re-attributes a `fixed_subscription` period's elapsed share. $180.46 attributed of a $100 plan across two starts; the first request after a restart refused `400 budget_exceeded` on a key that had never spent | N1 | **Not this cutover** — LiteLLM has no subscription class, so a faithful configuration declares none. It blocks *using* dorang's subscription accounting, and it is the largest defect on this page |
-| 2 | `/key/info` reports `spend: 0` for every key; the column has no producer on the request path | N3 | No — `/spend/logs` and `/global/spend/report` both carry the number and both agree with the ledger. But it is a **silent** zero, on the route a spend dashboard reaches for first |
-| 3 | A plan share is recorded as `marginal_spend`; `subscription_spend` is always `0`. The total is right | N2 | No, and unreachable without a subscription rule |
+| 1 | ~~A process restart re-attributes a `fixed_subscription` period's elapsed share. $180.46 attributed of a $100 plan across two starts; the first request after a restart refused `400 budget_exceeded` on a key that had never spent~~ | N1 | **Closed at `8e6016d`.** The accumulator crosses the process boundary as `pricing.SubscriptionState`; `TestARestartDoesNotRefuseAFreshKeyOnItsFirstRequest`. The `fixed_subscription` warning in §E is lifted with it |
+| 2 | ~~`/key/info` reports `spend: 0` for every key; the column has no producer on the request path~~ | N3 | **Closed at `8e6016d`.** `/key/info` reads the §9.4 per-key rollup; `TestKeyInfoReportsTheSpendTheLedgerRecorded` asserts it against `/global/spend/report` rather than against a literal |
+| 3 | ~~A plan share is recorded as `marginal_spend`; `subscription_spend` is always `0`. The total is right~~ | N2 | **Closed at `8e6016d`.** The three-way split survives the `meter.Trace` boundary; `TestAPlanShareIsRecordedAsSubscriptionSpend` |
 | 4 | Four `x-litellm-response-cost-*` names this deployment emits are unmirrored, and the one dorang models is not on this deployment's responses at all | D6 | Mildly, for an exporter built on this deployment |
 | 5 | On a stream there is no cost header at all — by design, and every agent turn streams | §C2 | No, once the exporter reads the usage event or the ledger. It must be told |
 | 6 | `GET /models` drops `max_input_tokens` / `max_output_tokens`; `owned_by` changes | A4 | Mildly, and it is configuration |
-| 7 | §7.7a's mirror table says `x-litellm-response-cost` is "always on" three rows above the table that says it is absent on a stream; §6.8's claim about the reference implementation's `total_tokens` | §C2, A8 | Documentation |
-| 8 | The first zero-cost request after a process start reports an unhydrated spend of `0` and a full budget | N4 | No |
+| 7 | ~~§7.7a's mirror table says `x-litellm-response-cost` is "always on" three rows above the table that says it is absent on a stream~~; §6.8's claim about the reference implementation's `total_tokens` | §C2, A8 | **First half closed at `8e6016d`.** COMPATIBILITY §7.7a's column now says what its pair table says, and records what it said before. The Korean mirror had it right already, so the English was the drifted copy. The §6.8 half stands |
+| 8 | ~~The first zero-cost request after a process start reports an unhydrated spend of `0` and a full budget~~ | N4 | **Closed at `8e6016d`.** `TestTheFirstZeroCostRequestDoesNotClaimAZeroSpend` |
 | 9 | Oversized body: `413` where LiteLLM answers `400` | A1 | No — the cap is configurable, so the status is the only difference left |
 | 10 | Unknown model `400 → 404` | A2 | Only a client branching on status; dorang matches the vendor |
 | 11 | `/v1/messages` omits the empty text block LiteLLM appends on a truncated turn | A8 | Only a client indexing `content[-1].text`; dorang matches the vendor |
@@ -886,3 +924,10 @@ The unit tests that pin each conclusion are named where they exist:
 `TestNoSecondTokenTotalRuleIsWrittenAnywhere`.
 
 **N1, N2, N3 and N4 have no test.** That is the point of naming them.
+
+> **They have tests now** — `TestARestartDoesNotRefuseAFreshKeyOnItsFirstRequest`,
+> `TestAPlanShareIsRecordedAsSubscriptionSpend`, `TestKeyInfoReportsTheSpendTheLedgerRecorded`
+> and `TestTheFirstZeroCostRequestDoesNotClaimAZeroSpend`, all at `8e6016d`. The sentence above
+> is kept rather than corrected because it is the argument, not the status: naming a defect with
+> nothing pinning it is what got it pinned, and a report that quietly rewrote itself once the
+> work landed would have deleted the only evidence that naming works. Dated 2026-07-29.

@@ -958,12 +958,13 @@ effective_used = max( provider_reported_used ,
 | `capacity.*.rpm`, `.tpm` | **로드 시 거부**되며, 동작하는 자리를 이름으로 알려준다: 배포별 rate는 `deployments[].limits[]`, 호출자별 rate는 api 키 자신의 `rpm_limit`/`tpm_limit` |
 | 노드 간 rate 제한 | 롤링 분은 프로세스별이다. N-노드 배포는 모든 `rpm_limit`, `tpm_limit`를 N배로 허용한다. durable 원장이 닫을 수 있으나 요청마다 store 쓰기가 든다 — 택하지 않았다 |
 | `tpm_limit`는 **다음** 요청을 제한한다 | 토큰 수는 정산 시점에야 존재하므로, 거대한 요청 하나는 아무것도 거부하기 전에 상한을 한 번 넘을 수 있다 |
-| **Lua** | **Lua 인터프리터가 없고**, 그것은 누락이 아니라 결정이다 — [CONFIG.ko.md](CONFIG.ko.md) §16. 네 훅 지점, 그 상한, 비밀값 없는 view는 구축돼 있다; 그 안에서 도는 것은 total 정책 언어(`*.policy`)이거나 컴파일된 Go `Native`다. `extensions.lua.dir` 아래의 `.lua` 파일은 조용히 무시되는 게 아니라 **로드 에러**다 |
+| **Lua** | Lua는 샌드박스 안에서 요청 경로 위를 **돈다**. VM은 gopher-lua, 순수 Go다. 플러그인은 `filters.plugins[].path`로 하나씩, 스캔이 아니라 이름으로 선언한다. `extensions.lua.dir`이 담는 것은 total 정책 언어인 `*.policy`이고, **그 디렉터리 아래의** `.lua` 파일은 여전히 **로드 에러**다 — 안에 나타나는 것을 무엇이든 실행하는 디렉터리는 코드 실행 프리미티브이기 때문이지, 조용히 무시하려는 것이 아니다. 컴파일된 Go `Native`가 세 번째다. [CONFIG.ko.md](CONFIG.ko.md) §16·§17. ⚠️ **이 행은 2026-07-29까지 "Lua 인터프리터가 없다"라고 적혀 있었다** — `a0d5871` 이후 거짓이고, 운영자가 없는 줄 알고 우회 설계를 하게 되는 종류의 오류다. 이 표는 정확히 그것을 막으려고 있다 |
 | `on_route`에서의 재라우팅 | 훅은 선택된 배포를 보고 거부할 수 있지만 다른 것을 요구할 수는 없다 |
 | 최상위 `quotas:`, `budget:` 블록 | 스키마에 없다. 예산은 `dorangctl key create --budget-usd`로 키별 |
 | 기존 데이터베이스로부터의 크리덴셜 임포트 | 스토어에 구현돼 있고 **CLI 진입점이 없다** — [MIGRATION.ko.md](MIGRATION.ko.md) §3 |
 | prefix / cluster 메트릭 | 상태는 존재하고 아무것도 export하지 않는다. capacity와 health는 `/admin/capacity`, `/health/history`에서 읽을 수 있다 |
-| `providers[].usage_probe`, `providers[].metrics.interval`, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. 목록은 `internal/config/consumed_test.go`에 실행 가능한 상태로 있어 드리프트할 수 없다 — [CONFIG.ko.md](CONFIG.ko.md) §23.1 |
+| `providers[].usage_probe`, **`providers[].metrics` 블록 전체**, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
+| **백엔드 메트릭 스크레이핑** | 스크레이퍼가 없다. `providers[].metrics.enabled`와 `.endpoint`는 검증되고 아무것도 읽지 않으므로, §12.4의 `least_busy`·`highest_tps`용 큐 깊이·캐시 사용률 신호에는 수집기가 없다. 신규 행: 그 전까지는 "폴링 간격만 읽히지 않는다"로 축소돼 있었다 |
 
 ---
 

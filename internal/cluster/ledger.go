@@ -1017,6 +1017,47 @@ func (l *Ledger) Close(ctx context.Context) error {
 	return firstErr
 }
 
+// Abandon closes the ledger WITHOUT returning anything to the store.
+//
+// It is what a node does on the way out when its identity turned out to belong
+// to another process ([ErrDuplicateNodeID]). A lease row is keyed by node id
+// alone -- [ledgerBlock.rowID] is derived from the key and the node id and
+// nothing else -- so under a duplicated id this ledger's rows and the other
+// process's are the SAME rows. [Ledger.Close] would hand back units that
+// process is still spending, and it would do so from a node the cluster never
+// admitted; the incumbent's counter would then read low by a whole block and
+// admit spend it has already committed.
+//
+// What it costs is that the blocks lapse on their own TTL rather than coming
+// back at once, so the key stays over-charged until [Ledger.ReclaimExpired]
+// reaches them. That is the same direction DESIGN 9.6 already takes on a crash
+// -- under-spend, never overspend -- and it is the only ending that cannot take
+// somebody else's money.
+func (l *Ledger) Abandon() {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return
+	}
+	l.closed = true
+	blocks := make([]*ledgerBlock, 0, len(l.blocks))
+	for _, b := range l.blocks {
+		blocks = append(blocks, b)
+	}
+	l.blocks = map[string]*ledgerBlock{}
+	l.mu.Unlock()
+
+	// Stop the hot path on every block this ledger handed out. A Hold taken
+	// before the disqualification still points at its block, and `closed` only
+	// guards the lookup.
+	for _, b := range blocks {
+		b.mu.Lock()
+		b.expiresUS.Store(0)
+		b.remaining.Store(0)
+		b.mu.Unlock()
+	}
+}
+
 func (l *Ledger) returnBlock(ctx context.Context, b *ledgerBlock, now time.Time) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

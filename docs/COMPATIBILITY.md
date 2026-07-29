@@ -515,3 +515,14 @@ Not gated behind a detail header (§10.4). A client acts on it; without it every
 degrades to a fixed guess. When the upstream supplies one, it is honoured; when it does not
 and the condition is a dorang-side wait, dorang supplies its own estimate from the quota
 reset time or the capacity queue.
+
+> ⚠️ **One case is not covered, and it is stated rather than left to be discovered.** "The
+> upstream supplies one" means a literal `Retry-After` header: `internal/backend`'s parser
+> reads that name and no other. An upstream that answers `429` carrying only
+> `x-ratelimit-reset-requests` — a window reset instant rather than a delay — supplies nothing
+> this gateway forwards. `router.Outcome.ResetAt` is the field that would carry it and **it has
+> no producer anywhere in the tree**, so the reset reaches neither this header nor §7.6's
+> cooldown, and the deployment is not taken out of selection for the window the provider named.
+> dorang's *own* quota source populates the header correctly; only the upstream-signalled reset
+> is affected. Tracked as the third row of DESIGN §17.1's harness table, which is where it was
+> found: the scenario harness read the reset header and production never has.

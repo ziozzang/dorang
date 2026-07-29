@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -99,28 +100,45 @@ func newClusterApp(t *testing.T, dsn, id, mode string, enabled bool) *App {
 // one test whose whole method is to make the tick absurd.
 func newClusterAppOpts(t *testing.T, dsn, id, mode string, enabled bool, tune func(*Options)) *App {
 	t.Helper()
+	a, err := New(context.Background(), clusterOptions(t, dsn, id, mode, enabled, tune))
+	if err != nil {
+		t.Fatalf("app.New(%s): %v", id, err)
+	}
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+	return a
+}
+
+// clusterOptions is everything newClusterAppOpts does except calling [New].
+//
+// It is split out for the tests whose subject is a gateway that must NOT come
+// up: a helper that fails the test on a construction error cannot express "this
+// one is supposed to be refused", and asserting the refusal is the whole point
+// of those tests.
+func clusterOptions(t *testing.T, dsn, id, mode string, enabled bool, tune func(*Options)) Options {
+	t.Helper()
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(fmt.Sprintf(clusterYAML, enabled, id, mode)))
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
 	cfg.Storage.SQLite.Path = dsn
-	// The metering spool, pointed somewhere this test owns.
+	// The metering spool, pointed somewhere this app owns.
 	//
-	// Its default is ~/.dorang/spool — a real path in the invoking user's home,
-	// shared by every test in this package and never cleaned. Traces accumulate
-	// there across runs, and each new gateway picks the backlog up and ships it
-	// into ITS store as one enormous multi-row insert. On SQLite, which has a
-	// single writer, that transaction is long enough that the node loop's next
-	// heartbeat waits out the store's five-second busy timeout and fails; the
-	// node then loses the leadership it cannot renew. Measured: these tests
-	// passed in eleven seconds alone and could not elect a leader in thirty
-	// when run after the rest of the package, purely from inherited spool.
+	// [isolateState] above already gives this TEST its own, and that is what
+	// makes it safe. This line makes it per APP, which matters here and nowhere
+	// else in the package: several of these tests assemble two gateways at once,
+	// because two nodes of one cluster is what they are about, and two live
+	// meters appending to one segment sequence behind one read cursor is the
+	// shared-spool defect in its concurrent form rather than its sequential one.
 	//
-	// That is a pre-existing isolation defect rather than anything to do with
-	// clustering — every helper in this package inherits the same default — but
-	// it is the node loop that first depended on making timely progress, so it
-	// is the node loop that found it.
+	// What it costs when it is missing was measured on the node loop, which is
+	// the first thing in the package that depended on making timely progress: a
+	// gateway that inherits a backlog ships it into its own store as one
+	// enormous multi-row insert, SQLite has a single writer, and the loop's next
+	// heartbeat waits out the store's five-second busy timeout and fails. These
+	// tests passed in eleven seconds alone and could not elect a leader in
+	// thirty when run after the rest of the package.
 	cfg.Metering.Spool.Dir = filepath.Join(t.TempDir(), "spool")
 	t.Setenv(cfg.Server.KeyPepperEnv, testPepper)
 	t.Setenv(cfg.Server.MasterKeyEnv, testMasterKey)
@@ -146,12 +164,7 @@ func newClusterAppOpts(t *testing.T, dsn, id, mode string, enabled bool, tune fu
 	if tune != nil {
 		tune(&opts)
 	}
-	a, err := New(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("app.New(%s): %v", id, err)
-	}
-	t.Cleanup(func() { _ = a.Close(context.Background()) })
-	return a
+	return opts
 }
 
 func sharedDSN(t *testing.T) string {
@@ -645,6 +658,204 @@ func TestClusteredScrapePublishesLeadership(t *testing.T) {
 	}
 	if got := scrapeInt(t, a, "dorang_cluster_term", ""); got < 1 {
 		t.Errorf("dorang_cluster_term is %d, want the term of the election that was won", got)
+	}
+}
+
+// readiness is what a load balancer polls, answered by the assembled gateway.
+//
+// It goes through the real HTTP surface rather than reading a flag, because the
+// claim being made in these tests is about what a balancer is told — and a
+// boolean read off the App would be satisfied by a field nothing serves.
+func readiness(t *testing.T, a *App) (int, string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	a.Server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health/readiness", nil))
+	return w.Code, w.Body.String()
+}
+
+// TestDuplicateNodeIDRefusesToStart: the second process does not come up.
+//
+// internal/cluster has refused the duplicate id since it was written, and
+// exported [cluster.Node.Conflict] so that the assembly could escalate it.
+// Nothing did: internal/app logged Node.Start's error and returned a boolean,
+// so the second process never led — which closes the leader-jobs-run-twice
+// harm — and KEPT SERVING. That is the part a boolean cannot express and this
+// test is about. App.Ledger is the node's ledger and App.Coordinator is built
+// with the node's id, so a process that started and merely declined to lead
+// draws budget from the incumbent's lease block and takes its share of every
+// leased limit, under an identity the cluster attributes to somebody else.
+//
+// So the assertions are on the PROCESS: New returns an error, the error names
+// the condition, no App comes back to serve anything, and the incumbent still
+// holds everything it held. Asserting a log line or a false return would pass
+// against the defect.
+func TestDuplicateNodeIDRefusesToStart(t *testing.T) {
+	ctx := context.Background()
+	dsn := sharedDSN(t)
+	const id = "node-copied-id"
+
+	a := newClusterApp(t, dsn, id, "shared-pg", true)
+	waitForNode(t, "the incumbent to take leadership", func() bool { return a.Node.IsLeader() })
+
+	// The incumbent takes half a shared ceiling. This is not scene-setting: the
+	// refused process's shutdown path releases by node id, and under a copied id
+	// that is the incumbent's row. A refusal that emptied the running node's
+	// share on its way out would be a worse defect than the one being closed.
+	const limit = 64
+	now := time.Now()
+	key := quota.NewKey("credential", "c1", quota.Daily, quota.MetricRequests, now)
+	if g, err := a.Coordinator.Charge(ctx, key, limit, limit/2, now); err != nil || !g.OK {
+		t.Fatalf("the incumbent could not take half the ceiling: %v %+v", err, g)
+	}
+
+	// The second process: same node_id, same database. Two pods of one
+	// deployment whose cluster.node_id was written into the config file.
+	b, err := New(ctx, clusterOptions(t, dsn, id, "shared-pg", true, nil))
+	if err == nil {
+		_ = b.Close(ctx)
+		t.Fatal("a second process started under a node id another process is already " +
+			"running: it is now drawing budget and quota under the incumbent's identity")
+	}
+	if b != nil {
+		t.Errorf("app.New returned an error AND a gateway; the caller has something to serve with")
+	}
+	if !errors.Is(err, cluster.ErrDuplicateNodeID) {
+		t.Fatalf("the refusal is %v, which does not identify itself as a duplicate node id; "+
+			"an operator cannot tell it from a store outage", err)
+	}
+	if !strings.Contains(err.Error(), id) {
+		t.Errorf("the refusal does not name the id at fault (%q): %v", id, err)
+	}
+
+	// The incumbent is untouched by the refusal, on all three of the things the
+	// id keys: its registry row, its leadership, and its share of the ceiling.
+	nodes, err := a.Node.Registry().List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != id {
+		t.Errorf("the registry holds %v after the refusal, want just the incumbent", nodes)
+	}
+	if !a.Node.IsLeader() {
+		t.Error("the refused process took leadership away from the incumbent")
+	}
+	used, err := a.Coordinator.Used(ctx, key, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != limit/2 {
+		t.Errorf("the incumbent's share of the ceiling reads %d after the refusal, want %d: "+
+			"the process that was refused released the leases of the process that holds the id",
+			used, limit/2)
+	}
+}
+
+// TestSupersededNodeReportsNotReady is the half start-up cannot reach.
+//
+// A process frozen past the node TTL — a long GC pause, a suspended container, a
+// paused debugger — is indistinguishable from a dead one, so a successor may
+// legitimately adopt its row while it is away. It learns that from its own
+// heartbeat, internal/cluster demotes it, and it never leads again. joinCluster
+// runs once and never re-checks, so nothing else in the process changes: it goes
+// on serving under a contested identity indefinitely.
+//
+// Readiness is the signal, because readiness is the one a load balancer polls.
+// The harness substitutes the DEPENDENCY — a successor that took the row over,
+// registered through the same [cluster.Registry] the gateway uses, on a clock an
+// hour ahead so that the frozen node's heartbeat has lapsed from its point of
+// view. Whether that supersedes this node, whether this node then stops leading,
+// and whether it stops being routed to are all still decided by the code under
+// test.
+func TestSupersededNodeReportsNotReady(t *testing.T) {
+	ctx := context.Background()
+	const id = "node-frozen"
+	a := newClusterApp(t, sharedDSN(t), id, "leased", true)
+	waitForNode(t, "the node to take leadership", func() bool { return a.Node.IsLeader() })
+
+	if code, body := readiness(t, a); code != http.StatusOK {
+		t.Fatalf("readiness before the supersession is %d: %s", code, body)
+	}
+
+	ahead := func() time.Time { return time.Now().Add(time.Hour) }
+	succ, err := cluster.NewRegistry(a.Store, id, clusterTimings.ClusterNodeTTL, ahead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := succ.Register(ctx, cluster.NodeInfo{ID: id}); err != nil {
+		t.Fatalf("the successor could not adopt the lapsed row: %v", err)
+	}
+
+	waitForStore(t, "readiness to go false on the superseded node", func() bool {
+		code, _ := readiness(t, a)
+		return code == http.StatusServiceUnavailable
+	})
+
+	// Not-ready is the observable; these say it is not-ready for the right
+	// reason, so that a probe failing for any other cause could not satisfy the
+	// wait above.
+	if a.Node.Conflict() == nil {
+		t.Error("readiness went false but the node reports no conflict")
+	}
+	if a.Node.IsLeader() {
+		t.Error("a superseded node still claims leadership")
+	}
+	_, body := readiness(t, a)
+	if !strings.Contains(body, `"disqualified":true`) {
+		t.Errorf("the readiness body does not say why the node is out of rotation, so an "+
+			"operator cannot tell it from a shutdown: %s", body)
+	}
+}
+
+// TestClusterJoinFailureIsFatal covers the OTHER thing joinCluster swallowed.
+//
+// [cluster.Node.Start] fails for more than a duplicate id: the registry write is
+// the first thing it does, and a store that cannot answer it fails the join.
+// Start is called exactly once and its loop is what would retry, so the error
+// that was logged and dropped left `cluster.enabled: true` running with no
+// registry row, no election, no leader job — no lease reclaim, no reservation
+// sweep — and publishing DESIGN §5.6's overshoot against a node count of one,
+// which reads "exact", from a node that is in a cluster and not counting itself
+// in it.
+//
+// The store here is opened without migrations, so the `nodes` table the join
+// writes to does not exist. That is a real store failure rather than a fake: the
+// registry statement is the one that fails, and it fails inside Node.Start
+// exactly where a connection refused would.
+func TestClusterJoinFailureIsFatal(t *testing.T) {
+	ctx := context.Background()
+	a, err := New(ctx, clusterOptions(t, sharedDSN(t), "node-unmigrated", "leased", true,
+		func(o *Options) { o.SkipMigrate = true }))
+	if err == nil {
+		_ = a.Close(ctx)
+		t.Fatal("a gateway with cluster.enabled: true started without joining the cluster; " +
+			"it runs no leader job and publishes an overshoot of 0 from inside a cluster")
+	}
+	if a != nil {
+		t.Errorf("app.New returned an error AND a gateway")
+	}
+	if errors.Is(err, cluster.ErrDuplicateNodeID) {
+		t.Errorf("a store failure was reported as a duplicate node id: %v", err)
+	}
+	if !strings.Contains(err.Error(), "node-unmigrated") {
+		t.Errorf("the refusal does not name the node that could not join: %v", err)
+	}
+}
+
+// TestUnclusteredGatewayIgnoresTheJoin holds DESIGN §0.2 against the change
+// above: making a refused join fatal must not make a notebook's start-up depend
+// on a cluster it does not have. `cluster.enabled: false` never calls Start, so
+// there is no failure to be fatal about — and the same unmigrated store that
+// refuses the clustered gateway above must not refuse this one.
+func TestUnclusteredGatewayIgnoresTheJoin(t *testing.T) {
+	ctx := context.Background()
+	a, err := New(ctx, clusterOptions(t, sharedDSN(t), "node-solo", "local", false,
+		func(o *Options) { o.SkipMigrate = true }))
+	if err != nil {
+		t.Fatalf("an unclustered gateway refused to start over a cluster join it never makes: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close(ctx) })
+	if code, body := readiness(t, a); code != http.StatusOK {
+		t.Errorf("an unclustered gateway is not ready: %d %s", code, body)
 	}
 }
 

@@ -683,11 +683,28 @@ exactly **1.00 wakeups per grant** with 1000 waiters against limits of 1, 7 and 
 broadcast would be `O(waiters)` per release. The full seven-axis acquire path is 455 ns and one
 allocation.
 
-⚠️ **The cost of "no partial holding" is a liveness hole that is open.** A waiter needing two
-saturated axes can sit at the head of both queues and never find them free at the same instant.
-That is not a deadlock and not an overtaking problem, so the aging mechanism cannot close it;
-it needs a soft-reservation protocol that is not yet designed. It is filed as risk W8, and it
-is measurable: a waiter that never wins while both its axes stay saturated.
+**The cost of "no partial holding" was a liveness hole, and it is closed.** A waiter needing two
+saturated axes could sit at the head of both queues and never find them free at the same instant.
+That is not a deadlock and not an overtaking problem, so the aging mechanism could not close it.
+It is filed as risk W8, and **DESIGN §18 is the authoritative status**: closed, by a soft
+reservation — a prefix-ordered claim on one unit per axis key, with deadlock excluded by §5.7's
+axis order. The oldest waiter is served within `SoftReserveAfter + axes` releases, and it cost
++5.3% on the mixed contended benchmark and nothing on the single-axis one.
+
+**There is no key for it, and that is the only thing this file has to say about it.** The guard
+is on, armed after 4 failed probes. `capacity.Config.SoftReservations` and `.SoftReserveAfter`
+are Go options an embedder can set; `internal/app` sets neither, so no YAML reaches them. The
+default is the behaviour, and an operator who wants a different one has no configuration for
+it — listed here rather than in §23.1 because the key does not exist to be inert.
+
+> **This paragraph said the opposite until this pass.** It read *"a liveness hole that is
+> open … it needs a soft-reservation protocol that is not yet designed"*, while DESIGN §18
+> recorded W8 closed and `internal/capacity/softreserve.go` had shipped the protocol
+> (`DefaultSoftReserveAfter = 4`, the served-within bound, `starvation_test.go` and
+> `fairness_test.go`) at commit `039c0b6`. Two documents of this repository asserted opposite
+> things about one risk. Where they disagree, DESIGN is the design of record; this file
+> describes what an operator can set, and the honest answer for this axis is *nothing* — which
+> is a different sentence from "the risk is open", and the one that was missing.
 
 ### 8.2 Keys
 
@@ -1685,7 +1702,7 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 |---|---|
 | `models[].deployments[].limits[]` with `metric: max_concurrent` or `max_queue` | Only `rpm` and `tpm` are consumed, and as a per-credential quota (§10.2) |
 | `providers[].usage_probe` | §6.2's fetchers exist in `internal/probe`; nothing constructs one from configuration |
-| `providers[].metrics.interval` | The endpoint and the enabled flag are read; the poll interval is not |
+| `providers[].metrics` — the **whole block**, `enabled`, `endpoint` and `interval` alike | Nothing scrapes a backend. The only reader in the repository is `validate.go`, which requires an endpoint when the flag is on; no HTTP client anywhere fetches one. §12.4's queue-depth and cache-utilization routing signals for `least_busy` and `highest_tps` have no collector, and §6.2's four engine traps are documented against nothing |
 | `providers[].params.drop`, `.drop_unsupported` | §10.3's two knobs never reach the conversion path — only the kind's own capability set decides what is dropped |
 | `routing.prefix.checkpoints` | The chain is cut logarithmically; `fixed` validates and selects nothing |
 | `models[].deployments[].stream_timeout` | Only the non-stream timeout reaches the upstream call |
@@ -1697,8 +1714,18 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 
 `internal/config/consumed_test.go` holds this list as executable state rather than prose:
 adding a setting with no consumer fails the build, and so does wiring one without striking it
-from the list. It cannot see the four rows whose Go field name is too common to search for
-(`interval`, `drop`, `stream_timeout`), which is why they are still written down here.
+from the list. It cannot see the rows whose Go field name is too common to search for —
+`Enabled`, `Endpoint`, `Interval`, `Drop`, `Scope`, `StreamTimeout` — which is why those are
+still written down here, and it is the whole reason this table exists beside the guard rather
+than being replaced by it.
+
+> **The `providers[].metrics` row said the wrong thing, in the direction that costs most.** It
+> read *"The endpoint and the enabled flag are read; the poll interval is not"*, and neither
+> half was true: no reader for any of the three exists outside `internal/config`. The guard
+> could not contradict it, because `Enabled`, `Endpoint` and `Interval` are all names that
+> occur elsewhere in the tree — the vacuity `consumed_test.go`'s own doc comment warns about,
+> firing on a whole block rather than on one field. A prose ledger whose entries the guard
+> cannot check has to be re-derived by hand, and this row had not been.
 
 ### 23.1a Closed since the last pass
 
@@ -1729,7 +1756,16 @@ Everything below used to be in the table above.
 | §6.1 `quotas:` — rolling `5h`/`daily`/`weekly`/`monthly` windows over `cost_usd` or `tokens_total`, with `on_exhaust` | There is **no top-level `quotas:` block**. The only quota rules this build creates are rolling-minute request and token counters derived from `deployments[].limits[].rpm`/`.tpm` |
 | §6.4 `budget:` — a `period`/`limit_usd`/`on_exceed` block | There is **no top-level `budget:` block**. Budgets are per-API-key, set with `dorangctl key create --budget-usd`, and enforced through the durable ledger |
 | §7.4a2 `stickiness.pin_on_state` | Not in the schema — and correctly so: the pin is inferred from the request, not configured (§7.1) |
-| §11.5 "Lua hooks" | The hook points, ceilings, fail-open/fail-closed rule and secret-free views are built; **there is no Lua interpreter** and a `.lua` file is a load error. §16 explains why, and what runs instead |
+| §11.5 "Lua hooks" — under `extensions.lua.dir` | The hook points, ceilings, fail-open/fail-closed rule and secret-free views are built, and what `extensions.lua.dir` holds is `*.policy`, the total policy language. **A `.lua` file under that directory is still a load error** — a directory that runs whatever appears in it is a code-execution primitive, which §11.5 refuses. Lua itself is not missing: it is declared one section over, as `filters.plugins[].path`, by name and never by scan. §16 |
+
+> **This row said "there is no Lua interpreter" until this pass, and that has been false since
+> `a0d5871`.** `go.mod` requires `github.com/yuin/gopher-lua v1.1.2`; `internal/luaext` is a
+> sandboxed VM with an instruction ceiling, a stack cap and charged allocation;
+> `internal/app/extensions.go` builds it from configuration and `internal/app/filter.go`
+> compiles every declared plugin, on the request path. `94de856`, `bb67140` and `241f73b`
+> hardened it. What survived correctly is the narrower claim the row now makes — the load
+> error on `extensions.lua.dir` — and merging the two was the whole error: the refusal is
+> about *scanning a directory*, not about the language.
 
 ### 23.3 What `--check` does not catch
 

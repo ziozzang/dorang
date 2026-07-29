@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ models:
 // client without a second assembly path existing.
 func newWiringApp(t *testing.T, yaml string, mut func(*config.Config), opts ...func(*Options)) *App {
 	t.Helper()
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(yaml))
 	if err != nil {
@@ -355,6 +357,113 @@ func TestMeteringDegradedReachesHealth(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("degraded metering took the pod out of rotation: /health answered %d", w.Code)
 	}
+}
+
+// TestRequestLedgerHoldsOnlyThisTestsRequests counts ledger rows with no
+// predicate on them, which is the one shape of assertion the package's shared
+// state directory was waiting for.
+//
+// DESIGN §12.1 splits metering in two so the trace payload may be dropped and
+// the counters may not, and the trace half's durability is a disk spool: an
+// append log with a read cursor, replayed at open so a crash costs at most one
+// batch. Every replayed record becomes a `request_logs` row — one ledger row per
+// metered request. Replay is scoped by DIRECTORY and by nothing else, so two
+// gateways pointed at one directory are one spool, and the rows the first one
+// still owed are written into the second one's database as its own.
+//
+// Before [isolateState], that directory was the whole package's: the default
+// spool path is `~/.dorang/spool`, `~` resolved to the single temporary
+// directory TestMain sets, and roughly ninety-seven tests shared it. Nothing
+// failed, because every test overrode the SQLite path to its own t.TempDir() and
+// every assertion that read the ledger read it through a filter — by key, by
+// team, by trace id — and a filtered read cannot see another test's rows. That
+// is a property of the tests that happened to exist, not of the harness.
+//
+// The position is deliberate, and it is worth saying why, because once the fix
+// is in it stops mattering entirely. A backlog only exists when the gateway
+// before this one left records unshipped, and it lands on whichever gateway
+// opens the directory NEXT — which then adopts it, writes it down as its own,
+// and acknowledges it, so the evidence is gone by the test after that. This test
+// therefore runs immediately behind the one gateway in the package that is made
+// to fall behind on purpose: TestMeteringDegradedReachesHealth pushes a hundred
+// thousand events through a meter to make it report a loss. Measured with the
+// two of them sharing a directory: 212 KB of spooled records with the cursor
+// still at the first one, all of them landing here.
+//
+// That is also the whole reason the defect read as nothing for so long. The
+// backlog goes to a neighbour, the neighbour does not count, and moving one test
+// makes it appear somewhere else. It would have arrived as a flake.
+func TestRequestLedgerHoldsOnlyThisTestsRequests(t *testing.T) {
+	ctx := context.Background()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"cmpl-1","object":"chat.completion","model":"m1-upstream",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+			"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	yaml := fmt.Sprintf(`
+version: 1
+providers:
+  - {name: p1, kind: openai, base_url: %q}
+credentials:
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: p1, upstream_model: m1-upstream, credentials: [c1]}
+`, up.URL)
+
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	dsn := a.Config().Storage.SQLite.Path
+	secret := issueKey(t, a, nil)
+
+	const requests = 3
+	for i := 0; i < requests; i++ {
+		w := callWith(a, secret, http.MethodPost, "/v1/chat/completions",
+			`{"model":"m1","messages":[{"role":"user","content":"go"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d answered %d: %s", i, w.Code, w.Body.String())
+		}
+	}
+
+	// Close is the flush. Meter.Close drains the ring to the spool, ships the
+	// spool to the sink and writes the numeric half, and it runs before the store
+	// it writes into closes — so afterwards the file holds everything this
+	// gateway ever metered and nothing is still in flight.
+	if err := a.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if got := countLedgerRows(t, dsn); got != requests {
+		t.Fatalf("this gateway served %d requests and its ledger holds %d rows. The "+
+			"difference was metered by another test and replayed into this database out "+
+			"of a shared trace spool; give every test its own state directory "+
+			"(isolateState)", requests, got)
+	}
+}
+
+// countLedgerRows counts `request_logs` in a closed SQLite database.
+//
+// It goes to the file rather than through internal/store because the point is to
+// count EVERYTHING, and every ledger read internal/store offers is scoped to a
+// key, a team, a trace or a status — which is precisely why rows belonging to
+// another test could sit there unnoticed. The gateway is closed first, so the
+// meter has drained, shipped and flushed, and the file is nobody's.
+func countLedgerRows(t *testing.T, dsn string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dsn, err)
+	}
+	defer func() { _ = db.Close() }()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&n); err != nil {
+		t.Fatalf("count request_logs: %v", err)
+	}
+	return n
 }
 
 // TestGrantedClientPriorityIsHonouredAndADropIsReported is §10.5 end to end: the

@@ -2491,8 +2491,12 @@ invoice. Two normalizations are mandatory:
    > **`input_tokens` does not identify a family.** Two of the three columns above spell the
    > prompt count that way and mean opposite things by it: `messages` excludes the cached
    > prefix, `responses` includes it. A decoder that reads the wire without knowing which
-   > endpoint produced the body — the passthrough relay of §10.6 step 5 is the one that does —
-   > therefore cannot settle the convention from the input key. What settles it is the
+   > endpoint produced the body cannot settle the convention from the input key, and **every**
+   > decoder is one of those. The passthrough relay of §10.6 step 5 never knew the route at
+   > all; a converting decoder knows only which route dorang ADDRESSED, and which shape comes
+   > back is the host's choice — a host serving both APIs on one base URL may answer either,
+   > and a translating proxy answers in a third combination, one family's envelope around
+   > another's usage block. What settles it is the
    > breakdown object, whose spelling the three families do **not** share:
    > `prompt_tokens_details` (inclusive), `input_tokens_details` (inclusive),
    > `cache_read_input_tokens` beside `input_tokens` (exclusive). The breakdown outranks the
@@ -2504,10 +2508,61 @@ invoice. Two normalizations are mandatory:
    > of the parent's — so the whole inclusive prompt is charged at the full **uncached** input
    > rate. Measured on the rate card of §8.5, a 120/15 request with a 40-token cached prefix and
    > 8 reasoning tokens was charged $0.000153_0 against the vendor's $0.000153_8.
+   >
+   > On a **converting** path the same body cost more than its cache row. A Responses answer
+   > read by the chat decoder has its counts under keys that decoder does not know AND its
+   > assistant turn under `output` rather than `choices`, so it decoded to a successful
+   > response with no content and no usage at all: the same 120/15 request charged
+   > $0.000000_0. The answer's own shape therefore selects the decoder — `object: "response"`
+   > or an `output` array, with a `choices` array refusing — and the usage block's shape
+   > settles the convention separately, because a body can carry one family's envelope around
+   > another's counts and only the second question is about arithmetic.
 2. **Reasoning tokens are billed as output.** One family breaks them out, another folds them
    in. `ReasoningTokens` is reported separately *and* is already contained in
    `OutputTokens`, so cost never adds them twice. A test asserts
    `OutputTokens >= ReasoningTokens`.
+3. **Every decoder records WHICH counters the backend stated**, in `Usage.Reported`. A token
+   counter has three states on the wire and an int holds two: the backend said 7, the backend
+   said 0, or the backend said nothing. `cached_tokens: 0` is a measurement — the cache
+   returned nothing on this request — and an absent breakdown is a capability statement, and
+   an encoder with only the integer to look at omits the measured zero, so a customer's cache
+   savings vanish from their own accounting with no error anywhere. A decoder that sets no
+   flags makes every count it produces indistinguishable from one dorang invented. Where the
+   vendor OMITS a breakdown it has nothing to say about — the Gemini family does — the wire
+   struct needs a pointer, or the flag inverts the same defect and reports a measurement that
+   was never made.
+
+#### Usage on the non-chat surfaces
+
+The table above is the three chat families. The other surfaces bill in the same tokens and
+spell them their own way, and every one of these was read as ZERO by the decoder that owns
+it until it was measured. Zero is not a rounding error here: `Result.Usage` is the single
+source for the `X-Dorang-Tokens-*` headers, for internal/meter and for pricing, and §11.6's
+token guard triggers on a positive total — so a surface priced at zero is also a surface the
+guard cannot see. Nothing fails, so nothing alerts.
+
+| Surface | Prompt count | Completion count | Breakdown |
+|---|---|---|---|
+| embeddings (relayed) | `prompt_tokens`, else `input_tokens`, else `total_tokens` | — | none |
+| rerank | `prompt_tokens`, else `input_tokens`, else `total_tokens` − output | `output_tokens` | `meta.billed_units` (search units, priced apart) |
+| images | `input_tokens` | `output_tokens` | `input_tokens_details` — `cached_tokens` priced, `text_tokens`/`image_tokens` carried |
+| audio | `input_tokens`, else `total_tokens` | `output_tokens` | `input_token_details` (singular `token`) carried; `type` + `seconds` for a duration-billed model |
+| gemini | `promptTokenCount` | `candidatesTokenCount` + `thoughtsTokenCount` | `cachedContentTokenCount`, `thoughtsTokenCount` |
+
+Three rules make that table safe to read as a whole:
+
+- **A total is a FALLBACK, never a preference, and it is taken net of any stated output half.**
+  An embedding and a rerank have no completion half, so a body stating only a total is stating
+  its prompt count — but a body stating 400 in, 7 out and 407 total is stating two quantities
+  priced at two rates, and reading the total as the prompt count bills the generation at the
+  prompt rate.
+- **A billing UNIT is never converted.** The audio surface bills in tokens or in seconds,
+  discriminated by `usage.type`, and a duration is not a token count. Both are carried; neither
+  is folded into the other, and an encoder never names a unit the backend did not.
+- **A count with no canonical counter is carried, not deleted.** `text_tokens`/`image_tokens`,
+  the audio breakdown, a vendor's `classifications` — dorang cannot price them and they are
+  still line items on somebody's invoice, so they ride in `UsageExtra` at the nesting level
+  they arrived at.
 
 #### Response identity — `id` and `created`
 
@@ -3483,6 +3538,31 @@ lives. The round-trip test through the assembled stack — real router, real cap
 pricing, real metering, asserting the ledger row and the reserved axis — is the only thing
 that does.
 
+#### The four rules this section exists to state
+
+The rest of §17.1 is a case list, and the cases are here to earn the rules. The rules are the
+part that transfers, so they are stated first and each names the case that produced it.
+
+1. **A harness may substitute a dependency, never a value the system under test is responsible
+   for producing.** Where a harness fills something in, that is itself the assertion worth
+   writing; if it cannot be written as an assertion, the harness is compensating for a gap
+   rather than exercising a path. — *"The harness that hid the bug"*, from `Decision.PriorityTier`.
+2. **A harness that reimplements its subject cannot fail, and the difference between what it
+   does and what the subject does is a defect list.** Where the difference cannot be closed in
+   the same change, it belongs in the suite as a characterization subtest that skips itself the
+   day the real path catches up — not as a silently narrower assertion. — *"the harness's second
+   dispatch path"*, which produced three such differences and closed two.
+3. **For any control of the form "A disagrees with B", the first question is where A and B were
+   each observed.** If the answer is "the same place, twice", the control is documentation. The
+   fix is not to strengthen the comparison but to find the reading that can actually differ. —
+   *"a control that is reached and can never fire"*, from §8.1's future-settlement clamp.
+4. **A disposition is the same shape as the defect it disposes of.** "Closed" that names a file
+   or a test is only true once that file or test exists on the branch it is claimed for — and
+   the mirror holds: an **open** disposition needs the same evidence a closed one does. Five of
+   this repository's six long-lived documents were asserting something the code had closed when
+   the 2026-07-29 reconciliation began, and one asserted both at once within a single file. —
+   result 1 below, and `docs/SECURITY-REVIEW.md`'s two correction sections.
+
 **This is not a pair of anecdotes. It is the dominant defect class in this codebase**, and a
 security review counted nine instances independently. Extracting the backend layer added four
 more, all of the same shape — a value computed, stored, documented, and never read:
@@ -3551,13 +3631,14 @@ name — left the old scenario suite **completely green**. Every one of them now
 scenario.
 
 Removing the substitution also exposed three things the harness could do that production could
-not. Each was a passing assertion that proved nothing:
+not. Each was a passing assertion that proved nothing. **Two are closed; the third is the
+oldest thing still open on this page.**
 
-| The harness did | Production does not | Consequence |
-|---|---|---|
-| scan a relayed stream for an in-band `"error"` frame and report a failed outcome | `backend.relay` copies it through and returns nil | the failure reaches neither `internal/health` nor §7.6's committed-stream boundary; a backend that fails every stream after the first frame keeps its full share of traffic |
-| surface `*anthropic.OpaqueError` to the caller | `backend.encodeError` flattens it to a message string under `conversion_failed`, with no `Unwrap` | the `Construct` id that `x-dorang-allow-lossy` takes never reaches the caller, so §10.1's "refuse, and say what to opt into" is prose only |
-| read `x-ratelimit-reset-requests` into `Outcome.ResetAt` | nothing sets `Outcome.ResetAt` from an upstream at all | a provider-signalled window reset cannot reach the cooldown; only dorang's own quota source can |
+| The harness did | Production did not | Consequence | Status |
+|---|---|---|---|
+| scan a relayed stream for an in-band `"error"` frame and report a failed outcome | `backend.relay` copied it through and returned nil | the failure reached neither `internal/health` nor §7.6's committed-stream boundary; a backend that failed every stream after the first frame kept its full share of traffic | **closed** — `errorFrame`/`errorMember` in `internal/backend/stream.go`, applied on the relay scan and again on the terminal check, with `internal/backend/streamfail_test.go` |
+| surface `*anthropic.OpaqueError` to the caller | `backend.encodeError` flattened it to a message string under `conversion_failed`, with no `Unwrap` | the `Construct` id that `x-dorang-allow-lossy` takes never reached the caller, so §10.1's "refuse, and say what to opt into" was prose only | **closed** — `internal/backend/errors.go` matches `*anthropic.OpaqueError` with `errors.As` rather than flattening it |
+| read `x-ratelimit-reset-requests` into `Outcome.ResetAt` | **nothing sets `Outcome.ResetAt` from an upstream at all** | a provider-signalled window reset cannot reach the cooldown or `Retry-After`; only dorang's own quota source can | **open**, and re-verified at `8e6016d`. `router.Outcome.ResetAt` (`internal/router/request.go`) has no producer anywhere in the tree, test or otherwise: `internal/router/router.go`'s `st.resetAt = o.ResetAt` is its only reader, so the `CauseQuotaExhausted` cooldown and the four terminal fail-back errors read a field nothing writes. `backend.Result` carries no reset instant for `backendResult` to assign. **The test that closes it must drive a 429 carrying only a reset header and read `Retry-After` off the client's response** — asserting on `Outcome` would pass throughout the defect, which is rule 1 above applied to its own fix |
 
 One duplication survives, and it is worth naming so it is not mistaken for a clean result.
 `internal/app`'s `backendResult` and `backendCause` — the mapping from a `backend.Result` onto
@@ -3621,14 +3702,26 @@ on the request path writes; a budget hold that takes no reservation reported an 
 as a measurement — and then a fourth that is worth separating, because it is not a value nobody
 reads.
 
-**§8.1's future-settlement clamp is reached on every settlement and its condition can never be
-true.** It compares the row's stamp against the catalog's clock, and internal/app supplies both
-from `a.now` — the stamp first, the catalog's reading after. The rule was written for an NTP
-step, a VM resume, a bad RTC and a fast node in a cluster; the first three move both readings
-together, and the fourth never reached this process at all because the accumulator was in
-memory. Re-driven with the clocks coupled the way the app couples them, the defect the clamp
+**§8.1's future-settlement clamp was reached on every settlement and its condition could never
+be true.** It compares the row's stamp against the catalog's clock, and internal/app supplies
+both from `a.now` — the stamp first, the catalog's reading after. The rule was written for an
+NTP step, a VM resume, a bad RTC and a fast node in a cluster; the first three move both
+readings together, and the fourth never reached this process at all because the accumulator was
+in memory. Re-driven with the clocks coupled the way the app couples them, the defect the clamp
 was written for reproduced to the cent — a stray 50.00 USD, a July attributing 10.00 USD of
 100.00 USD, an August opening at 49.00 USD — while the clamp did nothing.
+
+**Closed at `8e6016d`, and closed by moving the observation rather than by strengthening the
+comparison.** `pricing.Catalog.RestoreState` adopts a `SubscriptionState` written by an earlier
+process, and *there* the comparison is real: `now` is this process's reading of the present and
+`PeriodStart` was stamped by whatever process wrote the row — possibly on another host with
+another clock, which is what makes a disagreement possible at all. A stored period that has not
+begun yet is re-dated to the open one rather than dropped, so the attributed total stays a bound
+and the next period still opens at zero. `Catalog.Settle`'s own clamp is left in place and its
+doc comment now says outright that it cannot fire in a default deployment — a control that is
+documented as documentation is not the same defect as one that is documented as a guard. Pinned
+by `internal/pricing/processboundary_test.go`, which drives whole processes each with exactly
+one clock.
 
 Three things follow, and the third is the one that generalizes:
 
@@ -3644,7 +3737,56 @@ Three things follow, and the third is the one that generalizes:
    that can actually differ — here, a stamp that crossed a process boundary, which only exists
    because §8.1's accumulator was made durable in the first place.
 
+#### The reclassification: unreachable by decision is not the same finding
+
+This list is only worth reading if every entry on it is real, so one entry is taken off it.
+
+`internal/wire/openai/responses.go`'s **upstream** half is complete, tested, and — at `8e6016d`,
+where this was checked — had no non-test caller: `DecodeResponsesResponse`,
+`ResponsesResponseToCanonical`, `MarshalResponsesRequest`, `EncodeResponsesRequest`,
+`DecodeResponsesRequest` and `ResponsesItemsToMessages`. Counted by shape alone that is the
+ninth instance of the wired-to-nothing pattern, and it was recorded as one.
+
+**It is not one.** `internal/backend/openai.go` routes `/v1/responses` to the **chat** endpoint
+deliberately, and says why: `/v1/responses` is served by a strict subset of the deployments
+`/v1/chat/completions` is. `OpChat` and `OpResponses` encode alike as a chat request, decode
+alike as a chat response, and `internal/backend/t1.go` re-renders the answer with
+`MarshalResponsesResponse`. So dorang's client-facing Responses surface **works**; what has no
+caller is the path that would address an upstream speaking Responses *natively*, and nothing in
+the shipped catalog asks for one.
+
+The disposition matters more than the count. A reader who greps for these symbols finds the
+routing comment, concludes the ledger is wrong, and stops trusting the rest of it — which is the
+same failure as a stale "closed". **A control with no caller and a written reason is a bounded
+decision; a control with no caller and no reason is a defect.** The test that tells them apart
+is whether removing the code would change any behaviour a configuration can reach.
+
+The residual risk is stated rather than dismissed: `ResponsesResponseToCanonical` is the one
+decoder that knows all three families' `input_tokens` spellings, and at `8e6016d` nothing
+exercised it against a live convention — unvalidated code on the money path the day an upstream
+is pointed at natively.
+
+**That residual is the half that is being closed, and by the argument above rather than by the
+count.** The decode path now selects on the *answer's own shape* — `object: "response"` or an
+`output` array, with a `choices` array refusing — because which shape comes back is the host's
+choice and not dorang's: a host serving both APIs on one base URL may answer either, and a
+translating proxy answers in a third combination. So `DecodeResponsesResponse` is reached, and
+`ResponsesResponseToCanonical` with it. The other four — `MarshalResponsesRequest`,
+`EncodeResponsesRequest`, `DecodeResponsesRequest`, `ResponsesItemsToMessages` — are the
+*request* direction and remain unreached by the same decision, which is still written down in
+`internal/backend/openai.go`. **Two of six moved for a stated reason and four did not**, which
+is the disposition this entry was reclassified to hold.
+
 ## 18. Open risks
+
+**This table is the authoritative status of every W-numbered risk.** Where another document
+disagrees with it, this one is right and the other is stale — `docs/CONFIG.md` §8.1 asserted W8
+open for a full day after `039c0b6` closed it, and `docs/DESIGN.ko.md` §18 was missing W8
+through W11 entirely, which is four closed risks a Korean reader could not see. Rows are in
+numeric order for exactly that reason: an out-of-order register is one a mirror can silently
+truncate.
+
+**Open: W5 and W7.** Everything else is closed or mitigated.
 
 | # | Risk | Status |
 |---|---|---|
@@ -3655,7 +3797,7 @@ Three things follow, and the third is the one that generalizes:
 | W5 | Cross-protocol conversion loss | **open** — enumerated in headers; may need per-pair fidelity tests beyond golden |
 | W6 | Single-mutex broker throughput | **mitigated** — M2 gate decides; sharding invariant defined (§5.7) |
 | W7 | Sticky/prefix hit-rate dilution across nodes | **open** — documented; consistent hashing recommended, Redis sharing available |
-| W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **closed** — soft reservation as a prefix-ordered claim on one unit per axis key; deadlock excluded by the §5.7 axis order; the oldest waiter is served within `SoftReserveAfter + axes` releases. Measured +5.3% on the mixed contended benchmark, nil on single-axis. On by default, with an off switch |
-| W11 | **Revocation latency was never specified** (§11.2c) | **closed** — revocations, pends and early grace cuts publish a durable invalidation; every node drops the key from its snapshot on receipt, and the TTL is now the fallback for a node that missed the message rather than the mechanism. The worst case is published as a number (`auth.RevocationBound`): **0 on one node**, **`poll + store_latency` clustered** — 1.25 s at the defaults — with `entry_ttl` as the stated fallback and an unmeasured propagation delay publishing the TTL rather than an optimistic figure. Four further defects were found while closing it: a **found-but-refusing row was cached for the SERVING lifetime**, so a pended key was re-checked a full `entry_ttl` later on a node that missed the message (rule 3 was written and not implemented); `Rejoin` had to drop the snapshot **before** the reload rather than replace it after, or a failed reload left the stale set serving — the exact state rule 4 exists to prevent; a rejoining node had to read the invalidation watermark **before** the reload, or a message published during it was skipped; and **a row placed by a bulk load never expires** (§9.1), so publishing `entry_ttl` as its fallback was simply wrong — its fallback is the reload interval, and with no reload scheduled it has none, which the figure now says rather than reporting a number that does not apply. Measured end to end: **zero window** single-node, **~21 ms** to the last of four nodes at `poll: 20ms`. Was **open** — the auth snapshot's TTL is what makes authentication 354 ns, and it also means a revoked, pended, or rotation-cut key keeps serving until the snapshot refreshes, per node |
-| W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
+| W8 | **Multi-axis waiter starvation under sustained saturation** (§5.4 correction 5) | **closed** — soft reservation as a prefix-ordered claim on one unit per axis key; deadlock excluded by the §5.7 axis order; the oldest waiter is served within `SoftReserveAfter + axes` releases. Measured +5.3% on the mixed contended benchmark, nil on single-axis. On by default. ⚠️ The off switch is `capacity.Config.SoftReservations`, a Go option an embedder sets — **`internal/app` sets neither it nor `SoftReserveAfter`, so no YAML reaches either.** This row read "with an off switch" without that qualification, which is §17.1's own class at low stakes: a control with no path from configuration. The behaviour an operator gets is the default, and CONFIG §8.1 now says so |
 | W9 | **Quota and budget state is in-memory only** (§9.6) | **closed** — the request path reserves against the durable ledger. The gate holds an upper bound before every upstream call, settles with the actual cost, and refuses an exhausted budget as a terminal `400` (§6.4); a restart re-reads the counter rather than starting the period over, and a graceful stop returns the unspent part so a planned restart costs nothing. The hold is taken after the routing decision rather than at the gate, because §6.4's estimate prices output at `max_tokens` and there is no price before a deployment is chosen — the property that mattered (concurrent requests cannot both see the pre-spend balance, and anything that never reaches an upstream is refunded in full) is unaffected. No in-memory path is kept beside it: `quota.Budget` serializes on one mutex where the ledger takes an atomic compare-and-swap on a block it already holds, so the durable path is also the cheaper one. Was **mechanism closed** — durable leased blocks measured at 400 requests to 5 store writes; a crash can only under-spend, and the leader returns the unspent part. Was **open** — a restart resets the windows |
+| W10 | **Case-insensitive JSON decode diverges from the case-sensitive gate** (COMPATIBILITY 2.0) | **closed** — strict type-directed filtering in every request decode path, plus three further gate defects found while closing it: an escaped duplicate key that authorized one model and dispatched another (fail-open), a case-insensitive fallback inside the gate itself, and a stream flag that was OR-ed rather than assigned. A differential fuzzer (13.7M execs) and a mirror test that fails when the gate drifts now hold the two sides together. Was **open** — `encoding/json` fills a tagged field from a differently-cased key while the scanner does not, so a request can be authorized as one thing and dispatched as another. Needs a case-sensitive decode path in every wire adapter plus a differential test against the gate. Security-relevant: it is an allow-list bypass, not merely an inconsistency |
+| W11 | **Revocation latency was never specified** (§11.2c) | **closed** — revocations, pends and early grace cuts publish a durable invalidation; every node drops the key from its snapshot on receipt, and the TTL is now the fallback for a node that missed the message rather than the mechanism. The worst case is published as a number (`auth.RevocationBound`): **0 on one node**, **`poll + store_latency` clustered** — 1.25 s at the defaults — with `entry_ttl` as the stated fallback and an unmeasured propagation delay publishing the TTL rather than an optimistic figure. Four further defects were found while closing it: a **found-but-refusing row was cached for the SERVING lifetime**, so a pended key was re-checked a full `entry_ttl` later on a node that missed the message (rule 3 was written and not implemented); `Rejoin` had to drop the snapshot **before** the reload rather than replace it after, or a failed reload left the stale set serving — the exact state rule 4 exists to prevent; a rejoining node had to read the invalidation watermark **before** the reload, or a message published during it was skipped; and **a row placed by a bulk load never expires** (§9.1), so publishing `entry_ttl` as its fallback was simply wrong — its fallback is the reload interval, and with no reload scheduled it has none, which the figure now says rather than reporting a number that does not apply. Measured end to end: **zero window** single-node, **~21 ms** to the last of four nodes at `poll: 20ms`. Was **open** — the auth snapshot's TTL is what makes authentication 354 ns, and it also means a revoked, pended, or rotation-cut key keeps serving until the snapshot refreshes, per node |

@@ -25,7 +25,7 @@ at three levels. They have very different costs.
 | **Wire** | Client SDKs work unmodified against dorang. Byte-level contracts, covered by golden tests | None — it either works or it is a bug ([COMPATIBILITY.md](COMPATIBILITY.md)) |
 | **Configuration** | `dorangctl import config` converts a declarative model-list file and reports what it could not represent | An afternoon, plus the warnings |
 | **Credentials** | Existing keys keep working during a bounded window; expiry and revocation are honoured | A day, and it needs a decision about the window |
-| **Administrative** | Shape-compatible management paths so existing scripts keep working | ⚠️ **Not in this build** — see §1.2 |
+| **Administrative** | Shape-compatible management paths so existing scripts keep working | **Partial** — the credential lifecycle, spend, capacity, catalog, health history and the UI are served; users, teams, models and budgets answer 501. The list is §1.2. *(This cell said "Not in this build")* |
 
 Before planning, size the surface. An audit of a live 505-path proxy deployment against its
 actually-attached clients found:
@@ -66,19 +66,43 @@ provider credential.
 
 ### 1.2 The administrative surface
 
-⚠️ **This build mounts no HTTP administration.** Every `/key/*`, `/user/*`, `/team/*`,
-`/model/*`, `/model_group/*`, `/budget/*`, `/spend/*`, `/global/spend/*` and `/health/history`
-path answers **501 with a machine-readable reason**, never a silent `404`. So does the native
-`/admin/*` surface and the embedded UI.
+**This build mounts HTTP administration.** What is served and what is not is a list, not a
+blanket, and [OPERATIONS.md](OPERATIONS.md) §3.2 is the authoritative one — check it against the
+build you are cutting over to.
 
-The implementation exists and is tested; it is not wired into the server binary. Until it is:
+Served: the whole credential lifecycle (`/key/generate`, `/info`, `/update`, `/delete`, `/list`,
+`/block`, `/unblock`, `/regenerate`, plus `/key/rotate`, `/rotate/cut`, `/secrets`, `/pend`,
+`/release`), `/spend/logs`, `/global/spend/report`, `/admin/capacity`,
+`/admin/catalog/explain`, `/admin/catalog/unverified`, `/health/history`, and the embedded
+read-only `/ui`.
 
-- Key issuance, listing and revocation are `dorangctl key …` (see [OPERATIONS.md](OPERATIONS.md) §3).
-- User, team and budget administration have no interface at all.
-- Any script or dashboard your incumbent deployment drives through those paths **will not work
-  after cutover.** Inventory them first. Given that 80% of a real deployment's served surface is
-  control plane, this is likely to be the largest single piece of migration work, and it is not
-  something dorang can absorb for you.
+Answering **501 `dependency_not_configured`**, naming the missing piece rather than refusing
+generically: `/user/*`, `/team/*`, `/model/*`, `/model_group/info`, `/budget/*`, the three
+`/{user,team,tag}/daily/activity` endpoints, `/admin/credentials/health`, `/admin/quota`,
+`/spend/calculate`, `/admin/pricing/preview` and `/admin/config/reload`. `internal/store` has no
+Go code for `users`, `teams`, `team_members`, `deployments` or `model_aliases`, which is why.
+
+So, for a cutover:
+
+- Key issuance, listing and revocation work **over HTTP** — `cmd/dorang/revoke_test.go` runs the
+  leaked-key incident end to end, blocking a working key with one call and watching the next
+  request from it be refused. `dorangctl key …` remains available and is the same store.
+- User, team and budget administration still have no interface. `SIGHUP` replaces
+  `/admin/config/reload`.
+- Any script or dashboard your incumbent drives through the 501 list **will not work after
+  cutover.** Inventory them first — but inventory them against the list above, not against a
+  blanket.
+
+> ⚠️ **This section read "This build mounts no HTTP administration" until 2026-07-29, and it
+> was the single most expensive stale claim in these documents.** It told an operator that the
+> largest single piece of migration work was ahead of them when most of it was already done, and
+> it named revocation-over-HTTP as absent on the page a cutover plan is written from.
+> `docs/SECURITY-REVIEW.md` had already corrected the identical sentence in its own text —
+> *"there **is** an API path to revoke a leaked key — which the review's plainest sentence said
+> there was not"* — and `docs/OPERATIONS.md` §3.2 had documented the mounted surface in detail.
+> Two documents were right and this one was never updated. A claim that survives in one file
+> after being corrected in two others is not a typo; it is the absence of a step that re-derives
+> every document from the code.
 
 ### 1.3 The administrative credential
 
@@ -475,9 +499,15 @@ size:
 1. **~80% of a real deployment's served surface is control plane** (§0), and control-plane calls
    are not replayable — they change state on the system still serving production. `skipped_unsafe`
    is the count, and it is reported *next to the verdict* precisely so it is not read as zero.
-2. **Only the routes this build serves can be compared at all.** `/v1/responses`, rerank, audio,
-   images, moderations, OCR and the whole administrative shape answer 501 on dorang, so there is
-   nothing to compare (§1.5).
+2. **Only the routes this build serves can be compared at all.** `/v1/ocr`, `/v1/vector_stores`
+   and `/v1/assistants` answer 501 on dorang, as do the administrative paths §1.2 lists as
+   unserved, so for those there is nothing to compare (§1.5). ⚠️ **This line also named
+   `/v1/responses`, rerank, audio, images and moderations until 2026-07-29, and all five are
+   served** — §1.5, four hundred lines above, lists every one of them as built, so this file
+   disagreed with itself. An exclusion list that is too long is not the safe direction: it
+   silently reports "nothing to compare" for surfaces that *can* be compared, producing a clean
+   verdict over less than the reader believes it covers. Re-derive it against
+   [OPERATIONS.md](OPERATIONS.md) §0, not against either paragraph.
 3. **Output text is not compared**, by design. Model output is not deterministic. A clean report
    proves the two gateways agree on *structure* — status, field set, types, framing, error
    shape — not that they produce the same answers.

@@ -75,6 +75,7 @@ func planUpstream(t *testing.T) *httptest.Server {
 // boundary [newWiringApp]'s per-test TempDir deliberately hides.
 func restartableApp(t *testing.T, yaml, dbPath string, up *httptest.Server) *App {
 	t.Helper()
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(yaml))
 	if err != nil {

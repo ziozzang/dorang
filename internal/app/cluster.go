@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -139,13 +140,19 @@ func (l *liveNodes) set(n int) {
 // here starts a goroutine, writes a registry row, campaigns for a leadership
 // lease, or adds a query to any path. The cost of the node layer to a
 // single-node gateway is the [cluster.New] call above and one branch here.
-func (a *App) joinCluster(ctx context.Context) bool {
+//
+// A failed join is FATAL, and that is the whole of the second return value.
+// This used to log the error and report false, and a logged error returned as a
+// boolean is how [cluster.ErrDuplicateNodeID] — a condition internal/cluster
+// detects, names, demotes for and exports [cluster.Node.Conflict] to escalate —
+// reached production as a line in a log file. See [App.startBackground] for what
+// the two failure modes cost.
+func (a *App) joinCluster(ctx context.Context) (bool, error) {
 	if a.Node == nil || !a.Node.Enabled() {
-		return false
+		return false, nil
 	}
 	if err := a.Node.Start(ctx); err != nil {
-		a.logf("app: cluster node: %v", err)
-		return false
+		return false, a.joinError(err)
 	}
 	a.refreshAccuracy(ctx)
 
@@ -160,11 +167,95 @@ func (a *App) joinCluster(ctx context.Context) bool {
 	if err != nil {
 		a.logf("app: cluster: no published accuracy for capacity_mode %s against a limit of %d: %v",
 			a.Node.Mode(), limit, err)
-		return true
+		return true, nil
 	}
 	a.logf("app: cluster: node %s, %s", a.Node.ID(), acc)
-	return true
+	return true, nil
 }
+
+// joinError turns a refused join into a start-up failure, and says which of the
+// two it is.
+//
+// Both are fatal and they are fatal for different reasons, so they are two
+// messages rather than one:
+//
+//   - A duplicate id is a deployment mistake with a cost DESIGN §13 and
+//     [cluster.ErrDuplicateNodeID] set out in full. Refusing to LEAD is not
+//     enough, which is the whole point of escalating it here: the node id also
+//     keys this process's row in `nodes`, its share of every leased limit in
+//     `quota_leases`, and the budget draw in [App.Ledger] — which this assembly
+//     puts on the request path. A process that started and merely declined to
+//     lead would go on drawing budget from the incumbent's lease block and
+//     taking its slice of every ceiling, under an identity the cluster
+//     attributes to somebody else.
+//   - Anything else — a store that would not answer the registry write, a node
+//     already started — leaves the node NEVER joined, because
+//     [cluster.Node.Start] is called exactly once and its loop is what would
+//     retry. `cluster.enabled: true` would then be a gateway that runs no leader
+//     job (no lease reclaim, no reservation sweep, no partition maintenance) and
+//     publishes §5.6's overshoot against a node count of one — "exact" — from a
+//     node that is in a cluster and is not counting itself in it. That is the
+//     one answer 5.6 exists to prevent, and an operator sizes against it.
+//
+// Refusing to start is also the loud failure DESIGN §9.2 asks for here: a
+// process that will not come up halts a rollout and shows up in every
+// orchestrator's own alerting, and an orchestrator restarting it IS the retry.
+func (a *App) joinError(err error) error {
+	if errors.Is(err, cluster.ErrDuplicateNodeID) {
+		return fmt.Errorf("app: cluster.node_id %q is already in use by a running process; "+
+			"this one refuses to start rather than draw budget and quota under an identity "+
+			"the cluster attributes to somebody else (DESIGN §13): %w", a.Node.ID(), err)
+	}
+	return fmt.Errorf("app: cluster.enabled is true and node %q could not join, so it would "+
+		"run no leader job and publish an overshoot computed from a node count of one; "+
+		"refusing to start: %w", a.Node.ID(), err)
+}
+
+// noteConflict takes this process out of the load balancer's rotation once its
+// node id turns out to belong to somebody else.
+//
+// It is the half of DESIGN §13's identity check that start-up cannot reach.
+// [App.joinError] covers the process that arrives second; this covers the
+// process that was already running, was frozen past the node TTL — a long GC
+// pause, a suspended container, a paused debugger — and was legitimately
+// superseded. It learns that from its own heartbeat row, is demoted by
+// internal/cluster, and then never leads again. Nothing re-checks the join, so
+// without this it would keep serving under a contested identity forever.
+//
+// Readiness is the right signal and the only one that is. The registry row says
+// what the cluster believes and nothing routes on it (see cluster.Node.Close);
+// what a load balancer polls is /health/readiness, and "this node will never
+// lead again and is still taking traffic under an id another process owns" is
+// exactly what it should be told. The process is deliberately NOT killed: it is
+// serving requests correctly, and an operator draining it is a better ending
+// than an abrupt exit mid-stream.
+//
+// [server.Server.StartDrain] is the lever, because it flips readiness and
+// touches nothing else — the listener stays open, the route table is untouched,
+// and requests in flight are served in full. What it does not give is a distinct
+// word for the state, so /health reports `draining` with the reason beside it in
+// the `cluster` object [clusterHealth] contributes.
+func (a *App) noteConflict() {
+	if a.Node == nil {
+		return
+	}
+	err := a.Node.Conflict()
+	if err == nil || !a.disqualified.CompareAndSwap(false, true) {
+		return
+	}
+	a.logf("app: cluster: node %s has been disqualified and will never lead again; "+
+		"readiness is now false so the load balancer stops routing here. This process is "+
+		"still serving in-flight traffic under an identity another process owns — drain it "+
+		"and give every node a distinct cluster.node_id (DESIGN §13): %v", a.Node.ID(), err)
+	if a.Server != nil {
+		a.Server.StartDrain()
+	}
+}
+
+// Disqualified reports whether this node's identity turned out to belong to
+// another process. It is what /health answers from, and it is one-way: DESIGN
+// §13 makes a duplicated id a deployment mistake rather than a transient.
+func (a *App) Disqualified() bool { return a.disqualified.Load() }
 
 // clusterTick is the node loop's interval, which is also how often the live
 // node count is re-read. One knob: a deployment that beats faster because it

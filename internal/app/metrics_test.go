@@ -140,6 +140,7 @@ func TestScrapeDoesNotBlockAReload(t *testing.T) {
 
 func newMetricsApp(t *testing.T) *App {
 	t.Helper()
+	isolateState(t)
 	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
 	cfg, err := config.LoadBytes([]byte(metricsYAML))
 	if err != nil {

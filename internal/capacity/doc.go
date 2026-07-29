@@ -46,7 +46,9 @@
 // the head of A's queue, finds B full, moves to the head of B's queue, finds A
 // full again, and repeats forever. It is never passed over; it simply never
 // observes both axes free at the same instant. That is DESIGN §5.4 correction 5
-// and open risk W8, and the protocol below closes it.
+// and risk W8, and the protocol below closes it — which is why W8 reads closed
+// in §18 and why a citation of it as *open* anywhere in this package is a
+// leftover from before this file existed.
 //
 // A soft reservation ("claim") is one unit of one axis key set aside for one
 // named waiter. It is not a held slot: the waiter is still blocked, still owns

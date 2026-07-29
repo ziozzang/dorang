@@ -28,15 +28,28 @@ import (
 //     into a struct nobody forwarded for most of this project's life, and every
 //     name in that chain was "referenced". Reference is necessary, not
 //     sufficient.
+//
 //   - A field whose Go name collides with an unrelated identifier. `Enabled`,
-//     `Path`, `Drop`, `Interval` and `Timeout` are used everywhere; for those the
-//     check is vacuous, and four settings this sweep confirmed to be unwired —
-//     `providers[].metrics.interval`, `providers[].params.drop`,
-//     `providers[].usage_probe.interval` and
-//     `models[].deployments[].stream_timeout` — are invisible to it for exactly
-//     that reason. They are tracked in docs/CONFIG.md §23.1 instead. The check
-//     does hold for the distinctive names, which is where new settings land:
-//     `MaxQueueWait`, `ClientPriority`, `PrefixTTL`, `AffinityGroup`.
+//     `Endpoint`, `Path`, `Drop`, `Scope`, `Interval` and `Timeout` are used
+//     everywhere; for those the check is vacuous, and six settings confirmed to
+//     be unwired are invisible to it for exactly that reason:
+//     `providers[].metrics.enabled`, `.endpoint` and `.interval` (nothing
+//     scrapes a backend at all — the whole block is inert, not just the poll
+//     interval), `providers[].params.drop`, `providers[].usage_probe.interval`
+//     and `models[].deployments[].stream_timeout`. They are tracked in
+//     docs/CONFIG.md §23.1 instead. The check does hold for the distinctive
+//     names, which is where new settings land: `MaxQueueWait`,
+//     `ClientPriority`, `PrefixTTL`, `AffinityGroup`.
+//
+//     The metrics block is the worked example of why this limit costs
+//     something. Because the guard could not contradict it, docs/CONFIG.md
+//     §23.1 said "the endpoint and the enabled flag are read; the poll interval
+//     is not" for as long as it took someone to grep by hand — a claim wrong in
+//     both halves, understating an entirely unwired feature as a one-field gap.
+//     A prose ledger the guard cannot check has to be re-derived, not trusted,
+//     and the entries here name which ones those are so that the re-derivation
+//     has a work list.
+//
 //   - Semantics. Reading `MaxQueue` and comparing it against the wrong thing
 //     passes here.
 //

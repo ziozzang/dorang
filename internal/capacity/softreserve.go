@@ -18,7 +18,11 @@ package capacity
 var noClaimant = new(waiter)
 
 // SoftReservationMode selects the multi-axis starvation guard of DESIGN §5.4
-// correction 5 (open risk W8).
+// correction 5, which closed risk W8.
+//
+// W8 is closed BY this file, so the older wording — "open risk W8" — described
+// the state the file was written to end. A risk cited as open inside the code
+// that closes it is how a register outlives its own resolution.
 //
 // The guard costs at most one idled unit per axis key, and only while a
 // multi-axis waiter is being escorted in, so it is on by default. It is a knob
