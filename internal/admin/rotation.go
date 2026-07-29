@@ -200,9 +200,19 @@ func (c *call) keyRotate() error {
 		views = append(views, viewSecret(s, now))
 	}
 
+	// A rotation with a grace window refuses nothing, and it is still announced:
+	// a node holding this key's row has to re-read it to learn the NEW secret
+	// and the old one's expiry, and a node that does not will refuse a caller
+	// who has correctly rolled — for as long as its snapshot survives. A
+	// rotation asked for with `grace: 0` is a cut and says so.
+	cause := CauseRotated
+	if grace <= 0 {
+		cause = CauseGraceCut
+	}
+
 	// The audit row records the rotation, never the secret. Only view types are
 	// in scope here, so it cannot regress into recording one.
-	if err := c.recordAudit("key.rotate", "key", id, before, map[string]any{
+	if err := c.applied(id, cause, "key.rotate", before, map[string]any{
 		"key":                 after,
 		"generation":          res.New.Generation,
 		"previous_secret_id":  res.Previous.ID,
@@ -272,7 +282,11 @@ func (c *call) keyCutGrace() error {
 	for _, s := range secrets {
 		views = append(views, viewSecret(s, now))
 	}
-	if err := c.recordAudit("key.rotate.cut", "key", id,
+	// The cut is announced, because "immediately" is the entire content of this
+	// route. A grace period that ends only when every node's snapshot happens to
+	// refresh has not been ended early — it has been shortened to the credential
+	// cache TTL, which is not what a suspected compromise asked for.
+	if err := c.applied(id, CauseGraceCut, "key.rotate.cut",
 		map[string]any{"cut": n}, map[string]any{"secrets": views}); err != nil {
 		return err
 	}
@@ -397,14 +411,18 @@ func keySetPended(pended bool) handler {
 		updated.UpdatedAt = now
 		after := viewKey(&updated)
 
-		action := "key.release"
+		action, cause := "key.release", CauseReleased
 		note := "the key serves again; the caller keeps the credential it already has"
 		if pended {
-			action = "key.pend"
+			action, cause = "key.pend", CausePended
 			note = "the key is refused with a distinct, documented error and can be released " +
 				"in one action; it was not revoked, so no credential has to be reissued"
 		}
-		if err := c.recordAudit(action, "key", id, before, after); err != nil {
+		// Both halves are announced, which is §11.6's "released in ONE action"
+		// taken literally in both directions: a pend that starts on a cache TTL
+		// has started a timer rather than stopped anything, and a release that
+		// ends on one is an outage that outlives the decision to end it.
+		if err := c.applied(id, cause, action, before, after); err != nil {
 			return err
 		}
 		writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": after, "note": note})

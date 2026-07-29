@@ -442,6 +442,13 @@ func (c *call) keyGenerate() error {
 	c.a.metrics.keysIssued.Add(1)
 
 	view := viewKey(k)
+	// Nothing is announced here, and that is deliberate rather than an omission
+	// (see [Invalidator]). A key that has never been seen has no cached copy to
+	// drop; the one thing a node can hold about it is a NEGATIVE entry from a
+	// request that used the credential before it existed, and those carry the
+	// short negative TTL (`auth.DefaultNegativeTTL`, 5 s) precisely so that this
+	// case needs no message.
+	//
 	// The audit row records the key that was created — never the secret. The
 	// view type is the only thing in scope, so this cannot regress.
 	if err := c.recordAudit("key.generate", "key", k.ID, nil, view); err != nil {
@@ -523,7 +530,18 @@ func (c *call) keyUpdate() error {
 		return err
 	}
 	after := viewKey(&updated)
-	if err := c.recordAudit("key.update", "key", id, before, after); err != nil {
+	// Every field this handler writes is an authorization field the hot path
+	// reads off its cached snapshot — the block flag, the expiry, the model and
+	// route allow-lists, the tier, the ceilings — so an update that is not
+	// announced is an update the fleet honours a cache TTL later. `blocked` is
+	// singled out only in the CAUSE, because `{"blocked": true}` through this
+	// route is a revocation by another name and an operator reading a node's log
+	// should see it spelled that way.
+	cause := CauseUpdated
+	if updated.Blocked && !k.Blocked {
+		cause = CauseRevoked
+	}
+	if err := c.applied(id, cause, "key.update", before, after); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": after})
@@ -582,9 +600,30 @@ func (c *call) keyDelete() error {
 	if err != nil {
 		return err
 	}
+
+	// A deleted key is a revoked key as far as every node's cache is concerned:
+	// the row is gone, nothing will refuse it, and a node holding a cached copy
+	// serves it until the entry TTL expires. The announcement names the ids
+	// rather than the lookups because the rows that held the lookups no longer
+	// exist — which is exactly why an invalidation is authoritative on the
+	// durable key id (see [Invalidator]).
+	//
+	// One announcement per id, and the FIRST failure is remembered rather than
+	// returned: stopping half way through would leave the remaining keys of a
+	// bulk delete serving on the TTL because an earlier one could not be
+	// published.
+	var invErr error
+	for _, id := range ids {
+		if err := c.invalidate(id, CauseRevoked); err != nil && invErr == nil {
+			invErr = err
+		}
+	}
 	if err := c.recordAudit("key.delete", "key", strings.Join(ids, ","),
 		map[string]any{"keys": before}, map[string]any{"deleted": n}); err != nil {
 		return err
+	}
+	if invErr != nil {
+		return invErr
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{
 		"deleted":      n,
@@ -657,6 +696,13 @@ func (c *call) keyList() error {
 // keySetBlocked builds the handlers for POST /key/block and POST /key/unblock.
 // They are one implementation because they differ in exactly one boolean, and
 // two copies of this would drift.
+//
+// `/key/block` is the incident path of OPERATIONS §3.1: it is what an operator
+// reaches for when a key leaks. It therefore ANNOUNCES the block (§11.2c) rather
+// than leaving the fleet to discover it when the credential cache expires — see
+// [Invalidator]. The unblock announces too, for the reason a pend's release
+// does: a key that starts serving again only when a TTL says so is a key the
+// operator cannot un-break in one action.
 func keySetBlocked(blocked bool) handler {
 	return func(c *call) error {
 		ks, err := c.a.keys()
@@ -686,11 +732,11 @@ func keySetBlocked(blocked bool) handler {
 			return err
 		}
 		after := viewKey(&updated)
-		action := "key.unblock"
+		action, cause := "key.unblock", CauseUpdated
 		if blocked {
-			action = "key.block"
+			action, cause = "key.block", CauseRevoked
 		}
-		if err := c.recordAudit(action, "key", id, before, after); err != nil {
+		if err := c.applied(id, cause, action, before, after); err != nil {
 			return err
 		}
 		writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": after})
@@ -766,7 +812,14 @@ func (c *call) keyRegenerate() error {
 	c.a.metrics.keysIssued.Add(1)
 
 	after := viewKey(&updated)
-	if err := c.recordAudit("key.regenerate", "key", id, before, after); err != nil {
+	// The old secret is cut OUTRIGHT here — that is what regenerate has always
+	// meant, and OPERATIONS §3.1 offers it as the incident alternative to a
+	// block on the strength of "the cutover is immediate". It is immediate only
+	// on the node that served the call unless the cut is announced: every other
+	// node goes on verifying the compromised secret from its snapshot until the
+	// entry TTL expires. `grace_cut` rather than `rotated` is the honest cause,
+	// because a secret stopped working.
+	if err := c.applied(id, CauseGraceCut, "key.regenerate", before, after); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, generatedKey{

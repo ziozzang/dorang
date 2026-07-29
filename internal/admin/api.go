@@ -65,6 +65,12 @@ type Config struct {
 	// cannot be audited is refused before it happens (see [API.mutate]).
 	Audit Auditor
 
+	// Invalidator announces a key whose authorization changed, so that the
+	// change takes effect within the published bound of DESIGN §11.2c rather
+	// than within the credential cache's TTL. Optional; see [Invalidator] for
+	// what its absence costs.
+	Invalidator Invalidator
+
 	Credentials CredentialReporter
 	Capacity    CapacityReporter
 	Health      HealthHistory

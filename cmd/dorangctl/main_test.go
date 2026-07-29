@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,8 +326,49 @@ func TestKeyLifecycle(t *testing.T) {
 	if !strings.Contains(out, "blocked") {
 		t.Errorf("the revoked key is not blocked:\n%s", out)
 	}
+	// And the revocation is PUBLISHED, which is the difference between a
+	// running fleet honouring it within auth.revocation.poll and honouring it
+	// when each node's credential cache happens to expire. This is a CLI: it has
+	// no snapshot of its own to drop, so the durable message is its whole half
+	// of DESIGN §11.2c, and asserting the row is the only way to observe it from
+	// here.
+	assertRevocationPublished(t, filepath.Join(dir, "dorang.db"), id)
 	if _, _, code := invoke("key", "revoke", "no-such-id", "--config", path); code == 0 {
 		t.Error("revoking an unknown id must fail")
+	}
+}
+
+// assertRevocationPublished checks that `key revoke` left a message on the
+// invalidation bus, not only a flag on the row.
+func assertRevocationPublished(t *testing.T, dbPath, keyID string) {
+	t.Helper()
+	// The store's own driver name; importing internal/store registers it.
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open the database: %v", err)
+	}
+	defer db.Close()
+
+	var (
+		n       int
+		cause   string
+		lookups string
+	)
+	row := db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(cause), ''), COALESCE(MAX(lookups), '')
+		 FROM key_invalidations WHERE key_id = ?`, keyID)
+	if err := row.Scan(&n, &cause, &lookups); err != nil {
+		t.Fatalf("read key_invalidations: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("key revoke published %d invalidations for %s, want 1: a revocation that is "+
+			"only a row is one the fleet honours a cache TTL later", n, keyID)
+	}
+	if cause != "revoked" {
+		t.Errorf("published cause = %q, want %q", cause, "revoked")
+	}
+	if strings.TrimSpace(lookups) == "" {
+		t.Error("the message names no index keys; the key id alone still works, but the drop " +
+			"is a scan rather than a lookup and a negative entry is not caught at all")
 	}
 }
 

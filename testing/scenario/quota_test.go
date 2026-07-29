@@ -1,14 +1,18 @@
 package scenario
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
+	"github.com/ziozzang/dorang/internal/store"
 )
 
 // DESIGN §14 scenarios 4 and 5 — quota and budget.
@@ -130,28 +134,76 @@ func TestScenario04_ExhaustedCredentialStepsAsideAndReturns(t *testing.T) {
 // §14.5 — a budget cap is never exceeded under 100 concurrent requests
 // -----------------------------------------------------------------------------
 
+// The gate under test is the DURABLE ledger, which is the only budget mechanism
+// this build has.
+//
+// It used to be `quota.Budget`, an in-memory implementation of the same idea
+// that no non-test caller had ever reached. DESIGN §17's W9 row already asserted
+// the conclusion — "no in-memory path is kept beside it" — and that sentence was
+// written about a third implementation (`store.ReserveBudget`) which was deleted
+// while this one survived the same sweep. Two implementations of one thing is
+// this codebase's most expensive recurring defect, and the scenario is the
+// reason the second one looked alive: it was the only thing exercising it.
+//
+// So the scenario now drives the path a request actually takes.
+// `app.budgetGate` reserves an upper bound against [cluster.Ledger] after the
+// routing decision, settles it with the real cost, and releases in full anything
+// that never reached an upstream; that is exactly the sequence below, at the
+// hundred-way concurrency §14.5 names. What the move BUYS, beyond removing the
+// duplicate, is that the invariant is now checkable against the durable counter
+// rather than against a map in this process: a budget that a restart resets was
+// W9's open risk, and "never exceeded" asserted over state that does not survive
+// is not the property an operator was promised.
+
+const (
+	scenarioBudgetEstimate = int64(2_000_000) // 0.002 USD in nano
+	scenarioBudgetActual   = int64(1_400_000)
+)
+
+// newBudgetLedger opens a store on a temporary SQLite file and builds one node's
+// ledger over it. Two nodes of one cluster are two of these against the same
+// path, which is what [cluster.Ledger] means by a shared counter.
+func newBudgetLedger(t *testing.T, dsn, node string, clk *clock, block int64,
+	ttl time.Duration) *cluster.Ledger {
+
+	t.Helper()
+	st, err := store.Open(context.Background(), store.Config{
+		Driver: store.DialectSQLite, DSN: dsn, Now: clk.now,
+	})
+	if err != nil {
+		t.Fatalf("store.Open(%s): %v", node, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	l, err := cluster.NewLedger(cluster.LedgerConfig{
+		Store: st, NodeID: node, Block: block, TTL: ttl, RenewBefore: ttl / 3, Now: clk.now,
+	})
+	if err != nil {
+		t.Fatalf("NewLedger(%s): %v", node, err)
+	}
+	return l
+}
+
 func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 	const (
 		concurrent = 100
 		// Each request is estimated pessimistically and settles for less, which
 		// is the normal shape: the estimate prices output at max_tokens.
-		estimate = int64(2_000_000) // 0.002 USD in nano
-		actual   = int64(1_400_000)
+		estimate = scenarioBudgetEstimate
+		actual   = scenarioBudgetActual
 	)
-	// A limit that admits roughly half the requests, so the cap actually bites.
+	// A limit that cannot fit all hundred requests, so the cap actually bites:
+	// a hundred settlements of `actual` need 140% of it.
 	limit := estimate * concurrent / 2
+	// A block small enough that the run refills several times. A block equal to
+	// the limit would prove only that one draw was correctly sized.
+	block := estimate * 5
 
 	clk := newClock()
-	b, err := quota.NewBudget(quota.BudgetConfig{
-		Period:       quota.Daily,
-		DefaultLimit: limit,
-		Now:          clk.now,
-	})
-	if err != nil {
-		t.Fatalf("NewBudget: %v", err)
-	}
-	subject := quota.Subject{Kind: "team", ID: "team-a"}
-	b.SetLimit(subject, limit)
+	ctx := context.Background()
+	led := newBudgetLedger(t, filepath.Join(t.TempDir(), "budget.db"), "node-a", clk, block, time.Minute)
+	t.Cleanup(func() { _ = led.Close(ctx) })
+
+	key := cluster.BudgetKey("team", "team-a", quota.Daily, clk.now())
 
 	var (
 		admitted atomic.Int64
@@ -161,9 +213,11 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 		peak     atomic.Int64
 	)
 
-	// A watchdog samples the budget while the requests race. The invariant is
+	// A watchdog samples the counter while the requests race. The invariant is
 	// not merely "the final total fits" — a budget that overshoots and then
-	// refunds has already let the money be spent.
+	// refunds has already let the money be spent. It reads [cluster.Ledger.Stats],
+	// which is the same lock-free view §12.3's budget gauge exports and which
+	// therefore cannot itself perturb what it is watching.
 	stop := make(chan struct{})
 	var wgWatch sync.WaitGroup
 	wgWatch.Add(1)
@@ -175,16 +229,20 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 				return
 			default:
 			}
-			s := b.Snapshot(subject, clk.now())
-			held := s.Spent + s.Reserved
-			for {
-				old := peak.Load()
-				if held <= old || peak.CompareAndSwap(old, held) {
-					break
+			for _, s := range led.Stats() {
+				if s.Key.String() != key.String() {
+					continue
 				}
-			}
-			if held > s.Limit {
-				breach.Store(true)
+				held := s.Committed
+				for {
+					old := peak.Load()
+					if held <= old || peak.CompareAndSwap(old, held) {
+						break
+					}
+				}
+				if held > limit {
+					breach.Store(true)
+				}
 			}
 		}
 	}()
@@ -196,27 +254,21 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			now := clk.now()
-			res, err := b.Reserve(subject, estimate, now)
+			h, err := led.Reserve(ctx, key, limit, estimate)
 			if err != nil {
-				if !errors.Is(err, quota.ErrBudgetExceeded) {
+				if !errors.Is(err, cluster.ErrExhausted) {
 					t.Errorf("Reserve failed with an unexpected error: %v", err)
 					return
 				}
 				// DESIGN §6.4: exceeding a budget is terminal, never a fallback
-				// condition. A caller that retried elsewhere would overspend.
-				if !quota.IsTerminal(err) {
-					t.Error("a budget refusal must be terminal")
-				}
+				// condition. internal/app turns this sentinel into a 400 with
+				// code budget_exceeded rather than a 429 precisely so that the
+				// request is not sent down the fallback chain to spend another
+				// subject's budget on a model the caller never asked for.
 				refused.Add(1)
 				return
 			}
-			// The hold is soft at the gate and hard once capacity is acquired.
-			if err := b.Harden(res.ID, now); err != nil {
-				t.Errorf("Harden: %v", err)
-				return
-			}
-			if err := b.Settle(res.ID, actual, clk.now()); err != nil {
+			if err := led.Settle(h, actual); err != nil {
 				t.Errorf("Settle: %v", err)
 				return
 			}
@@ -229,22 +281,33 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 	close(stop)
 	wgWatch.Wait()
 
-	snap := b.Snapshot(subject, clk.now())
 	if breach.Load() {
-		t.Errorf("spent+reserved exceeded the limit during the run (peak %d, limit %d)", peak.Load(), limit)
+		t.Errorf("the counter exceeded the limit during the run (peak %d, limit %d)", peak.Load(), limit)
 	}
-	if snap.Spent > limit {
-		t.Errorf("settled spend %d exceeds the limit %d", snap.Spent, limit)
+	if got := spent.Load(); got > limit {
+		t.Errorf("settled spend %d exceeds the limit %d", got, limit)
 	}
-	if got := spent.Load(); got != snap.Spent {
-		t.Errorf("the budget recorded %d but the requests settled %d", snap.Spent, got)
+
+	// The durable figure, read back from the store: this is the number a process
+	// starting now would see, and it is the one W9 was about.
+	committed, err := led.Committed(ctx, key)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if snap.Reserved != 0 || b.Outstanding() != 0 {
-		t.Errorf("reservations leaked: reserved=%d outstanding=%d", snap.Reserved, b.Outstanding())
+	if committed > limit {
+		t.Errorf("the durable counter holds %d against a limit of %d", committed, limit)
+	}
+	if committed < spent.Load() {
+		// The block is charged BEFORE a unit of it is spent, so the counter is
+		// always at or ahead of reality. A counter behind what was settled would
+		// mean money was spent that nothing had committed — the direction this
+		// arrangement exists to make impossible.
+		t.Errorf("the durable counter holds %d but %d was settled against it", committed, spent.Load())
 	}
 
 	// The cap has to have bitten, or the test proved only that 100 small
-	// requests fit in a large budget.
+	// requests fit in a large budget. It cannot not bite: a hundred settlements
+	// of `actual` need 140% of the ceiling.
 	if refused.Load() == 0 {
 		t.Fatalf("no request was refused; the limit %d did not constrain %d requests of %d",
 			limit, concurrent, estimate)
@@ -252,29 +315,33 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 	if admitted.Load()+refused.Load() != concurrent {
 		t.Fatalf("admitted %d + refused %d != %d", admitted.Load(), refused.Load(), concurrent)
 	}
-	t.Logf("admitted %d, refused %d, settled %d of a %d limit (peak hold %d)",
-		admitted.Load(), refused.Load(), snap.Spent, limit, peak.Load())
+	t.Logf("admitted %d, refused %d, settled %d of a %d limit (peak committed %d) "+
+		"in %d store draws for %d reservations",
+		admitted.Load(), refused.Load(), spent.Load(), limit, peak.Load(),
+		led.Draws(), admitted.Load()+refused.Load())
 
 	t.Run("inverse: the same requests fit when the limit is large enough", func(t *testing.T) {
 		// If the refusals above were caused by anything other than the ceiling,
 		// raising the ceiling would not remove them.
-		b, err := quota.NewBudget(quota.BudgetConfig{
-			Period: quota.Daily, DefaultLimit: estimate * concurrent, Now: clk.now,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		clk := newClock()
+		ctx := context.Background()
+		led := newBudgetLedger(t, filepath.Join(t.TempDir(), "budget.db"), "node-a", clk,
+			block, time.Minute)
+		t.Cleanup(func() { _ = led.Close(ctx) })
+		key := cluster.BudgetKey("team", "team-a", quota.Daily, clk.now())
+		roomy := estimate * concurrent
+
 		var ok atomic.Int64
 		var wg sync.WaitGroup
 		for range concurrent {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				res, err := b.Reserve(subject, estimate, clk.now())
+				h, err := led.Reserve(ctx, key, roomy, estimate)
 				if err != nil {
 					return
 				}
-				_ = b.Settle(res.ID, actual, clk.now())
+				_ = led.Settle(h, actual)
 				ok.Add(1)
 			}()
 		}
@@ -284,30 +351,63 @@ func TestScenario05_BudgetNeverExceededUnderConcurrency(t *testing.T) {
 		}
 	})
 
-	t.Run("an unsettled hold is reclaimed rather than locking the budget", func(t *testing.T) {
-		// R1-5: without expiry, a process killed between reserve and settle
-		// locks that amount forever and the budget is eventually exhausted by
-		// money nobody spent.
+	t.Run("a hold nobody settles is reclaimed rather than locking the budget", func(t *testing.T) {
+		// R1-5: without expiry, a process killed between reserve and settle locks
+		// that amount forever and the budget is eventually exhausted by money
+		// nobody spent.
+		//
+		// The durable ledger answers it one level up, which is why the assertion
+		// is about a NODE rather than about a reservation: the block is charged
+		// to the counter before a unit of it is spent, so a node that dies takes
+		// its whole block out of circulation, and it is the lease — not the
+		// individual hold — that expires and is returned by the leader.
+		const ttl = 30 * time.Second
 		clk := newClock()
-		b, err := quota.NewBudget(quota.BudgetConfig{
-			Period: quota.Daily, DefaultLimit: estimate, Now: clk.now,
-			SoftTTL: time.Minute, HardTTL: time.Minute,
-		})
+		ctx := context.Background()
+		dsn := filepath.Join(t.TempDir(), "budget.db")
+		key := cluster.BudgetKey("team", "team-a", quota.Daily, clk.now())
+		limit := estimate * 10
+
+		// One block is the whole ceiling, so the node that draws it holds all of
+		// the money and none of the others can have any.
+		dying := newBudgetLedger(t, dsn, "node-a", clk, limit, ttl)
+		leader := newBudgetLedger(t, dsn, "node-b", clk, limit, ttl)
+		t.Cleanup(func() { _ = leader.Close(ctx) })
+
+		if _, err := dying.Reserve(ctx, key, limit, estimate); err != nil {
+			t.Fatalf("the first reservation was refused: %v", err)
+		}
+		// node-a is killed here: no Settle, no Close, no checkpoint.
+
+		if _, err := leader.Reserve(ctx, key, limit, estimate); !errors.Is(err, cluster.ErrExhausted) {
+			t.Fatalf("the budget should be held by node-a's lease, got %v", err)
+		}
+		// And it must stay held while the lease is live. Taking a lease whose
+		// holder may still be spending is how a two-node cluster once admitted
+		// 190 against a limit of 100.
+		if res, err := leader.ReclaimExpired(ctx, clk.now()); err != nil {
+			t.Fatal(err)
+		} else if res.Leases != 0 {
+			t.Fatalf("the leader reclaimed %d live leases", res.Leases)
+		}
+
+		clk.advance(ttl + time.Second)
+		res, err := leader.ReclaimExpired(ctx, clk.now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := b.Reserve(subject, estimate, clk.now()); err != nil {
-			t.Fatal(err)
+		if res.Leases != 1 {
+			t.Fatalf("reclaim took %d leases, want the dead node's one", res.Leases)
 		}
-		if _, err := b.Reserve(subject, estimate, clk.now()); !errors.Is(err, quota.ErrBudgetExceeded) {
-			t.Fatalf("the budget should be fully held, got %v", err)
+		// The whole block comes back, including the part node-a had reserved and
+		// never settled. That over-return is the published overshoot of §5.6 —
+		// block × (nodes − 1) — and it is the safe direction: the budget is
+		// usable again, and the residue is bounded by the block rather than
+		// unbounded in time.
+		if res.Returned != limit {
+			t.Fatalf("reclaim returned %d, want the unspent block of %d", res.Returned, limit)
 		}
-		clk.advance(2 * time.Minute)
-		n, reclaimed := b.SweepExpired(clk.now())
-		if n != 1 || reclaimed != estimate {
-			t.Fatalf("sweep reclaimed %d holds worth %d, want 1 worth %d", n, reclaimed, estimate)
-		}
-		if _, err := b.Reserve(subject, estimate, clk.now()); err != nil {
+		if _, err := leader.Reserve(ctx, key, limit, estimate); err != nil {
 			t.Fatalf("the reclaimed budget is still locked: %v", err)
 		}
 	})

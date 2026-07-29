@@ -131,6 +131,55 @@ func (c *KeyControl) CutGrace(ctx context.Context, keyID string) ([]string, erro
 	return lookups, nil
 }
 
+// InvalidateKey publishes the fact that a key's authorization changed, for a
+// caller that has ALREADY made the durable change itself.
+//
+// # Why this exists next to five methods that refuse to be halved
+//
+// The five controls above are each one method on purpose: a method that wrote
+// the row and left the announcement to its caller would have the contract "half
+// of a revocation", and half a revocation is a timer. That rule is about
+// splitting ONE control across two callers, and it stands.
+//
+// This is the other case. The administration surface (internal/admin) owns a
+// credential lifecycle this type does not model — bulk delete, a partial update
+// that may or may not set `blocked`, a regeneration — and writes it through its
+// own narrow key-store seam, which deliberately knows nothing about
+// authenticators or snapshots. Before this method existed, the consequence was
+// not a shape argument: `POST /key/block`, the route OPERATIONS §3.1 gives an
+// operator for a leaked key, wrote the row and published nothing, so the key
+// went on serving for the credential cache TTL (60 s) on every node that did not
+// handle the request — against a published bound of 270 ms and a measured 9–15
+// ms.
+//
+// The half that must not be separated is the one the OPERATOR sees, and it is
+// not: the handler does not answer until both the write and this call have
+// happened, so a 200 still means "it is durable and the fleet has been told".
+//
+// The lookups are read here rather than being passed in, because the caller that
+// needs this has already lost them — a deleted key has no secret rows left at
+// all. That is safe: an [auth.Invalidation] is authoritative on the durable key
+// id, and the lookups only make the drop O(1) instead of a scan. A store that
+// cannot answer is therefore not a reason to skip the announcement; it is a
+// reason to send the one that still works.
+func (c *KeyControl) InvalidateKey(ctx context.Context, keyID, cause string) error {
+	if keyID == "" {
+		return errors.New("cluster: InvalidateKey needs a key id")
+	}
+	parsed, ok := auth.ParseCause(cause)
+	if !ok {
+		// An unrecognised cause still invalidates and says nothing, which is
+		// exactly what auth.CauseUnspecified is for. Refusing would trade a
+		// working revocation for a spelling.
+		parsed = auth.CauseUnspecified
+	}
+	lookups, err := c.st.KeyLookups(ctx, keyID)
+	if err != nil {
+		lookups = nil
+	}
+	return c.announce(ctx, keyID, lookups, parsed)
+}
+
 // WarnOverdue reports the keys whose current secret is older than max_age and
 // sends one warning per key.
 //

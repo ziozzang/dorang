@@ -547,13 +547,19 @@ func (c *call) adminStatus() error {
 	m := c.a.Metrics()
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{
 		"dependencies": map[string]bool{
-			"keys":        cfg.Keys != nil,
-			"hasher":      cfg.Hasher != nil,
-			"directory":   cfg.Directory != nil,
-			"models":      cfg.Models != nil,
-			"budgets":     cfg.Budgets != nil,
-			"ledger":      cfg.Ledger != nil,
-			"audit":       cfg.Audit != nil,
+			"keys":      cfg.Keys != nil,
+			"hasher":    cfg.Hasher != nil,
+			"directory": cfg.Directory != nil,
+			"models":    cfg.Models != nil,
+			"budgets":   cfg.Budgets != nil,
+			"ledger":    cfg.Ledger != nil,
+			"audit":     cfg.Audit != nil,
+			// An absent invalidator refuses nothing, so it is the one dependency
+			// whose absence is invisible from every other endpoint: the
+			// mutations still apply and the fleet honours them a credential
+			// cache TTL later instead of within §11.2c's bound. This line is
+			// where an operator finds that out.
+			"invalidator": cfg.Invalidator != nil,
 			"credentials": cfg.Credentials != nil,
 			"capacity":    cfg.Capacity != nil,
 			"health":      cfg.Health != nil,
@@ -567,16 +573,21 @@ func (c *call) adminStatus() error {
 			"max_list_limit":  cfg.MaxListLimit,
 		},
 		"metrics": map[string]any{
-			"requests":         m.Requests,
-			"ui_requests":      m.UIRequests,
-			"auth_failures":    m.AuthFailures,
-			"unimplemented":    m.Unimplemented,
-			"server_errors":    m.ServerErrors,
-			"mutations":        m.Mutations,
-			"audit_failures":   m.AuditFailures,
-			"keys_issued":      m.KeysIssued,
-			"range_refusals":   m.RangeRefusals,
-			"notional_missing": m.NotionalMissing,
+			"requests":       m.Requests,
+			"ui_requests":    m.UIRequests,
+			"auth_failures":  m.AuthFailures,
+			"unimplemented":  m.Unimplemented,
+			"server_errors":  m.ServerErrors,
+			"mutations":      m.Mutations,
+			"audit_failures": m.AuditFailures,
+			"invalidations":  m.Invalidations,
+			// The number that matters of the two: a deployment where this is
+			// non-zero has revocations landing on the credential cache TTL
+			// rather than within the published bound.
+			"invalidation_failures": m.InvalidationFailures,
+			"keys_issued":           m.KeysIssued,
+			"range_refusals":        m.RangeRefusals,
+			"notional_missing":      m.NotionalMissing,
 		},
 	})
 	return nil

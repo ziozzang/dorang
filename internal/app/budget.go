@@ -59,21 +59,24 @@ type budgetSubject struct {
 
 // budgetGate holds money before it is spent, durably.
 //
-// # Why this is not internal/quota's Budget
+// # Why there is one budget mechanism and not two
 //
-// quota.Budget is exact, cheap and entirely in memory — and a process restart
-// resets it. That is safe for concurrency (nothing is over-granted by
+// There used to be an in-memory one — `quota.Budget` — exact, cheap, and reset
+// by a process restart. That is safe for concurrency (nothing is over-granted by
 // forgetting) and wrong for accounting: a monthly budget silently starts over,
 // which is DESIGN risk W9. internal/cluster closed the mechanism; this is the
-// call site W9's last line asks for.
+// call site W9's last line asks for, and `quota.Budget` has since been deleted
+// rather than kept beside it. internal/quota still names what a budget is ABOUT
+// — the subject, the typed refusal — and no longer implements reserving against
+// one.
 //
-// It is not a trade of speed for durability either, which is why no in-memory
-// path is kept alongside it. quota.Budget serializes every reservation on one
-// mutex; cluster.Ledger takes a read lock and an atomic compare-and-swap on a
-// block this node already holds, and touches the store once per BLOCK rather
-// than once per request. The durable path is the cheaper one under concurrency,
-// so "keep the in-memory one for the notebook tier" would be keeping a slower
-// implementation for its lack of a feature.
+// Keeping it would not have been a trade of speed for durability either. It
+// serialized every reservation on one mutex; cluster.Ledger takes a read lock
+// and an atomic compare-and-swap on a block this node already holds, and touches
+// the store once per BLOCK rather than once per request. The durable path is the
+// cheaper one under concurrency, so "keep the in-memory one for the notebook
+// tier" would have been keeping a slower implementation for its lack of a
+// feature.
 //
 // # Where the hold is taken
 //

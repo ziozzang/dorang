@@ -15,13 +15,53 @@
 
 ## 0. 이 문서를 읽는 법
 
-### 0.1 전제 하나가 틀렸고, 그 교정이 결론을 바꿨다
+### 0.1 인용 루트
+
+경로는 줄이 읽을 만하게 유지되도록 루트에 상대적으로 적는다.
+
+| 프리픽스 | 루트 |
+|---|---|
+| *(없음)* | 이 저장소, `` |
+| `codex/` | `codex` — Codex CLI Rust 워크스페이스 |
+| `grok/` | `grok` — grok CLI Rust 워크스페이스 |
+| `hermes/` | `hermes-agent` |
+| `jikji/` | `jikji` |
+| `openclaw/` | `openclaw` |
+| `opencode/` | `opencode` |
+| `openharness/` | `openharness` |
+| `claude-code/` | `claude-code` — 유출된 TypeScript 스냅숏, §G 참조 |
+| `vllm/` | `vllm-project/vllm`, 커밋 `7aea73d`. VLLM.md가 도출된 것과 같은 트리 |
+
+이 문서를 의뢰한 브리프가 주장한 것 중 셋이 성립하지 않는 것으로 드러났다. 존재하지 않는 vLLM
+라우트(§0.2), 테스트로만 존재하는 jikji 소스 파일 넷(§D.4), 그리고 실제로는 ingress 전송 패키지인
+`internal/press`를 compaction 기계로 서술한 것(§D.4). 각각은 조용히 우회하지 않고 그것이 나오는
+자리에서 교정한다. 틀린 전제를 말없이 흡수하는 명세는 그것을 그대로 실어 나르기 때문이다.
+
+### 0.2 브리프의 전제 하나가 틀렸고, 그 교정이 결론을 바꿨다
 
 이 문서를 의뢰한 과제는 VLLM.md가 "`/v1/responses/compact` 라우트 계열을 언급한다"고 했다.
-**그렇지 않고, vLLM에 그런 라우트는 존재하지 않는다.** vLLM의 Responses 라우터는 정확히 세 라우트를
-등록한다: `POST /v1/responses`, `GET /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`.
+**그렇지 않고, vLLM에 그런 라우트는 존재하지 않는다.** `compact`라는 문자열은 VLLM.md 어디에도
+없고, vLLM의 Responses 라우터는 정확히 세 라우트를 등록한다.
+
+- `vllm/entrypoints/openai/responses/api_router.py:49` — `POST /v1/responses`
+- `vllm/entrypoints/openai/responses/api_router.py:80` — `GET /v1/responses/{response_id}`
+- `vllm/entrypoints/openai/responses/api_router.py:110` — `POST /v1/responses/{response_id}/cancel`
+
+vLLM 체크아웃 전체에 대한 `compact` grep은 KV 커넥터, spec-decode, JSON 직렬화 용도만 돌려주고
+라우트 모양은 하나도 없다.
 
 `/responses/compact`는 실재하지만 **OpenAI/Codex 백엔드 라우트**이지 vLLM의 것이 아니다.
+
+```rust
+// codex/codex-rs/core/src/client.rs:159-165
+const REALTIME_CALLS_ENDPOINT: &str = "/realtime/calls";
+const RESPONSES_ENDPOINT: &str = "/responses";
+const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+// `/responses/compact`는 unary이므로 타임아웃이 스트림 이벤트 사이의 유휴 구간 하나가 아니라
+// 응답 전체를 덮는다.
+const COMPACT_REQUEST_TIMEOUT_IDLE_MULTIPLIER: u32 = 4;
+const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+```
 
 이 교정은 현학이 아니라 하중을 받는다. compaction이 vLLM 라우트였다면 dorang은 자신이 완전히 통제하는
 self-hosted 백엔드에서 그것을 만나 추론할 수 있었을 것이다. 아니다. **dorang이 요청·응답 본문을 구성할

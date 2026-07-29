@@ -1,9 +1,10 @@
 // Package quota meters how much a credential may consume within a window, and
-// reserves budget before it is spent.
+// names the subjects and refusals a budget is expressed in.
 //
 // Quota is orthogonal to concurrency (DESIGN §6): internal/capacity answers
-// "how many right now", this package answers "how much within a window" and
-// "is there money for this".
+// "how many right now", this package answers "how much within a window", and
+// "is there money for this" is answered by internal/cluster's durable ledger in
+// the vocabulary defined here.
 //
 // # Local metering
 //
@@ -84,23 +85,30 @@
 // interface the shared modes implement, and ships [MemShared], an in-memory
 // SharedStore that is exact and is what the tests coordinate through.
 //
-// # Budget
+// # Budget: the vocabulary, not the mechanism
 //
-// [Budget] reserves before spending so concurrent requests cannot overshoot
-// (DESIGN §6.4). Three properties are load-bearing, each of them a correction
-// from review:
+// This package defines what a budget is ABOUT — [Subject], the ceiling's owner;
+// [BudgetError], the typed refusal — and does not implement reserving against
+// one. internal/cluster's durable ledger does, and it is the only implementation
+// in the build.
 //
-//   - The estimate is an upper bound: exact input tokens plus output priced at
-//     max_tokens ([Estimate]).
-//   - Reservations expire. Every reservation carries reserved_until and
-//     [Budget.SweepExpired] reclaims the ones that outlive it. Without that, a
-//     process killed between reserve and settle locks the amount forever and
-//     the budget is eventually exhausted by money nobody spent.
-//   - A reservation is a soft hold at the gate and becomes a hard hold only
-//     once capacity is acquired ([Budget.Harden]). Anything that fails before
-//     dispatch is refunded in full ([Budget.Release]), because a request can
-//     reserve budget and then be rejected while waiting for capacity, never
-//     reaching an upstream.
+// It used to be both. `Budget` was an exact in-memory reserve/settle path with
+// no caller outside this package's tests, kept alive by the scenario suite after
+// the request path had moved to the ledger; DESIGN §17's W9 row already said "no
+// in-memory path is kept beside it", and this was the copy that had outlived the
+// sentence. Every property it carried is now asserted against the path a request
+// takes, which is where those properties actually have to hold:
+//
+//   - The estimate is a pessimistic upper bound — exact input tokens plus output
+//     priced at max_tokens (§6.4). It is computed after routing, because a price
+//     needs a provider and an upstream model.
+//   - Anything that fails before dispatch is refunded in full: the ledger's
+//     Release returns the hold, and the block was charged durably when it was
+//     drawn, so the correction only ever releases units.
+//   - Money nobody spent must not lock the budget (R1-5). The ledger answers it
+//     one level up: the whole block is charged before a unit is spent, so a node
+//     that dies takes its block out of circulation, and the leader returns it
+//     when the LEASE expires — a bounded delay rather than a permanent loss.
 //
 // Exceeding a budget is not a fallback condition: [ErrBudgetExceeded] is
 // terminal, and failing is the correct outcome.

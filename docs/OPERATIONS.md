@@ -329,9 +329,17 @@ dorangctl key revoke --config /etc/dorang/config.yaml <key-id>
 turn every historical request into an orphan. An expired or blocked key must stay present and be
 refused *as such*, never disappear and be refused as unknown.
 
-⚠️ **A running gateway caches credentials.** A revocation takes effect within the cached entry's
-TTL or on the next reload, not instantly. `dorangctl key revoke` says so on stderr. If you need
-it now, `SIGHUP` the process after revoking.
+**A running gateway caches credentials, and `key revoke` publishes.** The CLI writes the block and
+appends an invalidation, which every gateway node reads on its next `auth.revocation.poll` — so a
+running fleet stops serving the key within that poll plus one store round trip rather than when
+each node's entry TTL happens to expire. It says which on stderr. If the publish fails the block
+is still durable, the CLI exits non-zero and says so, and the fleet falls back to the entry TTL;
+`SIGHUP` then closes it immediately.
+
+⚠️ **This read "a revocation takes effect within the cached entry's TTL or on the next reload"
+until 2026-07-30**, and it was true: `key revoke` hand-wrote `UPDATE api_keys SET blocked = 1`
+against the database — a fourth place that knew how to stop a key serving, and one that could not
+publish because it never held the index keys the message names.
 
 ### 3.1 Revoking a leaked key
 
@@ -350,10 +358,31 @@ mutation that could not be audited is refused rather than applied silently, and 
 fails *after* the change was applied you get `500 audit_write_failed` telling you to reconcile
 rather than retry.
 
-**How fast it takes effect.** `internal/auth` caches a loaded credential for `DefaultEntryTTL`
-(60 s), so the key stops working within a minute of the block. `Authenticator.use` enforces
-`Blocked` on every request independently of the authorization checks, so no second gate has to be
-reached. `SIGHUP` clears the cache immediately if the minute matters.
+**How fast it takes effect.** The block is *published*, not merely written. The node that served
+the call drops the key from its snapshot before it answers, so there is no window on the node you
+are watching at all; every other node drops it when it reads the invalidation, which is
+`auth.revocation.poll` plus one store round trip — the same §11.2c mechanism the token guard's
+pend has always used, and the same number §10.1 publishes for a revocation: **270 ms at
+`poll: 20ms`, measured 9–15 ms on PostgreSQL, against a `/key/block` propagation measured at 14 ms
+on SQLite.** `Authenticator.use` enforces `Blocked` on every request independently of the
+authorization checks, so no second gate has to be reached.
+
+Two things can go wrong, and they have separate counters because the operator's follow-up differs.
+If the node serving the call could not *publish*, it answers `500 invalidation_publish_failed` and
+`admin.MetricsSnapshot.InvalidationFailures` moves; if another node cannot *read* the table, its
+own `PollFailures` moves and it logs that revocations are falling back to the entry TTL. Either
+way the block is durable and that node converges on the credential cache TTL (`DefaultEntryTTL`,
+60 s) instead. **Do not retry the block in that case** — it has already been applied. `SIGHUP`
+clears a node's cache immediately if the minute matters.
+
+⚠️ **This paragraph read "the key stops working within a minute of the block" until 2026-07-30,
+and it was true.** `POST /key/block` wrote `blocked = 1` and published nothing, so the one route an
+operator reaches under pressure was the one route on the fleet that observed on `entry_ttl` — 60 s
+against the 270 ms §10.1 publishes — while every mechanism needed to do better was already built
+and measured. The same gap covered `/key/delete`, `/key/update`, `/key/regenerate`, `/key/rotate`,
+`/key/rotate/cut`, `/key/pend` and `/key/release`; all eight publish now. `/key/generate`
+deliberately does not — a key nothing has seen has nothing cached, and "used before it existed"
+is bounded by the 5 s negative-entry TTL.
 
 **In-flight batches stop too.** `batchExecutor` re-resolves the owning credential per row within
 its 30 s owner-resolution TTL and calls `Authorize`, so a blocked key's running batch stops
@@ -377,7 +406,10 @@ you are responding to often happened.
 **Rotating instead of blocking.** `POST /key/regenerate` mints a new secret behind the same key
 id, keeping every authorization field, and returns the new token exactly once. The cutover is
 immediate: there is no grace window in which the old secret still verifies, because a grace
-window on an incident path keeps the compromised secret working for its duration.
+window on an incident path keeps the compromised secret working for its duration. It publishes a
+`grace_cut` on the same path a block does, so "immediate" holds on every node and not only on the
+one that served the call. `POST /key/rotate/cut` publishes the same message for a grace period an
+operator wants to end early.
 
 **Before this surface was mounted** the only lever was a hand-written
 `UPDATE api_keys SET blocked = 1 WHERE id = '<key id>'` against the database, which needs shell
@@ -391,7 +423,7 @@ Mounted and working:
 
 | Path | Notes |
 |---|---|
-| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | The whole credential lifecycle. `/key/regenerate` cuts the old secret outright — it is the incident path. **`spend` is read from DESIGN §9.4's per-key rollup**, over the key's own `budget_duration` window, so it is the same figure `/spend/logs` and `/global/spend/report` report. It used to come from `api_keys.spend_nano`, which the importer writes and the request path does not, so **every key reported `"spend": 0`** while the ledger, the response header and the report all agreed on another number. The durable budget counter is deliberately not the source: a node charges a whole lease block to it before spending a unit (§9.6), so it runs ahead of reality by design. A key with no dorang traffic yet keeps whatever the importer wrote, so an imported spend is still visible until this deployment has a figure of its own |
+| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | The whole credential lifecycle. `/key/regenerate` cuts the old secret outright — it is the incident path. **Every route here that changes whether a key serves publishes an invalidation** (§3.1), so the change takes effect across the fleet within `auth.revocation.poll` + one store round trip rather than within the 60 s credential cache TTL; `/key/generate` is the deliberate exception. **`spend` is read from DESIGN §9.4's per-key rollup**, over the key's own `budget_duration` window, so it is the same figure `/spend/logs` and `/global/spend/report` report. It used to come from `api_keys.spend_nano`, which the importer writes and the request path does not, so **every key reported `"spend": 0`** while the ledger, the response header and the report all agreed on another number. The durable budget counter is deliberately not the source: a node charges a whole lease block to it before spending a unit (§9.6), so it runs ahead of reality by design. A key with no dorang traffic yet keeps whatever the importer wrote, so an imported spend is still visible until this deployment has a figure of its own |
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c rotation: a new secret with a grace window, an early cut, and the list an operator reads to answer "did the client roll?". Same durable key id, so budget, spend, allow-list and ledger history are untouched |
 | `/key/pend`, `/key/release` | §11.6's reversible refusal. Distinct from block, because a pend is a statistical judgement that might be wrong and an operator releases it in one action |
 | `/spend/logs` | Per-request ledger. Requires one of `key_id`, `team_id`, `trace_id`, `tag` or `errors_only`, plus a bounded date range — §9.3 refuses an unbounded scan rather than answering it slowly |
@@ -608,8 +640,19 @@ scrape_configs:
     authorization: {type: Bearer, credentials_file: /etc/prometheus/dorang-master-key}
     static_configs: [{targets: ["dorang:4100"]}]
 ```
-The config key is never read. If the port is reachable, so is the scrape. Put it behind your
-network boundary.
+Both keys **are** read (`internal/app/metrics.go`, `metricsAccess`): `observability.prometheus`
+decides whether the route exists at all, and `observability.metrics.public` decides whether it
+is open. The default is neither — the route exists and requires the master credential or an
+admin key.
+
+> An earlier revision of this paragraph said the opposite — "the config key is never read, if
+> the port is reachable so is the scrape" — fourteen lines below the paragraph that describes
+> the credential. It was true of a build in which `/metrics` was unconditional and
+> unauthenticated, and it survived the commit that closed that. It is kept here rather than
+> deleted because it is the worst shape a stale document takes: an **absence claim about a
+> security control**, which reads as permission to stop configuring one.
+
+Put it behind your network boundary as well; the two are not alternatives.
 
 ⚠️ **Every metric is unlabelled by caller.** There are no per-path, per-model or per-key labels
 anywhere, deliberately: axis keys and model names are unbounded cardinality, and a gateway that
@@ -1002,7 +1045,7 @@ is why §CONFIG 4 covers setting it.
 DESIGN §13 states the mechanisms and, until now, no numbers: an operator sizing a fleet or writing
 an incident runbook had adjectives. These are measured on two `dorang` processes against one
 PostgreSQL, with real clocks and a real network round trip — not with an injected clock inside one
-process. Reproduce them with §8.6.
+process. Reproduce them with §8.5.
 
 | Event | Measured | Arithmetic |
 |---|---|---|
@@ -1175,7 +1218,7 @@ Two things that are **not** causes any more, and were:
 | Symptom | Explanation |
 |---|---|
 | Every key fails authentication after a move or a restore | Pepper mismatch (§2.3, §8.4). Key rows exist; the digests were computed under a different pepper |
-| A revoked key still works | Credentials are cached. It clears within the entry TTL (60 s) or on `SIGHUP` — see §3.1 |
+| A revoked key still works | Every control that stops a key serving publishes an invalidation, so this should clear within `auth.revocation.poll` + one store round trip (§3.1). If it does not, the announcement is not landing: check `invalidation_publish_failed` in the administrative logs and the node's poll-failure counters — a node whose polls fail is a node back on the 60 s entry TTL. `SIGHUP` closes it now |
 | A reload "did nothing" | It probably succeeded and rebuilt only what is rebuildable. Storage, the authenticator, the meter and the capacity broker are **not** replaced on reload — that needs a restart |
 | A shadow configuration change is ignored | Correct. `shadow:` is the one section that refuses to hot-reload, because rebuilding it re-arms the daily cost ceiling |
 | A passthrough prefix 501s | Its provider has no `base_url`, so the route was dropped at build time rather than pointed at nothing |

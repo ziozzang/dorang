@@ -15,7 +15,10 @@
 //
 // Both are authorized the same way: the out-of-band master credential, or a key
 // whose principal reports an administrative role. Every mutation writes an
-// audit row carrying the actor, the action, and the object before and after.
+// audit row carrying the actor, the action, and the object before and after, and
+// every mutation that changes whether a key SERVES also announces it — see
+// [Invalidator], which is the difference between a block taking effect in
+// milliseconds and taking effect when a cache expires.
 //
 // # Four rules that shape the code
 //
@@ -59,4 +62,11 @@
 // crash the capacity endpoint; it makes that endpoint answer 501 with a code
 // saying which dependency is absent, which is the honest answer and the one an
 // operator can act on.
+//
+// [Config.Invalidator] is optional in a different sense, and it is worth naming
+// because the difference is not visible in a status code: its absence does not
+// refuse anything, it lowers a guarantee. The mutations still apply and the
+// fleet still converges — on the credential cache TTL rather than within the
+// bound of §11.2c. A deployment that leaves it nil should know that is what it
+// has chosen.
 package admin

@@ -496,7 +496,7 @@ The metrics carry the same numbers as counters — `dorang_shadow_compared_total
 | What you see | What it means | What to do |
 |---|---|---|
 | `diffs` with `kind: missing_in_dorang` on a field the incumbent emits | A serialization difference. Often `logprobs: null` / `finish_reason: null`, which real OpenAI emits and the reference proxy omits | Decide which one your clients were built against. dorang follows the reference proxy by default, and the alternative is a one-line option — but it must be a **choice**, not an accident |
-| `diffs` on the error envelope's `type` or `code` | The two gateways classify a condition differently. This is API surface: SDKs branch on status and `type`, and application code often matches `code` | [COMPATIBILITY.md](COMPATIBILITY.md) §11.2 has dorang's canonical condition table, with the deliberate divergences explained — budget exhaustion is a terminal `400` rather than a `429`, and "no healthy deployment" is `429` rather than `503`. Note that the *model allow-list* case answers `401` in this build, matching the reference proxy rather than the taxonomy's `403`; check the code path before filing a diff on it |
+| `diffs` on the error envelope's `type` or `code` | The two gateways classify a condition differently. This is API surface: SDKs branch on status and `type`, and application code often matches `code` | [COMPATIBILITY.md](COMPATIBILITY.md) §11.2 has dorang's canonical condition table, with the deliberate divergences explained — budget exhaustion is a terminal `400` rather than a `429`, and "no healthy deployment" is `429` rather than `503`. Note that the *model allow-list* case answers `403 permission_error`, per §11.2 — an earlier revision of this line said `401`, which was true of the build before that row was corrected and is the kind of stale note that sends an operator chasing a diff that does not exist |
 | `inconclusive` on `stream_terminator` | The capture window did not reach the end of the stream | Raise `capture.tail_bytes`. A stream's terminator is the last thing on the wire, which is why there are two windows rather than one |
 | `reference_errors` climbing | The reference is not answering. Nothing is being proved | Fix the reference, then restart the run. Those requests are not "clean" |
 | `queue_dropped` non-zero | The shadow queue filled and work was discarded. Coverage has a hole the report cannot show you | Raise `queue_size` or `workers`, or lower `sample_rate`. A full queue must never push back into the request path, so dropping is correct — but it makes the report incomplete |
@@ -719,8 +719,10 @@ the arithmetic, not the adjective:
 | Budget ceiling across both nodes | **0 overshoot** | 39 requests admitted against a ceiling of 40, driven concurrently at both nodes |
 | A rolling restart of both nodes | **0 lost**, over four runs of ~200 000 requests each | with `pre_stop_delay` set per §6.4 |
 
-The reclaim figure is the one worth reading twice. The registry declares a node dead after
-`node_ttl` (30 s), but the reclaim then deliberately refuses to take a lease that has not itself
+The reclaim figure is the one worth reading twice. The registry declares a node dead after the
+node TTL (30 s) — a Go-level default, **not** a YAML key, and strict decoding makes
+`cluster.node_ttl` a load error, which matters on a page whose subject is which settings refuse
+to start. The reclaim then deliberately refuses to take a lease that has not itself
 expired — a lapsed heartbeat is a declaration, a lapsed lease is a fact, and reclaiming a live
 node's block is how a two-node cluster once admitted 190 against a limit of 100. So a killed
 node's units come back on the *lease* clock, not the heartbeat clock. Size a fleet against 70 s.

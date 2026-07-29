@@ -93,29 +93,13 @@ func BenchmarkMeterUrgency(b *testing.B) {
 	}
 }
 
-func BenchmarkBudgetReserveSettle(b *testing.B) {
-	bg, err := NewBudget(BudgetConfig{
-		Period: Monthly, DefaultLimit: 1 << 60, Now: func() time.Time { return base },
-	})
-	if err != nil {
-		b.Fatal(err)
-	}
-	s := Subject{Kind: "key", ID: "k"}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		r, err := bg.Reserve(s, 1000, base)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := bg.Harden(r.ID, base); err != nil {
-			b.Fatal(err)
-		}
-		if err := bg.Settle(r.ID, 500, base); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
+// The budget reserve/settle benchmark went with the in-memory Budget it timed.
+// There is no replacement here and there should not be: the reservation the
+// request path takes is cluster.Ledger's, over a block the node already holds,
+// and its cost is an atomic compare-and-swap plus one store write per BLOCK —
+// which is measured as a ratio (cluster.TestHotPathWritesPerBlockNotPerRequest)
+// rather than as a per-call nanosecond figure, because the per-call figure is
+// the uninteresting half.
 
 func BenchmarkCoordinatorCharge(b *testing.B) {
 	shared := NewMemShared(func() time.Time { return base })

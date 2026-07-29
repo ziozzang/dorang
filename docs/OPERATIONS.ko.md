@@ -30,7 +30,7 @@
 | `/v1/messages`, `/v1/messages/count_tokens` | POST | 필요 |
 | `/v1/models`, `/models` | GET, HEAD | 필요 |
 | `/health`, `/health/liveness`, `/health/liveliness`, `/health/readiness` | GET, HEAD, OPTIONS | **없음** |
-| `/metrics` | GET, HEAD | **없음** |
+| `/metrics` | GET, HEAD | **필요 — master 크리덴셜 또는 admin 키.** `observability.metrics.public: true`인 경우만 예외 |
 
 **T1 — 이것들이 없으면 범용 SDK 호출이 실패한다:**
 
@@ -132,26 +132,49 @@ docker pull ghcr.io/ziozzang/dorang:1.2.3
 쉘 없음, 패키지 매니저 없음, 프로세스가 손상돼도 피벗할 것이 없음. `nonroot`로 돌고 `4100`을 노출하며
 `/var/lib/dorang`에 볼륨을 선언한다.
 
-엔트리포인트는 `dorang --config /etc/dorang/config.yaml`이다.
-
-이미지에 대해 물릴 두 가지:
-
-⚠️ **`HEALTHCHECK`가 깨져 있다.** `dorangctl health --addr http://127.0.0.1:4100`을 호출하는데
-`dorangctl`에는 **`health` 서브커맨드가 없다** — 호출이 `unknown command "health"`와 함께 2로 종료하므로,
-프로세스의 실제 상태와 무관하게 `start-period + 3 × interval` 이후로 컨테이너가 unhealthy로 보고된다.
-override하거나, 없애고 오케스트레이터 프로브를 쓸 것. distroless 이미지에는 `wget`도 `curl`도 없으므로
-현실적으로는 `--no-healthcheck`로 돌리고 컨테이너 밖에서 `/health/readiness`를 프로브한다.
-
-⚠️ **`DORANG_STATE_DIR=/var/lib/dorang`은 이미지가 설정하고 아무것도 읽지 않는다.** state 경로는
-`storage.sqlite.path`와 `metering.spool.dir`에서 오고 기본값이 `~/.dorang/…`인데, `nonroot`에서 그것은
-선언된 볼륨이 **아니라** `/home/nonroot`다. 명시적으로 볼륨을 가리킬 것:
-
-```yaml
-storage: {driver: sqlite, sqlite: {path: /var/lib/dorang/dorang.db}}
-metering: {spool: {dir: /var/lib/dorang/spool}}
+```
+docker run -d --name dorang \
+  -p 4100:4100 \
+  -v dorang-state:/var/lib/dorang \
+  -v /etc/dorang:/etc/dorang:ro \
+  -e DORANG_MASTER_KEY \
+  -e DORANG_KEY_PEPPER \
+  -e CLOUD_A_KEY_1 \
+  ghcr.io/ziozzang/dorang:1.2.3
 ```
 
-아니면 데이터베이스와 spool이 컨테이너 쓰기 레이어에 살다가 `docker rm`에서 사라진다.
+엔트리포인트는 `dorang --config /etc/dorang/config.yaml`이다.
+
+이미지에 대해 전에는 물렸고 이제는 물리지 않는 두 가지:
+
+**`HEALTHCHECK`는 동작한다.** `dorangctl health --addr http://127.0.0.1:4100`을 호출하고, 그것이
+`/health/liveliness`를 프로브해 `200`이 아닌 모든 것에 대해 0이 아닌 값으로 종료한다. readiness가 아니라
+liveness인 것은 의도다: 드레인 중인 노드는 살아 있으며 재시작되면 안 되고([DESIGN.ko.md](DESIGN.ko.md) §13),
+둘을 혼동하면 graceful drain이 kill이 된다. readiness를 프로브하고 싶으면 `--ready`를 쓰고, `--addr`는
+`DORANG_LISTEN`에서 기본값을 가져오므로 리스너를 옮긴 이미지가 프로브까지 다시 쓸 필요는 없다.
+
+이것은 이미지가 존재한 기간 내내 깨져 있었다: `health` 서브커맨드가 아예 없어서 호출이
+`unknown command "health"`와 함께 2로 종료했고, 프로세스의 실제 상태와 무관하게
+`start-period + 3 × interval` 이후로 컨테이너가 unhealthy로 보고됐다. 이미지는 distroless라 `curl`도
+`wget`도 셸도 없으니 그 안의 무엇도 대신 프로브할 수 없었다. 이제 `cmd/dorangctl/health_test.go`가
+Dockerfile의 `HEALTHCHECK` 줄 자체를 읽어 그 인자를 진짜 디스패처에 먹인다. 결함은 두 반쪽 중 어느 하나가
+아니라 둘이 어긋나 있었다는 것이었기 때문이다.
+
+**`DORANG_STATE_DIR=/var/lib/dorang`은 읽힌다.** 실려 나가는 모든 state 경로는 `~/.dorang/…`으로 쓰여
+있고, 선행 `~`는 state 디렉터리로 해석된다: 데이터베이스, 트레이스 spool, batch blob, shadow 리포트,
+생성된 key pepper. 파일에 절대 경로를 쓰면 여전히 그쪽이 이긴다 — 그것은 기본값이 아니라 지시이고,
+그것을 조용히 다시 뿌리내리게 하는 것은 변수를 "의도적 선택을 우회하는 수단"으로 만드는 일이다.
+
+그 전에는 `~`가 서빙 사용자의 홈이었고 `nonroot`에서 그것은 `/home/nonroot`다: 선언된 볼륨 바깥,
+컨테이너의 쓰기 레이어 안, `docker rm`에 사라지는 자리. 눈에 보이는 손실은 데이터베이스였고, 비싼 손실은
+pepper였다 — pepper를 다시 생성하면 그 아래에서 발급된 모든 api 키가 검증 불가능해지기 때문이다.
+
+state를 볼륨이 아닌 곳에 두려면 그렇게 말할 것:
+
+```yaml
+storage: {driver: sqlite, sqlite: {path: /srv/dorang/dorang.db}}
+metering: {spool: {dir: /srv/dorang/spool}}
+```
 
 ### 1.3 Kubernetes 프로브
 
@@ -345,11 +368,11 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 
 | 경로 | 비고 |
 |---|---|
-| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | 크리덴셜 수명주기 전체. `/key/regenerate`는 유예 없이 옛 시크릿을 즉시 끊는다 — 사고 대응 경로다 |
+| `/key/generate`, `/key/info`, `/key/update`, `/key/delete`, `/key/list`, `/key/block`, `/key/unblock`, `/key/regenerate` | 크리덴셜 수명주기 전체. `/key/regenerate`는 유예 없이 옛 시크릿을 즉시 끊는다 — 사고 대응 경로다. **`spend`는 DESIGN §9.4의 키별 롤업**에서, 그 키 자신의 `budget_duration` 윈도에 대해 읽는다. 그래서 `/spend/logs`와 `/global/spend/report`가 보고하는 것과 같은 수치다. 예전에는 `api_keys.spend_nano`에서 왔는데, 그 컬럼은 임포터가 쓰고 요청 경로는 쓰지 않는다 — 원장과 응답 헤더와 리포트가 모두 다른 숫자에 합의하는 동안 **모든 키가 `"spend": 0`을 보고했다.** 내구 예산 카운터를 출처로 쓰지 않는 것도 의도다: 노드는 한 단위를 쓰기 전에 블록 전체를 그것에 부과하므로(§9.6) 설계상 현실보다 앞서 달린다. 아직 dorang 트래픽이 없는 키는 임포터가 쓴 값을 그대로 유지하므로, 이 배포가 자기 수치를 갖기 전까지는 임포트된 지출이 계속 보인다 |
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c 로테이션: 유예 기간을 둔 새 시크릿, 조기 컷, "클라이언트가 갈아탔는가"를 답하기 위한 목록. 키 id는 그대로이므로 예산·지출·허용 목록·원장 이력은 건드리지 않는다 |
 | `/key/pend`, `/key/release` | §11.6의 되돌릴 수 있는 거부. block과 구분된다 — pend는 틀릴 수 있는 통계적 판단이고 운영자가 한 동작으로 해제한다 |
 | `/spend/logs` | 요청별 원장. `key_id`, `team_id`, `trace_id`, `tag`, `errors_only` 중 하나와 유계 날짜 범위가 필요하다 — §9.3은 무계 스캔을 느리게 답하지 않고 거부한다 |
-| `/global/spend/report` | 유계 범위의 집계 지출. DESIGN §9.4의 롤업에서 읽는다. `group_by`는 `day`와 `model`·`key`·`team` 중 **하나**를 받는다 — 세 물질화가 실제로 가진 키다. §9.4는 큐브가 아니라 목적별 롤업을 두므로, 그 밖의 조합(`user`, `tag`, `provider`, 또는 주체 차원 둘 동시)은 테이블 스캔이 되는 대신 없는 것을 명시하며 **501**로 답한다. `notional_spend`는 `0`이 아니라 `null`로 보고된다: 롤업에 리스트 요율 컬럼이 없고 §8.5가 유리한 답을 금지한다 |
+| `/global/spend/report` | 유계 범위의 집계 지출. DESIGN §9.4의 롤업에서 읽는다. `group_by`는 `day`와 `model`·`key`·`team` 중 **하나**를 받는다 — 세 물질화가 실제로 가진 키다. §9.4는 큐브가 아니라 목적별 롤업을 두므로, 그 밖의 조합(`user`, `tag`, `provider`, 또는 주체 차원 둘 동시)은 테이블 스캔이 되는 대신 없는 것을 명시하며 **501**로 답한다. `notional_spend`는 `0`이 아니라 `null`로 보고된다: 롤업에 리스트 요율 컬럼이 없고 DESIGN §8.5가 유리한 답을 금지한다. `marginal_spend`와 `subscription_spend`는 각자의 컬럼에서 읽으며 `/spend/logs`와 행 단위로 일치한다 — 예전에는 `cost_nano`를 두 번 보고한 것이어서, 운영자가 모델을 비교하는 그 리포트에서 정액제 요금의 몫이 marginal 사용량으로 집계됐다. 그 컬럼들이 생기기 전에 기록된 행은 둘 다 `0`으로 보고한다. 분해가 애초에 기록되지 않았고 그것을 복원할 근거가 없기 때문이다 |
 | `/admin/capacity` | 축별 브로커 점유 현황 |
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | 카탈로그 모델 필드의 출처 |
 | `/health/history` | 인프로세스 링. 재시작할 때마다 비어 있는 상태로 시작한다 |
@@ -413,8 +436,34 @@ authenticator는 명시적 opt-out이 없는 한 그것 없이 구성을 거부�
 
 모든 참조가 로드 시 이름으로 검사되므로 순서가 중요하다.
 
-**1. 프로바이더 선언.** **2. capacity 그룹 선언** — 아니면 프로바이더 참조가 거부된다. **3. 크리덴셜
-선언** — 비밀값은 참조로, 환경 변수는 실제로 설정.
+**1. 프로바이더 선언.**
+
+```yaml
+providers:
+  - name: cloud-b
+    kind: anthropic
+    base_url: https://api.example-cloud-b.invalid
+    timeout: 180s
+    max_concurrency: 12
+    capacity_group: cloud-b-pool
+```
+
+**2. capacity 그룹 선언** — 아니면 프로바이더 참조가 거부된다:
+
+```yaml
+capacity:
+  provider_groups: {cloud-b-pool: {max_concurrency: 12}}
+```
+
+**3. 크리덴셜 선언** — 비밀값은 참조로 두고, 환경 변수는 실제로 설정할 것:
+
+```yaml
+credentials:
+  - {id: cloud-b-1, provider: cloud-b, key_env: CLOUD_B_KEY_1, capacity_group: cloud-b-acct}
+
+capacity:
+  credential_groups: {cloud-b-acct: {max_concurrency: 6}}
+```
 
 **4. 라우팅하기 전에 카탈로그가 그 모델을 어떻게 아는지 확인:**
 
@@ -432,7 +481,19 @@ dorangctl catalog unverified
 한 모델 버전에서 관측한 effort 스케일을 패밀리 전체로 일반화하는 것이 그 패밀리의 다른 멤버들에서 제어를
 조용히 떨어뜨리는 정확한 경로다.
 
-**5. 배포 추가.** **6. 가격 매기기** — 아니면 무료로 라우팅된다. 가격 없는 모델은 라우팅에서 *의견 없음*
+**5. 배포 추가** — 새 그룹에 넣거나, 기존 그룹의 두 번째 후보로 넣는다:
+
+```yaml
+models:
+  - name: model-x
+    class: chat-large
+    strategy: [prefix_sticky, lowest_cost, least_busy]
+    deployments:
+      - {provider: plan-a,  upstream_model: model-x, credentials: [plan-a-1], weight: 10, priority: 0}
+      - {provider: cloud-b, upstream_model: my-model-name, credentials: [cloud-b-1], weight: 5, priority: 1}
+```
+
+**6. 가격 매기기** — 아니면 무료로 라우팅된다. 가격 없는 모델은 라우팅에서 *의견 없음*
 이지 가장 싼 것이 아니지만, 동시에 0원이 아니라 UNPRICED로 기록된다:
 
 ```
@@ -499,8 +560,26 @@ dorang은 엔진을 튜닝하지 않고, 빠진 플래그를 게이트웨이가 
 라이브러리가 아니라 직접 작성한 것이다 — 노트북 티어에는 필수 의존성이 없고 거기에 메트릭 라이브러리도
 포함된다.
 
-⚠️ **`/metrics`는 인증이 없고 `observability.prometheus: false`로 끄지 못한다.** 그 설정 키는 절대 읽히지
-않는다. 포트에 닿을 수 있으면 스크레이프에도 닿는다. 네트워크 경계 뒤에 둘 것.
+**`/metrics`는 인증한다.** `observability.metrics.public: true`가 달리 말하지 않는 한 master 크리덴셜
+(또는 admin 키)이 필요하고, `observability.prometheus: false`는 라우트를 통째로 없앤다 — 그러면 이 빌드가
+서빙하지 않는 다른 모든 라우트와 마찬가지로 사유가 담긴 501로 답한다. 둘 다 전에는 읽히지 않았다:
+스크레이프는 키별 지출, 크리덴셜별 쿼터 상태, 설정된 모든 모델 이름을, 게이트웨이가 리슨하는 바로 그
+포트 위에 싣는다.
+
+따라서 스크레이프 설정에는 크리덴셜이 필요하다:
+
+```yaml
+scrape_configs:
+  - job_name: dorang
+    authorization: {type: Bearer, credentials_file: /etc/prometheus/dorang-master-key}
+    static_configs: [{targets: ["dorang:4100"]}]
+```
+
+인증이 붙었다고 해서 노출 자체가 없어지지는 않는다. 포트에 닿을 수 있는 쪽은 스크레이프를 시도할 수 있으니
+네트워크 경계 뒤에도 둘 것. (이 문단은 `observability.prometheus`가 배선되기 전까지 "그 설정 키는 절대
+읽히지 않는다"라고 적혀 있었다. 지금은 두 키 모두 읽힌다 — `internal/app/metrics.go`의 `metricsAccess`가
+`prometheus: false`를 `MetricsOff`로, `metrics.public: true`를 `MetricsPublic`으로 렌더링하고, 기본값은
+`MetricsAdmin`이다.)
 
 ⚠️ **모든 메트릭은 호출자별 라벨이 없다.** 경로별·모델별·키별 라벨이 어디에도 없으며 의도적이다: 축 키와
 모델 이름은 무한 카디널리티이고, 클라이언트가 라벨 값을 만들게 하는 게이트웨이는 자기 메트릭 레지스트리에
@@ -520,7 +599,7 @@ dorang은 엔진을 튜닝하지 않고, 빠진 플래그를 게이트웨이가 
 | `dorang_late_errors_total` | counter | 응답이 이미 시작돼 **인밴드**로 전달된 에러 |
 | `dorang_handler_panics_total` | counter | 핸들러에서 복구된 panic |
 | `dorang_meter_panics_total` | counter | meter에서 복구된 panic; 요청에는 영향 없음 |
-| `dorang_passthrough_requests_total` | counter | ⚠️ 이 빌드에 증가 지점이 없다; 항상 0 |
+| `dorang_passthrough_requests_total` | counter | 범용 패스스루 엔진이 서빙한 요청. 진입 시점에 센다 — 업스트림에 dial하지 못한 중계도 세어진다 |
 | `dorang_websocket_upgrades_total` | counter | 중계된 WebSocket 업그레이드 |
 | `dorang_replay_refused_total` | counter | 프로세스 전역 재생 예산이 가득 차 non-replayable로 표시된 요청 |
 | `dorang_body_too_large_total` | counter | 본문 상한 초과로 거부된 요청 |
@@ -637,17 +716,36 @@ shadow가 켜져 있으면 본문이 게이트 판정을 담은 `"shadow"` 객�
 | 작업 드롭 | `increase(dorang_shadow_dropped_total[1h]) > 0` | shadow 큐가 가득 차 작업이 버려졌다. 리포트로는 볼 수 없는 커버리지 구멍이 있다 | `queue_size`나 `workers`를 올리거나 `sample_rate`를 낮출 것 |
 | 리포트 절단 | `increase(dorang_shadow_report_dropped_total[1h]) > 0` | 리포트가 바이트 상한에 도달. **잘린 리포트를 빈 리포트로 읽는 것이 이 메커니즘 최악의 결과다** | `report.max_bytes`를 올리고 파일을 회전한 뒤 다시 돌릴 것 |
 
-### 7.4 이 빌드에서 알람을 걸 수 없는 것
+### 7.4 계측 degradation
 
-⚠️ **계측 degradation 신호가 없다.** meter는 `trace_queue_full`, `spool_full`, `spool_error`,
-`sink_error` 네 사유를 flapping하지 않도록 히스테리시스와 함께 추적하고, **아무것도 그것을 읽지 않는다**:
-메트릭도, health 필드도, 로그 기반 카운터도 없다. 설계의 "드롭은 절대 조용하지 않다"는 이 빌드에서 참이
-아니다. 연결되기 전까지는 spool 디렉터리 크기와 스토어 자체의 상태를 대신 볼 것이며, §11.4를 알람이 아니라
-진단 절차로 다룰 것.
+meter는 여섯 개의 degradation 사유 — `trace_queue_full`, `spool_full`, `spool_error`, `sink_error`,
+`meter_closed`, `none` — 를 히스테리시스와 함께 추적하므로, 꾸준한 드롭률이 신호를 flapping시키지
+못한다. 그중 다섯은 §12.1의 **버릴 수 있는** 트레이스 쪽 이야기다. `meter_closed`만이 그렇지 않고,
+그것이 수치 경로가 카운트를 잃을 수 있는 유일한 길이다. 두 곳에서 읽을 수 있다:
 
-축별 capacity 점유율, 크리덴셜 상태, 프로바이더 쿼터 퍼센트, 예산 소비율, prefix 적중률, 사유별 폴백에
-대한 export 메트릭도 없다. 그 상태는 capacity broker, health tracker, prefix 테이블, cluster 노드에
-존재하고, 어느 것도 `/metrics`에 도달하지 않으며, 그것을 노출할 관리 API는 마운트돼 있지 않다(§0.2).
+| 어디서 | 무엇 |
+|---|---|
+| `dorang_metering_degraded` / `dorang_metering_degraded_reason{reason=…}` | 게이지와 그 상태 집합. 샘플링과 일일 바이트 예산은 이것들을 절대 세우지 않는다: 그 둘은 정책이고, 정책을 실패와 뭉뚱그리면 샘플링하는 모든 배포에서 신호가 쓸모없어진다 |
+| `GET /health` → `"metering"` | `{"degraded":…,"reason":…,"dropped":…,"spool_bytes":…}`. degraded일 때만이 아니라 모든 응답에 실린다 — 그러지 않으면 "degraded 아님"과 "이 빌드는 그것을 보고하지 않음"이 똑같아 보인다 |
+
+| 알람 | 식 | 이유 |
+|---|---|---|
+| 계측 degraded | `dorang_metering_degraded == 1` | 트레이스 페이로드가 유실되고 있거나 shipping에 실패하고 있다. 수치 회계는 영향받지 않으므로(§12.1) 청구서는 여전히 맞고 그 뒤의 트레이스만 틀리다 |
+| 종료 시 카운트 유실 | `increase(dorang_meter_records_refused_closed_total[1h]) > 0` | **meter가 닫힌 뒤에** 끝난 요청이 거부됐다 — 수치 경로가 카운트를 잃는 유일한 조건이므로, 그 요청들의 청구는 근사한 것이 아니라 아예 빠진다. `dorang_metering_degraded_reason{reason="meter_closed"}`를 세운다. 창은 종료 구간, 즉 드레인이 meter 자신의 close와 경합하는 지점이다: `server.shutdown_grace`를 p99 요청보다 길게 잡고, 두 번째 SIGTERM이 드레인을 잘라먹고 있지는 않은지 확인할 것 |
+
+이것은 health 상태 코드를 절대 바꾸지 않는다. 트레이스 페이로드 유실은 서빙 실패가 아니라 데이터 품질
+실패이고, 그것 때문에 pod를 rotation에서 빼면 계측 사고가 장애가 된다.
+
+> **이 절은 2026-07-29까지 "이 빌드에서 알람을 걸 수 없는 것"이었고**, meter가 네 사유를 추적하지만
+> **아무것도 그것을 읽지 않는다** — 메트릭도, health 필드도 없다 — 고 적혀 있었다. 그것은 그때 참이었다.
+> 지금은 게이지와 그 사유 집합, health의 `"metering"` 객체, 그리고 `meter_closed`라는 다섯 번째 사유가
+> 모두 있다. 부재 주장이 가장 먼저 만료되는 주장이라는 이 문서의 경고가 자기 자신에게 적용된 자리다.
+
+### 7.5 크리덴셜 조회 상한
+
+| 알람 | 식 | 의미 | 조치 |
+|---|---|---|---|
+| 크리덴셜 조회가 throttle됨 | `rate(dorang_auth_lookup_throttled_total[5m]) > 0` | 미지의 키 예산(`auth.miss_budget`)이 비어서, **스토어를 조회하지도 않은 채** 요청이 `503 auth_unavailable`로 거부됐다. 미지의 인덱스 키는 정체성을 싣지 않으므로 dorang은 공격자의 첫 miss와 정상 호출자의 miss를 구별할 수 없고, 구별하는 척도 하지 않는다: 거부는 401이 아니라 재시도 가능한 503이다 | `dorang_auth_store_calls_total`과 나란히 읽을 것. **이쪽이 오르는 동안 저쪽이 평평한 것이 상한이 버티고 있다는 뜻이다** — miss 폭풍이 데이터베이스에 아무 비용도 물리지 않고 있고, 그것이 이 장치의 전부다. 공격이 없는데도 지속된다면 예산이 그 배포의 실제 "찾아도 없는 조회" 발생률보다 낮은 것이다: 폐기된 키를 재시도하는 클라이언트이거나, 스토어에서 모든 키를 읽는 차가운 fleet이다. `auth.miss_budget.rate`를 올리고, 기동 스파이크라면 `.burst`를 올릴 것 |
 
 ---
 
@@ -707,6 +805,42 @@ dorangctl key list --config /etc/dorang/config.yaml | head
 `credential_state.unavailable_until`은 저장된 장애다: 한 달 된 백업을 복구하면 크리덴셜이 아무 관련 없는
 날짜까지 unavailable로 표시된 채 돌아올 수 있다. 오래된 백업을 복구한 뒤 `credential_state`를 확인하고, 다른
 시대의 타임스탬프를 믿기보다 쿨다운을 리셋하는 쪽을 택할 것.
+
+### 8.5 데이터베이스가 필요한 테스트 돌리기
+
+dorang 스위트의 대부분은 외부 서비스 없이 `go test`로 돈다. 의도된 것이다: DESIGN §0.2의 노트북 티어에는
+의존성이 없으니, 그것이 동작함을 증명하는 쪽에도 의존성이 없어야 한다. 진짜 PostgreSQL에 대해서만 보일 수
+있는 것 — 마이그레이션 집합, 파티션된 원장의 쿼리 플랜, advisory-lock 선출, 그리고 §10.1이 숫자를 공표하는
+두 노드 동작 — 은 `integration` 빌드 태그 뒤에 있고 데이터베이스를 필요로 한다.
+
+```
+make deps-up          # docker compose: PostgreSQL 55432, Redis 56379
+make test-integration
+make deps-down        # -v가 붙어 있어 스크래치 데이터도 함께 사라진다
+```
+
+`deps-up`은 `deploy/docker-compose.test.yml`을 쓰고, 그 PostgreSQL은 데이터를 `tmpfs`에 둔다: 버리기
+위한 스크래치 데이터베이스다. 무언가를 서빙하는 데이터베이스를 건드리지 않으며, 그쪽으로 겨누어서도 안 된다.
+
+데이터베이스가 없어도 같은 명령이 그대로 통과한다 — 태그 뒤의 모든 테스트가 `DORANG_TEST_PG`를 읽고 그것이
+미설정이면 skip하므로, Docker가 없는 기여자는 연결 에러 더미가 아니라 초록색 결과를 받는다. 위의 두 명령을
+**짝으로** 돌려보고 나서 믿을 가치가 있는 이유가 바로 그것이다: 조용히 skip한 스위트와 실제로 통과한
+스위트는 종료 코드만 봐서는 구별되지 않는다.
+
+이미 가지고 있는 데이터베이스를 가리키려면 변수를 직접 설정할 것:
+
+```
+DORANG_TEST_PG='postgres://user:pass@host:5432/scratch?sslmode=disable' \
+  go test -tags=integration -count=1 ./...
+```
+
+각 테스트는 자기 스키마(`t_…` 또는 `n_…`)를 만들고 나가면서 드롭하므로, 스위트를 한 데이터베이스에 대해
+반복해서 돌려도 안전하고 여러 사본이 한 서버에 대해 동시에 돌 수도 있다. 그래도 쓰기는 한다: 스크래치
+데이터베이스를 쓸 것.
+
+`cmd/dorang`의 두 노드 테스트는 진짜 게이트웨이 프로세스를 띄우고 `127.0.0.1`의 임시 포트에 바인드한다.
+`TestKilledNodeLeasesAreReclaimed`는 설계상 60초 리스 TTL을 실제로 기다리며, 그 패키지가 몇 분 걸리는
+이유다.
 
 ---
 
@@ -809,6 +943,34 @@ terminationGracePeriodSeconds: 80       # pre_stop_delay + 2 × shutdown_grace +
 재분배 — 이 리더가 떠날 때 선출로 옮겨간다. 리스와 예약은 드레인의 일부로 반환된다. `cluster.node_id`가
 안정적인 노드는 재시작 시 만료를 기다리는 대신 자기 리스를 회수하며, 그것이 CONFIG §4가 그 설정을 다루는
 이유다.
+
+### 10.1 두 노드가 하는 일의 측정값
+
+DESIGN §13은 메커니즘을 진술하고, 지금까지 숫자는 없었다: fleet 크기를 잡거나 사고 런북을 쓰는 운영자에게
+있는 것은 형용사뿐이었다. 아래는 하나의 PostgreSQL에 대해 두 개의 `dorang` 프로세스로, 진짜 시계와 진짜
+네트워크 왕복 위에서 측정한 값이다 — 한 프로세스 안에 주입한 시계로 잰 것이 아니다. 재현 방법은 §8.5.
+
+| 사건 | 측정값 | 산술 |
+|---|---|---|
+| 콜드 상태에서 리더가 선출된다 | **5.0 s** | 틱 하나(`cluster` 틱, 5 s) |
+| 리더가 정확히 하나, 15초 동안 250 ms마다 샘플링 | **리스 행 1, 홀더 1** | `axis = 'leader'`인 `capacity_leases` 한 행 |
+| **SIGKILL**당한 노드의 쿼터·예산 리스가 fleet으로 돌아온다 | **65–70 s** | 원장 리스 TTL(60 s) + 리더 틱 최대 두 번(각 5 s) |
+| 발급하지 않은 노드에까지 폐기가 도달한다 | **9–15 ms** | `auth.revocation.poll + store_latency`; `poll: 20ms`에서 공표 상한은 270 ms |
+| 예산 상한이 두 노드에 걸쳐 지켜진다 | **초과 0** | 상한 40에 대해 39 admit, 양쪽에서 동시에 구동 |
+| 두 노드의 롤링 재시작 | **유실 0**, 각 ~200,000 요청의 네 차례 실행에 걸쳐 | 위 §10의 `pre_stop_delay`와 함께 |
+
+**회수 수치는 30초가 아니라 65–70초이고, 그 차이가 중요하다.** 레지스트리는 30초 하트비트 TTL이 지나면
+노드를 죽은 것으로 선언하지만, 회수는 거기서 **자기 자신이 만료되지 않은 리스를 가져가기를 의도적으로
+거부한다**: 끊긴 하트비트는 선언이고 만료된 리스는 사실이며, 살아 있는 노드의 블록을 회수하는 것이 두 노드
+클러스터가 한때 상한 100에 대해 190을 admit했던 경로다. 그래서 죽은 노드의 단위는 **리스** 시계 위에서,
+그리고 만료 시점이 아니라 리더 자신의 틱 위상이 잡는 sweep 위에서 돌아온다 — 두 번째 틱이 거기서 나온다.
+죽은 노드의 예산이 풀리기를 기다리는 중이라면 30초가 아니라 70초를 기다릴 것. 노드 하나를 잃는 상황에 대비해
+여유를 잡는 중이라면, 한 노드의 리스를 아무도 쥐지 않은 채로 1분이 흐르는 것을 기준으로 잡을 것.
+
+**`shared-pg`가 공표하는 초과분은 0이고, 그 0은 모든 홀더가 자기 리스를 갱신하는 동안 성립한다.** 한 번의
+누락 — 너무 짧게 잡은 TTL, 창을 놓친 스토어 쓰기, 일시 정지에 삼켜진 하트비트 — 은 상한 전체만큼을 더한다.
+카운터가 *살아 있는* 리스 행들의 합이기 때문이다. 위의 회수와 같은 메커니즘을 반대로 겨눈 것이다: 감독자
+없이도 죽은 홀더의 단위가 돌아오게 만드는 바로 그것이, 갱신이 늦은 살아 있는 홀더의 단위도 돌아오게 만든다.
 
 안정적인 id는 **구별되는** id여야 한다. 하나의 `cluster.node_id`를 쓰는 두 프로세스는 레지스트리에도,
 리더십 리스에도, 리스된 모든 상한에도 하나의 노드이며, 그러면 리더 전용 작업이 양쪽에서 전부 돈다 —
@@ -918,7 +1080,8 @@ effective_used = max( provider_reported_used ,
 스토어는 요청당이 아니라 블록당 쓰기를 본다 — 요청 400건에 스토어 쓰기 5회로 측정됐다.
 
 **graceful** 정지는 모든 블록의 쓰이지 않은 부분을 반환하므로 계획된 재시작이 정확하다. **크래시**는 그러지
-않고, 반환되지 않은 나머지가 부과된다. 그것이 공표된 초과분이며 블록 크기로 제한된다: 기본 블록은 $0.05다.
+않고, 반환되지 않은 나머지가 부과된다. 그것이 공표된 초과분이며 블록 크기로 제한된다:
+`DefaultBudgetBlockNanoUSD`는 블록당 $0.05다.
 
 재시작 후 예산이 예상보다 낮게 읽히면:
 
@@ -943,11 +1106,10 @@ effective_used = max( provider_reported_used ,
 | 증상 | 설명 |
 |---|---|
 | 이전이나 복구 후 모든 키가 인증에 실패 | pepper 불일치(§2.3, §8.4). 키 행은 있고 다이제스트가 다른 pepper로 계산됐다 |
-| 폐기한 키가 아직 동작 | 크리덴셜이 캐시된다. 엔트리 TTL 이내나 `SIGHUP`에 해소된다 |
+| 폐기한 키가 아직 동작 | 크리덴셜이 캐시된다. 엔트리 TTL(60초) 이내나 `SIGHUP`에 해소된다 — §3.1 |
 | 리로드가 "아무것도 안 했다" | 아마 성공했고 재구성 가능한 것만 재구성했다. 스토어, authenticator, meter, capacity broker는 리로드로 교체되지 **않는다** — 재시작이 필요하다 |
 | shadow 설정 변경이 무시됨 | 올바르다. `shadow:`는 핫 리로드를 거부하는 유일한 절이다. 재구성이 일일 비용 상한을 재무장시키기 때문 |
 | 패스스루 프리픽스가 501 | 그 프로바이더에 `base_url`이 없어 라우트가 빌드 시점에 삭제됐다 |
-| `observability.prometheus: false`를 설정해도 `/metrics`가 계속 서빙 | 그 키는 절대 읽히지 않는다(§12) |
 | 모델이 엉뚱한 배포로 라우팅되는데 결정 헤더는 맞아 보인다 | 과거에 정확히 이 형태가 있었다: pinned와 쿼터 필터된 후보 리스트가 하나의 공유 버퍼에서 잘려 나와, 모든 후보가 마지막 것의 프로바이더를 실었고 예약이 다른 배포의 축에 착지하면서 **결정은 올바른 정체성을 보고했다.** 결정에 대한 어떤 단언도 그것을 관측할 수 없다. 보이면 `X-Dorang-Deployment`와 capacity 스냅샷을 함께 확보할 것 |
 | 두 축이 계속 바쁜 채로 다축 요청이 영원히 대기 | 리스크 W8, 열려 있음. 포화된 두 축이 필요한 대기자가 두 큐의 head에 앉은 채 둘이 동시에 비는 순간을 만나지 못할 수 있다. aging이 닫을 수 없다 — 대기자는 추월당하지 않고 그저 이기지 못한다. 두 축 중 하나를 넓힐 것 |
 
@@ -959,7 +1121,7 @@ effective_used = max( provider_reported_used ,
 
 | 영역 | 상태 |
 |---|---|
-| **HTTP 관리** | 마운트됨(§3.1–3.3). 키, `/spend/logs`, capacity, catalog, health history, `/ui`는 서빙된다. 사용자·팀·배포·예산과 집계 지출 리포트는 `internal/store`에 해당 테이블 코드가 없어 `501 dependency_not_configured`로 답한다. 그것들은 `dorangctl`을 쓸 것 |
+| **HTTP 관리** | 마운트됨(§3.1–3.3). 로테이션과 pend를 포함한 크리덴셜 수명주기 전체, `/spend/logs`, capacity, catalog, health history, `/ui`는 서빙된다. 사용자·팀·배포·예산과 집계 지출 리포트는 `internal/store`에 해당 테이블 코드가 없어 `501 dependency_not_configured`로 답한다. 그것들은 `dorangctl`을 쓸 것 |
 | **감사 기록 조회** | `audit_logs`는 모든 관리 변경이 기록하지만 `/audit/list`는 이름이 붙은 501이다. 테이블을 직접 조회할 것 |
 | `observability.otlp_endpoint` | exporter가 연결돼 있지 않다. 지연 내역은 기록되고 export되지 않는다 |
 | `capacity.*.rpm`, `.tpm` | **로드 시 거부**되며, 동작하는 자리를 이름으로 알려준다: 배포별 rate는 `deployments[].limits[]`, 호출자별 rate는 api 키 자신의 `rpm_limit`/`tpm_limit` |
@@ -971,7 +1133,7 @@ effective_used = max( provider_reported_used ,
 | 기존 데이터베이스로부터의 크리덴셜 임포트 | `dorangctl import keys --from <dsn>`. 기본은 보고, `--commit` 으로 기록 — [MIGRATION.ko.md](MIGRATION.ko.md) §3.5. ⚠️ **이 행은 2026-07-29까지 "CLI 진입점이 없다"였고 사실이었다** |
 | prefix / cluster 메트릭 | 상태는 존재하고 아무것도 export하지 않는다. capacity와 health는 `/admin/capacity`, `/health/history`에서 읽을 수 있다 |
 | `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. ⚠️ **`providers[].usage_probe`는 2026-07-29에 이 행에서 빠졌다** — 배선되었다(§6.2). `providers[].metrics`도 빠졌고, 반대 방향이다: 로드에서 거부된다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
-| **백엔드 메트릭 스크레이핑** | 스크레이퍼가 없다. `providers[].metrics.enabled`와 `.endpoint`는 검증되고 아무것도 읽지 않으므로, §12.4의 `least_busy`·`highest_tps`용 큐 깊이·캐시 사용률 신호에는 수집기가 없다. 신규 행: 그 전까지는 "폴링 간격만 읽히지 않는다"로 축소돼 있었다 |
+| **백엔드 메트릭 스크레이핑** | 스크레이퍼가 없고, `providers[].metrics`는 이제 받아들여진 뒤 무시되는 것이 아니라 **로드에서 거부된다**. §12.4의 큐 깊이·캐시 사용률 신호에는 수집기가 없다. dorang 바깥에서도 트래픽을 받는 self-hosted 백엔드를 돌리는 경우가 아니라면 이것은 아무 대가도 물리지 않는다: `least_busy`는 dorang 자신의 실시간 capacity 점유로, `highest_tps`는 측정된 초당 출력 토큰으로 순위를 매기며 둘 다 폴이 필요 없다 — `models[].strategy`에 이름을 적을 것. [CONFIG.ko.md](CONFIG.ko.md) §6.2. ⚠️ 이 간극은 전에 "폴링 간격만 읽히지 않는다"로 축소돼 있었다 |
 
 ---
 

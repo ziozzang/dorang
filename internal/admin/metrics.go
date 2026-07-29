@@ -22,6 +22,14 @@ type Metrics struct {
 	// means the trail is incomplete, which is an operational fact rather than a
 	// transient failure.
 	auditFailures atomic.Uint64
+	// invalidations counts changes announced to the rest of the fleet, and
+	// invalidationFailures the ones that were applied and could not be
+	// announced. The second is the number that matters: a deployment where it
+	// is non-zero is a deployment whose revocations are landing on the
+	// credential cache TTL rather than within the published bound, and that has
+	// to be visible rather than inferred.
+	invalidations        atomic.Uint64
+	invalidationFailures atomic.Uint64
 	// keysIssued counts credentials minted. The secret is returned once; this
 	// counter is the only lasting trace of the count.
 	keysIssued atomic.Uint64
@@ -37,27 +45,35 @@ type Metrics struct {
 
 // MetricsSnapshot is a consistent-enough read of [Metrics] for export.
 type MetricsSnapshot struct {
-	Requests        uint64
-	UIRequests      uint64
-	AuthFailures    uint64
-	Unimplemented   uint64
-	ServerErrors    uint64
-	Mutations       uint64
-	AuditFailures   uint64
-	KeysIssued      uint64
-	RangeRefusals   uint64
-	NotionalMissing uint64
+	Requests      uint64
+	UIRequests    uint64
+	AuthFailures  uint64
+	Unimplemented uint64
+	ServerErrors  uint64
+	Mutations     uint64
+	AuditFailures uint64
+	Invalidations uint64
+	// InvalidationFailures counts mutations that were applied and could not be
+	// announced, so the fleet is converging on the credential cache TTL.
+	InvalidationFailures uint64
+	KeysIssued           uint64
+	RangeRefusals        uint64
+	NotionalMissing      uint64
 }
 
 func (m *Metrics) snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
-		Requests:        m.requests.Load(),
-		UIRequests:      m.uiRequests.Load(),
-		AuthFailures:    m.authFailures.Load(),
-		Unimplemented:   m.unimplemented.Load(),
-		ServerErrors:    m.serverErrors.Load(),
-		Mutations:       m.mutations.Load(),
-		AuditFailures:   m.auditFailures.Load(),
+		Requests:      m.requests.Load(),
+		UIRequests:    m.uiRequests.Load(),
+		AuthFailures:  m.authFailures.Load(),
+		Unimplemented: m.unimplemented.Load(),
+		ServerErrors:  m.serverErrors.Load(),
+		Mutations:     m.mutations.Load(),
+		AuditFailures: m.auditFailures.Load(),
+
+		Invalidations:        m.invalidations.Load(),
+		InvalidationFailures: m.invalidationFailures.Load(),
+
 		KeysIssued:      m.keysIssued.Load(),
 		RangeRefusals:   m.rangeRefusals.Load(),
 		NotionalMissing: m.notionalMissing.Load(),

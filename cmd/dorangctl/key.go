@@ -219,20 +219,35 @@ func (e env) keyRevoke(args []string) int {
 	if _, err := st.GetAPIKey(ctx, rest[0]); err != nil {
 		return e.fail("%v", err)
 	}
-	q := `UPDATE api_keys SET blocked = ?, updated_at = ? WHERE id = ?`
-	if st.Driver() == store.DialectPostgres {
-		q = `UPDATE api_keys SET blocked = $1, updated_at = $2 WHERE id = $3`
-	}
-	res, err := st.DB().ExecContext(ctx, q, true, store.Micros(time.Now()), rest[0])
+	// [store.Store.RevokeKey], not a hand-written UPDATE. This used to reach for
+	// st.DB() and write `blocked = 1` itself, which made it a FOURTH place that
+	// knew how to stop a key serving, and — the part that mattered — a place
+	// that could not publish the change because it did not have the index keys
+	// the invalidation names. RevokeKey returns them.
+	lookups, err := st.RevokeKey(ctx, rest[0])
 	if err != nil {
 		return e.fail("%v", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return e.fail("no key with id %s", rest[0])
+
+	// The revocation is PUBLISHED, so a running fleet honours it within
+	// `auth.revocation.poll` plus one store round trip (DESIGN §11.2c) rather
+	// than when each node's credential cache happens to expire. This process has
+	// no snapshot of its own to drop — it is a CLI, not a gateway — so the
+	// durable message is the whole of its half, and the failure is reported
+	// rather than swallowed: the block is durable either way, and an operator
+	// who is told nothing would assume the fast path took.
+	if _, err := st.PublishInvalidation(ctx, store.KeyInvalidation{
+		KeyID: rest[0], Lookups: lookups, Cause: "revoked", CreatedAt: time.Now(),
+	}); err != nil {
+		fmt.Fprintf(e.stdout, "key %s revoked\n", rest[0])
+		fmt.Fprintf(e.stderr, "the key is blocked, but the invalidation could not be published "+
+			"(%v); a running gateway will pick it up when its credential cache expires "+
+			"(auth.revocation.entry_ttl) or on SIGHUP\n", err)
+		return 1
 	}
 	fmt.Fprintf(e.stdout, "key %s revoked\n", rest[0])
-	fmt.Fprintln(e.stderr, "a running gateway caches credentials; it picks this up "+
-		"within the configured entry TTL or on the next reload")
+	fmt.Fprintln(e.stderr, "published; a running gateway stops serving this key within "+
+		"auth.revocation.poll plus one store round trip")
 	return 0
 }
 

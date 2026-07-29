@@ -10,6 +10,7 @@ import (
 	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/capacity"
+	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/server"
@@ -186,6 +187,14 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		Ledger: &adminLedger{st: a.Store},
 		Spend:  &adminSpendReporter{st: a.Store, now: a.now},
 
+		// The invalidation half of DESIGN §11.2c. Without it every credential
+		// mutation on this surface — block first among them — was a durable
+		// write the fleet honoured when its snapshot next refreshed, 60 s later
+		// on every node that did not serve the call. cluster.KeyControl already
+		// published for the five controls it owns; this is the same publication
+		// for the lifecycle internal/admin owns.
+		Invalidator: adminInvalidatorOrNil(a.KeyControl),
+
 		Capacity: &adminCapacityReporter{b: a.Broker},
 		Catalog:  &adminCatalog{c: a.Catalog},
 		Pricing:  &adminPricer{d: a.dispatch},
@@ -203,6 +212,16 @@ func adminHasherOrNil(h *auth.Hasher) admin.Hasher {
 		return nil
 	}
 	return &adminHasher{h: h}
+}
+
+// adminInvalidatorOrNil does the same for the key controls, for the same reason:
+// a typed nil behind admin.Invalidator would turn "no invalidation path is
+// configured" from a skipped call into a panic on the incident route.
+func adminInvalidatorOrNil(c *cluster.KeyControl) admin.Invalidator {
+	if c == nil {
+		return nil
+	}
+	return c
 }
 
 // ---------------------------------------------------------------------------
