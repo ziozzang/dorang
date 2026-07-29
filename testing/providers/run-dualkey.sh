@@ -3,7 +3,7 @@
 #
 #   ./run-dualkey.sh
 #
-# It spends nothing: the only upstream is deploy/providers/fake_upstream.py.
+# It spends nothing: the only upstream is testing/providers/fake_upstream.py.
 # The two "credentials" are 32 random bytes generated here, exported by name,
 # and never written to a file. Nothing in this directory contains a secret.
 set -euo pipefail

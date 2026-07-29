@@ -1167,7 +1167,7 @@ not price separately.
 >
 > What let it survive two clean parity runs and a clean cutover is worth more than the fix:
 > **neither harness declared a price**, so every run compared zero against zero. The harness
-> configurations under `deploy/litellm-parity/` now price, and the assertion is against a
+> configurations under `testing/parity/` now price, and the assertion is against a
 > hand-computed vendor figure rather than against another dorang function — a test that
 > compares two internal functions cannot catch a convention error, because both of them agreed.
 

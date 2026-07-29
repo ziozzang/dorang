@@ -12,7 +12,7 @@
 #   1. `providers[].base_url` is a literal string. Environment expansion works
 #      for secret fields (`key_env` / `key_file`) and nowhere else, so a base
 #      URL that must come from the environment cannot be written here. That is
-#      gap G1, established by deploy/litellm-parity.
+#      gap G1, established by testing/parity.
 #   2. Repository policy: no file here may contain a value taken from the
 #      operator's environment file. Several of these hosts are perfectly public
 #      but are *stated* in that file, so they are substituted rather than
