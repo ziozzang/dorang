@@ -342,9 +342,14 @@ func (d *dispatcher) rowCost(st *dispatchState, dec *router.Decision,
 		CacheWriteTokens: int64(usage.CacheWriteTokens),
 		ReasoningTokens:  int64(usage.ReasoningTokens),
 		Requests:         1,
+		AudioSeconds:     usage.AudioSeconds,
+		Billed:           billedUnit(usage.Billed),
 		At:               now,
 	})
-	if err != nil || cost.Missing {
+	// A rule that matched and could not price this row is unpriced for the same
+	// reason no rule at all is: the hold settles at what the row cost, and a
+	// figure produced from a quantity the vendor did not bill in is not that.
+	if err != nil || cost.Missing || cost.NoPrice != pricing.NoPriceNone {
 		return 0
 	}
 	return cost.TotalNano

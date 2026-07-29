@@ -303,26 +303,37 @@ func TestNoFloatInPricePath(t *testing.T) {
 	if checked < 5 {
 		t.Fatalf("only %d source files were checked; the test is not reading the package", checked)
 	}
-	// types.go is allowed the Request.Seconds declaration and its doc comment, no more.
+	// types.go is allowed the two MEASURED-DURATION fields and their doc comments, no
+	// more. There are two rather than one because wall time and recorded audio are two
+	// billable quantities that share a word (§10.7); the guard names both, so a third
+	// float arriving in this file still has to be argued for.
 	src, err := os.ReadFile("types.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := 0
+	wantFloats := map[string]bool{"Seconds float64": true, "AudioSeconds float64": true}
+	got := map[string]bool{}
 	for _, raw := range strings.Split(string(src), "\n") {
 		line := raw
 		if k := strings.Index(line, "//"); k >= 0 {
 			line = line[:k]
 		}
-		if strings.Contains(line, "float64") {
-			code++
-			if !strings.Contains(line, "Seconds float64") {
-				t.Errorf("types.go declares a float outside Request.Seconds: %s", strings.TrimSpace(raw))
-			}
+		if !strings.Contains(line, "float64") {
+			continue
 		}
+		decl := strings.TrimSpace(line)
+		if !wantFloats[decl] {
+			t.Errorf("types.go declares a float outside Request.Seconds and "+
+				"Request.AudioSeconds: %s", strings.TrimSpace(raw))
+			continue
+		}
+		got[decl] = true
 	}
-	if code != 1 {
-		t.Errorf("types.go has %d float64 declarations, want exactly one (Request.Seconds)", code)
+	for decl := range wantFloats {
+		if !got[decl] {
+			t.Errorf("types.go no longer declares %q; the measured quantity it carries "+
+				"has gone somewhere this guard is not watching", decl)
+		}
 	}
 }
 

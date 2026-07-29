@@ -122,10 +122,16 @@ type TranscriptionResponse struct {
 	// a rounded minute for a 12.5-second clip, and only one of the two numbers
 	// is on the invoice. Empty means the backend named no unit.
 	//
-	// A duration is never folded into a token count (DESIGN §10.7). dorang prices
-	// per_second rules on wall time, so these two are carried for the client
-	// rather than metered — but a transcript that leaves stating a unit it was
-	// not billed in is wrong whether or not this gateway prices it.
+	// These two are the VERBATIM wire values, re-emitted to the client exactly as
+	// the vendor wrote them — including a unit word this build does not model.
+	// The same two facts also ride on [Usage.Billed] and [Usage.AudioSeconds] in
+	// canonical form, which is what internal/pricing and internal/meter read.
+	//
+	// A duration is never folded into a token count (DESIGN §10.7), and it is now
+	// never folded into a WALL TIME either: `per_audio_second` prices this
+	// quantity and `per_compute_second` prices the request's own duration. They
+	// were one field until a ten-minute recording transcribed in eight seconds
+	// was billed as eight seconds.
 	UsageUnit    string
 	UsageSeconds float64
 	// UsageExtra carries the members of the upstream usage object that no

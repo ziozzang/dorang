@@ -421,7 +421,15 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		// so the published bound reports the interval this process actually
 		// runs rather than a number that does not apply.
 		ReloadInterval: reloadInterval(cfg),
-		Now:            a.now,
+		// The unknown-key lookup budget (risk R1-B). It was two Config fields
+		// with a working bucket behind them and no path from the file, so the
+		// only sizing a deployment could have was the built-in one — and the
+		// deployments that need a different one are precisely the ones that
+		// provision keys in bursts or run a slow store, neither of which the
+		// built-in number knows about.
+		MissRate:  cfg.Auth.MissBudget.Rate,
+		MissBurst: cfg.Auth.MissBudget.Burst,
+		Now:       a.now,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: authenticator: %w", err)
@@ -566,14 +574,24 @@ func (a *App) Config() *config.Config { return a.cfg.Load() }
 // serverOptions renders the HTTP surface's configuration from the file.
 func (a *App) serverOptions(cfg *config.Config) server.Options {
 	return server.Options{
-		Auth:              &authAdapter{a: a.Auth, now: a.now, rates: a.rates},
-		Dispatcher:        a.dispatch,
-		Models:            a.models,
-		Meter:             &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics, guard: a.Guard},
-		RequestTimeout:    cfg.Server.RequestTimeout.Duration(),
-		ShutdownGrace:     cfg.Server.ShutdownGrace.Duration(),
-		PreStopDelay:      cfg.Server.PreStop().Duration(),
-		MaxBodyBytes:      cfg.Server.MaxBodyBytes.Bytes(),
+		Auth:           &authAdapter{a: a.Auth, now: a.now, rates: a.rates},
+		Dispatcher:     a.dispatch,
+		Models:         a.models,
+		Meter:          &meterAdapter{m: a.Meter, now: a.now, record: a.recordMetrics, guard: a.Guard},
+		RequestTimeout: cfg.Server.RequestTimeout.Duration(),
+		ShutdownGrace:  cfg.Server.ShutdownGrace.Duration(),
+		PreStopDelay:   cfg.Server.PreStop().Duration(),
+		MaxBodyBytes:   cfg.Server.MaxBodyBytes.Bytes(),
+		// The three connection deadlines. They existed as Options fields with
+		// working consumers that no configuration could reach — the same shape as
+		// compat.legacy_headers — so a deployment behind a proxy that already
+		// bounds reads had no way to say so, and one that accepts large uploads
+		// over a slow link had no way to raise the budget. Deadline carries the
+		// three-valued answer these fields take: a duration, `0` for the default,
+		// and `none` for no bound at all.
+		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.Duration(),
+		ReadTimeout:       cfg.Server.ReadTimeout.Duration(),
+		IdleTimeout:       cfg.Server.IdleTimeout.Duration(),
 		AlwaysFullHeaders: cfg.Observability.AlwaysFullHeaders,
 		LegacyHeaders:     cfg.Compat.LegacyHeaders,
 		Passthrough:       passthroughRoutes(cfg, a.dispatch.state().upstreams),

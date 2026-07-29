@@ -262,6 +262,9 @@ server:
   shutdown_grace: 30s
   pre_stop_delay: 10s
   max_body_bytes: 32MiB
+  read_header_timeout: 30s
+  read_timeout: 2m
+  idle_timeout: 2m
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
@@ -273,7 +276,34 @@ server:
 | `request_timeout` | duration | `600s` | The whole-request deadline. It also sets the capacity reservation's expiry (`request_timeout + 30s`), so a leaked goroutine cannot hold a slot forever | Zero or negative is refused. Too short truncates long generations; too long lets a wedged upstream hold a reservation for the whole window |
 | `shutdown_grace` | duration | `30s` | How long a drain waits for in-flight requests, and separately how long the post-drain teardown may take | Negative is refused. Shorter than your p99 request turns a rolling restart into visible errors: the process hard-closes and returns exit code 1 with `drain grace expired with requests still in flight` |
 | `pre_stop_delay` | duration | `10s` | How long the process keeps serving **after** readiness goes false and **before** the listener closes, so a polling load balancer has time to stop routing here (§13). Size it as `probe period × failure threshold + probe timeout + endpoint-withdrawal propagation`; `deploy/kubernetes.yaml`'s probes need 5s and the default leaves 5s of margin | Negative is refused. Too short and every rolling restart is connection-refused at the client for as long as the balancer takes to notice — the failure a graceful drain exists to prevent. `0` is explicit and legitimate: nothing is routing to a single node or a workstation, and an absent key takes the default rather than zero, so writing `0` really does mean none. A second SIGTERM also skips the wait |
-| `max_body_bytes` | size | `32MiB` | Caps one request body. Past it the request is refused **mid-upload** with `413 request_too_large`, and the message names this key | The refusal has always named `max_body_bytes` and until now **there was no such setting**: an operator was told the name of a knob that did not exist, and the only remedy was a rebuild. A client posting a 40 MiB transcript or a batch of base64 images through an incumbent with no cap stops working on cutover, so raise it deliberately rather than discovering it. The ceiling is real: a body is buffered to stay replayable across a fallback (§15.5), so this bounds what one request can pin — size it against `metering.max_replay_bytes` and the process memory budget, not to the largest number that parses. A negative value is refused at load; `0` is indistinguishable from unset and takes the default |
+| `max_body_bytes` | size | `32MiB` | Caps one request body. Past it the request is refused **mid-upload** with `413 request_too_large`, and the message names this key | The refusal has always named `max_body_bytes` and until now **there was no such setting**: an operator was told the name of a knob that did not exist, and the only remedy was a rebuild. A client posting a 40 MiB transcript or a batch of base64 images through an incumbent with no cap stops working on cutover, so raise it deliberately rather than discovering it. The ceiling is real: a body is buffered to stay replayable across a fallback (§15.5), so this bounds what one request can pin — size it against the process memory budget, not to the largest number that parses. A negative value is refused at load; `0` is indistinguishable from unset and takes the default |
+| `read_header_timeout` | duration \| `none` | `30s` | Bounds reading the request **headers** | The client that connects and then says nothing never reaches a handler and costs no capacity slot; what it exhausts is the listener's accept queue, which is why this is the shortest of the three. `none` removes the bound |
+| `read_timeout` | duration \| `none` | `2m` | Bounds reading the **whole** request, headers and body, from the connection's first byte | This is the **upload budget**, not the generation budget: it does not bound the response, so a stream that runs for minutes is unaffected. The default carries a maximal `max_body_bytes` at about 2.9 Mbit/s — raise it for large audio or batch-input uploads over slow links. It **must not be shorter than `read_header_timeout`**: both are measured from the same instant, so the smaller one would be the only one that ever fires and would enforce the other under its own name. That is a **load error** at `dorangctl config lint` and again when the server builds |
+| `idle_timeout` | duration \| `none` | `2m` | Bounds a keep-alive connection **between** requests | Go's default for this is `read_timeout`, which would silently make the two one setting; they answer different questions and are set apart. Size it **longer** than the idle timeout of whatever sits in front (60s on an AWS ALB, 75s for nginx's `keepalive_timeout`): the side that closes an idle connection should be the side that knows it is idle, and if the gateway closes first the proxy finds out by reusing a dead socket and the client gets a 502 for a request that never left |
+
+### 2.1 The three connection deadlines, and what `none` means
+
+All three take `0`/absent as "use the default" and the word **`none`** as "do not bound this
+at all" — the same two-valued distinction `pre_stop_delay` needs and for the same reason. A
+setting whose "off" value collides with its "unset" value is how a disabled feature turns back
+on at the next refactor. A literal negative duration (`-1s`) is accepted as a synonym for
+`none` and normalized to it, because `-1s` and `-5s` cannot mean two different amounts of "not
+bounded".
+
+`none` is a real answer, not an escape hatch: a deployment behind a proxy that already enforces
+the same deadline is enforcing it twice, and the shorter of the two wins in a way nobody
+configured. It is also the only route back to the unbounded behaviour these deadlines replaced.
+
+> **All three existed as `server.Options` fields with working consumers that no configuration
+> could reach.** The same shape as `compat.legacy_headers` before it was wired: the code was
+> right, the tests passed, and every deployment ran the built-in numbers whatever the file
+> said — because the file could not say anything. `internal/config`'s recurrence guard
+> (`TestEveryConfiguredFieldIsReadSomewhere`) is **vacuous** for these: it matches identifier
+> names, and `ReadTimeout` and `IdleTimeout` occur in `internal/server`'s own source, so it
+> reported them as consumed throughout. That is the blind spot its own doc comment lists.
+> What holds them now is per-setting behavioural tests in `internal/app` that drive
+> `config.LoadBytes` through an assembled gateway and assert a socket the running server does
+> or does not close.
 
 ---
 
@@ -390,6 +420,7 @@ is collision-proof by construction, and the only thing it costs is a lease TTL o
 auth:
   legacy: {enabled: false, until: ""}
   rehash_on_use: true
+  miss_budget: {rate: 100, burst: 500}
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
@@ -397,6 +428,15 @@ auth:
 | `legacy.enabled` | bool | `false` | Accepts the unsalted incumbent digest during a migration window | See §1.3 |
 | `legacy.until` | date | `""` | The window's end. Required when `legacy.enabled` is true | An unparseable date, or one already past, refuses to start |
 | `rehash_on_use` | bool | `true` | A successful legacy verification schedules an asynchronous upgrade to `dorang_v1` | Turning it off means the migration never completes on its own, and the window closes with keys that then stop working |
+| `miss_budget.rate` | float | `100` | Store lookups **per second** that may be spent on index keys the store does not know | A negative cache entry is keyed by the index key, so a caller presenting distinct random keys never hits one and every unknown key was one database round trip bought for nothing. This bounds **fruitless** lookups only — a lookup that returns a row gives its token straight back, so the first use of a real credential, which is the whole of a cold node's traffic, is not rate limited at all. Sized below the deployment's real rate of lookups that find nothing, it answers legitimate callers `503 auth_unavailable`: watch `dorang_auth_lookup_throttled_total` rising while `dorang_auth_store_calls_total` flattens. `0` is unset and takes the default; **negative removes the bound**, which restores the amplifier and is a deliberate choice |
+| `miss_budget.burst` | int | `500` | The bucket's depth — how many fruitless lookups may happen at once before the rate governs | Too small and a node coming up cold against a store it must read for every key is throttled by its own legitimate traffic. `0` is unset and takes the default; a **negative value is refused at load**, deliberately: `internal/auth` reads a non-positive burst as absence and would silently take the default, so a minus sign here would mean the opposite of a minus sign one row above. The bound is removed with `rate` |
+
+> **Both of these existed as `auth.Config` fields with a working token bucket behind them and
+> no path from the file.** Every deployment ran 100/s and 500 whatever it wrote, because it
+> could not write anything — and the deployments that need different numbers are exactly the
+> ones the built-in numbers know nothing about: a fleet that provisions keys in bursts, or one
+> whose store is slow enough that 100 fruitless reads a second is already too many. See §2.1
+> for why the recurrence guard did not catch this class and what does now.
 
 Both digests are always computed and the comparison target is chosen branchlessly, so the
 scheme a key uses is not observable in timing. Authentication is 354 ns and zero-allocation on
@@ -1007,7 +1047,7 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
-| `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a** | A `marginal_usage` rule with no rates is refused. ⚠️ **`images` passes validation and then refuses to assemble** — the request type carries no image count, so the component is unreachable and is reported rather than silently priced at zero. Use `request` on an image endpoint |
+| `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
 | `rules[].period` + `rules[].amount` | string + decimal | — | A `fixed_subscription` rule's period and cost | Both required for that class; a zero amount is refused |
 | `rules[].percent` | decimal | — | An `adjustment` rule's percentage | Required for that class; zero is refused |
 
@@ -1064,6 +1104,42 @@ because a cache hit is literally a prefix of the prompt.
 If a usage report contradicts itself — more cached tokens than prompt tokens — the parent's
 charge falls to zero and never below it. A negative component would hand back budget and
 quota that nobody paid for.
+
+### 13.1b Which second a per-second rate prices
+
+**There is no `seconds`.** A second of wall time and a second of recorded audio are two
+different billable quantities that share a word, and DESIGN §10.7's rule — *a billing unit is
+never converted* — is why they are two components on two units rather than one field serving
+both.
+
+| Write this | On this unit | And dorang charges | Use it for |
+|---|---|---|---|
+| `compute_seconds` | `per_compute_second` | how long **the request** took | a GPU-second / occupancy rate on a self-hosted deployment |
+| `audio_seconds` | `per_audio_second` | how long **the recording the vendor billed** was, from `usage.seconds` | speech-to-text, and anything else billed by media length |
+
+The rate names the axis, so the axis cannot be left unsaid. `unit: per_second` and a bare
+`seconds:` rate are **load errors** that name both replacements — an operator who writes one is
+not making a typo, they are writing the only spelling that used to exist.
+
+A rule quoted on one axis against a request carrying only the other does **not** fall back to
+the other number. The request is recorded **UNPRICED** under §8.3, the rule that declined is
+named in the log and in `dorangctl price`, and nothing is charged. The same applies one level
+up, to the unit the *vendor* stated in `usage.type`: an `audio_seconds` rule against a
+transcript billed in tokens, and a token rule against one billed by duration, are both
+no-prices, because in each case the arithmetic would succeed and produce a plausible figure.
+
+> ⚠️ **This is the second convention defect in this section and it cost more than the first.**
+> `unit: per_second` was filled from the request's elapsed time. A transcription vendor bills
+> the recording — so **a ten-minute recording transcribed in eight seconds was charged as
+> eight seconds**, $0.0008 against the vendor's $0.06 at $0.006/minute: **1.3% of the
+> invoice**, in the direction nobody disputes. The recording's length was decoded correctly
+> the whole time; it reached the neutral transcript and stopped there, because there was no
+> second axis for it to arrive on.
+>
+> Migrating: a rate imported from an incumbent's `input_cost_per_second` becomes
+> `compute_seconds`, because that is what the incumbent multiplies by — the response time.
+> **If the model bills by the length of the audio, change it to `audio_seconds`**; the
+> importer warns on every such key rather than choosing for you.
 
 ### 13.2 Classes compose; they do not compete
 
@@ -1748,6 +1824,43 @@ Everything below used to be in the table above.
 | `compat.legacy_headers` | New, and wired end to end. It had existed as a `server.Options` field with a working consumer that **no configuration could reach** — `internal/app` never set it — so COMPATIBILITY §7.7's mirroring claim was true of the code and false of every deployment. §21a |
 | `compat.usage_chunk_choices` | Wired. `empty` reaches `openai.StreamConfig.UsageChunkChoices` through `backend.Call`, so a streaming usage chunk now carries strict OpenAI's `"choices":[]` when it is asked for. It had been **refused** at that value: the encoder had emitted both shapes since it was written and no configuration could select one. Selecting it also takes a same-family stream off the byte-relay fast path, where the usage chunk is the upstream's bytes rather than dorang's. §21a, COMPATIBILITY §3.3 |
 | `compat.anthropic_total_tokens` | Wired. `false` reaches `anthropic.ResponseOptions.TotalTokens`, so a non-streaming Anthropic answer omits the non-spec `usage.total_tokens`. Also **refused** at that value before. Streaming is unchanged at either setting, deliberately — the asymmetry is §6.8 itself. §21a |
+| `server.read_header_timeout`, `.read_timeout`, `.idle_timeout` | New, and wired end to end. All three existed as `server.Options` fields with working consumers no configuration could reach, so every deployment ran the built-in 30s/2m/2m. `none` removes a bound, for a deployment whose proxy already enforces one; `read_timeout` inside `read_header_timeout` is a load error at lint **and** at start-up. §2, §2.1 |
+| `auth.miss_budget.rate`, `.burst` | New, and wired end to end. Same shape: the token bucket that bounds store lookups on keys nobody issued worked, and its two `auth.Config` fields had no path from YAML. A negative `rate` removes the bound; a negative `burst` is refused, because `internal/auth` reads it as absence. §5 |
+| `pricing.rules[].rates.request`, `.characters` | **Fixed, not new.** They validated and then refused to assemble with "rate does not belong to unit per_1m_tokens": the inline schema has no `unit:` key and wrote none, so every non-token rate it advertised was the `rates.images` defect — lint passed, the server would not start. The unit is now derived from the components a rule prices, and a rule mixing two units is refused at lint |
+| `pricing.rules[].rates.seconds` | **Replaced**, by `compute_seconds` and `audio_seconds`. One key named two billable quantities and priced whichever the field held — the request's wall time — so a transcription vendor that bills the recording was charged dorang's own latency. §13.1b |
+
+### 23.1b The opposite direction: knobs that exist in Go and not in YAML
+
+§23.1 is settings the schema accepts and nothing acts on. **This is the mirror**, and it is the
+one that has produced more instances: a field on `server.Options` or `auth.Config` with a
+working consumer, a default, and no path from the configuration file. §23.1a is the closed
+list — `compat.legacy_headers`, `compat.usage_chunk_choices`, `compat.anthropic_total_tokens`,
+`server.max_body_bytes`, the three connection deadlines and the two miss-budget knobs among
+them — and each one was invisible for the same reason.
+
+**`internal/config`'s recurrence guard cannot see this direction at all.**
+`TestEveryConfiguredFieldIsReadSomewhere` walks the `Config` type and asks whether each field is
+read; a knob that is not in `Config` is not walked. And for the ones that do get added, the
+guard matches on identifier NAMES, so `ReadTimeout`, `IdleTimeout`, `Rate` and `Burst` all
+reported as consumed while nothing consumed them — the vacuity its own doc comment lists. What
+holds these is per-setting behavioural tests in `internal/app` that drive `config.LoadBytes`
+through an assembled gateway.
+
+Still open, found by the sweep that closed the five above and listed here so the next one is
+looked for rather than stumbled on:
+
+| Field | What it does | What wiring it needs |
+|---|---|---|
+| `server.Options.ReplayBudgetBytes` | The **process-wide** retained-body budget (§15.4): what all in-flight requests together may pin so a fallback can replay them. `0` takes 256 MiB, negative disables retention and marks every request non-replayable | A `server.replay_budget_bytes` key. §2's `max_body_bytes` row already tells operators to "size it against `metering.max_replay_bytes`" — **a key that has never existed**, so the advice names a knob nobody can turn. The per-request cap is configurable and the process-wide one it is supposed to be sized against is not |
+| `auth.Config.StoreTimeout` | Bounds one credential-store lookup; 2s | An `auth.store_timeout` key. It is a property of the database, exactly like `auth.revocation.store_latency`, which *is* configurable — a deployment whose store is slow enough to need a different revocation bound needs a different lookup bound too |
+| `auth.Config.RehashQueue` | Depth of the asynchronous `legacy_sha256` → `dorang_v1` upgrade queue; 256 | An `auth.rehash_queue` key. It matters only during a legacy migration, and that is exactly when a fleet is upgrading every key it sees; overflow is visible as `dorang_auth_rehash_dropped_total` |
+| `auth.Config.MasterKeyID` | Names the master principal in logs and metering; `"master"` | Arguably none — it is a label, not a bound. Listed so the judgement is written down rather than re-made |
+
+One more of the same shape, outside these two types: **`admin.Config.Pricing` is never set by
+`internal/app`**, so `POST /admin/pricing/preview` and `POST /spend/calculate` answer
+`dependency_unavailable` ("pricing engine") in every deployment. DESIGN §8.4's "one engine, one
+answer" holds for `dorangctl price` and for the ledger; the two HTTP surfaces it names have a
+complete implementation behind a dependency nobody injects.
 
 ### 23.2 Designed and not in the schema at all
 

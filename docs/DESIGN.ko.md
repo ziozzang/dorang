@@ -650,7 +650,9 @@ provider → default. 동률은 명시 priority, 그다음 규칙 id로 결정�
 - 반올림은 **마지막에 한 번**, half-to-even, 나머지는 다음 정산으로 이월한다.
 - 모든 쓰기는 범위 검사한다. 오버플로는 음수 비용이 아니라 오류다.
 
-컴포넌트: input, output, cached read, cache write, reasoning, request, characters, seconds.
+컴포넌트: input, output, cached read, cache write, reasoning, request, characters, **compute seconds, audio seconds**.
+
+마지막 두 개는 원래 `seconds` 하나였고 요청의 벽시계 시간으로 가격이 매겨졌다. 그것은 GPU-초 요율에는 맞는 입력이지만 녹음 길이로 청구하는 전사(transcription) 벤더에는 틀린 입력이다 — 그래서 둘은 서로 다른 단위(`per_compute_second`, `per_audio_second`)의 별도 컴포넌트이고, 모호한 표기는 로드 오류이며, 한 축으로 인용된 규칙이 다른 축만 실은 요청을 만나면 가장 가까운 숫자에 요율을 적용하는 대신 **가격 미책정(UNPRICED)** 요청이 된다. 표와 측정치는 §10.7에 있다.
 
 **사용량 카운트는 포함(inclusive)이고 요율표는 배타(exclusive)이며, 둘을 맞추는 일이 필요하다.**
 §10.7은 `InputTokens`를 캐시 읽기·쓰기 접두부를 포함한 프롬프트 전체로, `OutputTokens`를 추론

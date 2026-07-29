@@ -68,6 +68,89 @@ func ParseDuration(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("invalid duration %q: want a value such as \"250ms\", \"30s\" or \"1h\"", s)
 }
 
+// NoDeadline is the [Deadline] spelling for "do not bound this at all".
+const NoDeadline = "none"
+
+// Deadline is a connection deadline: a duration, or `none` for no bound.
+//
+// It is not a [Duration] because absence and "off" are DIFFERENT answers here
+// and Duration has one spelling for both. An absent key — and a literal `0` —
+// means "take the documented default"; `none` means "do not bound this", which
+// is a real answer for a deployment behind a proxy that already enforces the
+// same deadline, and the only way back to the unbounded behaviour these
+// deadlines replaced. A setting whose "off" value collides with its "unset"
+// value is how a disabled feature turns back on at the next refactor, which is
+// the reason [CacheTTL] exists one type above and the reason this one does.
+//
+// The Go fields it feeds spell "no bound" as a NEGATIVE duration
+// (server.Options.ReadTimeout and its two siblings), so `none` renders as -1 and
+// a literal negative duration is accepted as a synonym for it. One rule —
+// negative is no bound — and the readable spelling is the one the documentation
+// uses.
+type Deadline time.Duration
+
+// Duration returns the value in the form the server's Options field takes:
+// positive is a bound, zero means "use the default", negative means none.
+func (d Deadline) Duration() time.Duration { return time.Duration(d) }
+
+// IsZero reports whether the value was left unset, which means "take the
+// default". It is FALSE for `none`, which is a value and not an absence.
+func (d Deadline) IsZero() bool { return d == 0 }
+
+// Unbounded reports the explicit "no bound".
+func (d Deadline) Unbounded() bool { return d < 0 }
+
+func (d Deadline) String() string {
+	switch {
+	case d < 0:
+		return NoDeadline
+	case d == 0:
+		return ""
+	}
+	return time.Duration(d).String()
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Deadline) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.ScalarNode {
+		return fmt.Errorf("line %d: a deadline must be a scalar such as %q or %q",
+			n.Line, "30s", NoDeadline)
+	}
+	s := strings.TrimSpace(n.Value)
+	switch s {
+	case "", "~", "null":
+		*d = 0
+		return nil
+	case NoDeadline, "off", "unbounded":
+		*d = -1
+		return nil
+	}
+	// A literal negative duration is the same answer as `none`, and it is
+	// normalized to one value: -1s and -5s cannot mean two different amounts of
+	// "not bounded", so they must not be storable as two different numbers.
+	if strings.HasPrefix(s, "-") {
+		if _, err := ParseDuration(strings.TrimPrefix(s, "-")); err == nil {
+			*d = -1
+			return nil
+		}
+	}
+	v, err := ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("line %d: %w (or %q to remove the bound entirely, for a "+
+			"deployment whose proxy already enforces one)", n.Line, err, NoDeadline)
+	}
+	*d = Deadline(v)
+	return nil
+}
+
+// MarshalYAML implements yaml.Marshaler.
+func (d Deadline) MarshalYAML() (any, error) {
+	if d == 0 {
+		return nil, nil
+	}
+	return d.String(), nil
+}
+
 // UntilEvicted is the CacheTTL spelling for "this entry does not expire on a
 // clock; it lives until the table's byte budget evicts it".
 const UntilEvicted = "until_evicted"

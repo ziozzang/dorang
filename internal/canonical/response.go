@@ -97,19 +97,81 @@ const (
 	UsageReasoning
 )
 
-// Usage counts tokens.
+// BilledUnit is what a backend said it billed a request IN.
+//
+// DESIGN §10.7: **a billing unit is never converted.** The audio surface bills
+// in tokens or in duration, discriminated by `usage.type`, and a duration is not
+// a token count. Which one the vendor named is a fact about the invoice, so it
+// travels with the counts rather than being inferred from which field happens to
+// be non-zero — that inference is exactly how a duration ends up priced as a
+// token count, or a request billed by the second gets charged for its latency.
+type BilledUnit uint8
+
+const (
+	// BilledUnstated is the zero value: the backend named no unit, which is
+	// every surface but audio and every hand-built Usage.
+	BilledUnstated BilledUnit = iota
+	// BilledTokens is `usage.type: "tokens"`.
+	BilledTokens
+	// BilledDuration is `usage.type: "duration"`.
+	BilledDuration
+)
+
+func (b BilledUnit) String() string {
+	switch b {
+	case BilledTokens:
+		return "tokens"
+	case BilledDuration:
+		return "duration"
+	}
+	return ""
+}
+
+// ParseBilledUnit reads the wire's `usage.type`. Anything a canonical unit does
+// not name — including the empty string — is Unstated, which asserts nothing:
+// a vendor word this build does not know must not be guessed into one it does.
+func ParseBilledUnit(s string) BilledUnit {
+	switch s {
+	case "tokens":
+		return BilledTokens
+	case "duration":
+		return BilledDuration
+	}
+	return BilledUnstated
+}
+
+// Usage is what a backend said this request consumed.
 //
 // InputTokens is the FULL prompt count including anything served from or
 // written to cache, matching OpenAI's prompt_tokens. Protocols that report a
 // cache-exclusive input count (Anthropic) subtract on the way out; doing the
 // arithmetic in the encoder rather than here keeps one definition instead of
 // two conventions that look identical in a struct dump.
+//
+// It is mostly a token count, and [Usage.AudioSeconds] is the one member that is
+// not. It is a separate field for the reason §10.7 gives — the two are different
+// billable quantities and neither is folded into the other — and it is on this
+// type rather than beside it because this is what internal/backend hands to
+// pricing and metering: a quantity carried anywhere else is a quantity that
+// reaches the ledger only if somebody remembers to forward it, which is how the
+// recording's length reached the neutral response and stopped there.
 type Usage struct {
 	InputTokens      int
 	OutputTokens     int
 	CacheReadTokens  int
 	CacheWriteTokens int
 	ReasoningTokens  int
+
+	// AudioSeconds is the length of media the backend BILLED for, in seconds, on
+	// a duration-billed surface. Zero means none was reported.
+	//
+	// It is what is on the invoice, not necessarily the length of the file: a
+	// model that bills a rounded minute for a 12.5-second clip billed sixty
+	// seconds. It is never the request's wall time, which is dorang's own
+	// latency and belongs to a different rate on a different axis.
+	AudioSeconds float64
+	// Billed is the unit the backend named for this request, when it named one.
+	Billed BilledUnit
 
 	// Reported is the set of counters the backend actually stated. A decoder
 	// sets it; an encoder consults it to decide whether a zero is a measurement
@@ -144,6 +206,13 @@ func (u *Usage) Add(o Usage) {
 	u.CacheReadTokens += o.CacheReadTokens
 	u.CacheWriteTokens += o.CacheWriteTokens
 	u.ReasoningTokens += o.ReasoningTokens
+	u.AudioSeconds += o.AudioSeconds
+	if o.Billed != BilledUnstated {
+		// The unit is a statement, not a count: a later increment that names one
+		// supersedes silence, and two increments never name different units on
+		// one response.
+		u.Billed = o.Billed
+	}
 	u.Reported |= o.Reported
 }
 

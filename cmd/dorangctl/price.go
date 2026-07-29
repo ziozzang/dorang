@@ -28,7 +28,14 @@ func (e env) runPrice(args []string) int {
 		cacheWrite = fs.Int64("cache-write", 0, "cache write tokens")
 		reasoning  = fs.Int64("reasoning", 0, "reasoning tokens")
 		characters = fs.Int64("characters", 0, "characters, for per-1k-character rules")
-		seconds    = fs.Float64("seconds", 0, "wall seconds, for per-second rules")
+		// Two second axes, because a second of wall time and a second of recorded
+		// audio are different billable quantities (DESIGN §10.7). Naming them apart
+		// here is the same decision the catalog makes: there is no --seconds, so a
+		// figure cannot be handed to the wrong rate by leaving the axis unsaid.
+		computeSeconds = fs.Float64("compute-seconds", 0,
+			"wall seconds the request took, for per_compute_second rules")
+		audioSeconds = fs.Float64("audio-seconds", 0,
+			"seconds of recorded audio the vendor billed, for per_audio_second rules")
 		requests   = fs.Int64("requests", 1, "request count, for per-request rules")
 		credential = fs.String("credential", "", "price as this credential instead of the deployment's first")
 		at         = fs.String("at", "", "price at this RFC 3339 instant instead of now")
@@ -80,7 +87,8 @@ func (e env) runPrice(args []string) int {
 		CacheWriteTokens: *cacheWrite,
 		ReasoningTokens:  *reasoning,
 		Characters:       *characters,
-		Seconds:          *seconds,
+		Seconds:          *computeSeconds,
+		AudioSeconds:     *audioSeconds,
 		Requests:         *requests,
 		At:               when,
 	}
@@ -139,6 +147,11 @@ func (e env) runPrice(args []string) int {
 	if x.Cost.Missing {
 		fmt.Fprintf(e.stderr, "\nwarning: no marginal_usage rule matched; this request would be "+
 			"recorded UNPRICED rather than as costing zero (§8.3)\n")
+	}
+	if x.Cost.NoPrice != pricing.NoPriceNone {
+		fmt.Fprintf(e.stderr, "\nwarning: rule %s matched and could not price this request on "+
+			"%s — %s. It would be recorded UNPRICED rather than as costing zero (§8.3, §10.7)\n",
+			x.Cost.NoPriceRule, x.Cost.NoPriceQuantity, x.Cost.NoPrice.Why())
 	}
 	for _, note := range x.Notes {
 		fmt.Fprintf(e.stderr, "note: %s\n", note)

@@ -62,6 +62,45 @@ type Server struct {
 	RequestTimeout Duration `yaml:"request_timeout,omitempty"`
 	ShutdownGrace  Duration `yaml:"shutdown_grace,omitempty"`
 
+	// The three CONNECTION deadlines. They bound the half of a request that is
+	// finished long before the answer begins — reading it — and none of them
+	// bounds the response, so a generation that streams for minutes is
+	// unaffected by any of the three. There is deliberately no write deadline:
+	// net/http measures one from the start of the request and it would cut a
+	// legitimate long stream.
+	//
+	// They are configuration because each one is a property of the DEPLOYMENT's
+	// network rather than of dorang: what a slow uplink needs, and what the
+	// proxy in front is already doing. Each takes its default from `0`/absent
+	// and `none` removes the bound entirely — see [Deadline].
+	//
+	// ReadHeaderTimeout bounds the client that connects and then says nothing.
+	// That client never reaches a handler, so it costs no capacity slot; what it
+	// exhausts is the listener's accept queue, which is why it is the shortest.
+	ReadHeaderTimeout Deadline `yaml:"read_header_timeout,omitempty"`
+	// ReadTimeout bounds the WHOLE request read, headers and body, measured from
+	// the connection's first byte. It is the deadline the slow-body client
+	// needs, and that client is the worse of the two: by the time a body is
+	// dribbling the request has been admitted and is holding the in-flight slot
+	// that the drain and `dorang_inflight_requests` both count.
+	//
+	// It is the UPLOAD budget, so raise it for large audio or batch-input
+	// uploads over slow links. It must not be shorter than
+	// `read_header_timeout`: both are measured from the same instant, so a
+	// smaller whole-request deadline would make the header deadline unreachable
+	// and enforce itself under the other name. That is a load error.
+	ReadTimeout Deadline `yaml:"read_timeout,omitempty"`
+	// IdleTimeout bounds a keep-alive connection BETWEEN requests. Go's default
+	// for it is the read timeout, which would silently make the two one setting;
+	// they answer different questions and are set apart.
+	//
+	// It should be LONGER than the idle timeout of whatever sits in front — 60 s
+	// on an AWS ALB, 75 s for nginx's keepalive_timeout — because the side that
+	// closes an idle connection should be the side that knows it is idle. If the
+	// gateway closes first, the proxy finds out by reusing a dead connection and
+	// the client gets a 502 for a request that never left.
+	IdleTimeout Deadline `yaml:"idle_timeout,omitempty"`
+
 	// MaxBodyBytes caps one request body. Past it the request is refused with
 	// 413 and a message that names this key.
 	//
@@ -162,6 +201,41 @@ type Auth struct {
 	// Revocation configures how fast a revocation, a pend or an early grace cut
 	// actually takes effect across a cluster (§11.2c, risk W11).
 	Revocation Revocation `yaml:"revocation,omitempty"`
+	// MissBudget bounds the store lookups an unauthenticated caller can buy with
+	// keys nobody issued (§11.2, risk R1-B).
+	MissBudget MissBudget `yaml:"miss_budget,omitempty"`
+}
+
+// MissBudget is the `auth.miss_budget` block: the rate discipline on the one
+// database round trip a caller with no credential can force.
+//
+// A negative cache entry is keyed by the index key, so a caller presenting
+// distinct random keys never hits one and every distinct unknown key was one
+// store read — against the resource every tenant shares. The budget bounds
+// FRUITLESS lookups only: a lookup that returns a row gives its token straight
+// back, so first use of a real credential, which is the whole of a cold node's
+// traffic, is not rate limited at all.
+//
+// It is configuration because the right numbers are a property of the
+// deployment: how many keys are provisioned per second, how fast the store is,
+// and how much of the fleet is cold at once. Sizing it below the deployment's
+// real rate of lookups that find nothing turns a client retrying a revoked key
+// into 503s, which is visible as `dorang_auth_lookup_throttled_total` rising
+// while `dorang_auth_store_calls_total` flattens.
+type MissBudget struct {
+	// Rate is the fruitless store lookups per second the budget refills at.
+	// Absent or `0` takes the default (100/s); NEGATIVE removes the bound, which
+	// restores the amplifier and is only sensible in a test measuring something
+	// else.
+	Rate float64 `yaml:"rate,omitempty"`
+	// Burst is the bucket's depth — how many fruitless lookups may happen at
+	// once before the rate governs. Absent or `0` takes the default (500).
+	//
+	// A negative value is a LOAD ERROR rather than "no bound": internal/auth
+	// reads a non-positive burst as absence and takes the default, so a negative
+	// written here would quietly mean the opposite of what it means one field
+	// above. The bound is removed with `rate`, and only with `rate`.
+	Burst int `yaml:"burst,omitempty"`
 }
 
 // Rotation is the `auth.rotation` block of §11.2c.
@@ -904,9 +978,57 @@ const (
 // `images` is NOT here. §8.3 lists it among the priced quantities and
 // internal/pricing has no per-image unit, so a rule that priced images passed
 // validation and then failed to assemble — a load error one layer too late.
+// `seconds` is not here either, and for a sharper reason: it named a UNIT and not
+// a quantity. A second of wall time and a second of recorded audio are two
+// different billable quantities (§10.7), and the one spelling priced whichever
+// was in the field — so a transcription vendor that bills the recording was
+// charged dorang's own latency. The two axes are spelled apart.
 var pricingComponents = []string{
 	"input", "output", "cached_read", "cache_read", "cache_write", "reasoning",
-	"request", "characters", "seconds",
+	"request", "characters", "compute_seconds", "audio_seconds",
+}
+
+// pricingComponentUnit maps a canonical component onto the price catalog's `unit`.
+//
+// The main file's `pricing.rules[]` has no `unit:` key and the catalog file
+// requires one, so the unit is DERIVED from the components a rule prices — which
+// is possible only because a component belongs to exactly one unit. That is also
+// why a rule may not mix two of them: `unit` is one value per rule, so a rule
+// pricing input tokens beside audio seconds has no unit to be assembled with.
+var pricingComponentUnit = map[string]string{
+	"input":           "per_1m_tokens",
+	"output":          "per_1m_tokens",
+	"cache_read":      "per_1m_tokens",
+	"cache_write":     "per_1m_tokens",
+	"reasoning":       "per_1m_tokens",
+	"request":         "per_request",
+	"characters":      "per_1k_characters",
+	"compute_seconds": "per_compute_second",
+	"audio_seconds":   "per_audio_second",
+}
+
+// PricingUnit returns the price catalog `unit` a set of canonical component names
+// belongs to, and reports whether they all belong to the same one.
+//
+// It exists because the two files disagreed silently: `pricing.rules[]` accepted
+// `request`, `characters` and `seconds`, wrote no `unit`, and internal/pricing
+// then refused the assembled catalog with "rate does not belong to unit
+// per_1m_tokens" — so `dorangctl config lint` passed and the server would not
+// start. That is the `rates.images` defect exactly, and it covered every
+// non-token rate the schema advertised.
+func PricingUnit(components []string) (string, bool) {
+	unit := ""
+	for _, name := range components {
+		u, ok := pricingComponentUnit[CanonicalComponent(name)]
+		if !ok {
+			return "", false
+		}
+		if unit != "" && unit != u {
+			return "", false
+		}
+		unit = u
+	}
+	return unit, true
 }
 
 // CanonicalComponent maps a priced-component name onto the price catalog's

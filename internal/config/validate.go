@@ -245,6 +245,20 @@ func (c *Config) validateServer(col *collector) {
 	// unreachable validation rule reads like a guarantee nobody is enforcing.
 	nonNegative(col, "server.shutdown_grace", int64(c.Server.ShutdownGrace))
 	nonNegative(col, "server.pre_stop_delay", int64(c.Server.PreStop()))
+
+	// Both deadlines are measured by net/http from the connection's first byte,
+	// so a whole-request deadline INSIDE the header deadline makes the header
+	// deadline unreachable and enforces itself under the other name. internal/
+	// server refuses the same pair when it builds — that refusal is where the
+	// values are used and it stays — and it is repeated here so that
+	// `dorangctl config lint` and the running server agree about which files
+	// load. A load error delivered one layer too late is the `rates.images`
+	// defect: lint said the file was good and the process would not start.
+	if rt, ht := c.Server.ReadTimeout, c.Server.ReadHeaderTimeout; rt > 0 && ht > 0 && rt < ht {
+		col.add("server.read_timeout", "%s is shorter than server.read_header_timeout (%s); "+
+			"both are measured from the connection's first byte, so the header timeout could "+
+			"never fire and the whole-request deadline would be enforcing it instead", rt, ht)
+	}
 }
 
 func (c *Config) validateStorage(col *collector) {
@@ -399,6 +413,7 @@ func (c *Config) validateNodeID(col *collector) {
 func (c *Config) validateAuth(col *collector) {
 	c.validateRotation(col)
 	c.validateRevocation(col)
+	c.validateMissBudget(col)
 	c.validateTiers(col)
 	c.validateTokenGuard(col)
 	if !c.Auth.Legacy.Enabled {
@@ -421,6 +436,23 @@ func (c *Config) validateAuth(col *collector) {
 		col.add("auth.legacy.until",
 			"the legacy migration window closed at %s: legacy verification is refused after that date (§2.4)",
 			until.UTC().Format(time.RFC3339))
+	}
+}
+
+// validateMissBudget checks the `auth.miss_budget` block.
+//
+// Only the burst has a rule, and it is the asymmetry that makes it worth having:
+// a negative RATE is the documented "no bound" and internal/auth honours it,
+// while a negative BURST is read there as absence and silently takes the
+// default. Two adjacent fields where a minus sign means opposite things is a
+// configuration nobody can read, so one of the two is refused and the message
+// names the field that actually removes the bound.
+func (c *Config) validateMissBudget(col *collector) {
+	if c.Auth.MissBudget.Burst < 0 {
+		col.add("auth.miss_budget.burst", "must not be negative (%d): a negative burst is read "+
+			"as absence and would silently take the default. Remove the bound with "+
+			"auth.miss_budget.rate, which is where a negative value means \"no bound\"",
+			c.Auth.MissBudget.Burst)
 	}
 }
 
@@ -1213,6 +1245,17 @@ func (c *Config) validatePricing(col *collector, providers map[string]*Provider,
 				col.add(cpath, "the images component is not priced by this build: "+
 					"§8.3 lists it, internal/pricing has no per-image unit, and there is no "+
 					"rate that would be applied. Price the request instead (rates.request)")
+			case comp == "seconds":
+				// Same class of defect as `images` and a worse consequence: this
+				// one loaded and priced, against whichever second was in the
+				// field. §10.7's rule is that a billing unit is never converted,
+				// and one key covering two units is a conversion nobody wrote.
+				col.add(cpath, "the seconds component does not say WHICH second it "+
+					"prices: use compute_seconds for the request's own wall time (a "+
+					"GPU-second rate) or audio_seconds for the length of the recording "+
+					"a transcription vendor bills for. They are different quantities "+
+					"on different axes and dorang will not substitute one for the "+
+					"other (§10.7)")
 			case !oneOf(comp, pricingComponents):
 				col.add(cpath, "%q is not a priced component: want one of %s",
 					comp, strings.Join(pricingComponents, ", "))
@@ -1226,6 +1269,17 @@ func (c *Config) validatePricing(col *collector, providers map[string]*Provider,
 			}
 			if err := checkDecimal(string(r.Rates[comp])); err != nil {
 				col.add(cpath, "%v", err)
+			}
+		}
+		// A rule's components must all belong to one `unit`, because the catalog
+		// this rule is assembled into carries exactly one. Refused HERE rather
+		// than at assembly: the whole point of the check is that `config lint`
+		// and the server agree about which files load.
+		if len(seenComp) > 0 {
+			if _, ok := PricingUnit(sortedKeys(seenComp)); !ok {
+				col.add(path+".rates", "these components are quoted in different units "+
+					"and a rule has one unit: %s. Split them into one rule per unit",
+					strings.Join(sortedKeys(seenComp), ", "))
 			}
 		}
 		c.validateProvenance(col, path, r)

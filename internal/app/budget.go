@@ -369,11 +369,18 @@ func (g *budgetGate) estimate(st *dispatchState, c *call, dec *router.Decision) 
 		Requests:     1,
 		At:           g.now(),
 	})
-	if err != nil || cost.Missing {
+	if err != nil || cost.Missing || cost.NoPrice != pricing.NoPriceNone {
 		// An unpriced model reserves nothing. It is already reported as
 		// unpriced at settlement (§8.3), and refusing traffic on a price the
 		// deployment never configured would be a worse answer than counting it
 		// at zero.
+		//
+		// A rule that prices a duration reaches here on every request, because a
+		// pre-flight quote has no duration to price: the request has not run, so
+		// there is no wall time, and no recording has been transcribed yet. That
+		// is a real no-price and not a defect in the catalog — it is the same
+		// answer this quote has always given for a per-second rate, now stated
+		// rather than arrived at by multiplying by zero.
 		return 0
 	}
 	// TotalNano cannot be negative — pricing floors it (see [pricing.Cost]) —

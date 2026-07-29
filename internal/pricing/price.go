@@ -109,6 +109,12 @@ func (c *Catalog) Explain(req Request) Explanation {
 		ex.Notes = append(ex.Notes,
 			"no marginal_usage rule matched: this request is unpriced, not free")
 	}
+	if cost.NoPrice != NoPriceNone {
+		ex.Notes = append(ex.Notes,
+			"rule "+cost.NoPriceRule+" matched and could not price this request on "+
+				cost.NoPriceQuantity+": "+cost.NoPrice.Why()+
+				". The request is unpriced, not free")
+	}
 	if cost.SubscriptionNano != 0 {
 		ex.Notes = append(ex.Notes,
 			"the subscription share is the plan cost this period has accrued since the previous "+
@@ -149,23 +155,31 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 	// marginal_usage: the most specific rule wins.
 	var marginal amt
 	winner := c.idx[ClassMarginal].selectWinner(req, at, &ev.examined, trace)
-	if winner == nil {
+	switch {
+	case winner == nil:
 		cost.Missing = true
-	} else {
-		// One allocation each for the component lines and the applied-rule chain.
+	default:
+		cost.AppliedRules = make([]Applied, 0, c.appliedCap)
+		cost.AppliedRules = append(cost.AppliedRules, Applied{
+			RuleID: winner.id, Class: ClassMarginal, Level: winner.level,
+			Priority: winner.priority, Reason: ReasonMostSpecific,
+		})
+		// The unit check comes first, and it refuses the whole rule rather than the
+		// one component it names: a rule that cannot measure one of its quantities
+		// must not bill the others and file the rest as free.
+		if why, what := noPriceReason(winner, req); why != NoPriceNone {
+			cost.NoPrice, cost.NoPriceRule, cost.NoPriceQuantity = why, winner.id, what
+			break
+		}
+		// One allocation for the component lines; the applied-rule chain is above.
 		if winner.maxComponents > 0 {
 			cost.Components = make([]Component, 0, winner.maxComponents)
 		}
-		cost.AppliedRules = make([]Applied, 0, c.appliedCap)
 		m, err := evalUsage(winner, req, &cost.Components)
 		if err != nil {
 			return Cost{}, err
 		}
 		marginal = m
-		cost.AppliedRules = append(cost.AppliedRules, Applied{
-			RuleID: winner.id, Class: ClassMarginal, Level: winner.level,
-			Priority: winner.priority, Reason: ReasonMostSpecific,
-		})
 	}
 
 	// fixed_subscription: the most specific rule wins, then this request takes the share
@@ -205,7 +219,13 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		notionalComps []Component
 	)
 	cost.NotionalMissing = true
-	if n := c.idx[ClassNotional].selectWinner(req, at, &ev.examined, trace); n != nil {
+	// A notional rule that cannot price this request leaves the estimate UNAVAILABLE,
+	// which is the flag this class already carries for exactly that distinction (§8.5).
+	// A figure invented from the wrong quantity would make a plan look efficient against
+	// a rate nobody was charged, and it would look like a measurement.
+	if n := c.idx[ClassNotional].selectWinner(req, at, &ev.examined, trace); n != nil &&
+		notionalPriceable(n, req) {
+
 		var sink *[]Component
 		if ex != nil {
 			// Notional components stay out of Cost.Components: a caller that sums the
@@ -426,13 +446,81 @@ func quantityOf(i int, req *Request) (int64, error) {
 		}
 	case cCharacters:
 		q = req.Characters
-	case cSeconds:
+	case cComputeSeconds:
 		return secondsToMicros(req.Seconds)
+	case cAudioSeconds:
+		// The recorded length the vendor billed, and never req.Seconds. The two are
+		// different quantities and [noPriceReason] has already refused the request if
+		// this one is absent, so there is no branch here that could fall back.
+		return secondsToMicros(req.AudioSeconds)
 	}
 	if q < 0 {
 		return 0, fmt.Errorf("pricing: %s quantity is negative (%d)", componentInfo[i].name, q)
 	}
 	return q, nil
+}
+
+// effectiveRates is the rate set a rule will actually price this request with.
+//
+// The tier is selected on the whole inclusive prompt — a bracket is about how big the
+// request is, not about how much of it is billable at the input rate.
+func effectiveRates(r *rule, req *Request) rateSet {
+	if len(r.tiers) > 0 {
+		return selectTier(r, req.InputTokens).rates
+	}
+	return r.rates
+}
+
+// noPriceReason asks whether a matching usage rule can price this request AT ALL, and
+// returns the component that settled it.
+//
+// # Why this is a refusal and not a zero
+//
+// A token count of zero is a measurement: the request had no cached prefix, or produced
+// no completion, and pricing it at zero is right. A DURATION of zero is not a
+// measurement, it is an absence — no request takes no time and no recording is zero
+// seconds long — so a rule quoted per second against a request with no such duration is
+// a rule that cannot be applied. Charging zero for it would file the request as free,
+// which is the one outcome §8.3 exists to prevent, and it is indistinguishable in the
+// ledger from a genuinely free request.
+//
+// The unit disagreement is the same failure one level up. The audio surface bills in
+// tokens or in duration and says which on the wire (DESIGN §10.7); a rule that prices the
+// axis the vendor did not bill in is applying a rate to a quantity that is not on the
+// invoice, and the arithmetic will succeed. Both directions are refused, because both
+// produce a number that looks like a price.
+//
+// It runs before evalUsage rather than inside it so that the refusal covers the WHOLE
+// rule: a rule that prices audio seconds beside a token rate must not quietly bill the
+// token half and drop the half it could not measure, which under-bills without ever
+// being visibly wrong.
+func noPriceReason(r *rule, req *Request) (NoPriceReason, string) {
+	rates := effectiveRates(r, req)
+	if rates.set[cAudioSeconds] {
+		if req.Billed == BilledTokens {
+			return NoPriceVendorBilledTokens, componentInfo[cAudioSeconds].name
+		}
+		if req.AudioSeconds == 0 {
+			return NoPriceAudioNotMeasured, componentInfo[cAudioSeconds].name
+		}
+	}
+	if rates.set[cComputeSeconds] && req.Seconds == 0 {
+		return NoPriceComputeNotMeasured, componentInfo[cComputeSeconds].name
+	}
+	if req.Billed == BilledDuration && !rates.set[cAudioSeconds] {
+		for i := 0; i < numComponents; i++ {
+			if rates.set[i] && tokenComponents[i] {
+				return NoPriceVendorBilledDuration, componentInfo[i].name
+			}
+		}
+	}
+	return NoPriceNone, ""
+}
+
+// notionalPriceable applies the same unit rule to the notional class.
+func notionalPriceable(r *rule, req *Request) bool {
+	why, _ := noPriceReason(r, req)
+	return why == NoPriceNone
 }
 
 // evalUsage prices every component the winning rule declares a rate for. It serves
@@ -442,12 +530,7 @@ func quantityOf(i int, req *Request) (int64, error) {
 // The quantities are the CHARGED ones, not the measured ones: a rule that declares
 // `cache_read` beside `input` charges each token once. [chargedQuantity] states the rule.
 func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
-	rates := r.rates
-	if len(r.tiers) > 0 {
-		// The tier is selected on the whole inclusive prompt — a bracket is about how big
-		// the request is, not about how much of it is billable at the input rate.
-		rates = selectTier(r, req.InputTokens).rates
-	}
+	rates := effectiveRates(r, req)
 	carvedIn, carvedOut := carvedInput(&rates, req), carvedOutput(&rates, req)
 	var total amt
 	for i := 0; i < numComponents; i++ {

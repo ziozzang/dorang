@@ -559,6 +559,14 @@ func DecodeTranscriptionResponse(b []byte, mediaType string) (*canonical.Transcr
 			InputTokens:  w.Usage.InputTokens,
 			OutputTokens: w.Usage.OutputTokens,
 			Reported:     canonical.UsageInput | canonical.UsageOutput,
+			// The two halves of §10.7's "a billing unit is never converted", on
+			// the type that reaches pricing and metering. Until they were here
+			// the recording's length reached the neutral transcript and went no
+			// further, and a per-second rate was applied to the request's WALL
+			// TIME instead: a ten-minute recording transcribed in eight seconds
+			// was charged as eight seconds.
+			AudioSeconds: w.Usage.Seconds,
+			Billed:       canonical.ParseBilledUnit(w.Usage.Type),
 		}
 		if u.InputTokens == 0 && u.OutputTokens == 0 && w.Usage.TotalTokens > 0 {
 			// A transcript has no completion half on a duration-billed model and
@@ -568,6 +576,10 @@ func DecodeTranscriptionResponse(b []byte, mediaType string) (*canonical.Transcr
 			u.InputTokens = w.Usage.TotalTokens
 		}
 		out.Usage = u
+		// The verbatim wire spelling, kept beside the typed pair above because
+		// they answer different questions: these two are re-emitted to the client
+		// exactly as the vendor wrote them, including a unit word this build does
+		// not model, while the typed pair is what dorang prices and meters.
 		out.UsageUnit = w.Usage.Type
 		out.UsageSeconds = w.Usage.Seconds
 		out.UsageExtra = w.Usage.Extra

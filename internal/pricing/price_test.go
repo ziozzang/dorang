@@ -356,7 +356,8 @@ func TestUnitsOtherThanTokens(t *testing.T) {
 rules:
   - { id: per-req,   match: { model: r }, unit: per_request,       request:    "0.002" }
   - { id: per-char,  match: { model: c }, unit: per_1k_characters, characters: "0.030" }
-  - { id: per-sec,   match: { model: s }, unit: per_second,        seconds:    "0.006" }
+  - { id: per-sec,   match: { model: s }, unit: per_compute_second, compute_seconds: "0.006" }
+  - { id: per-audio, match: { model: a }, unit: per_audio_second,   audio_seconds:   "0.006" }
 `)
 	now := at(t, "2026-07-15T12:00:00Z")
 
@@ -377,10 +378,20 @@ rules:
 
 	cost = mustPrice(t, c, Request{Model: "s", Seconds: 12.5, At: now})
 	if cost.MarginalNano != 75_000_000 {
-		t.Fatalf("per_second = %d, want 75_000_000", cost.MarginalNano)
+		t.Fatalf("per_compute_second = %d, want 75_000_000", cost.MarginalNano)
 	}
 	if cost.Components[0].Scale != 6 || cost.Components[0].Quantity != 12_500_000 {
-		t.Fatalf("seconds component = %+v, want micro-seconds", cost.Components[0])
+		t.Fatalf("compute_seconds component = %+v, want micro-seconds", cost.Components[0])
+	}
+
+	// The audio axis reads AudioSeconds and nothing else. A wall time of 12.5s beside
+	// it must not become the priced quantity.
+	cost = mustPrice(t, c, Request{Model: "a", AudioSeconds: 12.5, Seconds: 600, At: now})
+	if cost.MarginalNano != 75_000_000 {
+		t.Fatalf("per_audio_second = %d, want 75_000_000", cost.MarginalNano)
+	}
+	if cost.Components[0].Quantity != 12_500_000 {
+		t.Fatalf("audio_seconds component = %+v, want the recording's 12.5s", cost.Components[0])
 	}
 
 	if _, err := c.Price(Request{Model: "s", Seconds: -1, At: now}); err == nil {

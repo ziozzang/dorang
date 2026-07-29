@@ -24,7 +24,8 @@ const (
 	cReasoning
 	cRequest
 	cCharacters
-	cSeconds
+	cComputeSeconds
+	cAudioSeconds
 	numComponents
 )
 
@@ -44,7 +45,16 @@ var componentInfo = [numComponents]struct {
 	cReasoning:  {"reasoning", "reasoning", UnitPerMillionTokens, 1_000_000, 0},
 	cRequest:    {"request", "request", UnitPerRequest, 1, 0},
 	cCharacters: {"characters", "characters", UnitPerThousandCharacters, 1_000, 0},
-	cSeconds:    {"seconds", "seconds", UnitPerSecond, microsPerSecond, 6},
+	// The two second axes. Their names are the whole of the convention: a rate says
+	// which quantity it prices, in the one place a catalog author cannot omit it.
+	cComputeSeconds: {"compute_seconds", "compute_seconds", UnitPerComputeSecond, microsPerSecond, 6},
+	cAudioSeconds:   {"audio_seconds", "audio_seconds", UnitPerAudioSecond, microsPerSecond, 6},
+}
+
+// tokenComponents is the set of components that price a token count. It is what
+// [noPriceReason] asks about when the vendor said it billed by duration.
+var tokenComponents = [numComponents]bool{
+	cInput: true, cOutput: true, cCacheRead: true, cCacheWrite: true, cReasoning: true,
 }
 
 // rateSet holds the rates a rule (or one of its tiers) declares.
@@ -529,7 +539,10 @@ type rawTier struct {
 	Reasoning       string `yaml:"reasoning"`
 	Request         string `yaml:"request"`
 	Characters      string `yaml:"characters"`
-	Seconds         string `yaml:"seconds"`
+	ComputeSeconds  string `yaml:"compute_seconds"`
+	AudioSeconds    string `yaml:"audio_seconds"`
+	// Seconds exists only so the refusal can name the key. See [rawRule.Seconds].
+	Seconds string `yaml:"seconds"`
 }
 
 type rawRule struct {
@@ -540,14 +553,21 @@ type rawRule struct {
 	Unit     string   `yaml:"unit"`
 	Priority int      `yaml:"priority"`
 
-	Input      string `yaml:"input"`
-	Output     string `yaml:"output"`
-	CacheRead  string `yaml:"cache_read"`
-	CacheWrite string `yaml:"cache_write"`
-	Reasoning  string `yaml:"reasoning"`
-	Request    string `yaml:"request"`
-	Characters string `yaml:"characters"`
-	Seconds    string `yaml:"seconds"`
+	Input          string `yaml:"input"`
+	Output         string `yaml:"output"`
+	CacheRead      string `yaml:"cache_read"`
+	CacheWrite     string `yaml:"cache_write"`
+	Reasoning      string `yaml:"reasoning"`
+	Request        string `yaml:"request"`
+	Characters     string `yaml:"characters"`
+	ComputeSeconds string `yaml:"compute_seconds"`
+	AudioSeconds   string `yaml:"audio_seconds"`
+	// Seconds is decoded ONLY so that the refusal below can name the key the operator
+	// wrote and say what to write instead. Deleting the field would turn `seconds:`
+	// into KnownFields' "field seconds not found", which reads like a typo — and it is
+	// not a typo, it is the spelling this catalog used to have, whose rate was applied
+	// to wall time whatever the vendor billed.
+	Seconds string `yaml:"seconds"`
 
 	Tiers    []rawTier `yaml:"tiers"`
 	TierMode string    `yaml:"tier_mode"`
@@ -568,7 +588,8 @@ func (r rawRule) rateStrings() [numComponents]string {
 	return [numComponents]string{
 		cInput: r.Input, cOutput: r.Output, cCacheRead: r.CacheRead,
 		cCacheWrite: r.CacheWrite, cReasoning: r.Reasoning,
-		cRequest: r.Request, cCharacters: r.Characters, cSeconds: r.Seconds,
+		cRequest: r.Request, cCharacters: r.Characters,
+		cComputeSeconds: r.ComputeSeconds, cAudioSeconds: r.AudioSeconds,
 	}
 }
 
@@ -576,9 +597,22 @@ func (t rawTier) rateStrings() [numComponents]string {
 	return [numComponents]string{
 		cInput: t.Input, cOutput: t.Output, cCacheRead: t.CacheRead,
 		cCacheWrite: t.CacheWrite, cReasoning: t.Reasoning,
-		cRequest: t.Request, cCharacters: t.Characters, cSeconds: t.Seconds,
+		cRequest: t.Request, cCharacters: t.Characters,
+		cComputeSeconds: t.ComputeSeconds, cAudioSeconds: t.AudioSeconds,
 	}
 }
+
+// errAmbiguousSecondRate is the load error for the rate key that did not say which
+// second it priced. It is the companion of [errAmbiguousSecond]: a catalog can name the
+// axis on the unit, on the rate, or on both, and getting either one wrong is a load
+// error rather than a wrong invoice.
+const errAmbiguousSecondRate = "rate \"seconds\" does not say WHICH second it prices: " +
+	"use \"compute_seconds\" for the request's own wall time (a GPU-second rate, unit " +
+	"per_compute_second) or \"audio_seconds\" for the length of the recording a " +
+	"transcription vendor bills for (unit per_audio_second). They are different " +
+	"quantities on different axes and dorang will not substitute one for the other " +
+	"(DESIGN §10.7: a billing unit is never converted). A ten-minute recording " +
+	"transcribed in eight seconds is ten minutes on the invoice"
 
 // ParseCatalog compiles a price catalog from YAML. Unknown fields are rejected: a typo in
 // a price list must fail loudly at load, not silently price at zero.
@@ -658,6 +692,17 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 
 	if class != ClassNotional && (raw.Source != "" || raw.AsOf != "") {
 		return nil, errors.New("source/as_of belong to a notional_rate rule")
+	}
+	// Before the class switch, because the ambiguous key is refused on every class and
+	// not only where a rate table is legal. It is the first thing an operator upgrading
+	// a catalog will hit, so it is refused once, in one place, with the whole answer.
+	if raw.Seconds != "" {
+		return nil, errors.New(errAmbiguousSecondRate)
+	}
+	for i := range raw.Tiers {
+		if raw.Tiers[i].Seconds != "" {
+			return nil, fmt.Errorf("tier %d: %s", i, errAmbiguousSecondRate)
+		}
 	}
 
 	switch class {

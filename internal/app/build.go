@@ -620,15 +620,25 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 		Class    string `yaml:"class,omitempty"`
 		Match    match  `yaml:"match,omitempty"`
 		Priority int    `yaml:"priority,omitempty"`
+		// Unit is DERIVED from the components below, because the main file has no
+		// `unit:` key and the catalog file requires one. Leaving it empty was the
+		// third instance of the `rates.images` defect and the widest: internal/
+		// pricing defaults an absent unit to per_1m_tokens, so every non-token
+		// rate the schema advertised — `request`, `characters`, `seconds` —
+		// passed `dorangctl config lint` and then refused to assemble with "rate
+		// does not belong to unit per_1m_tokens". internal/config refuses a rule
+		// that mixes two units, which is what makes one derived value correct.
+		Unit string `yaml:"unit,omitempty"`
 
-		Input      string `yaml:"input,omitempty"`
-		Output     string `yaml:"output,omitempty"`
-		CacheRead  string `yaml:"cache_read,omitempty"`
-		CacheWrite string `yaml:"cache_write,omitempty"`
-		Reasoning  string `yaml:"reasoning,omitempty"`
-		Request    string `yaml:"request,omitempty"`
-		Characters string `yaml:"characters,omitempty"`
-		Seconds    string `yaml:"seconds,omitempty"`
+		Input          string `yaml:"input,omitempty"`
+		Output         string `yaml:"output,omitempty"`
+		CacheRead      string `yaml:"cache_read,omitempty"`
+		CacheWrite     string `yaml:"cache_write,omitempty"`
+		Reasoning      string `yaml:"reasoning,omitempty"`
+		Request        string `yaml:"request,omitempty"`
+		Characters     string `yaml:"characters,omitempty"`
+		ComputeSeconds string `yaml:"compute_seconds,omitempty"`
+		AudioSeconds   string `yaml:"audio_seconds,omitempty"`
 
 		AmountPerPeriod string `yaml:"amount_per_period,omitempty"`
 		Period          string `yaml:"period,omitempty"`
@@ -651,7 +661,9 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 			ModelPrefix: r.Match.ModelPrefix,
 		},
 	}
+	names := make([]string, 0, len(r.Rates))
 	for name, v := range r.Rates {
+		names = append(names, name)
 		// The main file has always spelled the cached-input component
 		// "cached_read" and the price catalog "cache_read". Both spellings are
 		// now accepted in both files and resolved to the catalog's here, so a
@@ -672,14 +684,27 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 			out.Request = v.String()
 		case "characters":
 			out.Characters = v.String()
-		case "seconds":
-			out.Seconds = v.String()
+		case "compute_seconds":
+			out.ComputeSeconds = v.String()
+		case "audio_seconds":
+			out.AudioSeconds = v.String()
 		default:
 			// Unreachable from a loaded configuration: internal/config refuses
 			// an unknown component, and `images` with it. It stays as a guard
 			// for a Config built in code rather than parsed.
 			return nil, fmt.Errorf("app: pricing rule %s: unknown rate component %q", r.ID, name)
 		}
+	}
+	if len(names) > 0 {
+		unit, ok := config.PricingUnit(names)
+		if !ok {
+			// Unreachable from a loaded configuration for the same reason as the
+			// branch above: internal/config refuses a rule whose components are
+			// quoted in two different units, because a rule carries one.
+			return nil, fmt.Errorf("app: pricing rule %s: its rate components are quoted "+
+				"in different units and a rule has one unit", r.ID)
+		}
+		out.Unit = unit
 	}
 	switch r.Class {
 	case config.PricingFixedSubscription:

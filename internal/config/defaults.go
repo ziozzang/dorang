@@ -29,6 +29,27 @@ const (
 	// internal/app, which is the one package that imports both.
 	defaultMaxBodyBytes = 32 << 20
 
+	// The three connection deadlines, spelled out here for the same reason and
+	// pinned the same way: they are server.DefaultReadHeaderTimeout,
+	// DefaultReadTimeout and DefaultIdleTimeout, and
+	// TestConfigDeadlineDefaultsMatchTheServers in internal/app fails if either
+	// side moves without the other.
+	//
+	// The read timeout is the UPLOAD budget and not the generation budget:
+	// thirty seconds of it can go on headers and the remaining ninety carry a
+	// body up to defaultMaxBodyBytes, which is about 2.9 Mbit/s for a maximal
+	// one. The idle timeout is deliberately LONGER than what sits in front of a
+	// typical deployment (60 s on an ALB, 75 s for nginx), so the side that
+	// closes an idle connection is the side that knows it is idle.
+	defaultReadHeaderTimeout = 30 * time.Second
+	defaultReadTimeout       = 2 * time.Minute
+	defaultIdleTimeout       = 2 * time.Minute
+
+	// The unknown-key lookup budget, matching internal/auth's DefaultMissRate
+	// and DefaultMissBurst. Pinned by TestConfigMissBudgetDefaultsMatchTheAuths.
+	defaultAuthMissRate  = 100.0
+	defaultAuthMissBurst = 500
+
 	defaultStorageDriver = "sqlite"
 	defaultSQLitePath    = "~/.dorang/dorang.db"
 	defaultPostgresEnv   = "DORANG_DATABASE_URL"
@@ -227,6 +248,11 @@ func (c *Config) ApplyDefaults() {
 	if c.Server.PreStopDelay == nil {
 		c.Server.PreStopDelay = durPtr(defaultPreStopDelay)
 	}
+	// Only an ABSENT deadline is defaulted. `none` is stored as a negative and
+	// survives, which is the whole reason it is a [Deadline] and not a Duration.
+	setDeadline(&c.Server.ReadHeaderTimeout, defaultReadHeaderTimeout)
+	setDeadline(&c.Server.ReadTimeout, defaultReadTimeout)
+	setDeadline(&c.Server.IdleTimeout, defaultIdleTimeout)
 
 	// storage
 	setStr(&c.Storage.Driver, defaultStorageDriver)
@@ -243,6 +269,12 @@ func (c *Config) ApplyDefaults() {
 	setDur(&c.Auth.Revocation.Poll, defaultRevocationPoll)
 	setDur(&c.Auth.Revocation.Retain, defaultRevocationRetain)
 	setDur(&c.Auth.Revocation.StoreLatency, defaultRevocationStoreLatency)
+	// Rate zero is absence and takes the default; a NEGATIVE rate is the explicit
+	// "no bound" and survives, exactly as internal/auth reads it.
+	if c.Auth.MissBudget.Rate == 0 {
+		c.Auth.MissBudget.Rate = defaultAuthMissRate
+	}
+	setInt(&c.Auth.MissBudget.Burst, defaultAuthMissBurst)
 
 	// token guard (§11.6). Filled whether or not it is enabled, so that a
 	// rendered configuration shows what turning it on would do.
@@ -477,5 +509,13 @@ func setInt(dst *int, v int) {
 func setDur(dst *Duration, v time.Duration) {
 	if *dst == 0 {
 		*dst = Duration(v)
+	}
+}
+
+// setDeadline fills an ABSENT deadline. A negative one is `none` — a value the
+// operator wrote — and is left alone.
+func setDeadline(dst *Deadline, v time.Duration) {
+	if *dst == 0 {
+		*dst = Deadline(v)
 	}
 }

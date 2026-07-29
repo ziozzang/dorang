@@ -90,13 +90,35 @@ func (l Level) String() string {
 }
 
 // Unit is what a marginal rate is quoted per.
+//
+// # Two units are quoted per second and they are not interchangeable
+//
+// There is no `per_second`. A second of WALL TIME and a second of RECORDED AUDIO are
+// two different billable quantities that share a word, and DESIGN §10.7's rule — **a
+// billing unit is never converted** — is what makes them two units here rather than one
+// field serving both. A GPU-second rate is a real thing and the request's own duration
+// is the right input for it; a transcription vendor bills the length of the recording,
+// which has nothing to do with how long dorang waited for the answer.
+//
+// The unit a rule declares is therefore also the statement of which quantity it prices,
+// so a catalog author states the axis in the one place they cannot leave it out. A rule
+// that names one axis while the request carries only the other is a NO-PRICE that says
+// so ([Cost.NoPrice]) — never a silent substitution of the number that happens to be
+// there. Ten minutes of audio transcribed in eight seconds is ten minutes on the
+// invoice, and the defect this shape removes charged it as eight seconds.
 type Unit uint8
 
 const (
 	UnitPerMillionTokens Unit = iota
 	UnitPerRequest
 	UnitPerThousandCharacters
-	UnitPerSecond
+	// UnitPerComputeSecond is quoted per second of WALL TIME — how long the request
+	// took. It reads [Request.Seconds].
+	UnitPerComputeSecond
+	// UnitPerAudioSecond is quoted per second of RECORDED AUDIO — how long the media
+	// the vendor billed for was. It reads [Request.AudioSeconds] and never falls back
+	// to wall time.
+	UnitPerAudioSecond
 	UnitSubscription
 	UnitNone
 )
@@ -109,13 +131,26 @@ func (u Unit) String() string {
 		return "per_request"
 	case UnitPerThousandCharacters:
 		return "per_1k_characters"
-	case UnitPerSecond:
-		return "per_second"
+	case UnitPerComputeSecond:
+		return "per_compute_second"
+	case UnitPerAudioSecond:
+		return "per_audio_second"
 	case UnitSubscription:
 		return "subscription"
 	}
 	return "none"
 }
+
+// errAmbiguousSecond is the load error for the spelling that did not say which second
+// it priced. It is spelled out rather than folded into "unknown unit" because the
+// operator who wrote it was not making a typo — they were writing the only spelling
+// this catalog used to have, whose rate was applied to wall time whatever the vendor
+// billed.
+const errAmbiguousSecond = "unit %q does not say WHICH second it prices: use " +
+	"per_compute_second for the request's own wall time (a GPU-second rate) or " +
+	"per_audio_second for the length of the recording a transcription vendor bills " +
+	"for. They are different quantities on different axes and dorang will not " +
+	"substitute one for the other (DESIGN §10.7: a billing unit is never converted)"
 
 func parseUnit(s string) (Unit, error) {
 	switch s {
@@ -125,12 +160,49 @@ func parseUnit(s string) (Unit, error) {
 		return UnitPerRequest, nil
 	case "per_1k_characters":
 		return UnitPerThousandCharacters, nil
-	case "per_second":
-		return UnitPerSecond, nil
+	case "per_compute_second":
+		return UnitPerComputeSecond, nil
+	case "per_audio_second":
+		return UnitPerAudioSecond, nil
 	case "subscription":
 		return UnitSubscription, nil
+	case "per_second":
+		return 0, fmt.Errorf(errAmbiguousSecond, s)
 	}
 	return 0, fmt.Errorf("unknown unit %q", s)
+}
+
+// BilledUnit is the unit the VENDOR said it billed a request in.
+//
+// It is the second half of the same rule, one level up from the catalog. The audio
+// surface bills in tokens or in duration, discriminated by `usage.type` on the wire
+// (DESIGN §10.7), and a rule pricing the axis the vendor did NOT bill in is the same
+// error as a rule reading the wrong quantity — it just makes it against a number that
+// exists. Carrying what the vendor named is what lets [Catalog.Price] refuse instead of
+// charging whichever figure is in the struct.
+//
+// Only the audio decoder states it today. Everything else leaves it unstated, which
+// asserts nothing and constrains nothing.
+type BilledUnit uint8
+
+const (
+	// BilledUnstated is a backend that named no unit. It is the zero value, so every
+	// request built before this existed behaves exactly as it did.
+	BilledUnstated BilledUnit = iota
+	// BilledTokens is `usage.type: "tokens"` — the invoice is a token count.
+	BilledTokens
+	// BilledDuration is `usage.type: "duration"` — the invoice is a length of media.
+	BilledDuration
+)
+
+func (b BilledUnit) String() string {
+	switch b {
+	case BilledTokens:
+		return "tokens"
+	case BilledDuration:
+		return "duration"
+	}
+	return "unstated"
 }
 
 // Period is the recurrence of a subscription charge.
@@ -293,10 +365,27 @@ type Request struct {
 	// one, because Price prices one request.
 	Requests   int64
 	Characters int64
-	// Seconds is wall time for per_second rules. It is the one float64 in the API and it
-	// is a measured quantity, never a price: it is converted to exact micro-seconds at
-	// the boundary (see seconds.go) and no price value ever touches binary floating point.
+	// Seconds is the request's own WALL TIME, and it prices per_compute_second rates and
+	// nothing else. It is a measured quantity, never a price: it is converted to exact
+	// micro-seconds at the boundary (see seconds.go) and no price value ever touches
+	// binary floating point.
+	//
+	// It is NOT the length of anything the request carried. It used to be the only
+	// per-second quantity, so a transcription vendor that bills the recording was billed
+	// dorang's own latency instead: a ten-minute recording transcribed in eight seconds
+	// was charged as eight seconds. That quantity is AudioSeconds, and the two never
+	// substitute for one another.
 	Seconds float64
+	// AudioSeconds is the length of RECORDED MEDIA the vendor billed for, in seconds, and
+	// it prices per_audio_second rates and nothing else.
+	//
+	// It is the quantity on the invoice, not necessarily the length of the file: a model
+	// that bills a rounded minute for a 12.5-second clip has billed sixty seconds, and
+	// that is the number a rate is applied to.
+	AudioSeconds float64
+	// Billed is the unit the VENDOR said it billed this request in, when it said (§10.7).
+	// Unstated is the zero value and constrains nothing.
+	Billed BilledUnit
 
 	// At is the instant used to evaluate time-dependent predicates and to place a
 	// subscription period. Zero means "now".
@@ -333,6 +422,57 @@ const (
 	// ReasonAllApply: adjustments do not compete; every matching rule applies in order.
 	ReasonAllApply
 )
+
+// NoPriceReason says why a matching marginal rule did not price a request.
+//
+// Every value is a disagreement about the BILLING UNIT, which is the only kind of
+// disagreement that cannot be resolved by arithmetic (§10.7). A token count of zero is a
+// measurement and prices to zero; a duration that was never measured is not, and neither
+// is a duration the vendor did not bill in.
+type NoPriceReason uint8
+
+const (
+	// NoPriceNone: the rule priced the request.
+	NoPriceNone NoPriceReason = iota
+	// NoPriceAudioNotMeasured: the rule prices per_audio_second and the request carries
+	// no recorded duration. Wall time is NOT substituted, which is the whole point: the
+	// substitution charged a ten-minute recording as the eight seconds the transcription
+	// took.
+	NoPriceAudioNotMeasured
+	// NoPriceComputeNotMeasured: the rule prices per_compute_second and the request
+	// carries no wall time. This is the ordinary state of a routing QUOTE, which is
+	// priced before the request runs — a quote cannot know how long an answer will take,
+	// and reporting that is better than quoting zero as though the deployment were free.
+	NoPriceComputeNotMeasured
+	// NoPriceVendorBilledTokens: the rule prices a duration and the vendor said it
+	// billed this request in tokens. The duration may well be reported; it is not what
+	// is on the invoice.
+	NoPriceVendorBilledTokens
+	// NoPriceVendorBilledDuration: the rule prices tokens and the vendor said it billed
+	// this request by duration. The token counts on such a response are usually absent
+	// or synthesized, so the rule would charge a confident zero.
+	NoPriceVendorBilledDuration
+)
+
+// Why renders the reason in words, for the preview endpoint and the operator's log line.
+func (r NoPriceReason) Why() string {
+	switch r {
+	case NoPriceAudioNotMeasured:
+		return "the rule prices per_audio_second and this request carries no recorded " +
+			"duration; the request's wall time is a different quantity and is not " +
+			"substituted for it"
+	case NoPriceComputeNotMeasured:
+		return "the rule prices per_compute_second and this request carries no wall time, " +
+			"which is the ordinary state of a quote priced before the request runs"
+	case NoPriceVendorBilledTokens:
+		return "the rule prices a duration and the backend reported billing this request " +
+			"in tokens (usage.type); a billing unit is never converted"
+	case NoPriceVendorBilledDuration:
+		return "the rule prices tokens and the backend reported billing this request by " +
+			"duration (usage.type); a billing unit is never converted"
+	}
+	return ""
+}
 
 // Applied is one rule that contributed to a Cost.
 //
@@ -403,6 +543,27 @@ type Cost struct {
 	// caller is expected to increment a counter and warn (§8.3): silent zero-cost
 	// accounting is the failure mode this package exists to avoid.
 	Missing bool
+
+	// NoPrice reports that a marginal_usage rule DID match and could not price this
+	// request, because it prices a quantity the request does not carry — or one the
+	// vendor did not bill in. MarginalNano is zero and no component line was emitted.
+	//
+	// It is a separate flag from Missing because it has a different cause and a
+	// different fix: Missing means the catalog says nothing about this model, this
+	// means the catalog says the wrong thing about it. It is separate from BOTH of
+	// them being silent, which is what the alternative — charging the rate against
+	// whatever number is in the neighbouring field — did for as long as one field
+	// served two quantities.
+	//
+	// A caller treats it exactly as it treats Missing: record the request UNPRICED,
+	// count it, and say which rule declined. It is deliberately not folded into
+	// Missing, so that "no rule" and "the wrong rule" are answerable apart.
+	NoPrice NoPriceReason
+	// NoPriceRule is the id of the rule that could not price, and NoPriceQuantity the
+	// component that could not be measured. Both are constants taken from the compiled
+	// catalog, never formatted here: §15.5 forbids building a string on the hot path.
+	NoPriceRule     string
+	NoPriceQuantity string
 
 	// Floored reports that the adjustments summed to less than the cost they applied to,
 	// so the total was clamped to zero and AdjustmentNano reduced to match. A credit that

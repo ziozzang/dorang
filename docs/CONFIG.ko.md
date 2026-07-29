@@ -715,7 +715,7 @@ Go 옵션이지만 `internal/app`은 둘 다 설정하지 않으므로 어떤 YA
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` | `marginal_usage` | 어떤 종류의 비용인가 | 그 외 거부 — 카탈로그 전용인 `notional_rate` 포함 (§13.3) |
 | `rules[].priority` | int | `0` | id보다 먼저 specificity 동률을 가른다 | 음수 거부 |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | specificity 사다리 | 선언되지 않은 `provider`나 `credential`은 거부. `model`과 `model_prefix`는 선언된 모델과 대조되지 **않는다** — 현재 어떤 배포도 서빙하지 않는 모델을 정당하게 가격 매길 수 있다 |
-| `rules[].rates.<component>` | decimal | — | 단위당 요율. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `seconds`, `images`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a** | 요율 없는 `marginal_usage` 규칙 거부. ⚠️ **`images`는 검증을 통과하고 조립에서 거부된다** — 요청 타입이 이미지 수를 싣지 않아 도달 불가능한 컴포넌트이며, 조용히 0으로 가격 매기는 대신 보고된다. 이미지 엔드포인트에는 `request`를 쓸 것 |
+| `rules[].rates.<component>` | decimal | — | 단위당 요율. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 영문 CONFIG.md §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다 |
 | `rules[].period` + `rules[].amount` | string + decimal | — | `fixed_subscription`의 주기와 비용 | 그 클래스에 둘 다 필수; 금액 0 거부 |
 | `rules[].percent` | decimal | — | `adjustment`의 퍼센트 | 그 클래스에 필수; 0 거부 |
 

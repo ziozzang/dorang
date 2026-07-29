@@ -801,8 +801,18 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		CacheWriteTokens: int64(res.usage.CacheWriteTokens),
 		ReasoningTokens:  int64(res.usage.ReasoningTokens),
 		Requests:         1,
-		Seconds:          res.total.Seconds(),
-		At:               now,
+		// The two second axes, and they are two on purpose (DESIGN §10.7). Seconds
+		// is how long THIS REQUEST took, which is what a GPU-second rate is quoted
+		// against. AudioSeconds is how much recorded media the vendor billed for,
+		// which is what a transcription rate is quoted against — and it was reaching
+		// canonical.TranscriptionResponse and stopping there, so a ten-minute
+		// recording transcribed in eight seconds was charged as eight seconds.
+		// Billed carries the vendor's own `usage.type` so a rule that prices the
+		// wrong axis is refused rather than applied to whichever number is present.
+		Seconds:      res.total.Seconds(),
+		AudioSeconds: res.usage.AudioSeconds,
+		Billed:       billedUnit(res.usage.Billed),
+		At:           now,
 	})
 	if err != nil {
 		d.logf("app: pricing %s/%s: %v", dec.Provider, dec.UpstreamModel, err)
@@ -819,11 +829,23 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 			"was clamped to zero (a credit may zero a request out, not pay the caller)",
 			dec.Provider, dec.UpstreamModel)
 	}
-	if cost.Missing {
+	switch {
+	case cost.Missing:
 		// §8.3: an unpriced model warns rather than costing zero in silence.
 		d.logf("app: no marginal price rule matched %s/%s; the request is unpriced",
 			dec.Provider, dec.UpstreamModel)
-	} else {
+	case cost.NoPrice != pricing.NoPriceNone:
+		// A rule matched and could not be applied, which is a DIFFERENT catalog
+		// error from having no rule and has a different fix: the catalog says the
+		// wrong thing about this model rather than nothing. It is reported at the
+		// same volume, because the two are indistinguishable in the ledger — both
+		// record the request unpriced — and because what the flag exists to
+		// forbid is charging one billing unit's rate against another unit's
+		// number, which produces a plausible figure and no error at all.
+		d.logf("app: price rule %s matched %s/%s and could not price it on %s: %s; "+
+			"the request is unpriced", cost.NoPriceRule, dec.Provider, dec.UpstreamModel,
+			cost.NoPriceQuantity, cost.NoPrice.Why())
+	default:
 		rq.Result.CostNanoUSD = cost.TotalNano
 		// The decomposition of the number on the line above, by pricing class —
 		// and it travels WITH that number rather than beside it, so a row can
@@ -860,6 +882,24 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		TokensOutput: int64(res.usage.OutputTokens),
 		Requests:     1,
 	})
+}
+
+// billedUnit carries the vendor's stated billing unit across the one package
+// boundary that separates the decoders from the price engine.
+//
+// It is a translation and not a shared type because internal/pricing imports
+// nothing of dorang's — it is the package DESIGN §8.3 keeps free of binary
+// floating point and of every other package's shape — so the two enumerations are
+// declared apart and mapped here, where a new member on either side is a compile
+// error rather than a silent default.
+func billedUnit(u canonical.BilledUnit) pricing.BilledUnit {
+	switch u {
+	case canonical.BilledTokens:
+		return pricing.BilledTokens
+	case canonical.BilledDuration:
+		return pricing.BilledDuration
+	}
+	return pricing.BilledUnstated
 }
 
 // fillRouteResult stamps the routing decision onto the request before the first

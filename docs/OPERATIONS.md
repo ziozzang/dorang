@@ -758,8 +758,10 @@ Each row is a condition worth paging on, what it actually means, and the first a
 
 ### 7.4 Metering degradation
 
-The meter tracks five degradation reasons — `trace_queue_full`, `spool_full`, `spool_error`,
-`sink_error` and `none` — with hysteresis, so a steady drop rate cannot flap the signal. It is
+The meter tracks six degradation reasons — `trace_queue_full`, `spool_full`, `spool_error`,
+`sink_error`, `meter_closed` and `none` — with hysteresis, so a steady drop rate cannot flap the
+signal. Five of them are about the **droppable** trace half of §12.1; `meter_closed` is the one
+that is not, and it is the only way the numeric path can lose a count. It is
 readable in two places:
 
 | Where | What |
@@ -770,10 +772,17 @@ readable in two places:
 | Alert | Expression | Why |
 |---|---|---|
 | Metering degraded | `dorang_metering_degraded == 1` | Trace payloads are being lost or failing to ship. Numeric accounting is unaffected (§12.1), so the bill is still right and the traces behind it are not |
+| Counts lost at shutdown | `increase(dorang_meter_records_refused_closed_total[1h]) > 0` | Requests finished **after the meter closed** and were refused — the one condition under which the numeric path loses a count, so the bill for those requests is missing rather than approximate. It raises `dorang_metering_degraded_reason{reason="meter_closed"}`. The window is shutdown, where the drain races the meter's own close: lengthen `server.shutdown_grace` past your p99 request, and check that the drain is not being cut short by a second SIGTERM |
 
 It never changes the health status code. Losing trace payloads is a data-quality failure, not a
 serving failure, and taking the pod out of rotation for it would turn a metering incident into
 an outage.
+
+### 7.5 The credential-lookup bound
+
+| Alert | Expression | What it means | Do |
+|---|---|---|---|
+| Credential lookups throttled | `rate(dorang_auth_lookup_throttled_total[5m]) > 0` | Requests were refused `503 auth_unavailable` **without the store being consulted**, because the unknown-key budget (`auth.miss_budget`) was empty. An unknown index key carries no identity, so dorang cannot tell an attacker's first miss from a legitimate one and does not pretend to: the refusal is a retryable 503, not a 401 | Read it beside `dorang_auth_store_calls_total`. **This rising while that flattens is the bound holding** — a miss storm is costing the database nothing, which is the whole point. Sustained and with no attack, the budget is below the deployment's real rate of lookups that find nothing: a client retrying a revoked key, or a cold fleet reading every key from the store. Raise `auth.miss_budget.rate`, or `.burst` if it is a start-up spike |
 
 ---
 

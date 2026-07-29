@@ -1468,7 +1468,16 @@ accumulation can overflow a signed 64-bit nano value.
 - Every write is range-checked; overflow is an error, not a negative cost.
 
 Components: input, output, cached read, cache write, reasoning, request, characters,
-seconds. Cached counts are read from whichever usage field the backend reports.
+**compute seconds and audio seconds**. Cached counts are read from whichever usage field the
+backend reports.
+
+The last two used to be one component called `seconds`, priced against the request's wall
+time. That is the right input for a GPU-second rate and the wrong one for a transcription
+vendor, which bills the length of the recording — so the two are separate components on
+separate units (`per_compute_second`, `per_audio_second`), the ambiguous spelling is a load
+error, and a rule quoted on one axis against a request carrying only the other is an UNPRICED
+request rather than a rate applied to the nearest available number. §10.7 has the table and
+the measurement.
 
 **The usage counts are inclusive and the rate table is exclusive, and something has to
 reconcile them.** §10.7 normalizes `InputTokens` to the whole prompt with the cached and
@@ -2546,7 +2555,7 @@ guard cannot see. Nothing fails, so nothing alerts.
 | embeddings (relayed) | `prompt_tokens`, else `input_tokens`, else `total_tokens` | — | none |
 | rerank | `prompt_tokens`, else `input_tokens`, else `total_tokens` − output | `output_tokens` | `meta.billed_units` (search units, priced apart) |
 | images | `input_tokens` | `output_tokens` | `input_tokens_details` — `cached_tokens` priced, `text_tokens`/`image_tokens` carried |
-| audio | `input_tokens`, else `total_tokens` | `output_tokens` | `input_token_details` (singular `token`) carried; `type` + `seconds` for a duration-billed model |
+| audio | `input_tokens`, else `total_tokens` | `output_tokens` | `input_token_details` (singular `token`) carried; `type` + `seconds` **priced**, as `Usage.Billed` and `Usage.AudioSeconds`, for a duration-billed model |
 | gemini | `promptTokenCount` | `candidatesTokenCount` + `thoughtsTokenCount` | `cachedContentTokenCount`, `thoughtsTokenCount` |
 
 Three rules make that table safe to read as a whole:
@@ -2559,6 +2568,36 @@ Three rules make that table safe to read as a whole:
 - **A billing UNIT is never converted.** The audio surface bills in tokens or in seconds,
   discriminated by `usage.type`, and a duration is not a token count. Both are carried; neither
   is folded into the other, and an encoder never names a unit the backend did not.
+
+  > ⚠️ **The rule holds between two DURATIONS as well, and that is where it was broken.**
+  > "Seconds" named two different billable quantities: the length of the recording a
+  > transcription vendor bills for, and the wall time the request took. dorang carried one
+  > field and one `unit: per_second`, filled from the request's elapsed time — so **a
+  > ten-minute recording transcribed in eight seconds was charged as eight seconds**, 1.3% of
+  > the invoice, with no error anywhere.
+  >
+  > Both quantities are real and both have real rates. A GPU-second rate on a self-hosted
+  > deployment is priced on how long the request held the machine; a transcription rate is
+  > priced on the recording. So the fix is not to pick one — it is that there is no unqualified
+  > second left to pick wrongly:
+  >
+  > | Axis | Catalog `unit` | Rate key | Priced against |
+  > |---|---|---|---|
+  > | wall time | `per_compute_second` | `compute_seconds` | how long the request took |
+  > | recorded media | `per_audio_second` | `audio_seconds` | `usage.seconds`, what the vendor billed |
+  >
+  > `unit: per_second` and the bare `seconds:` rate are **load errors** that name both
+  > replacements, because an operator who writes one is not making a typo — they are writing
+  > the only spelling that used to exist. The convention is decided once and written where a
+  > catalog author reads it, exactly as §8.5's inclusive/exclusive rule is, rather than
+  > becoming a per-catalog knob.
+  >
+  > A rule that names one axis while the request carries only the other is a **no-price**: the
+  > request is recorded UNPRICED under §8.3 and the rule that declined is named, rather than
+  > the rate being applied to the number that happens to be there. That covers the unit
+  > disagreement one level up too — a `per_audio_second` rule against a transcript the vendor
+  > billed in tokens, and a token rule against one it billed by duration — because in both
+  > cases the arithmetic succeeds and produces a plausible figure.
 - **A count with no canonical counter is carried, not deleted.** `text_tokens`/`image_tokens`,
   the audio breakdown, a vendor's `classifications` — dorang cannot price them and they are
   still line items on somebody's invoice, so they ride in `UsageExtra` at the nesting level
@@ -2833,6 +2872,25 @@ So revocation is explicit rather than incidental:
 3. **The bound is enforced by shortening the TTL for negative entries specifically.** A key
    that was refused is cheap to re-check; a key that is serving is not. The two do not need
    the same freshness, and treating them alike is what made the number large.
+
+   > **That TTL is also the bound on the OPPOSITE event, and only this paragraph says so.**
+   > A key that is used *before* it is created — a client that starts up beside its own
+   > provisioning, a rotation script that hands the secret over before the row commits —
+   > gets a refusal, and that refusal is cached. **Creation deliberately publishes no
+   > invalidation**: there is nothing to invalidate on the other nodes, because a row that
+   > has never existed cannot be in anybody's snapshot, and publishing an invalidation for
+   > every key issued would put the provisioning rate onto the same bus a compromise
+   > depends on.
+   >
+   > So the window in which a *newly created* key is still refused is bounded by
+   > `negative_ttl` (5 s) and by nothing else. It is short for the same reason it is short
+   > in the revocation direction — a refusal is cheap to re-check — and it is the reason
+   > `negative_ttl` may not simply be raised toward `entry_ttl` to save lookups: doing so
+   > lengthens both windows, and only one of them is about an attacker.
+   >
+   > The figure is `auth.RevocationBound().Negative`, and it is published there as "the
+   > reversibility half of the same number" precisely so that this direction has a stated
+   > bound rather than an assumed one.
 4. **A revocation must not be lost by a node that was down.** On rejoin a node reloads rather
    than trusting a stale snapshot, and this is one of the few places the request path is
    deliberately allowed to wait: serving from a snapshot known to be stale is worse than a
@@ -3121,6 +3179,24 @@ subject to sampling and a daily byte budget. `none` and `hash` are also availabl
 Requests, duration, TTFT, tokens, cost, capacity in-flight and wait time per axis,
 credential health, provider quota percentage, budget consumption ratio, prefix hit ratio,
 fallbacks by reason, metering drops, and spool depth.
+
+#### Three series that are emitted and were not written down
+
+The list above is a list of *subjects*, and three series that exist in the scrape belonged to
+none of them. All three answer the same kind of question — **is a bound being pushed on, and
+is anything being lost while it is** — which is the class of series that is useless unless an
+operator knows to look for it.
+
+| Series | Type | What a non-zero value means |
+|---|---|---|
+| `dorang_auth_lookup_throttled_total` | counter | Credential lookups refused **without consulting the store**, because the unknown-key budget (§11.2, `auth.miss_budget`) was empty. Every distinct unknown key used to be one database round trip an unauthenticated caller could buy for nothing; this is what that amplifier costs now. **Read it against `dorang_auth_store_calls_total`: this one rising while that one flattens is the bound holding.** A sustained non-zero value with no attacker means the budget is sized below the deployment's real rate of lookups that find nothing — a client retrying a key that was revoked, most likely — and those callers are getting `503 auth_unavailable` |
+| `dorang_meter_records_refused_closed_total` | counter | Completed requests handed to the meter **after it was closed**, and refused. It is the only way §12.1's numeric path can lose a count, and the window is shutdown, where the drain races the meter's own close. It is a counter rather than a silence because "the ledger stopped listening before the last requests finished" is not a thing to infer from an absence |
+| `dorang_metering_degraded_reason{reason="meter_closed"}` | gauge | The reason set gained a sixth member for the row above. Any non-zero `..._refused_closed_total` raises `dorang_metering_degraded` with this reason, so the shutdown loss is visible on the same signal as every other metering degradation rather than only in a counter nobody is alerting on |
+
+The full reason set of `dorang_metering_degraded_reason` is therefore `none`,
+`trace_queue_full`, `spool_full`, `spool_error`, `sink_error` and `meter_closed`. Sampling and
+the daily byte budget still never set it: those are policy, and conflating policy with failure
+makes the signal useless on any deployment that samples.
 
 > **Three of the labels above were not sourceable as written, and the reason is worth
 > recording rather than quietly dropping them.**

@@ -50,6 +50,27 @@ import (
 //     and the entries here name which ones those are so that the re-derivation
 //     has a work list.
 //
+//     `Config.Server.ReadTimeout`, `.IdleTimeout`, `.ReadHeaderTimeout`,
+//     `Config.Auth.MissBudget.Rate` and `.Burst` are the second worked example,
+//     and they are worse than the metrics block because the collision is with
+//     the CONSUMER's own field name: `ReadTimeout` and `IdleTimeout` occur in
+//     internal/server and `MissRate`/`MissBurst` in internal/auth, so the guard
+//     reported all five as consumed on the day they were added and would have
+//     gone on doing so for as long as they were unwired. A field is most likely
+//     to collide with the identifier of the thing it is supposed to be feeding,
+//     which makes this the failure mode of the check rather than an edge of it.
+//     What holds those five is TestReadHeaderTimeoutIsReachableFromConfiguration
+//     and its four siblings in internal/app, which drive [LoadBytes] through an
+//     assembled gateway and assert a socket the running server does or does not
+//     close and a status the running authenticator does or does not return.
+//
+//   - The OPPOSITE DIRECTION, entirely. A knob that exists on server.Options or
+//     auth.Config and has no Config field at all is not walked here, because
+//     this walk starts from Config. That direction is where most of this
+//     repository's unreachable settings have come from, and four of them are
+//     still open; docs/CONFIG.md §23.1b is its ledger, and it is prose for the
+//     same reason §23.1 is — there is nothing here to hang it on.
+//
 //   - Semantics. Reading `MaxQueue` and comparing it against the wrong thing
 //     passes here.
 //

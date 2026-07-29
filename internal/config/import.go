@@ -458,7 +458,18 @@ func (im *importer) importParams(path string, params *yamlMap, provider string, 
 		case "output_cost_per_token":
 			im.price(p, provider, upstream, "output", n)
 		case "input_cost_per_second":
-			im.price(p, provider, upstream, "seconds", n)
+			// The incumbent's own semantic for this key is the request's ELAPSED
+			// TIME — it multiplies the rate by the response time — so that is what
+			// it imports as, faithfully. It is also the key an incumbent
+			// configuration uses for a transcription model that bills the length
+			// of the recording, and those two are different quantities (§10.7);
+			// the one key cannot say which, so the import says so rather than
+			// choosing silently.
+			im.warn(p+".input_cost_per_second", "imported as compute_seconds, which prices "+
+				"the request's own wall time. If this model bills by the length of the "+
+				"AUDIO it was given, change the component to audio_seconds — the two are "+
+				"different quantities and dorang will not substitute one for the other")
+			im.price(p, provider, upstream, "compute_seconds", n)
 		case "output_cost_per_character", "input_cost_per_character":
 			im.price(p, provider, upstream, "characters", n)
 		case "cache_read_input_token_cost":
@@ -554,9 +565,19 @@ func (im *importer) price(path, provider, model, component string, n *yaml.Node)
 	if im.priceSeen == nil {
 		im.priceSeen = map[string]string{}
 	}
-	key := provider + "\x00" + model
-	id, ok := im.priceSeen[key]
+	// Keyed by UNIT as well as by provider and model, so an imported model that
+	// quotes both a token price and a per-second price lands in two rules. A rule
+	// carries one `unit`, and merging the two into one would produce a
+	// configuration this package then refuses — which is worse than two rules,
+	// because the operator did not write either of them.
+	unit, ok := pricingComponentUnit[CanonicalComponent(component)]
 	if !ok {
+		im.warn(path, "%q is not a priced component and was not imported", component)
+		return
+	}
+	key := provider + "\x00" + model + "\x00" + unit
+	id, seen := im.priceSeen[key]
+	if !seen {
 		id = fmt.Sprintf("imported-%s-%d", provider, len(im.cfg.Pricing.Rules)+1)
 		im.cfg.Pricing.Rules = append(im.cfg.Pricing.Rules, PricingRule{
 			ID:    id,
