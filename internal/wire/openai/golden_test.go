@@ -515,6 +515,55 @@ func TestNoHTMLEscaping(t *testing.T) {
 	}
 }
 
+// TestNoHTMLEscapingOnTheRequestPath is the same rule where it was NOT held.
+//
+// [TestNoHTMLEscaping] above passes on a chunk because Delta.Content is a plain
+// struct field, encoded by this package's escaping-off encoder. Message content
+// is not a plain field — it is [Content], a string-or-array type with its own
+// MarshalJSON — and that method called encoding/json.Marshal, whose escaping is
+// ON by default. So the single most caller-controlled string in the whole
+// protocol went upstream as "a && b" while every field around it went
+// as itself, and no test looked: the escaping tests all sat on the response
+// side, on fields that never took that path. [StopSequences] and Anthropic's
+// [anthropic.BlockList] had it for the same reason.
+//
+// It is a divergence a client sees. A caller that sends "<think>" and reads the
+// upstream's echo of its own prompt back gets bytes it did not send, and a
+// substring match on the raw frame — which COMPATIBILITY 2.1a exists for — fails
+// against every other OpenAI-compatible server.
+func TestNoHTMLEscapingOnTheRequestPath(t *testing.T) {
+	const text = "a && b <tag>"
+	req := &canonical.Request{
+		Model: "m",
+		Messages: []canonical.Message{
+			{Role: canonical.RoleUser, Content: canonical.Content{canonical.TextBlock(text)}},
+			{Role: canonical.RoleUser, Content: canonical.Content{
+				canonical.TextBlock(text),
+				{Kind: canonical.KindImage, Source: &canonical.Source{
+					Kind: canonical.SourceURL, Data: "https://example.test/a?x=1&y=2"}},
+			}},
+		},
+		Stop: []string{text},
+	}
+	got, err := MarshalRequest(req, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"content":"a && b <tag>"`,               // the string form
+		`"text":"a && b <tag>"`,                  // the array form
+		`"stop":"a && b <tag>"`,                  // the string-or-array stop field
+		`"url":"https://example.test/a?x=1&y=2"`, // a plain field, unchanged
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("missing %s in:\n%s", want, got)
+		}
+	}
+	if bytes.Contains(got, []byte(`\u00`)) || bytes.Contains(got, []byte(`\u003`)) {
+		t.Errorf("HTML escaping is on somewhere in:\n%s", got)
+	}
+}
+
 func mustWrite(t *testing.T, s *StreamWriter, ev canonical.StreamEvent) {
 	t.Helper()
 	if err := s.WriteEvent(ev); err != nil {

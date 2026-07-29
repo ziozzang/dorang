@@ -35,6 +35,14 @@ func (r ModerationRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, moderationRequestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ModerationRequest.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ModerationRequest) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ModerationRequest
+	return appendWithExtra(dst, alias(r), r.Extra, moderationRequestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0).
 func (r *ModerationRequest) UnmarshalJSON(b []byte) error {
@@ -177,6 +185,14 @@ func (r ModerationResponse) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, moderationResponseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ModerationResponse.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ModerationResponse) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ModerationResponse
+	return appendWithExtra(dst, alias(r), r.Extra, moderationResponseKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
 // json.Unmarshal with a case-folding split — see [splitExtraFold].
 func (r *ModerationResponse) UnmarshalJSON(b []byte) error {
@@ -216,6 +232,14 @@ var moderationResultKnown = knownKeys("flagged", "categories", "category_scores"
 func (r ModerationResult) MarshalJSON() ([]byte, error) {
 	type alias ModerationResult
 	return marshalWithExtra(alias(r), r.Extra, moderationResultKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [ModerationResult.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ModerationResult) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ModerationResult
+	return appendWithExtra(dst, alias(r), r.Extra, moderationResultKnown)
 }
 
 type moderationFlags struct {
@@ -368,7 +392,7 @@ func MarshalModerationRequest(req *canonical.ModerationRequest, model string) ([
 	if model != "" {
 		w.Model = model
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // ErrNotAModerationResponse is a JSON object that parsed cleanly and is not a
@@ -442,5 +466,5 @@ func MarshalModerationResponse(r *canonical.ModerationResponse) ([]byte, error) 
 		w.Results[i].Extra = r.Results[i].Extra
 		w.Results[i].setCategories(r.Results[i].Categories)
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }

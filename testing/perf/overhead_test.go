@@ -37,14 +37,15 @@ import (
 //
 // The p50 was published as 200 µs and was never measured end to end. It holds
 // for a request of a few hundred bytes and not at the profile's stated 4 KiB
-// ceiling, where the four JSON passes over the body dominate everything else.
-// This figure has now been corrected twice: up to 480 µs when it was first
-// measured here, and back down to 375 µs when two duplicate parses came out of
-// those four passes (§15.1, "Two of those passes were the same bytes read
-// twice"). It is still the codec that sets it. The p99 was published as 2 ms and
-// holds with better than a factor of three.
+// ceiling, where the JSON passes over the body dominate everything else. This
+// figure has now been corrected three times: up to 480 µs when it was first
+// measured here, down to 375 µs when two duplicate parses came out of the
+// decode, and down to 280 µs when the encode stopped re-scanning every nested
+// type once per level of its nesting (§15.1, "A Marshaler's document is
+// compacted into its parent"). It is still the codec that sets it. The p99 was
+// published as 2 ms and holds with better than a factor of four.
 const (
-	warmLocalP50 = 375 * time.Microsecond
+	warmLocalP50 = 280 * time.Microsecond
 	warmLocalP99 = 2 * time.Millisecond
 )
 
@@ -55,10 +56,11 @@ const (
 // answer is skipped rather than accommodated, which is how a gate stays a gate
 // instead of drifting upward every time CI is loaded.
 //
-// It came DOWN from 900 µs with the budget, which is the direction a bound
-// derived from a measurement has to move when the measurement improves. A
-// ceiling left where it was would stop catching the regression it exists for.
-const p50Bound = 750 * time.Microsecond
+// It came DOWN from 900 to 750 with the decode measurement and from 750 to 560
+// with the encode one, which is the direction a bound derived from a
+// measurement has to move when the measurement improves. A ceiling left where
+// it was would stop catching the regression it exists for.
+const p50Bound = 560 * time.Microsecond
 
 // measurable is how far two measurements of the same thing may differ before
 // the host is judged unable to answer. Same instrument and same reasoning as
@@ -234,8 +236,10 @@ func TestTheInstrumentSeparatesTheUpstream(t *testing.T) {
 // intercept.
 //
 // The slope is what moved when the duplicate parses inside those passes came
-// out: 186/251/469/1179 µs before, 158/198/355/1037 after. The intercept barely
-// moved, because the intercept was never the codec.
+// out: 186/251/469/1179 µs before, 158/198/355/1037 after; and again when the
+// encode stopped compacting every nested type into its parent, 145/163/246/508.
+// The intercept barely moved either time, because the intercept was never the
+// codec.
 func TestGatewayOverheadByBodySize(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: this is a measurement, not a unit test")
@@ -393,10 +397,19 @@ func TestGatewayAddedTTFTStreaming(t *testing.T) {
 	if !gated(t) {
 		return
 	}
-	if spread := disagreement(ttft.P50, ttft2.P50); spread > measurable {
-		t.Skipf("this machine cannot hold a sub-millisecond budget: the same "+
-			"measurement came back %v then %v, a spread of %.0f%%",
-			ttft.P50, ttft2.P50, 100*spread)
+	// The disagreement check has to be on the statistic the gate ASSERTS, and
+	// it was not: it compared the two p50s and then failed the build on a p99.
+	// Those are different quantities with different noise — a p50 built from a
+	// thousand samples is stable on a loaded machine and the p99 is built from
+	// ten, so this gate would fail honest builds whenever the host had a
+	// neighbour, and did. Measured back to back on a busy machine it read
+	// 2.59 ms then 798 µs from the same binary against the same fake, which is
+	// not a measurement of anything.
+	if spread := disagreement(ttft.P99, ttft2.P99); spread > measurable {
+		t.Skipf("this machine cannot hold a sub-millisecond budget: the p99 came "+
+			"back %v then %v, a spread of %.0f%% (over %.0f%%). Run it alone, or "+
+			"with -short to skip it by name.",
+			ttft.P99, ttft2.P99, 100*spread, 100*measurable)
 	}
 	if ttft.P99 > time.Millisecond {
 		t.Errorf("added TTFT p99 is %v, over §15.1's published 1 ms", ttft.P99)

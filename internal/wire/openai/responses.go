@@ -107,6 +107,14 @@ func (r ResponsesRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, responsesRequestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ResponsesRequest.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ResponsesRequest) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponsesRequest
+	return appendWithExtra(dst, alias(r), r.Extra, responsesRequestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0).
 func (r *ResponsesRequest) UnmarshalJSON(b []byte) error {
@@ -138,6 +146,14 @@ func (i ResponseInput) MarshalJSON() ([]byte, error) {
 		return Marshal(i.Items)
 	}
 	return Marshal(i.Text)
+}
+
+// AppendJSON implements [wirejson.Appender].
+func (i ResponseInput) AppendJSON(dst []byte) ([]byte, error) {
+	if i.Items != nil {
+		return appendValue(dst, i.Items)
+	}
+	return appendString(dst, i.Text), nil
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -205,6 +221,14 @@ func (i ResponseItem) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(i), i.Extra, responseItemKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ResponseItem.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (i ResponseItem) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponseItem
+	return appendWithExtra(dst, alias(i), i.Extra, responseItemKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (i *ResponseItem) UnmarshalJSON(b []byte) error {
 	type alias ResponseItem
@@ -234,6 +258,14 @@ func (c ResponseContent) MarshalJSON() ([]byte, error) {
 		return Marshal(c.Parts)
 	}
 	return Marshal(c.Text)
+}
+
+// AppendJSON implements [wirejson.Appender].
+func (c ResponseContent) AppendJSON(dst []byte) ([]byte, error) {
+	if c.Parts != nil {
+		return appendValue(dst, c.Parts)
+	}
+	return appendString(dst, c.Text), nil
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -292,6 +324,14 @@ func (p ResponsePart) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(p), p.Extra, responsePartKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ResponsePart.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (p ResponsePart) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponsePart
+	return appendWithExtra(dst, alias(p), p.Extra, responsePartKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (p *ResponsePart) UnmarshalJSON(b []byte) error {
 	type alias ResponsePart
@@ -330,6 +370,14 @@ var responsesToolKnown = knownKeys("type", "name", "description", "parameters", 
 func (t ResponsesTool) MarshalJSON() ([]byte, error) {
 	type alias ResponsesTool
 	return marshalWithExtra(alias(t), t.Extra, responsesToolKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [ResponsesTool.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (t ResponsesTool) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponsesTool
+	return appendWithExtra(dst, alias(t), t.Extra, responsesToolKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -432,6 +480,14 @@ func (u ResponsesUsage) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(u), u.Extra, responsesUsageKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ResponsesUsage.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (u ResponsesUsage) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponsesUsage
+	return appendWithExtra(dst, alias(u), u.Extra, responsesUsageKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (u *ResponsesUsage) UnmarshalJSON(b []byte) error {
 	type alias ResponsesUsage
@@ -468,6 +524,14 @@ func (d InputTokensDetails) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(d), d.Extra, inputDetailsKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [InputTokensDetails.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (d InputTokensDetails) AppendJSON(dst []byte) ([]byte, error) {
+	type alias InputTokensDetails
+	return appendWithExtra(dst, alias(d), d.Extra, inputDetailsKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (d *InputTokensDetails) UnmarshalJSON(b []byte) error {
 	type alias InputTokensDetails
@@ -497,6 +561,14 @@ var outputDetailsKnown = knownKeys("reasoning_tokens")
 func (d OutputTokensDetails) MarshalJSON() ([]byte, error) {
 	type alias OutputTokensDetails
 	return marshalWithExtra(alias(d), d.Extra, outputDetailsKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [OutputTokensDetails.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (d OutputTokensDetails) AppendJSON(dst []byte) ([]byte, error) {
+	type alias OutputTokensDetails
+	return appendWithExtra(dst, alias(d), d.Extra, outputDetailsKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -741,7 +813,7 @@ func MarshalResponsesItems(msgs []canonical.Message) ([]byte, error) {
 	if items == nil {
 		items = []ResponseItem{}
 	}
-	return Marshal(items)
+	return marshalAppender(items)
 }
 
 // ResponsesItemsToMessages is the inverse: a stored item array read back as
@@ -939,7 +1011,7 @@ func MarshalResponsesRequest(req *canonical.Request, opt *EncodeOptions) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeResponsesRequest converts a neutral request to the Responses shape.
@@ -1179,7 +1251,7 @@ func MarshalResponsesResponse(r *canonical.Response, opt *ResponsesOptions) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeResponsesResponse converts a neutral response to the Responses shape.

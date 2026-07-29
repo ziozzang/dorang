@@ -692,7 +692,7 @@ one is a place a plausible reading produces broken behavior.
    11 in the worst case, against a hole that was previously unbounded. Cost is one idled unit
    per claimed axis key, and measured **+5.3%** on the mixed contended workload that provokes
    it, nil on single-axis contention (which never claims). On by default; capacity acquisition
-   is ~450 ns against §15.1's measured 375 µs budget, so the trade is a liveness guarantee for a
+   is ~450 ns against §15.1's measured 249 µs budget, so the trade is a liveness guarantee for a
    fraction of a percent of the gateway.
 
 6. **Check order.** §5.3 and §5.7 stated different orders. §5.7's is authoritative because it
@@ -3664,19 +3664,19 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 
 | Profile | p50 | p99 | Notes |
 |---|---|---|---|
-| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | **375 µs** | 2 ms | headline, **measured**; was published as 200 µs, corrected to 480 µs, and now 375 µs because the codec got faster — see below |
+| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | **249 µs** | 2 ms | headline, **measured**; was published as 200 µs, corrected to 480 µs, then 375 µs and now 249 µs because the codec got faster twice — see below |
 | `cold-auth` — auth cache miss, one store read | — | 15 ms | |
 | `shared-redis` — clustered exact capacity | — | 5 ms | +1 RTT, deliberate |
 | `external-auth` — delegated auth | — | governed by the callee | stated, not promised |
 | `lua-enabled` — hooks active | — | +hook ceiling | ceiling is configured |
-| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | **34 ms / 512 ms** | **measured**; published as 6 ms / 60 ms, and misnamed — see below |
+| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | **22 ms / 283 ms** | **measured**; published as 6 ms / 60 ms, and misnamed — see below |
 
 | Other | Target | Measured |
 |---|---|---|
-| Added TTFT, streaming | p99 < 1 ms | **p99 600 µs** — holds |
+| Added TTFT, streaming | p99 < 1 ms | **p50 196 µs, p99 410 µs** — holds |
 | Idle RSS, notebook profile | < 100 MB | **62 MB** including the load generator and a fake backend in the same process — holds |
 | 1000 concurrent streams | < 300 MB **including** the replay budget (§15.4) | **256 MB** for three participants in one address space — holds, with the gateway's own share strictly less |
-| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.039%** of the measured 375 µs warm-local p50 |  |
+| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.059%** of the measured 249 µs warm-local p50 |  |
 
 > **"5%" needed a denominator.** An earlier draft said only "metering on vs off < 5%", which never
 > said 5% *of what*. Measured against a no-op meter the ratio is **7.6×** — but the no-op returns after
@@ -3686,8 +3686,8 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 > metering is *cheaper* (110 ns), because a failed ring push skips the payload copy while the numeric
 > path does identical work. That asymmetry is the two-queue split (§12.1) behaving as designed.
 >
-> The gate's absolute bound stayed at **10 µs** through both corrections of the budget above — up
-> from 200 µs to 480 µs, then down to 375 µs. 5% of either figure would be looser than 10 µs, and a
+> The gate's absolute bound stayed at **10 µs** through every correction of the budget above — up
+> from 200 µs to 480 µs, then down to 375 µs and to 249 µs. 5% of any of those would be looser than 10 µs, and a
 > bound that moves because the thing it is a fraction of moved is a ratchet, not a bound.
 
 #### The 200 µs p50 was never measured, and it does not hold
@@ -3703,15 +3703,19 @@ fixed sleep, would not survive a streaming relay whose work is interleaved with 
 Measured on a 16-core AMD Ryzen 7 8745HS, warm, prefix on, metering with traces at full
 sampling, 100 pricing rules loaded, two deployments competing, four concurrent clients:
 
-| request body | p50 | p90 | p99 | p50 before the codec fix below |
-|---|---|---|---|---|
-| 256 B | 158 µs | 232 µs | 344 µs | 186 µs |
-| 1 KiB | 198 µs | 279 µs | 382 µs | 251 µs |
-| **4 KiB** (the profile's stated ceiling) | **355 µs** | 475 µs | **635 µs** | 469 µs |
-| 16 KiB (outside the profile) | 1.04 ms | 1.40 ms | 1.74 ms | 1.18 ms |
+| request body | p50 | p90 | p99 | p50 before the encode fix | p50 before the decode fix |
+|---|---|---|---|---|---|
+| 256 B | 125 µs | 175 µs | 244 µs | 150 µs | 186 µs |
+| 1 KiB | 156 µs | 218 µs | 306 µs | 187 µs | 251 µs |
+| **4 KiB** (the profile's stated ceiling) | **249 µs** | 324 µs | **429 µs** | 354 µs | 469 µs |
+| 16 KiB (outside the profile) | 616 µs | 867 µs | 1.08 ms | 958 µs | 1.18 ms |
+
+The last two columns are the same harness on the same machine, run back to back against binaries
+built from the two forms of the code, because a latency figure quoted from a different day is a
+figure about the day.
 
 So the published 200 µs held for a request of a few hundred bytes and was never true at the
-4 KiB the profile names. The p99 of 2 ms holds with better than a factor of three, and the p99
+4 KiB the profile names. The p99 of 2 ms holds with better than a factor of four, and the p99
 is the number an operator notices: a p50 is a story about the machine, a p99 is a story about a
 client that timed out.
 
@@ -3720,8 +3724,8 @@ trace metering, a 100-rule price catalog and a second deployment turned on and o
 arm moved the p50 outside the noise (341 µs bare, 344 µs with all four). The cost is the four
 JSON passes a cross-protocol gateway makes over the body — decode the client's request into the
 canonical form, encode the upstream's, decode the upstream's response, encode the client's —
-and they are ~85% of the CPU the request path burns. That fraction has not moved; what the
-passes cost has.
+and they are ~85% of the CPU the request path burns. That fraction has not moved through either
+correction below; what the passes cost has.
 
 #### Two of those passes were the same bytes read twice, and are gone
 
@@ -3763,17 +3767,96 @@ replaced over arbitrary bytes and require the same members, the same values and 
 text. The strict-decode differential (`canonical.FuzzGateAdapterAgreement`) and the gate's own
 (`server.FuzzPeekRequest`) are unchanged and still pass, which is what says W10 survived.
 
-**What is left is the encode side, and it is the same shape of problem.** With decode halved,
-`MarshalRequest` is now the largest single component of the request path — ~35% of it, against
-decode's ~34% — and one function inside it, `encoding/json.appendCompact`, is **34% of the
-request path on its own**. Every nested type's `MarshalJSON` returns a byte slice, and
-`encoding/json` re-scans and copies that slice into the output buffer, once per nesting level:
-the same "read the same bytes again to satisfy an interface" that decode had, in the other
-direction. It is the `json.Marshaler` contract, not a defect, and removing it means not
-implementing `MarshalJSON` on nested types — a much larger change than this one, and one that
-would put the byte-exact serializer contract (COMPATIBILITY 2.1a) at risk to buy it. It is
-named here so that the next person measuring this starts where the cost is rather than where it
-used to be.
+#### The encode side had the same shape, and the `json.Marshaler` contract was the whole of it
+
+The paragraph that used to sit here named the encode side as the largest remaining component
+and declined to touch it, on the ground that removing the cost meant not implementing
+`MarshalJSON` on nested types and so putting COMPATIBILITY 2.1a's byte-exact serializer at
+risk. The measurement was right and the conclusion was not: the cost is removable **without**
+removing `MarshalJSON`, and the byte-exactness ends up better pinned than it was.
+
+**What it cost.** `encoding/json`'s contract for a `Marshaler` is that the method returns a
+finished document, which the encoder then folds into the buffer it is building with `compact` —
+a full pass of the JSON state machine over every byte, which with HTML escaping off drops
+nothing and copies everything. Every wire type implements `MarshalJSON`, because that is how
+the `Extra` splice, the field order and the omission rules are made exact. So the text of a
+message was re-scanned by the part's marshal, by the content's, by the message's and by the
+request's: **`appendCompact` and its state machine were 70% of `MarshalRequest`** — more than
+the encoding — and encode as a whole was **34.6% of the request path** against decode's 19%.
+
+**What replaced it.** `wirejson.Appender` is `json.Marshaler` with one argument different:
+`AppendJSON(dst []byte) ([]byte, error)` writes into the caller's buffer instead of returning a
+slice. A nested type is written straight into its parent, so the document is built once and
+scanned never, and the top-level `MarshalRequest` calls `AppendJSON` directly rather than
+handing the type to `encoding/json` at all. **`MarshalJSON` stays**, unchanged, still reflective,
+still reaching its nested types through `encoding/json` — which is what makes the next paragraph
+possible.
+
+**Why this is not a second serializer.** `wirejson.Append` plans a type by walking it with
+`reflect`, and the rule that keeps it honest is that it **refuses** anything it does not model:
+an embedded field, a `,string` or `,omitzero` tag, a `json.Number`, an interface, a
+`TextMarshaler`, a type that is a `Marshaler` only through its pointer, a recursive type. A
+refusal returns no plan and the value goes to `encoding/json` unchanged, so an unhandled shape
+is **slow and never wrong**. `TestEveryMarshalerIsAnAppender` lists which types are on the fast
+path and `TestRequestSubtreeIsPlanned` asserts the property itself rather than a proxy for it —
+`wirejson.Delegations()` counts the values an append run handed back, and for a chat request
+with array content, tool calls, tool declarations and a cache breakpoint the answer must be
+none.
+
+The rest is the differential that the decode work established as the price of admission:
+`FuzzAppendAgreesWithMarshal` renders arbitrary DECODED wire values both ways and requires the
+same bytes or the same error — **13.8M executions** across the 27 chat, Responses, completions,
+audio, image and moderation types, **54.6M** on Messages, **51.8M** on rerank and **11.7M** on
+the primitives, plus **16.5M** on `FuzzAppendString` alone, which is the one with a stated
+contract to check against.
+
+**It refuted itself twice, which is what it was for.**
+
+1. **`Content.MarshalJSON` was HTML-escaping the one field a caller controls.** The package
+   encoder sets `SetEscapeHTML(false)`, so every plain struct field was right and every existing
+   escaping test was checking one of those. But a string-or-array type carries its own
+   `MarshalJSON`, and the three that do — `openai.Content`, `openai.StopSequences`,
+   `anthropic.BlockList` — called `encoding/json.Marshal`, whose escaping is on. A user message
+   reading `a && b` went upstream as `a \u0026\u0026 b` while the `name` beside it went as
+   itself. That is COMPATIBILITY 2.1a's exact failure mode, unpinned by any test, and it is
+   fixed and pinned now (`TestNoHTMLEscapingOnTheRequestPath`). The appender did not cause it;
+   the appender is what made it visible, because two encoders that must agree cannot both be
+   silently wrong in the same way.
+2. **The `Extra` splice must compact.** `MarshalWithExtra` splices an unmodelled member's bytes
+   verbatim — and its result has always gone straight back to `encoding/json`, which compacts it
+   on the way into whatever holds it. The appender is the first path with no encoder above it,
+   so splicing verbatim there would have put a caller's whitespace on the wire for the first
+   time in the project's history. Also caught: a non-nil, empty `json.RawMessage` is an error in
+   `encoding/json` and was `null` here.
+
+| | before | after |
+|---|---|---|
+| `openai.MarshalRequest`, 1 KiB | 75 MB/s, 33 allocs, 7.5 KB | **431 MB/s, 20 allocs, 3.5 KB** |
+| `openai.MarshalRequest`, 32 KiB | 78 MB/s, 601 allocs | **587 MB/s, 344 allocs** |
+| `openai.MarshalRequest`, 400 KiB | 79 MB/s, 8 266 allocs | **468 MB/s, 5 128 allocs** |
+| the same at 4 KiB with array content, tool calls and a breakpoint | 52 MB/s, 256 allocs | **243 MB/s, 187 allocs** |
+| one dispatched 4 KiB request | 266 allocs, 56 KB | **249 allocs, 36 KB** |
+| warm-local p50 / p99 | 352 µs / 688 µs | **248 µs / 515 µs** |
+| added TTFT, streaming, p50 / p99 | 278 µs / 620 µs | **196 µs / 410 µs** |
+| throughput ceiling (§15.3) | 24 758 req/s | **30 979 req/s** |
+| encode's share of the request path | 34.6% | **12.2%** |
+
+`DecodeRequest` measured 63.5 MB/s on both binaries, which is the control: the change is on the
+encode side and nowhere else.
+
+**Read the allocation row carefully, because its two halves are different sizes.** The COUNT
+fell 6% and the BYTES fell 35%. What a `Marshaler` per level costs is not one object per value:
+it is a copy of the whole subtree at every level above it. A gate on the count alone would have
+registered almost nothing, which is why `testing/perf` now bounds both.
+
+**What is left.** `encoding/json.appendCompact` is gone from the profile entirely. Encode is
+12.2% of the request path and the largest codec component is `checkValid` on the decode side
+again — `json.Unmarshal` validating a document before it is decoded, which is the pass §15.1's
+decode note left in place deliberately. Below that, the appender's own remainder is one
+allocation per nested value, because handing a struct to `reflect` puts it on the heap; removing
+that means hand-writing the field loops for `Message`, `Part` and `Request`, which would buy a
+few percent of the request path for a large increase in the surface the differential has to
+cover. It is named here, and it is not recommended.
 
 **The measurement depends on the offered rate, and the profile should say so.** The same gateway
 doing the same work measured 259 µs at 1585 req/s, 347 µs at 558 req/s and 510 µs at 344 req/s
@@ -3783,11 +3866,15 @@ without one is the kind of unfalsifiable number the top of this section refuses.
 
 #### The large-body rows were wrong by an order of magnitude, and misnamed
 
-| profile | published p99 | measured p99 | measured before the codec fix |
-|---|---|---|---|
-| 256 KiB | — | 10.1 ms | 14.8 ms |
-| `prefix-1MiB` | 6 ms | **34 ms** | 45 ms |
-| `prefix-16MiB` | 60 ms | **512 ms** | 682 ms |
+| profile | published p99 | measured p99 | before the encode fix | before the decode fix |
+|---|---|---|---|---|
+| 256 KiB | — | **6.0 ms** | 10.6 ms | 14.8 ms |
+| `prefix-1MiB` | 6 ms | **22 ms** | 35 ms | 45 ms |
+| `prefix-16MiB` | 60 ms | **283 ms** | 476 ms | 682 ms |
+
+These arms carry 120, 60 and 20 samples, so each figure is the mean of two runs of the two
+binaries interleaved rather than a single reading; a p99 over twenty samples is the second-worst
+of twenty and moves several milliseconds between runs on its own.
 
 The name is the more useful defect. **The prefix chain is about 1% of these figures.** Its own
 benchmark puts a 16 MiB chain at **7.1 ms and 728 B in 17 allocations**, running at 2.36 GB/s —
@@ -3807,9 +3894,10 @@ configuration names and this note says what is actually in them.
    > **This says "gate", not "hot path", and the change is a correction.** It read "no
    > allocation on the hot path", which was never true of a request that gets dispatched.
    > Measured end to end (`testing/perf`, `BenchmarkGatewayRequest` minus its no-gateway
-   > control) one 4 KiB non-streaming request allocates about **262 objects and 55 KB** — 13×
-   > the request body, down from 391 and 71 KB before §15.1's codec fix. Essentially all of it
-   > is the four JSON passes of §15.1's note, and none of it is in the gate. The claim was true about the code it was written about and false
+   > control) one 4 KiB non-streaming request allocates about **249 objects and 36 KB** — 9×
+   > the request body, down from 391 and 71 KB before §15.1's decode fix and 266 and 56 KB
+   > before its encode one. Essentially all of it is the four JSON passes of §15.1's note, and
+   > none of it is in the gate. The claim was true about the code it was written about and false
    > about the sentence it was written in, which is the failure mode this document exists to
    > avoid.
 3. **Single-pass, no-decode streaming relay [R1-C1]** — upstream SSE frames are scanned,
@@ -3840,29 +3928,33 @@ state. Two numbers are reported separately and both must hold:
 with a 5 ms think time and 4 KiB bodies, and reports where it stops scaling. On a 16-core
 Ryzen 7 8745HS, with the load generator and the fake backend in the same process:
 
-| concurrent clients | req/s | overhead p50 | overhead p99 | req/s before the codec fix |
+| concurrent clients | req/s | overhead p50 | overhead p99 | req/s before the encode fix |
 |---|---|---|---|---|
-| 1 | 159 | 535 µs | 877 µs | 153 |
-| 16 | 2 471 | 607 µs | 1.22 ms | 2 381 |
-| 64 | 10 227 | 316 µs | 1.09 ms | 10 027 |
-| **128** | **21 246** | 310 µs | 1.57 ms | 20 117 |
-| 256 | **23 532** | 320 µs | 6.33 ms | 20 489 |
-| 512 | 22 076 | 332 µs | 18.37 ms | 19 268 |
+| 1 | 162 | 417 µs | 638 µs | 159 |
+| 16 | 2 529 | 419 µs | 814 µs | 2 450 |
+| 64 | 10 272 | 219 µs | 885 µs | 10 380 |
+| 128 | 21 005 | 195 µs | 924 µs | 21 282 |
+| **256** | **30 979** | 202 µs | 3.81 ms | 24 758 |
+| 512 | 29 730 | 214 µs | 14.45 ms | 23 893 |
 
 Throughput is linear in offered concurrency to about 128 clients and flat after it. The knee is
 sharper in the p99 than in the throughput, which is what an operator sees first: past it, extra
-concurrency buys queueing and nothing else. The knee moved out from 128 clients to 256 and the
-plateau rose about 15% when §15.1's codec duplication came out, which is what a CPU-bound
-ceiling does when the CPU gets cheaper.
+concurrency buys queueing and nothing else. The knee moved out from 128 clients to 256 when
+§15.1's decode duplication came out and stayed there through the encode one; the plateau rose
+about 15% then and **25%** now, which is what a CPU-bound ceiling does when the CPU gets
+cheaper. Below the knee the change shows up as latency rather than throughput — at 64 clients
+the p50 fell by a third and the req/s did not move, because at that concurrency the offered
+rate, not the machine, is the limit.
 
 **What holds it there is CPU, and the CPU is JSON.** At the knee the three participants together
 saturate the machine, and 85% of the request path's own cycles are the four codec passes of
-§15.1 — a share that did not move when those passes were made ~1.8× cheaper, which is the
-clearest statement available that the ceiling is the codec and nothing else. It is not a lock. Mutex profiles taken in steady state at the knee — after warm-up, so
+§15.1 — a share that did not move when the decode passes were made ~1.8× cheaper nor when the
+encode ones were made ~5×, which is the clearest statement available that the ceiling is the
+codec and nothing else. It is not a lock. Mutex profiles taken in steady state at the knee — after warm-up, so
 the connection-pool and SQLite cold starts are excluded — put the largest identified contention
 inside `capacity.Broker`, reached three or more times per request (`TryAcquire`, `Release`, and
 once per candidate from `least_busy`), and even that is smaller than the Go allocator's heap
-lock, which is itself a consequence of the 262 allocations per request rather than a cause.
+lock, which is itself a consequence of the ~250 allocations per request rather than a cause.
 None of `internal/prefix`'s table, `internal/meter`'s ring or the auth snapshot appears at all.
 
 > **`least_busy` takes one turn at the broker's single mutex per candidate**, so the routing
@@ -3877,10 +3969,10 @@ None of `internal/prefix`'s table, `internal/meter`'s ring or the auth snapshot 
 > and touches that lock about 1% of the time.
 
 **Footprint follows the allocation rate, not the concurrency.** At the knee the heap in use is
-about 740 MB against 66 MB live after collection — Go's pacer doing its job against a 1.3 GB/s
-allocation rate (23.5k req/s × 55 KB), not a leak. Halving the allocations per request did not
-halve the heap at the knee, because the throughput rose to spend them: the pacer sizes against
-the allocation RATE, and that is roughly where it was. With a thousand streams held genuinely open
+about 960 MB against 67 MB live after collection — Go's pacer doing its job against a ~1.1 GB/s
+allocation rate (31k req/s × 36 KB), not a leak. Neither codec fix reduced the heap at the knee;
+both raised it, because the throughput rose faster than the per-request footprint fell and the
+pacer sizes against the allocation RATE. With a thousand streams held genuinely open
 the resident set is 256 MB (§15.1). An operator who needs a smaller heap at high throughput
 sets `GOGC` or `GOMEMLIMIT`; an operator who needs both wants the codec passes reduced.
 

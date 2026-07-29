@@ -103,13 +103,21 @@ func gatewayRequest(g *Gateway, secret string, body []byte) *http.Request {
 // gates it.
 //
 // The bound is a ceiling on a REGRESSION, not a target: the measured figure is
-// roughly 390 allocations and 86 KB for a 4 KiB request INCLUDING the control
+// roughly 375 allocations and 66 KB for a 4 KiB request INCLUDING the control
 // below, essentially all of it the four JSON passes a cross-protocol gateway
 // makes over the body (decode the client's request, encode the upstream's,
 // decode the upstream's response, encode the client's). It was 518 and 101 KB
 // until the duplicate parses inside those passes came out (§15.1); the
-// gateway's own share, with the control subtracted, went from 391 to 262. What
-// this gate catches is a fifth pass.
+// gateway's own share, with the control subtracted, went from 391 to 262 there
+// and to 246 when the encode stopped building a document per nesting level.
+//
+// The two halves of that second improvement are very different sizes, and the
+// difference is worth reading: the COUNT fell by 6% and the BYTES by 35%,
+// because what a Marshaler per level costs is not one object per value but a
+// copy of the whole subtree at every level above it. A gate on the count alone
+// would have registered almost nothing.
+//
+// What this gate catches is a fifth pass.
 func TestHotPathAllocations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short: this is a measurement, not a unit test")
@@ -144,16 +152,19 @@ func TestHotPathAllocations(t *testing.T) {
 	// Generous, because the control is subtracted from a benchmark that ran
 	// under a different iteration count and both are wall-clock adaptive. What
 	// it catches is an order of magnitude, which is what a new decode pass or a
-	// lost buffer pool looks like. It came down from 900 with the measurement:
-	// a ceiling that stays where it was after a 25% improvement has stopped
-	// being a ceiling on anything.
-	const allocCeiling = 700
+	// lost buffer pool looks like. It came down from 900 to 700 with the decode
+	// measurement and from 700 to 650 with the encode one: a ceiling that stays
+	// where it was after an improvement has stopped being a ceiling on anything.
+	const allocCeiling = 650
 	if gwAllocs > allocCeiling {
 		t.Errorf("one request allocates %d objects, over the %d ceiling: "+
 			"something on the dispatch path started allocating per element",
 			gwAllocs, allocCeiling)
 	}
-	const byteCeiling = 256 << 10
+	// The byte ceiling moved further than the count, because that is where the
+	// encode improvement landed: 86 KB to 66 KB measured, so the same threefold
+	// headroom is now 192 KiB rather than 256.
+	const byteCeiling = 192 << 10
 	if gwBytes > byteCeiling {
 		t.Errorf("one request allocates %d bytes for a %d byte body, over the %d "+
 			"ceiling", gwBytes, len(benchBody), byteCeiling)

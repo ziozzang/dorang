@@ -189,6 +189,28 @@ func marshalWithExtra(v any, extra map[string]json.RawMessage, known map[string]
 	return out, nil
 }
 
+// appendWithExtra is [marshalWithExtra] writing into the caller's buffer.
+//
+// It is what a nested wire type uses so that encoding/json never sees it: a
+// Marshaler's result is COMPACTED into its parent, which is a full scan of the
+// subtree at every level of the nesting. See [wirejson.Append] for the plan and
+// for what it refuses.
+func appendWithExtra(dst []byte, v any, extra map[string]json.RawMessage, known map[string]struct{}) ([]byte, error) {
+	return wirejson.AppendWithExtra(dst, v, extra, known)
+}
+
+// marshalAppender renders v as a standalone document through the append path.
+// It is what a top-level Marshal entry point calls in place of [Marshal]: the
+// document is built once instead of being compacted into a buffer once per
+// level of the type it came from.
+func marshalAppender(v any) ([]byte, error) { return wirejson.MarshalAppended(v) }
+
+// appendValue writes v into dst, using v's own AppendJSON where it has one.
+func appendValue(dst []byte, v any) ([]byte, error) { return wirejson.Append(dst, v) }
+
+// appendString appends s as a JSON string literal with HTML escaping off.
+func appendString(dst []byte, s string) []byte { return wirejson.AppendString(dst, s) }
+
 func trimSpace(b []byte) []byte {
 	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\n' || b[0] == '\r') {
 		b = b[1:]

@@ -40,6 +40,14 @@ func (r SpeechRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, speechRequestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [SpeechRequest.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r SpeechRequest) AppendJSON(dst []byte) ([]byte, error) {
+	type alias SpeechRequest
+	return appendWithExtra(dst, alias(r), r.Extra, speechRequestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0).
 func (r *SpeechRequest) UnmarshalJSON(b []byte) error {
@@ -96,7 +104,7 @@ func MarshalSpeechRequest(req *canonical.SpeechRequest, model string) ([]byte, e
 	if model != "" {
 		w.Model = model
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // SpeechMediaType is the response Content-Type for a speech container.
@@ -350,6 +358,14 @@ func (r TranscriptionResponse) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, transcriptionResponseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [TranscriptionResponse.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r TranscriptionResponse) AppendJSON(dst []byte) ([]byte, error) {
+	type alias TranscriptionResponse
+	return appendWithExtra(dst, alias(r), r.Extra, transcriptionResponseKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (r *TranscriptionResponse) UnmarshalJSON(b []byte) error {
 	type alias TranscriptionResponse
@@ -389,6 +405,14 @@ var transcriptionSegmentKnown = knownKeys("id", "start", "end", "text")
 func (s TranscriptionSegment) MarshalJSON() ([]byte, error) {
 	type alias TranscriptionSegment
 	return marshalWithExtra(alias(s), s.Extra, transcriptionSegmentKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [TranscriptionSegment.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (s TranscriptionSegment) AppendJSON(dst []byte) ([]byte, error) {
+	type alias TranscriptionSegment
+	return appendWithExtra(dst, alias(s), s.Extra, transcriptionSegmentKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -442,6 +466,14 @@ var transcriptionUsageKnown = knownKeys("type", "input_tokens", "output_tokens",
 func (u TranscriptionUsage) MarshalJSON() ([]byte, error) {
 	type alias TranscriptionUsage
 	return marshalWithExtra(alias(u), u.Extra, transcriptionUsageKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [TranscriptionUsage.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (u TranscriptionUsage) AppendJSON(dst []byte) ([]byte, error) {
+	type alias TranscriptionUsage
+	return appendWithExtra(dst, alias(u), u.Extra, transcriptionUsageKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].

@@ -11,9 +11,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"sort"
 	"sync"
 )
+
+// errNotObject is what a splice reports when the value it was handed did not
+// marshal to an object. Nothing that reaches it can, which is why it is a
+// sentinel and not a formatted message.
+var errNotObject = errors.New("wirejson: cannot splice extra fields into a non-object")
 
 // Marshal encodes v the way the reference serializer does.
 //
@@ -84,19 +88,12 @@ func MarshalWithExtra(v any, extra map[string]json.RawMessage, known map[string]
 	if len(extra) == 0 {
 		return b, nil
 	}
-	keys := make([]string, 0, len(extra))
-	for k := range extra {
-		if _, clash := known[k]; clash {
-			continue
-		}
-		keys = append(keys, k)
-	}
+	keys := extraKeys(extra, known)
 	if len(keys) == 0 {
 		return b, nil
 	}
-	sort.Strings(keys)
 	if len(b) < 2 || b[len(b)-1] != '}' {
-		return nil, errors.New("wirejson: cannot splice extra fields into a non-object")
+		return nil, errNotObject
 	}
 	out := make([]byte, 0, len(b)+64*len(keys))
 	out = append(out, b[:len(b)-1]...)

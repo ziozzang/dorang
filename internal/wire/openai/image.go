@@ -63,6 +63,14 @@ func (r ImageRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, imageRequestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ImageRequest.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ImageRequest) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ImageRequest
+	return appendWithExtra(dst, alias(r), r.Extra, imageRequestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0).
 func (r *ImageRequest) UnmarshalJSON(b []byte) error {
@@ -132,7 +140,7 @@ func MarshalImageRequest(req *canonical.ImageRequest, model string) ([]byte, err
 	if model != "" {
 		w.Model = model
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // imageFormKnown is the set of form fields this adapter models.
@@ -308,6 +316,14 @@ func (r ImageResponse) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, imageResponseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [ImageResponse.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r ImageResponse) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ImageResponse
+	return appendWithExtra(dst, alias(r), r.Extra, imageResponseKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (r *ImageResponse) UnmarshalJSON(b []byte) error {
 	type alias ImageResponse
@@ -359,6 +375,14 @@ var imageUsageKnown = knownKeys("input_tokens", "output_tokens", "total_tokens",
 func (u ImageUsage) MarshalJSON() ([]byte, error) {
 	type alias ImageUsage
 	return marshalWithExtra(alias(u), u.Extra, imageUsageKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [ImageUsage.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (u ImageUsage) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ImageUsage
+	return appendWithExtra(dst, alias(u), u.Extra, imageUsageKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -510,5 +534,5 @@ func MarshalImageResponse(r *canonical.ImageResponse) ([]byte, error) {
 			w.Usage.InputTokensDetails.Extra = r.UsageExtra.PromptDetails
 		}
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }

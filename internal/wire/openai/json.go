@@ -65,6 +65,28 @@ func decodeSelf(b []byte, v json.Unmarshaler) error { return wirejson.UnmarshalS
 func getBuf() *bytes.Buffer  { return wirejson.GetBuf() }
 func putBuf(b *bytes.Buffer) { wirejson.PutBuf(b) }
 
+// appendWithExtra is marshalWithExtra writing into the caller's buffer.
+//
+// It is what a nested wire type uses so that encoding/json never sees it: a
+// Marshaler's result is COMPACTED into its parent, which is a full scan of the
+// subtree at every level of the nesting, and on a chat request that was 70% of
+// the encode. See [wirejson.Append] for the plan and for what it refuses.
+func appendWithExtra(dst []byte, v any, extra map[string]json.RawMessage, known map[string]struct{}) ([]byte, error) {
+	return wirejson.AppendWithExtra(dst, v, extra, known)
+}
+
+// marshalAppender renders v as a standalone document through the append path.
+// It is what a top-level Marshal entry point calls in place of [Marshal]: the
+// document is built once instead of being compacted into a buffer once per
+// level of the type it came from.
+func marshalAppender(v any) ([]byte, error) { return wirejson.MarshalAppended(v) }
+
+// appendValue writes v into dst, using v's own AppendJSON where it has one.
+func appendValue(dst []byte, v any) ([]byte, error) { return wirejson.Append(dst, v) }
+
+// appendString appends s as a JSON string literal with HTML escaping off.
+func appendString(dst []byte, s string) []byte { return wirejson.AppendString(dst, s) }
+
 // ptr is shorthand for taking the address of a literal, which this package does
 // constantly because "absent" and "zero" are different on this wire
 // (COMPATIBILITY 2.1).

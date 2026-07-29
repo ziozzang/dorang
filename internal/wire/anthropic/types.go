@@ -114,13 +114,25 @@ func modelledBlockType(t string) bool {
 
 func (b ContentBlock) MarshalJSON() ([]byte, error) {
 	type alias ContentBlock
-	known := blockKnown
+	return marshalWithExtra(alias(b), b.Extra, b.reserved())
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [ContentBlock.MarshalJSON]
+// writing into the caller's buffer.
+func (b ContentBlock) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ContentBlock
+	return appendWithExtra(dst, alias(b), b.Extra, b.reserved())
+}
+
+// reserved is the modelled-member set for this block, which depends on the
+// block. Only the discriminator is reserved on a type this package does not
+// model: an opaque block's members must be spliced back even when they share a
+// name with a modelled field.
+func (b ContentBlock) reserved() map[string]struct{} {
 	if !modelledBlockType(b.Type) {
-		// Only the discriminator is reserved: an opaque block's members must be
-		// spliced back even when they share a name with a modelled field.
-		known = blockTypeOnly
+		return blockTypeOnly
 	}
-	return marshalWithExtra(alias(b), b.Extra, known)
+	return blockKnown
 }
 
 func (b *ContentBlock) UnmarshalJSON(data []byte) error {
@@ -233,9 +245,19 @@ func (l *BlockList) String() string {
 
 func (l BlockList) MarshalJSON() ([]byte, error) {
 	if l.Blocks != nil {
-		return json.Marshal(l.Blocks)
+		return Marshal(l.Blocks)
 	}
-	return json.Marshal(l.Text)
+	return Marshal(l.Text)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [BlockList.MarshalJSON]
+// writing into the caller's buffer, which is what keeps a turn's content from
+// being re-scanned once per level of the message it hangs from.
+func (l BlockList) AppendJSON(dst []byte) ([]byte, error) {
+	if l.Blocks != nil {
+		return appendValue(dst, l.Blocks)
+	}
+	return appendString(dst, l.Text), nil
 }
 
 func (l *BlockList) UnmarshalJSON(b []byte) error {
@@ -289,6 +311,14 @@ func (m Message) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(m), m.Extra, messageKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Message.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (m Message) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Message
+	return appendWithExtra(dst, alias(m), m.Extra, messageKnown)
+}
+
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type alias Message
 	var a alias
@@ -333,6 +363,14 @@ var toolKnown = knownKeys("type", "name", "description", "input_schema", "cache_
 func (t Tool) MarshalJSON() ([]byte, error) {
 	type alias Tool
 	return marshalWithExtra(alias(t), t.Extra, toolKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [Tool.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (t Tool) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Tool
+	return appendWithExtra(dst, alias(t), t.Extra, toolKnown)
 }
 
 func (t *Tool) UnmarshalJSON(b []byte) error {
@@ -403,6 +441,14 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(m), m.Extra, metadataKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Metadata.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (m Metadata) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Metadata
+	return appendWithExtra(dst, alias(m), m.Extra, metadataKnown)
+}
+
 func (m *Metadata) UnmarshalJSON(b []byte) error {
 	type alias Metadata
 	var a alias
@@ -463,6 +509,14 @@ func (r Request) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, requestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Request.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r Request) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Request
+	return appendWithExtra(dst, alias(r), r.Extra, requestKnown)
+}
+
 func (r *Request) UnmarshalJSON(b []byte) error {
 	type alias Request
 	var a alias
@@ -519,6 +573,14 @@ func (r Response) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, responseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Response.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r Response) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Response
+	return appendWithExtra(dst, alias(r), r.Extra, responseKnown)
+}
+
 func (r *Response) UnmarshalJSON(b []byte) error {
 	type alias Response
 	var a alias
@@ -572,6 +634,14 @@ var usageKnown = knownKeys("input_tokens", "cache_creation_input_tokens",
 func (u Usage) MarshalJSON() ([]byte, error) {
 	type alias Usage
 	return marshalWithExtra(alias(u), u.Extra, usageKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [Usage.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (u Usage) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Usage
+	return appendWithExtra(dst, alias(u), u.Extra, usageKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so

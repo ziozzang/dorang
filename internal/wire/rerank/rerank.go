@@ -61,6 +61,14 @@ func (r Request) MarshalJSON() ([]byte, error) {
 	return wirejson.MarshalWithExtra(alias(r), r.Extra, requestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Request.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r Request) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Request
+	return wirejson.AppendWithExtra(dst, alias(r), r.Extra, requestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0): the authorization gate scanned these
 // same bytes for "model" with an exact key comparison, and a decoder that
@@ -90,6 +98,20 @@ func (d Document) MarshalJSON() ([]byte, error) {
 		return d.Fields, nil
 	}
 	return wirejson.Marshal(d.Text)
+}
+
+// AppendJSON implements [wirejson.Appender].
+//
+// The structured form goes through json.RawMessage rather than being appended
+// raw, because that is what MarshalJSON's caller does to it: encoding/json
+// COMPACTS a Marshaler's result, so a document that arrived with whitespace in
+// it goes out folded flat, and an appender that spliced the bytes verbatim
+// would be a second serializer rather than the same one.
+func (d Document) AppendJSON(dst []byte) ([]byte, error) {
+	if len(d.Fields) > 0 {
+		return wirejson.Append(dst, json.RawMessage(d.Fields))
+	}
+	return wirejson.AppendString(dst, d.Text), nil
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -153,6 +175,14 @@ func (r Response) MarshalJSON() ([]byte, error) {
 	return wirejson.MarshalWithExtra(alias(r), r.Extra, responseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Response.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r Response) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Response
+	return wirejson.AppendWithExtra(dst, alias(r), r.Extra, responseKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only, so
 // json.Unmarshal rather than the strict filter: nothing is authorized against
 // an answer.
@@ -203,6 +233,14 @@ func (u Usage) MarshalJSON() ([]byte, error) {
 	return wirejson.MarshalWithExtra(alias(u), u.Extra, usageKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [Usage.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (u Usage) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Usage
+	return wirejson.AppendWithExtra(dst, alias(u), u.Extra, usageKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
 func (u *Usage) UnmarshalJSON(b []byte) error {
 	type alias Usage
@@ -236,6 +274,14 @@ var metaKnown = wirejson.KnownKeys("billed_units")
 func (m Meta) MarshalJSON() ([]byte, error) {
 	type alias Meta
 	return wirejson.MarshalWithExtra(alias(m), m.Extra, metaKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [Meta.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (m Meta) AppendJSON(dst []byte) ([]byte, error) {
+	type alias Meta
+	return wirejson.AppendWithExtra(dst, alias(m), m.Extra, metaKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -279,6 +325,14 @@ var billedUnitsKnown = wirejson.KnownKeys("search_units")
 func (b BilledUnits) MarshalJSON() ([]byte, error) {
 	type alias BilledUnits
 	return wirejson.MarshalWithExtra(alias(b), b.Extra, billedUnitsKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [BilledUnits.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (b BilledUnits) AppendJSON(dst []byte) ([]byte, error) {
+	type alias BilledUnits
+	return wirejson.AppendWithExtra(dst, alias(b), b.Extra, billedUnitsKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -481,7 +535,7 @@ func MarshalRequest(req *canonical.RerankRequest, opt *EncodeOptions) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	return wirejson.Marshal(w)
+	return wirejson.MarshalAppended(w)
 }
 
 // EncodeRequest converts a neutral request to the wire shape.
@@ -523,7 +577,7 @@ func MarshalResponse(r *canonical.RerankResponse) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wirejson.Marshal(w)
+	return wirejson.MarshalAppended(w)
 }
 
 // EncodeResponse converts a neutral response to the wire shape.

@@ -44,7 +44,7 @@ func MarshalResponse(r *canonical.Response, opt *ResponseOptions) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeResponse converts a neutral response to the OpenAI wire shape.

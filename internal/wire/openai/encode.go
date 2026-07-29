@@ -96,7 +96,7 @@ func MarshalRequest(req *canonical.Request, opt *EncodeOptions) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeRequest converts a neutral request to the OpenAI wire shape.

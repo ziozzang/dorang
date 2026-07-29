@@ -71,6 +71,14 @@ func (r CompletionRequest) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, completionRequestKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [CompletionRequest.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r CompletionRequest) AppendJSON(dst []byte) ([]byte, error) {
+	type alias CompletionRequest
+	return appendWithExtra(dst, alias(r), r.Extra, completionRequestKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler] with case-SENSITIVE
 // field matching (COMPATIBILITY 2.0).
 func (r *CompletionRequest) UnmarshalJSON(b []byte) error {
@@ -98,9 +106,9 @@ func (p Prompt) MarshalJSON() ([]byte, error) {
 	switch {
 	case len(p.Tokens) > 0:
 		if !p.Array && len(p.Tokens) == 1 {
-			return json.Marshal(p.Tokens[0])
+			return Marshal(p.Tokens[0])
 		}
-		return json.Marshal(p.Tokens)
+		return Marshal(p.Tokens)
 	case p.Array:
 		if p.Texts == nil {
 			return []byte(`[]`), nil
@@ -196,6 +204,14 @@ func (r CompletionResponse) MarshalJSON() ([]byte, error) {
 	return marshalWithExtra(alias(r), r.Extra, completionResponseKnown)
 }
 
+// AppendJSON implements [wirejson.Appender]. It is [CompletionResponse.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (r CompletionResponse) AppendJSON(dst []byte) ([]byte, error) {
+	type alias CompletionResponse
+	return appendWithExtra(dst, alias(r), r.Extra, completionResponseKnown)
+}
+
 // UnmarshalJSON implements [encoding/json.Unmarshaler]. Response-only type, so
 // json.Unmarshal rather than the strict filter — see [strictUnmarshal].
 func (r *CompletionResponse) UnmarshalJSON(b []byte) error {
@@ -233,6 +249,14 @@ var completionChoiceKnown = knownKeys("index", "text", "logprobs",
 func (c CompletionChoice) MarshalJSON() ([]byte, error) {
 	type alias CompletionChoice
 	return marshalWithExtra(alias(c), c.Extra, completionChoiceKnown)
+}
+
+// AppendJSON implements [wirejson.Appender]. It is [CompletionChoice.MarshalJSON]
+// writing into the caller's buffer; the two are held byte-identical by
+// FuzzAppendAgreesWithMarshal.
+func (c CompletionChoice) AppendJSON(dst []byte) ([]byte, error) {
+	type alias CompletionChoice
+	return appendWithExtra(dst, alias(c), c.Extra, completionChoiceKnown)
 }
 
 // UnmarshalJSON implements [encoding/json.Unmarshaler].
@@ -376,7 +400,7 @@ func MarshalCompletionRequest(req *canonical.Request, opt *EncodeOptions) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeCompletionRequest converts a neutral request to the legacy wire shape.
@@ -473,7 +497,7 @@ func MarshalCompletionResponse(r *canonical.Response, opt *ResponseOptions) ([]b
 	if err != nil {
 		return nil, err
 	}
-	return Marshal(w)
+	return marshalAppender(w)
 }
 
 // EncodeCompletionResponse converts a neutral response to the legacy shape.
