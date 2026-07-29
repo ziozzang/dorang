@@ -5,10 +5,13 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"hash/fnv"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ziozzang/dorang/internal/store"
 )
@@ -60,7 +63,8 @@ func (t tx) query(ctx context.Context, q string, args ...any) (*sql.Rows, error)
 	return t.t.QueryContext(ctx, rebind(t.dia, q), args...)
 }
 
-// txAttempts bounds the retries withTx makes against a busy SQLite writer.
+// txAttempts bounds the retries withTx makes against a store that refused the
+// write for a reason another attempt can resolve.
 const txAttempts = 8
 
 // withTx runs fn inside a write transaction.
@@ -79,9 +83,12 @@ const txAttempts = 8
 //     It is released by COMMIT or ROLLBACK, so a crashed node cannot wedge the
 //     cluster.
 //
-// A SQLite writer that loses the race waits out busy_timeout and then reports
-// SQLITE_BUSY; retrying is the correct response and is done here so that no
-// caller has to know SQLite exists.
+// Both dialects can refuse a write for a reason that is transient, and both are
+// retried here so that no caller has to know which store it is talking to. A
+// SQLite writer that loses the race waits out busy_timeout and then reports
+// SQLITE_BUSY. A PostgreSQL transaction that loses a lock cycle is aborted with
+// deadlock_detected. Neither is a failure of the operation; both are the store
+// saying "not on this attempt". See [isBusy].
 func (c conn) withTx(ctx context.Context, fn func(context.Context, tx) error) error {
 	var err error
 	for i := 0; i < txAttempts; i++ {
@@ -181,12 +188,47 @@ func rebind(d store.Dialect, q string) string {
 	return b.String()
 }
 
-// isBusy reports whether err is SQLite refusing to hand over the write lock.
-// It is matched on the message because modernc.org/sqlite does not export a
-// typed error for it, and the alternative -- treating a lock contention as a
-// permanent failure -- turns a two-node test into a flake.
+// isBusy reports whether err is the store refusing this attempt at the write
+// rather than refusing the write.
+//
+// It used to test only for SQLite's messages, and the whole classifier was
+// therefore shaped by the dialect that needs it least: SQLite has one writer,
+// so its contention is common and benign, while PostgreSQL has many, so its
+// contention is rarer and worse. On PostgreSQL every one of those strings is
+// absent, so a transaction the server aborted so that another could proceed --
+// which is a retry instruction, and which the server has already rolled back --
+// came back to a caller of this package as a permanent failure. In a two-node
+// deployment that is a leader job that gives up, a lease that is not reclaimed,
+// or a budget draw that refuses a request the ceiling had room for.
+//
+// PostgreSQL is classified by SQLSTATE, the way internal/store already
+// classifies a missing partition, because pgx exports a typed error and a
+// classifier that reads localized server text is a classifier that stops
+// working when the server's lc_messages changes:
+//
+//   - 40001 serialization_failure: the transaction could not be serialized.
+//     Not reachable at READ COMMITTED, which is what this package opens, but it
+//     is the same instruction and costs nothing to honour.
+//   - 40P01 deadlock_detected: this transaction was chosen as the victim of a
+//     lock cycle and rolled back so another could proceed. Retrying is the
+//     documented response.
+//
+// Nothing else is retried. A constraint violation, a missing column and a
+// refused connection are all permanent on a second attempt too, and retrying
+// them would turn a clear failure into eight of them.
+//
+// SQLite stays matched on the message because modernc.org/sqlite exports no
+// typed error for it.
 func isBusy(err error) bool {
 	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "40001", "40P01":
+			return true
+		}
 		return false
 	}
 	s := err.Error()

@@ -718,19 +718,33 @@ func TestHotPathWritesPerBlockNotPerRequest(t *testing.T) {
 	})
 }
 
-// TestReservationSweepsReclaimBothKinds is the pairing DESIGN 13 is explicit
-// about: "expiry sweeps (capacity reservations 5.3 AND budget reservations
-// 6.4)". Revision 1 of the design had only the first. They are the same pattern
-// with the same failure mode, and a sweep that does one of them is a sweep that
-// silently leaks the other.
-func TestReservationSweepsReclaimBothKinds(t *testing.T) {
-	eachBackend(t, func(t *testing.T, s *store.Store, clk *clock) {
+// TestLeaderJobsReclaimBothKindsOfAbandonedHold is the pairing DESIGN 13 is
+// explicit about: "expiry sweeps (capacity reservations 5.3 AND budget
+// reservations 6.4)". They are the same pattern with the same failure mode, and
+// a leader that reclaims one of them silently leaks the other.
+//
+// This was TestReservationSweepsReclaimBothKinds and its budget half drove
+// store.ReserveBudget, which had no caller outside tests: the row it planted
+// was one the gateway could not produce, which is §17.1 rule 1 inverted — a
+// harness supplying the value the system under test is responsible for. The
+// mechanism is gone and the pairing is not, because the budget half moved to
+// the job that holds the budget: a block lease, charged in full when it is
+// drawn, returned by LeaseReclaimJob when its TTL passes.
+//
+// So both halves are still asserted, and the budget half is now planted the way
+// a real node plants it — by drawing a block and dying.
+func TestLeaderJobsReclaimBothKindsOfAbandonedHold(t *testing.T) {
+	eachCluster(t, 2, func(t *testing.T, stores []*store.Store, clk *clock) {
 		ctx := context.Background()
+		const (
+			limit = 10 * 1_000_000_000
+			ttl   = 2 * time.Second
+		)
 
 		// The capacity half: a real broker, with the background sweeper off so
 		// the job is the only thing that can reclaim.
 		broker := capacity.New(capacity.Config{
-			Global: 4, SweepInterval: -1, ReservationTTL: 2 * time.Second, Now: clk.Now,
+			Global: 4, SweepInterval: -1, ReservationTTL: ttl, Now: clk.Now,
 		})
 		t.Cleanup(broker.Close)
 		res, ok := broker.TryAcquire(capacity.Request{Provider: "p", Model: "m"})
@@ -741,42 +755,57 @@ func TestReservationSweepsReclaimBothKinds(t *testing.T) {
 			t.Fatalf("live reservations = %d, want 1", n)
 		}
 
-		// The budget half: a store reservation whose holder dies before settling.
-		sub := store.Subject{Kind: store.SubjectTeam, ID: "team-1"}
-		periodStart := quota.Monthly.PeriodStart(clk.Now())
-		if _, err := s.ReserveBudget(ctx, store.ReserveRequest{
-			Subject: sub, Period: "monthly", PeriodStart: periodStart,
-			AmountNano: usd(2), Until: clk.Now().Add(2 * time.Second),
-		}); err != nil {
-			t.Fatalf("ReserveBudget: %v", err)
-		}
-		st, err := s.GetBudgetState(ctx, sub, "monthly", periodStart)
+		// The budget half: a node draws a block, spends a quarter of it and is
+		// killed. Nobody settles the rest, and the whole block is already
+		// charged to the durable counter -- which is the state a process killed
+		// mid-request actually leaves behind, and the one no reservation sweep
+		// could ever have reclaimed.
+		key := BudgetKey("team", "team-1", quota.Monthly, clk.Now())
+		dead := newLedger(t, stores[0], "node-a", clk, usd(2), ttl)
+		h, err := dead.Reserve(ctx, key, limit, usd(0.5))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.ReservedNano != usd(2) {
-			t.Fatalf("reserved %d nano, want %d", st.ReservedNano, usd(2))
+		if err := dead.Settle(h, usd(0.5)); err != nil {
+			t.Fatal(err)
+		}
+		if err := dead.Checkpoint(ctx); err != nil {
+			t.Fatal(err)
 		}
 
-		job := ReservationSweepJob(s, broker.Sweep, time.Second, clk.Now)
+		leader := newLedger(t, stores[1], "node-b", clk, usd(2), ttl)
+		t.Cleanup(func() { _ = leader.Close(ctx) })
+		if v, err := leader.Committed(ctx, key); err != nil || v != usd(2) {
+			t.Fatalf("committed %d nano (err %v), want the whole block of %d charged "+
+				"up front", v, err, usd(2))
+		}
 
-		// Before either deadline, the sweep must reclaim nothing. A sweep that
-		// is merely eager releases live reservations out from under requests in
-		// flight.
-		if err := job.Run(ctx); err != nil {
-			t.Fatalf("early sweep: %v", err)
+		sweep := CapacitySweepJob(broker.Sweep, time.Second)
+		reclaim := LeaseReclaimJob(nil, leader, nil, time.Second, clk.Now)
+
+		// Before either deadline, neither job may reclaim anything. A sweep
+		// that is merely eager releases live holds out from under requests in
+		// flight -- for the ledger that is the case measured at 190 admitted
+		// against a limit of 100.
+		if err := sweep.Run(ctx); err != nil {
+			t.Fatalf("early capacity sweep: %v", err)
+		}
+		if err := reclaim.Run(ctx); err != nil {
+			t.Fatalf("early lease reclaim: %v", err)
 		}
 		if n := broker.Snapshot().Reservations; n != 1 {
-			t.Fatalf("the early sweep reclaimed a live capacity reservation")
+			t.Fatal("the early sweep reclaimed a live capacity reservation")
 		}
-		st, _ = s.GetBudgetState(ctx, sub, "monthly", periodStart)
-		if st.ReservedNano != usd(2) {
-			t.Fatal("the early sweep released a live budget reservation")
+		if v, _ := leader.Committed(ctx, key); v != usd(2) {
+			t.Fatalf("the early reclaim took %d nano off a live block lease", usd(2)-v)
 		}
 
 		clk.Add(5 * time.Second)
-		if err := job.Run(ctx); err != nil {
-			t.Fatalf("sweep: %v", err)
+		if err := sweep.Run(ctx); err != nil {
+			t.Fatalf("capacity sweep: %v", err)
+		}
+		if err := reclaim.Run(ctx); err != nil {
+			t.Fatalf("lease reclaim: %v", err)
 		}
 		if n := broker.Snapshot().Reservations; n != 0 {
 			t.Fatalf("capacity reservations after the sweep = %d, want 0", n)
@@ -784,12 +813,15 @@ func TestReservationSweepsReclaimBothKinds(t *testing.T) {
 		if e := broker.Snapshot().Expired; e != 1 {
 			t.Fatalf("the broker recorded %d expiries, want 1", e)
 		}
-		st, err = s.GetBudgetState(ctx, sub, "monthly", periodStart)
+		// Exactly the unspent part came back. The dead node's 0.5 is still
+		// charged; the 1.5 it was holding and never spent is spendable again.
+		v, err := leader.Committed(ctx, key)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.ReservedNano != 0 {
-			t.Fatalf("budget reservations after the sweep = %d nano, want 0", st.ReservedNano)
+		if v != usd(0.5) {
+			t.Fatalf("after reclaim the budget shows %d nano spent, want the %d the "+
+				"dead node actually used", v, usd(0.5))
 		}
 	})
 }

@@ -82,6 +82,8 @@ commands:
   price <model> --input N --output N
                                preview the cost of one request, rule by rule
   import config <file>         convert a foreign proxy configuration, with warnings
+  import keys --from <dsn>     migrate caller credentials from an incumbent proxy's
+                               database. Reads and reports by default; --commit writes
   key create                   issue an api key and print it once
   key list                     list issued keys
   key revoke <id>              block a key

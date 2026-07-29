@@ -378,6 +378,9 @@ priority 요청이 `type: "abort"`, HTTP 503,
 
 ## 4. 메트릭
 
+> **이 절은 R17의 명세이지, 돌고 있는 경로의 서술이 아니다.** dorang에는 메트릭 스크레이퍼가
+> 없고 `providers[].metrics`는 로드에서 거부된다(CONFIG §6.2).
+
 ### 4.1 게이트, 그리고 그것이 vLLM보다 나은 이유
 
 `--enable-metrics`가 있을 때만 `/metrics` 마운트가 추가된다. 그것이 HTTP 서버의 유일한 `/metrics`

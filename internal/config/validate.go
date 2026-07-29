@@ -652,9 +652,8 @@ func (c *Config) validateProviders(col *collector, providers map[string]*Provide
 			col.add(path+".usage_probe.fetcher", "must name a fetcher when the usage probe is enabled")
 		}
 		nonNegative(col, path+".usage_probe.interval", int64(p.UsageProbe.Interval))
-		if p.Metrics.Enabled && p.Metrics.Endpoint == "" {
-			col.add(path+".metrics.endpoint", "must be set when provider metrics collection is enabled")
-		}
+		validateProbeAllowances(col, path+".usage_probe", p.UsageProbe)
+		refuseBackendMetrics(col, path, p.Metrics)
 		checkCacheTTL(col, path+".prefix_ttl", p.PrefixTTL, false)
 		for j, d := range p.Params.Drop {
 			if strings.TrimSpace(d) == "" {
@@ -912,6 +911,120 @@ func refuseRate(col *collector, path string, rpm, tpm int64, home string) {
 				"reservations, which are released when a request finishes, and has no time "+
 				"window to count a rate over. %s", home)
 	}
+}
+
+// backendMetricsHome is what an operator reaching for `metrics:` actually
+// wants, and already has.
+//
+// The two strategies §12.4 names are implemented and are not blocked on a
+// scrape. `least_busy` ranks on internal/capacity's live occupancy of the axis
+// the request would reserve — which is dorang's own count of what it has in
+// flight against that deployment, exact, with no poll interval to be stale
+// over. `highest_tps` ranks on internal/health's measured output tokens per
+// second, taken from completed requests through this gateway. Both treat "no
+// samples yet" as no opinion rather than as a zero, so neither can be dragged
+// by a backend that has not been used.
+//
+// What the scrape would ADD is the backend's own view — queue depth and KV-cache
+// utilization — which is a better signal in exactly one case: a self-hosted
+// engine serving traffic that did not come through dorang. That is R17, and it
+// does not exist.
+const backendMetricsHome = "`least_busy` and `highest_tps` are implemented and need no " +
+	"scrape: least_busy ranks on this gateway's own live capacity occupancy, and highest_tps " +
+	"on output tokens per second measured from completed requests (§7.5a). Name them in " +
+	"models[].strategy and remove this block. What a scrape would add is the ENGINE's queue " +
+	"depth and KV-cache utilization, which is only a better signal for a self-hosted backend " +
+	"also serving traffic that did not come through dorang"
+
+// validateProbeAllowances checks the shape of §6.2's window mappings.
+//
+// The vocabulary is quota's own, and it is checked HERE against a copy of the
+// list rather than by importing internal/quota, because internal/config imports
+// no sibling (§1). The copy is a real risk and it is bounded the only way it
+// can be: internal/app parses the same strings through quota.ParseWindow and
+// quota.ParseMetric when it builds the prober, so a value this accepts and that
+// rejects is a start-up error naming the field rather than a silently dropped
+// allowance. The two lists agreeing is what
+// TestProbeAllowanceVocabularyMatchesQuota asserts.
+func validateProbeAllowances(col *collector, path string, up UsageProbe) {
+	// Allowances written beside `enabled: false` are NOT refused, and the line
+	// is worth stating because this file refuses a good deal else. `enabled` is
+	// unambiguous about what the block does, `fetcher` and `interval` are inert
+	// beside it too and are accepted, and writing the mapping before flipping
+	// the flag is the order an operator stages this in. The inert-setting rule
+	// is about a key that misleads, not about every key that is currently
+	// asleep.
+	for i, a := range up.Allowances {
+		p := fmt.Sprintf("%s.allowances[%d]", path, i)
+		if strings.TrimSpace(a.Label) == "" {
+			col.add(p+".label",
+				"must name the provider's own label for the window, as internal/probe "+
+					"normalizes it (for example \"tokens_limit:5h\"); an allowance with no "+
+					"label matches nothing and is silently inert, which is what it exists to prevent")
+		}
+		if !isProbeWindow(a.Window) {
+			col.add(p+".window",
+				"want a rolling duration of at least one minute (5h, 1m) or one of "+
+					"daily, weekly, monthly; got %q", a.Window)
+		}
+		if !probeMetrics[strings.ToLower(strings.TrimSpace(a.Metric))] {
+			col.add(p+".metric",
+				"want one of cost_usd, tokens_total, tokens_input, tokens_output, requests; got %q",
+				a.Metric)
+		}
+		nonNegative(col, p+".limit", a.Limit)
+	}
+}
+
+// probeMetrics mirrors quota.ParseMetric's vocabulary. See
+// [validateProbeAllowances] for why it is a copy.
+var probeMetrics = map[string]bool{
+	"cost_usd": true, "tokens_total": true, "tokens_input": true,
+	"tokens_output": true, "requests": true,
+}
+
+// probeCalendarWindows mirrors quota.ParseWindow's named windows.
+var probeCalendarWindows = map[string]bool{"daily": true, "weekly": true, "monthly": true}
+
+// isProbeWindow mirrors quota.ParseWindow, including its one-minute floor: the
+// counter is a minute-bucket ring, so a shorter window has nothing to count in.
+func isProbeWindow(s string) bool {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if probeCalendarWindows[t] {
+		return true
+	}
+	d, err := time.ParseDuration(strings.TrimPrefix(t, "rolling:"))
+	return err == nil && d >= time.Minute
+}
+
+// refuseBackendMetrics rejects a declared backend metrics endpoint.
+//
+// §12.4 specifies a scrape whose queue-depth and cache-utilization figures
+// become routing signals, and no collector was ever built: the only reader of
+// this block in the whole repository was the validator below it, which required
+// an endpoint when the flag was on. So the configuration asked for a URL, got
+// one, and fetched it never — while [VLLM.md] and [SGLANG.md] documented four
+// engine-specific traps in numbers nothing read.
+//
+// It is refused rather than left inert for the reason DESIGN §17.1 gives about
+// its own dominant defect class: a setting that validates and does nothing is
+// worse than no setting, because the operator who configured it believes a
+// signal is feeding their routing and has no way to discover that it is not.
+// This one is worse than most — `metrics.endpoint` looks like it took effect
+// (the flag is checked, the URL is required, the load succeeds) and the traps
+// documented against it read as operational advice for a live path.
+//
+// The block stays in the schema rather than becoming an unknown-field error so
+// that this refusal can name the key, which is the same decision key_ref and
+// capacity.*.rpm carry.
+func refuseBackendMetrics(col *collector, path string, m ProviderMetrics) {
+	if !m.Enabled && m.Endpoint == "" && m.Interval == 0 {
+		return
+	}
+	col.add(path+".metrics",
+		"no backend metrics scraper ships with this build: nothing fetches the endpoint, so "+
+			"enabling it configures a collector that does not exist and leaves routing "+
+			"exactly as it was. %s", backendMetricsHome)
 }
 
 // validateClientPriority checks the §10.5 grant.

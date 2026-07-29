@@ -334,11 +334,10 @@ another process ...
 | `retry.backoff` | `exponential` \| `linear` \| `constant` | `exponential` | 재시도 간격 | 그 외 거부 |
 | `retry.base` | duration | `500ms` | 첫 재시도 간격 | 음수 거부 |
 | `usage_probe.enabled` | bool | `false` | 프로바이더 자신의 잔여 쿼터 조회 | 없으면 쿼터가 로컬 계측만 되고, 로컬 계측은 dorang을 거치지 않은 트래픽만큼 과소 계산한다 |
-| `usage_probe.fetcher` | string | `""` | 어느 프로바이더별 fetcher를 쓸지 | 프로브가 켜져 있으면 필수 |
-| `usage_probe.interval` | duration | `0` | 폴 간격 | 음수 거부. 폴은 최대 한 간격만큼 낡는다 — §6.1 |
-| `metrics.enabled` | bool | `false` | `least_busy` / `highest_tps`용 백엔드 메트릭 스크레이프 | §6.2 |
-| `metrics.endpoint` | string | `""` | 스크레이프 URL | `metrics.enabled`가 true면 필수 |
-| `metrics.interval` | duration | `0` | 스크레이프 간격 | — |
+| `usage_probe.fetcher` | string | `""` | 어느 프로바이더별 fetcher를 쓸지: `zai`(별칭 `z.ai`·`glm`·`zhipu`·`bigmodel`), `anthropic`, `deepseek` | 프로브가 켜져 있으면 필수. **prober가 없는 fetcher는 기동을 중단시키고** 존재하는 것들을 이름으로 알려 준다 — 스키마가 스스로 검사할 수 없고, 대안은 영원히 아무것도 보고하지 않는 프로바이더다 |
+| `usage_probe.interval` | duration | `60s` | 폴 간격이자 한 크리덴셜을 얼마나 자주 읽는지의 하한 | 음수 거부. 폴은 최대 한 간격만큼 낡는다 — §6.1. 간격 안의 두 번째 읽기는 요청을 쓰지 않고 마지막 스냅샷을 재생한다 |
+| `usage_probe.allowances[]` | list | `[]` | 프로바이더가 보고한 윈도를 규칙 키에 배치하고 그 크기를 선언한다 | **없으면 퍼센트로 보고하는 프로바이더는 아무것도 게이트하지 못한다** — 영문 [CONFIG.md](CONFIG.md) §6.1a. 어떤 규칙도 쓰지 않는 키에 배치된 윈도는 무력하다 |
+| `metrics.*` — 블록 전체 | — | — | **아무것도 하지 않는다. 로드에서 거부된다**(§23.2): §12.4의 백엔드 메트릭 스크레이프에는 이 빌드에 수집기가 없다 | `enabled`·`endpoint`·`interval` 중 무엇이든 쓰면 검증 실패하며, 대신 쓸 것을 이름으로 알려 준다. `least_busy`와 `highest_tps`에는 필요 없다 — §6.2 |
 
 ### 6.0 `base_url`의 의미와 dorang이 덧붙이는 것
 
@@ -392,18 +391,37 @@ effective_used = max( provider_reported_used ,
 크리덴셜을 비활성화하지 않는다** — 실패한 읽기는 소진된 쿼터가 아니다. 마지막 정상 스냅샷이 유지되고 낡음
 정도가 노출된다.
 
-### 6.2 백엔드 메트릭에는 엔진별 함정이 있다
+### 6.2 백엔드 메트릭 스크레이프는 없고, `least_busy`에는 필요도 없다
 
-`metrics`를 켠다고 `least_busy`가 옳아지지 않는다. 두 self-hosted 엔진 모두 잘못 명명됐거나 죽었거나
-리셋되는 메트릭이 있다:
+**`providers[].metrics`는 로드에서 거부된다.** §12.4는 큐 깊이와 캐시 사용률이 라우팅 입력이 되는
+스크레이프를 규정하고 — 그것이 요구사항 R17이다 — 수집기는 끝내 만들어지지 않았다. 블록은 존재하는 내내
+검증만 되고 아무 일도 하지 않았다: 플래그가 검사되고, 켜지면 endpoint가 *요구*되고, 설정이 로드되고,
+그 URL을 가져오는 코드는 어디에도 없었다.
 
-- vLLM의 `kv_cache_usage_perc`는 이름과 달리 0–1 분수이고, `--disable-log-stats`를 주면 `/metrics`가
-  **시리즈 0개로 200**을 반환한다 — 유휴와 구별되지 않으면서 정반대를 뜻한다. [VLLM.ko.md](VLLM.ko.md) §3.
-- SGLang의 `/metrics`는 `--enable-metrics`가 없으면 **404**이며 그것이 정직한 실패다. 그리고
-  `sglang:cache_hit_rate`는 매 decode 리포트마다 `0.0`으로 하드 리셋되어 게이지가 대부분의 시간을 0에서
-  보낸다. [SGLANG.ko.md](SGLANG.ko.md) §4.3.
+**§12.4가 이름을 대는 두 전략은 dorang 자신의 측정으로 오늘 동작한다.**
 
-숫자로 라우팅하기 전에 해당 엔진 절을 읽을 것.
+| 전략 | 순위 근거 |
+|---|---|
+| `least_busy` | 이 요청이 선점할 축에 대한 `internal/capacity`의 실시간 점유율 — 이 게이트웨이가 그 배포에 대해 진행 중인 것의 자기 집계. 정확하고, 낡을 폴 간격이 없다 |
+| `highest_tps` | 이 게이트웨이를 통과한 완료 요청에서 측정된 `internal/health`의 초당 출력 토큰 |
+
+둘 다 "아직 표본 없음"을 0이 아니라 *의견 없음*으로 다루므로, 쓰이지 않은 배포가 유리해지지도 불리해지지도
+않는다. `models[].strategy`에 이름을 적으면 스크레이프할 것이 없다.
+
+스크레이프가 더해 주는 것은 dorang이 아니라 **엔진 자신의** 시야이고, 그것이 더 나은 신호인 경우는 정확히
+하나다: dorang을 거치지 않은 트래픽도 함께 받는 self-hosted 백엔드. 그 경우는 실재하며 R17이 닫을 대상이다.
+
+> **R17이 만들어진다면 이 함정들이 따라온다.** 거부된 키와 함께 잃어버리지 않도록 여기 남긴다. 두
+> self-hosted 엔진 모두 잘못 명명됐거나 죽었거나 리셋되는 메트릭이 있다:
+>
+> - vLLM의 `kv_cache_usage_perc`는 이름과 달리 0–1 분수이고, `--disable-log-stats`를 주면 `/metrics`가
+>   **시리즈 0개로 200**을 반환한다 — 유휴와 구별되지 않으면서 정반대를 뜻한다. [VLLM.ko.md](VLLM.ko.md) §3.
+> - SGLang의 `/metrics`는 `--enable-metrics`가 없으면 **404**이며 그것이 정직한 실패다. 그리고
+>   `sglang:cache_hit_rate`는 매 decode 리포트마다 `0.0`으로 하드 리셋되어 게이지가 대부분의 시간을 0에서
+>   보낸다. [SGLANG.ko.md](SGLANG.ko.md) §4.3.
+>
+> 첫 번째 — 시리즈 없는 200이 유휴로 읽히는 것 — 는 엔진 절을 읽지 않고 출시된 스크레이퍼가 보고를 끄라고
+> 지시받은 백엔드 *쪽으로* 라우팅하게 만들었을 것이다. R17의 어려운 부분은 수집기가 아니다.
 
 ---
 
@@ -845,8 +863,8 @@ marginal 값만 본다** — 매몰된 플랜 비용이 포화된 플랜을 싸 
 | `spool.max_bytes` | size | `2GiB` | spool 자체 상한 | 음수 거부. 도달하면 트레이스를 드롭하고 계수한다 — 프로세스가 죽을 때까지 자라는 큐는 스토어 장애를 서비스 장애로 바꾼 것이다 |
 | `flush_interval` | duration | `250ms` | 카운터 병합과 spool 출하 주기 | 0 이하 거부. 크래시가 정밀도를 잃는 창이기도 하다: 쿼터 링과 롤업은 마지막 upsert + 원장으로 재구성 가능하므로 꼬리를 잃는 것은 정확성이 아니라 정밀도의 비용이고, 이 간격이 그 양이다 |
 
-**측정된 계측 비용:** 정상 상태 +148 ns, **버퍼 가득에서 +110 ns**, 즉 200 µs warm-local p50 예산의
-0.074%. 버퍼 가득이 *더 싼* 것은 분리가 설계대로 동작하는 것이다 — 실패한 링 push는 페이로드 복사를 건너뛰고
+**측정된 계측 비용:** 정상 상태 +148 ns, **버퍼 가득에서 +110 ns**, 즉 측정된 480 µs warm-local p50
+예산의 0.031%(DESIGN §15.1 — 200 µs로 공표했으나 `testing/perf`가 재기 전까지 측정된 적이 없었다). 버퍼 가득이 *더 싼* 것은 분리가 설계대로 동작하는 것이다 — 실패한 링 push는 페이로드 복사를 건너뛰고
 수치 경로는 동일한 일을 한다. "계측 on/off < 5%"에는 분모가 필요했다: no-op meter 대비 비율은 7.6×지만
 no-op은 분기 하나 뒤에 반환하므로 그것으로 나누는 것은 실제 요청에 대해 아무것도 재지 않는다. 요구사항은
 게이트웨이 오버헤드 예산의 5%다.
@@ -1146,8 +1164,6 @@ priority에 의존하기 전에 알아야 할 둘:
 | 키 | 상태 |
 |---|---|
 | `metric: max_concurrent` 또는 `max_queue`인 `models[].deployments[].limits[]` | `rpm`과 `tpm`만 소비되며, 크리덴셜별 쿼터로 (§10.2) |
-| `providers[].usage_probe` | §6.2의 fetcher들은 `internal/probe`에 있고, 설정에서 그것을 만드는 코드가 없다 |
-| `providers[].metrics` — `enabled`, `endpoint`, `interval` **블록 전체** | 백엔드를 스크레이프하는 것이 없다. 저장소 안의 유일한 독자는 `validate.go`뿐이고(플래그가 켜지면 endpoint를 요구한다), 어떤 HTTP 클라이언트도 가져오지 않는다. §12.4의 `least_busy`·`highest_tps`용 큐 깊이/캐시 사용률 신호에는 수집기가 없다 |
 | `providers[].params.drop`, `.drop_unsupported` | §10.3의 두 노브는 변환 경로에 닿지 않는다 — 무엇이 떨어지는지는 kind 자신의 capability 집합만 정한다 |
 | `routing.prefix.checkpoints` | 체인은 로그 간격으로 잘린다; `fixed`는 검증만 되고 아무것도 선택하지 않는다 |
 | `models[].deployments[].stream_timeout` | 비스트리밍 타임아웃만 업스트림 호출에 닿는다 |
@@ -1161,7 +1177,8 @@ priority에 의존하기 전에 알아야 할 둘:
 없는 설정을 추가하면 실패하고, 목록에서 지우지 않은 채 배선해도 실패한다. Go 필드 이름이 너무 흔해서
 검색으로 볼 수 없는 행들 — `Enabled`, `Endpoint`, `Interval`, `Drop`, `Scope`, `StreamTimeout` — 은
 보지 못하며, 그래서 그 행들은 여기에 손으로 적혀 있다. 가드가 검사할 수 없는 산문 항목은 손으로 다시
-유도해야 하고, `providers[].metrics` 행은 그렇게 되어 있지 않았다(영문 §23.1 참조).
+유도해야 하고, `providers[].metrics` 행은 그렇게 되어 있지 않았다(영문 §23.1 참조). 그 블록은 이제
+표에 없다 — **로드 에러**가 되었고, 정본은 영문 [CONFIG.md](CONFIG.md) §23.2다.
 
 ### 23.1a 지난 패스 이후 닫힌 것
 
@@ -1243,7 +1260,9 @@ PostgreSQL, 노드 1–2개, 공유 계정 풀, 실제 비용 회계. 조정 서
 - ~50 req/s에서 `sample_rate: 0.2`는 발췌를 하루 ~2.2 GB 대신 ~440 MB로 유지한다.
 - plan-a 숫자가 축이 존재하는 이유의 형태다: 모델별 7 *그리고* 계정별 7이면 모델 둘이 한 키에서 동시
   14에 이르는 동안 계정 상한은 provider-group 수준에서 여전히 지켜진다.
-- `cloud-a`의 `usage_probe`가 dorang을 거치지 않은 트래픽까지 쿼터에 반영시킨다(§6.1).
+- `usage_probe`가 dorang을 거치지 않은 트래픽까지 쿼터에 반영시킨다(§6.1). 이 파일의 두 프로바이더에는
+  prober가 없어서 쓰이지 않았다. prober가 있는 셋은 `zai`, `anthropic`(OAuth 구독, §11.2b), `deepseek`이고,
+  보고된 퍼센트를 규칙이 게이트할 수 있는 수치로 바꾸는 `allowances`는 영문 §6.1a에 있다.
 - `shutdown_grace`를 p99보다 길게 둘 것. 롤링 재시작이 조용해진다.
 
 ### 24.3 엔터프라이즈 — 의존성 2
@@ -1263,8 +1282,8 @@ N 노드, 정확한 공유 capacity, 파티션 원장, 강한 샘플링.
   보관한다.
 - `key_ref`는 **이 빌드에서 기록되고 해결되지 않는다**: 외부 resolver가 생기기 전까지 그 크리덴셜은
   로드되고 쓸 수 있는 비밀값이 없다. 오늘은 `key_env`나 `key_file`을 쓸 것.
-- vLLM `metrics` 스크레이프는 `--disable-log-stats`가 **없을** 때만 유용하다. 그것이 있으면 `/metrics`가
-  시리즈 0개로 200을 반환하고 `least_busy`가 모든 백엔드를 유휴로 읽는다([VLLM.ko.md](VLLM.ko.md) §3.1).
+- vLLM `metrics` 스크레이프는 **이 빌드에 없고 `providers[].metrics`는 거부된다**(§6.2). `least_busy`는
+  dorang 자신의 용량 점유율로 순위를 매기므로 폴이 필요 없다. R17이 만들어질 때를 위해 함정은 §6.2에 남겨 두었다.
 
 ---
 

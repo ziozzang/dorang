@@ -9,11 +9,20 @@ import (
 )
 
 // p50BudgetNanos is the DESIGN 15.1 warm-local p50 gateway-overhead budget:
-// 200 microseconds from the last request header byte read to the first byte
-// written upstream, plus the tail. "Metering on vs off < 5%" is a fraction of
-// that budget, so the benchmarks below convert their nanoseconds into a
-// percentage of it rather than reporting a bare ratio -- a bare ratio against
-// a no-op baseline of a fraction of a nanosecond is arithmetic, not evidence.
+// from the last request header byte read to the first byte written upstream,
+// plus the tail. "Metering on vs off < 5%" is a fraction of that budget, so the
+// benchmarks below convert their nanoseconds into a percentage of it rather
+// than reporting a bare ratio -- a bare ratio against a no-op baseline of a
+// fraction of a nanosecond is arithmetic, not evidence.
+//
+// §15.1 published 200 microseconds and testing/perf later MEASURED 480. This
+// constant stays at 200 deliberately. It is a denominator for a bound, and
+// recomputing it from the larger figure would raise overheadBudgetNanos from
+// 10 us to 24 us -- a gate that loosens itself because the thing it is a
+// fraction of got slower is a ratchet pointing the wrong way. The percentages
+// this file reports are therefore against the ORIGINAL budget, which makes them
+// the pessimistic reading: against the measured 480 us they are less than half
+// what is printed.
 const p50BudgetNanos = 200_000.0
 
 // overheadBudgetNanos is 5% of the p50 budget: the number Record's added cost
@@ -309,9 +318,14 @@ func bestNsPerOp(f func(*testing.B), runs int) float64 {
 // only ever meaningful in the first one.
 //
 // The comparison is Record's added nanoseconds against the warm-local p50
-// gateway-overhead budget of 200 us, which is the quantity the 5% is 5% of.
-// Comparing on-vs-off as a bare ratio would divide by a no-op baseline and
-// produce a number with no relationship to the requirement.
+// gateway-overhead budget, which is the quantity the 5% is 5% of. Comparing
+// on-vs-off as a bare ratio would divide by a no-op baseline and produce a
+// number with no relationship to the requirement.
+//
+// The budget below is 200 us and the measured figure is 480 us (§15.1, measured
+// by testing/perf after this gate was written). The bound is deliberately NOT
+// recomputed from the larger number: a gate that loosens itself because the
+// thing it is a fraction of got slower is a ratchet pointing the wrong way.
 func TestMeteringOverheadMeetsTarget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("overhead gate runs benchmarks; skipped under -short")

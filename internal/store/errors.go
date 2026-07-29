@@ -28,11 +28,6 @@ var (
 	// overflow is an error, not a negative cost).
 	ErrAmountRange = errors.New("store: monetary amount out of range")
 
-	// ErrBudgetExceeded is returned by ReserveBudget when spent + reserved +
-	// requested would exceed the limit. DESIGN 6.4: exceeding a budget is not
-	// a fallback condition, failing is the correct outcome.
-	ErrBudgetExceeded = errors.New("store: budget exceeded")
-
 	// ErrNoPartitioning is returned by partition-specific operations on a
 	// dialect that has no partitions. It exists so that a caller who needs to
 	// know cannot be fooled by a silent no-op.

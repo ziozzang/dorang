@@ -80,8 +80,10 @@ func benchRouter(b *testing.B, n int, chain []Strategy) (*Router, *capacity.Brok
 }
 
 // BenchmarkRoute measures the routing decision itself with ten candidates.
-// DESIGN §15.1's warm-local p50 is 200 µs for the whole gateway, so this must
-// be a small fraction of it.
+// DESIGN §15.1's warm-local p50 is 480 µs for the whole gateway, measured, so
+// this must be a small fraction of it — and is: testing/perf found that turning
+// routing's inputs on and off (prefix affinity, a hundred pricing rules, a
+// second deployment) does not move the assembled gateway's p50 outside noise.
 func BenchmarkRoute(b *testing.B) {
 	r, _ := benchRouter(b, 10, DefaultStrategy())
 	ctx := context.Background()
@@ -182,4 +184,57 @@ func BenchmarkRouteParallel(b *testing.B) {
 			d.Reservation.Release()
 		}
 	})
+}
+
+// BenchmarkRouteParallelByCandidates is the shape of the routing decision's
+// cost rather than its value: what one costs on every core as the GROUP grows.
+//
+// Measured on a 16-core machine: 1.4 µs/op at one candidate, 1.9 µs at four,
+// 3.8 µs at sixteen. The growth is superlinear in the last step, and the reason
+// is the capacity broker's single mutex: `least_busy` — which is in the default
+// chain — asks [capacity.Broker.InUse] once per candidate, so a group of N
+// takes N turns at a lock that TryAcquire and Release are also queuing for.
+//
+// # Batching it was tried and is slower
+//
+// The obvious repair is to answer all N questions under one acquisition, and it
+// was written, measured and reverted. Two shapes were tried:
+//
+//   - Both axes for every candidate in one list: 3.8 -> 7.0 µs/op at N=16. It
+//     doubles the map lookups performed while the lock is HELD, and on a
+//     saturated mutex hold time is what decides throughput, not turn count.
+//   - The preferred axis first and the fallback only for what missed, so the
+//     lookup count is unchanged: 4.8 -> 6.1 µs/op at N=16 (GOMAXPROCS=4,
+//     minimum of six interleaved runs). The staging is the cost — the query
+//     carries strings, so writing it into a reused heap slice is a GC write
+//     barrier per candidate. CPU profiles confirm it: the batched call uses
+//     HALF the CPU of the loop it replaced and still finishes fewer operations
+//     per second.
+//
+// So the per-candidate acquisition stays, and this benchmark records the shape
+// rather than guarding a fix. On the assembled gateway it is not the ceiling:
+// throughput was flat at 19-20k req/s from one deployment to eight, because a
+// real request spends ~400 µs elsewhere and touches this lock about 1% of the
+// time, where the microbenchmark touches it continuously.
+func BenchmarkRouteParallelByCandidates(b *testing.B) {
+	for _, n := range []int{1, 4, 16} {
+		b.Run("n="+itoa(n), func(b *testing.B) {
+			r, _ := benchRouter(b, n, DefaultStrategy())
+			digests := prefixFor("model-x", strings.Repeat("conversation bytes ", 200))
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				ctx := context.Background()
+				req := Request{Model: "model-x", Principal: "key-1", Digests: digests,
+					InputTokens: 4096, MaxOutputTokens: 1024}
+				for pb.Next() {
+					d, err := r.Route(ctx, req)
+					if err != nil {
+						b.Fatalf("Route: %v", err)
+					}
+					r.Report(d, Outcome{TTFT: time.Millisecond, Total: 5 * time.Millisecond})
+				}
+			})
+		})
+	}
 }

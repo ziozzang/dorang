@@ -9,10 +9,13 @@ import (
 
 // durationBuckets are the cumulative histogram bounds in seconds.
 //
-// They are dense around the warm-local p50 of 200 µs and the p99 of 2 ms
-// (DESIGN §15.1), because a histogram whose lowest bucket is 5 ms cannot tell
-// anyone whether that target is being met — which is the only question this
-// histogram exists to answer.
+// They are dense around the warm-local p50 and p99 of DESIGN §15.1 — measured
+// at 480 µs and 2 ms — because a histogram whose lowest bucket is 5 ms cannot
+// tell anyone whether that target is being met, which is the only question this
+// histogram exists to answer. The bounds were chosen when §15.1 published a
+// 200 µs p50 and are left alone now it is measured at 480 µs: resolving BELOW
+// the target is the requirement, and 100 µs / 200 µs / 500 µs / 1 ms brackets
+// the corrected figure at least as well as the old one.
 var durationBuckets = [...]float64{
 	0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025,
 	0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,

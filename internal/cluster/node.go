@@ -215,7 +215,7 @@ func New(cfg Config) (*Node, error) {
 	every := n.tick
 	n.addJobs(
 		MaintenanceJob(cfg.Store, cfg.Retention, maxDuration(every, time.Minute), now),
-		ReservationSweepJob(cfg.Store, cfg.SweepCapacity, every, now),
+		CapacitySweepJob(cfg.SweepCapacity, every),
 		LeaseReclaimJob(reg, ledger, leases, every, now),
 	)
 	n.addJobs(cfg.Jobs...)

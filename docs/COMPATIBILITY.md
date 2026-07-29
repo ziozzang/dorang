@@ -116,9 +116,10 @@ not a passthrough.
 | 7.3 | **Six authentication header names** are accepted and any one authenticates: `Authorization: Bearer`, `API-Key`, `x-api-key`, `x-goog-api-key`, `Ocp-Apim-Subscription-Key`, and a proxy-specific header. dorang accepts all six and **strips every one of them before forwarding upstream.** |
 | 7.4 | `GET /v1/models` items are `{"id","object":"model","created":<constant>,"owned_by"}`. `created` is a **fixed constant**, not the current time — clients cache on it. The list is filtered by the calling key's model allow-list. |
 | 7.5 | ⚠️ **Route matching is specificity-ordered.** `/openai/deployments/{model}/chat/completions` must match before `/openai/{endpoint...}`. A naive prefix router silently swallows the specific route into the catch-all. |
-| 7.6 | Unsupported parameters are **dropped silently by default**, not rejected. A gateway that forwards everything verbatim surfaces upstream 400s that clients have never seen. dorang defaults `drop_unsupported: true` for this reason. |
+| 7.6 | Unsupported parameters are **dropped silently by default**, not rejected. A gateway that forwards everything verbatim surfaces upstream 400s that clients have never seen. dorang defaults `drop_unsupported: true` for this reason. **The rule is about knobs, and it stops where a parameter states something about the ANSWER** — see §7.9, whose four rows are refused with a `400` naming the construct rather than dropped. Dropping `top_k` costs a caller nothing; dropping their `stop` sequence bills them for text they excluded. |
 | 7.7 | Response headers are read by tooling — a call id and a model/deployment id in particular. dorang emits `x-dorang-request-id` and `x-dorang-deployment`, and mirrors the legacy header names when `compat.legacy_headers` is on. The mirrored set and the names dorang deliberately does **not** mirror are §7.7a; the flag is off by default. |
 | 7.8 | An inbound call-id header, if the client sets one, is honored as the request id. |
+| 7.9 | The **§10.1 construct table** — which losses are refused and which are dropped, and why each one is on the side it is on. Versioned, and every row has a conversion test in both directions. Below. |
 
 ### 7.7a The legacy header mirror, name by name
 
@@ -227,6 +228,77 @@ listing a name dorang saw once would read as a commitment about a surface dorang
 each named omission is an omission, not that the mirrored set is complete against any
 particular build of the reference proxy. An operator whose tooling reads a `x-litellm-*` name
 absent from both tables above should expect it not to arrive.
+
+### 7.9 The §10.1 construct table — what is refused, what is dropped
+
+DESIGN §10.1 splits conversion loss in two. A **droppable** loss is a knob the target does
+not have: dorang omits it, lists it in `x-dorang-dropped-params`, and the request still means
+what it meant. A **refused** loss answers `400` with `code: unsupported_construct` naming the
+construct, unless the caller listed that construct in `x-dorang-allow-lossy`.
+
+The test is one question, and it is not "can the target represent it":
+
+> **Does the absence change what the caller RECEIVES or is CHARGED, or only which knobs
+> dorang applied on the way?**
+
+Refused losses come in two reporting forms. A **located** one has an instance to point at and
+the detail carries it (`messages[2].content[1]: application/pdf`). A **material** one is a
+request parameter — there is one `service_tier` and it means one thing — so the detail carries
+the value the caller wrote, and the `400` body can fill `param` with the field name, which the
+located half has no equivalent of.
+
+**Refused — located.** No wire parameter; the construct is a shape.
+
+| Construct | What its absence destroys |
+|---|---|
+| `multi_block_content` | the array form of a message's content |
+| `image_block` | the image |
+| `document_block` | the document entirely |
+| `cache_breakpoints` | the caching topology, **and therefore the bill** |
+| `thinking_block` | the reasoning block, and any integrity material on it |
+| `multi_block_tool_result` | the non-text blocks of a tool result |
+| `structured_system` | per-block attributes on the system prompt |
+| `rich_stop_reason` | *which* terminal condition occurred |
+| `tool_calls` | the ability to call a tool at all |
+| `json_schema` | enforcement of the response schema |
+
+**Refused — material.** The construct id **is** the wire parameter.
+
+| Construct | Parameter | What its absence changes | Not raised when |
+|---|---|---|---|
+| `stop` | `stop` / `stop_sequences` | **when generation ends.** The text runs past the terminator the caller stated, the caller is billed for tokens they excluded, and a client that splits on the sequence never fires. Nothing in the response says the terminator was not applied. | the list is empty |
+| `n` | `n` | **how many choices come back.** `n: 4` answered with one choice makes `choices[3]` an index error inside the client rather than an error from the gateway. | `n: 1` — the default written down |
+| `logprobs` | `logprobs`, `top_logprobs` | **a member of the response that was asked for.** The body comes back without the thing it was requested for, with a `200` to say it went well. | neither field is set |
+| `service_tier` | `service_tier` | **the price band.** The request runs in a band the caller did not select and is billed for it — the same reason `cache_breakpoints` has always been refused. | `auto`, case-insensitively: it delegates the band to the provider, which is exactly what omitting the field does |
+
+**Dropped and named.** Each of these was weighed against the rule above and stays droppable;
+the reasoning is the load-bearing part, because "it changes the answer" proves too much — every
+sampling knob changes the answer — and a caller trained to set `x-dorang-allow-lossy` on
+everything has been given a mechanism that reports nothing.
+
+| Construct | Parameter(s) | Why the answer is materially the same |
+|---|---|---|
+| `logit_bias` | `logit_bias` | A **prior over sampling**. No vendor promises a distribution — the same request returns different text on every call — so there is no postcondition for its absence to violate, and the result is indistinguishable from an ordinary re-draw of the request that carried it. Refusing here would commit dorang to refusing `top_k` and `frequency_penalty` by the identical argument. |
+| `top_k` | `top_k` | Same class, and it is the everyday case: `top_k` is Messages-native and absent from chat-completions, so refusing it would refuse a conversion that works today. |
+| `penalties` | `frequency_penalty`, `presence_penalty` | Same class. |
+| `seed` | `seed` | Reproducibility is **vendor-documented as best effort**; the same seed does not promise the same bytes, so a dropped seed removes a preference and not a guarantee. |
+| `parallel_tool_calls` | `parallel_tool_calls` | A target that cannot express it **does not make parallel tool calls**, so `false` is already satisfied there and `true` is a permission rather than a requirement. The constraint holds by default. |
+| `reasoning` | `reasoning` | DESIGN §10.2 decides this one normatively: an unverified reasoning capability is **omitted and reported**, never guessed. |
+| `priority` | `priority` | DESIGN §10.5 makes ignoring a client hint the **default policy**, not a capability gap. Refusing would refuse the configured behaviour. |
+| `metadata` | `metadata` | Labels for the vendor's own dashboards. They do not enter the answer, its shape, or its price. |
+| `user` | `user` | The same. |
+
+Two things the table is deliberate about:
+
+- **The no-op values are not refusals.** `n: 1` and `service_tier: auto` mean "do the
+  default", so they raise no capability and cost the everyday caller nothing. SDKs fill `n`
+  whether or not the application asked for it; a classification that 400'd on that would be a
+  worse defect than the one it replaces.
+- **The refusal is raised twice, on purpose.** Routing answers "does any deployment of this
+  model express it" (DESIGN §7.1); the backend answers "does the one that was chosen",
+  against that deployment's declared capability set and after the self-hosted normalizations
+  of DESIGN §4.4 have run. Gating only at routing is correct exactly as long as the two
+  capability sets agree, and silently downgrades the day they do not.
 
 ## 8. Routing behavior is part of compatibility
 

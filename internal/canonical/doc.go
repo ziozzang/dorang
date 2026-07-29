@@ -27,14 +27,20 @@
 // A conversion can lose two very different things and they must not be reported
 // through the same channel:
 //
-//   - Droppable parameters — a knob the backend does not have (seed, logit_bias,
-//     top_logprobs, an unsupported reasoning control). The request still means
-//     what it meant. Reported by name in x-dorang-dropped-params.
+//   - Droppable parameters — a knob the backend does not have (seed,
+//     logit_bias, top_k, an unsupported reasoning control). The request still
+//     means what it meant. Reported by name in x-dorang-dropped-params.
 //
-//   - Structural downgrades — a construct that cannot be expressed at all (a
-//     document block, a cache breakpoint, a multi-block tool result). Returning
-//     200 after silently discarding a PDF or destroying a caching strategy is
-//     worse than an error, because the caller has no way to find out.
+//   - Structural downgrades — everything else, refused with a 400 naming the
+//     construct unless the caller opts in. Two reporting forms: a construct
+//     that cannot be expressed at all and has an instance to point at (a
+//     document block, a cache breakpoint, a multi-block tool result), and a
+//     [Material] parameter reported by name with the value the caller wrote
+//     (stop, n, logprobs, service_tier).
+//
+// The line between the two is NOT "can the target represent it" — see
+// [Structural], where the test and the four parameters that were on the wrong
+// side of the old one are set out.
 //
 // [Capability] is the vocabulary for both. [Request.RequiredCapabilities]
 // reports what a request actually uses so the router can prefer a backend that

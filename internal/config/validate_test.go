@@ -347,11 +347,22 @@ func TestValidationRules(t *testing.T) {
 			path: "providers[1].usage_probe.fetcher",
 			want: "must name a fetcher",
 		},
+		// Refused whether or not an endpoint is written: the endpoint was the
+		// only part the old rule checked, and requiring a URL that nothing
+		// fetches is what made the block look wired. See
+		// TestBackendMetricsAreRefused for the message.
 		{
-			name: "backend metrics without an endpoint",
+			name: "backend metrics enabled",
 			f:    fragments{providers: "  - {name: p2, kind: openai, metrics: {enabled: true}}\n"},
-			path: "providers[1].metrics.endpoint",
-			want: "must be set",
+			path: "providers[1].metrics",
+			want: "no backend metrics scraper",
+		},
+		{
+			name: "backend metrics endpoint without the flag",
+			f: fragments{providers: "  - {name: p2, kind: openai, " +
+				"metrics: {endpoint: \"http://127.0.0.1:8000/metrics\"}}\n"},
+			path: "providers[1].metrics",
+			want: "no backend metrics scraper",
 		},
 		{
 			name: "unknown retry backoff",

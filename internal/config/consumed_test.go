@@ -228,10 +228,15 @@ var readExempt = map[string]bool{
 // that added this guard; they are what the guard found on its first run, which is
 // the strongest argument for having it.
 var knownUnwired = map[string]bool{
-	// §6.2 provider usage probes. internal/probe implements the fetchers and
-	// nothing constructs one from configuration.
-	"Config.Providers.UsageProbe":         true,
-	"Config.Providers.UsageProbe.Fetcher": true,
+	// Config.Providers.UsageProbe and .Fetcher were here — "internal/probe
+	// implements the fetchers and nothing constructs one from configuration".
+	// internal/app/usageprobe.go constructs one now: a prober per enabled
+	// provider, a quota.Tracker per credential that has a rule to gate, polled
+	// off the request path. A fetcher no prober exists for is refused at
+	// assembly, by name, with the supported list — internal/config cannot check
+	// that itself without importing a sibling package (§1), which is why the
+	// entries had to leave this list rather than become a validation rule.
+	//
 	// §10.3 parameter conversion. The knob that says whether unsupported
 	// parameters are dropped never reaches the conversion path; only the kind's
 	// own capability set decides.

@@ -223,11 +223,20 @@ func waitForStore(t *testing.T, what string, cond func() bool) {
 // permanently, and the only recovery is manual — DESIGN §13 lists lease
 // rebalancing as leader work precisely so that this cannot happen.
 //
-// Both assertions are on effects the app package cannot produce by itself. The
+// The assertion is on an effect the app package cannot produce by itself: the
 // reclaimed budget was drawn by a DIFFERENT node's ledger and is returned by
-// the leader walking Registry.Dead; the swept reservation was written straight
-// to the store and is cleared by store.SweepExpiredReservations. A harness
-// substituting either would be substituting the value under test.
+// the leader walking Registry.Dead. A harness substituting it would be
+// substituting the value under test.
+//
+// There used to be a second assertion here, on the budget-reservation half of
+// the sweep job: the test planted a row through store.ReserveBudget with an
+// expiry already in the past and waited for the leader to clear it. It proved
+// nothing about the gateway. ReserveBudget had no caller outside tests, so the
+// state it planted was one no running gateway could reach — the harness was
+// producing the value the system under test is responsible for producing, which
+// is exactly §17.1 rule 1. The mechanism is deleted; the capability it claimed
+// ("a process killed mid-request must not lock budget forever") is what the
+// remaining assertion covers, through the lease the dead peer left behind.
 func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 	ctx := context.Background()
 	dsn := sharedDSN(t)
@@ -321,18 +330,6 @@ func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 		t.Fatalf("the gateway sees %v as dead, want exactly the abandoned peer", dead)
 	}
 
-	// A budget reservation that nobody will settle: the §6.4 half of the
-	// reservation sweep. Written through the store's own API, with an expiry
-	// already in the past, which is exactly the state a process killed between
-	// reserve and settle leaves behind.
-	sub := store.Subject{Kind: store.SubjectKey, ID: "key-abandoned"}
-	if _, err := a.Store.ReserveBudget(ctx, store.ReserveRequest{
-		Subject: sub, Period: "month", PeriodStart: time.Now().UTC().Truncate(time.Hour),
-		AmountNano: 5_000, Until: time.Now().Add(-time.Minute),
-	}); err != nil {
-		t.Fatalf("planting an abandoned reservation: %v", err)
-	}
-
 	// Nothing below drives a tick. The gateway's own loop has to do it, which
 	// is the whole point: reverting the Node.Start call in joinCluster leaves
 	// every assertion from here on unmet.
@@ -350,11 +347,6 @@ func TestLeaderJobsRunInTheAssembledGateway(t *testing.T) {
 		t.Fatalf("after reclaim the durable counter reads %d (err %v), want the peer's "+
 			"spend of %d", v, err, spend)
 	}
-	waitForStore(t, "the leader to sweep the abandoned reservation", func() bool {
-		st, err := a.Store.GetBudgetState(ctx, sub, "month", time.Now().UTC().Truncate(time.Hour))
-		return err == nil && st.ReservedNano == 0
-	})
-
 	// The reclaim is attributed, not blind: the peer's row is what the leader
 	// walked to find the lease, so it must still have been there when the
 	// reclaim ran. Pruning happens on a much longer grace (§13).

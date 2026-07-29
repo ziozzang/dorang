@@ -114,10 +114,16 @@ func EncodeRequest(req *canonical.Request, opt *EncodeOptions) (*Request, error)
 	loss := opt.loss()
 
 	// Droppable parameters first: one bit-mask subtraction reports every knob
-	// this family does not have, by wire name — seed, logit_bias, logprobs,
-	// penalties, n, service_tier.
+	// this family does not have, by wire name — seed, logit_bias, penalties.
 	missing := caps.Missing(req.RequiredCapabilities())
 	loss.DropCapability(missing.Droppable())
+	// The MATERIAL half of the same subtraction — n, logprobs, service_tier,
+	// none of which this family has — is a downgrade rather than a dropped
+	// knob, because its absence changes the answer or the price
+	// (canonical.Material). It is recorded, not refused: this encoder still does
+	// not decide policy, and the two things it DOES refuse are refusals to
+	// invent a value, which is a different act.
+	req.MaterialLoss(caps, loss)
 
 	out := &Request{
 		Model:  req.Model,

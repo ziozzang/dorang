@@ -57,7 +57,12 @@ func (anthropicAdapter) encode(x *exchange) ([]byte, error) {
 		})
 	}
 	return anthropic.MarshalRequest(x.req, &anthropic.EncodeOptions{
-		Model:            x.target.UpstreamModel,
+		Model: x.target.UpstreamModel,
+		// The set the §10.1 gate just cleared this request against. Letting the
+		// encoder fall back to its own family default instead would mean a
+		// deployment that expresses LESS than its family is refused on one set
+		// and encoded against another.
+		Capabilities:     x.capabilities(),
 		AllowLossy:       x.call.AllowLossy,
 		DefaultMaxTokens: x.call.DefaultMaxTokens,
 	})

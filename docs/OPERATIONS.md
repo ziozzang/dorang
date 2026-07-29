@@ -1047,7 +1047,16 @@ so a lagging poll cannot erase a burst. If you are diagnosing a quota decision:
 1. **A failed fetch never disables a credential.** A failed read is not an exhausted quota. The
    last good snapshot is retained and its staleness is exposed.
 2. Reported percentages come from the last poll plus the local delta, so a figure that looks
-   behind is expected between polls. Shorten `usage_probe.interval` if the gap matters.
+   behind is expected between polls. Shorten `usage_probe.interval` if the gap matters — it is
+   also the floor on how often one credential is read, so a second poll inside it replays the
+   last snapshot rather than spending a request.
+2a. ⚠️ **If a probe appears to change nothing, check these two before anything else.** The
+   provider must report in the metric's units, and most report a percentage of an allowance
+   whose size they do not publish — such a window carries its RESET INSTANT only until you
+   declare the size with `usage_probe.allowances[].limit` ([CONFIG.md](CONFIG.md) §6.1a). And
+   the credential must have a rule for the figure to gate: quota is keyed by (window, metric),
+   and the rule comes from `models[].deployments[].limits[]`. A probe enabled for a credential
+   with no rule is logged at start-up saying exactly that.
 3. `x-dorang-quota-<window>-used-pct` on a response (with `X-Dorang-Detail: full`) is what the
    router saw for that request.
 4. ⚠️ **Rolling windows are exact only under `capacity_mode: local`.** A rolling 5-hour allowance
@@ -1116,12 +1125,12 @@ Operationally relevant gaps, so you do not plan around something that is not the
 | **Lua** | Lua **runs**, sandboxed, on the request path — the VM is gopher-lua, pure Go. Plugins are declared one at a time as `filters.plugins[].path` and never scanned for; `extensions.lua.dir` holds `*.policy`, the total policy language, and a `.lua` file **under that directory** is still a **load error** rather than a file silently ignored, because a directory that runs whatever appears in it is a code-execution primitive. A compiled-in Go `Native` is the third way. See [CONFIG.md](CONFIG.md) §16 and §17. ⚠️ **This row read "there is no Lua interpreter" until 2026-07-29** — false since `a0d5871`, and it is the kind of gap an operator plans around, which is exactly what this table exists to prevent |
 | `on_route` re-routing | The hook sees the chosen deployment and may refuse it; it cannot ask for a different one |
 | Top-level `quotas:` and `budget:` blocks | Not in the schema. Budgets are per-key via `dorangctl key create --budget-usd` |
-| Credential import from an incumbent database | Implemented in the store and **has no CLI entry point** — see [MIGRATION.md](MIGRATION.md) §3 |
+| Credential import from an incumbent database | `dorangctl import keys --from <dsn>`, reporting by default and writing with `--commit` — see [MIGRATION.md](MIGRATION.md) §3.5. ⚠️ **This row read "has no CLI entry point" until 2026-07-29**, and it was true: the importer was complete in the store and reachable from nothing an operator could type |
 | Rate limiting across nodes | The rolling minute is per process. An N-node deployment enforces N times every `rpm_limit` and `tpm_limit`. The durable ledger would close it, at a store write per request — not taken |
 | `tpm_limit` bounds the NEXT request | A token count does not exist until settlement, so one enormous request can cross the ceiling once before anything refuses |
 | Prefix / cluster metrics | State exists; nothing exports it. Capacity and health are readable at `/admin/capacity` and `/health/history` |
-| `providers[].usage_probe`, **`providers[].metrics` entire**, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. The list is held as executable state in `internal/config/consumed_test.go` for the field names that guard can see; the rest are prose in [CONFIG.md](CONFIG.md) §23.1, which is why that half has to be re-derived by hand rather than trusted |
-| **Backend metrics scraping** | There is no scraper. `providers[].metrics.enabled` and `.endpoint` validate and are read by nothing, so §12.4's queue-depth and cache-utilization signals for `least_busy` and `highest_tps` have no collector, and [VLLM.md](VLLM.md)'s engine-metrics guidance describes a collection path that does not exist. New row: the gap was previously understated as "the poll interval is not read", in [CONFIG.md](CONFIG.md) §23.1, and appeared nowhere here |
+| `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. ⚠️ **`providers[].usage_probe` left this row on 2026-07-29** — it is wired (§6.2), and `providers[].metrics` left it too, in the other direction: it is refused at load. The list is held as executable state in `internal/config/consumed_test.go` for the field names that guard can see; the rest are prose in [CONFIG.md](CONFIG.md) §23.1, which is why that half has to be re-derived by hand rather than trusted |
+| **Backend metrics scraping** | There is no scraper, and `providers[].metrics` is now **refused at load** rather than accepted and ignored. §12.4's queue-depth and cache-utilization signals have no collector. This costs you nothing unless you are running a self-hosted backend that also serves traffic from outside dorang: `least_busy` ranks on dorang's own live capacity occupancy and `highest_tps` on measured output tokens per second, both without a poll — name them in `models[].strategy`. See [CONFIG.md](CONFIG.md) §6.2. ⚠️ The gap was previously understated as "the poll interval is not read" |
 
 ---
 

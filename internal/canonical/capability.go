@@ -43,8 +43,10 @@ const (
 	// CapJSONSchema — a response JSON Schema can be enforced.
 	CapJSONSchema
 
-	// --- droppable from here down: a missing one changes nothing about what the
-	// request MEANS, so it is reported by name and the request continues.
+	// --- from here down the construct is a named request PARAMETER rather than
+	// a shape, so a loss is reported by parameter name and never located. That
+	// is a statement about how the loss is REPORTED, not about whether it is
+	// tolerated: [Material] below picks out the ones that are refused anyway.
 
 	// CapParallelToolCalls — parallel tool calling can be turned off.
 	CapParallelToolCalls
@@ -74,21 +76,110 @@ const (
 	CapServiceTier
 )
 
-// Structural is the mask of capabilities whose absence destroys information.
+// Structural is the mask of capabilities dorang refuses to lose silently: a
+// request needing one that the target lacks is a `400` naming the construct,
+// unless the caller opts in with `x-dorang-allow-lossy` (DESIGN §10.1).
 //
-// The split is the whole point of §10.1. A missing droppable capability means
-// dorang did not apply a knob and says so. A missing structural capability means
-// dorang would return 200 having thrown away a document, a caching topology or
-// the images inside a tool result — which is worse than an error, because the
-// caller cannot find out.
+// # The test, and the test it replaces
+//
+// This mask used to be defined as "the target cannot REPRESENT it", which reads
+// as a statement about shape, and four parameters were filed as droppable on
+// that reading even though their absence changes the answer: `stop`, `n`,
+// `logprobs` and `service_tier`. Each returned 200 with the parameter named in
+// `x-dorang-dropped-params`, which is not consent — it is a header nobody
+// parses, carrying news that the reply is not the one that was asked for.
+//
+// The shape reading was never what the mask actually contained, either.
+// [CapCacheBreakpoints] is here because losing a caching topology changes the
+// BILL, and [CapRichStopReasons] because collapsing an enumeration loses WHICH
+// terminal condition occurred. Neither is about shape. So the axis is restated
+// as the question that was always deciding it:
+//
+//	Does the absence change what the caller RECEIVES or is CHARGED,
+//	or only which knobs dorang applied on the way?
+//
+// A knob is droppable. Everything else needs the caller's word for it.
+//
+// The two halves differ in how a loss is REPORTED, not in whether it is
+// refused: the shape half is located per instance ("messages[2].content[1]:
+// application/pdf"), and [Material] is named by parameter. Both are
+// [Downgrade]s and both are refused.
 const Structural = CapMultiBlockContent | CapImageBlocks | CapDocumentBlocks |
 	CapCacheBreakpoints | CapThinkingBlocks | CapMultiBlockToolResult |
-	CapStructuredSystem | CapRichStopReasons | CapToolCalls | CapJSONSchema
+	CapStructuredSystem | CapRichStopReasons | CapToolCalls | CapJSONSchema |
+	Material
 
-// Droppable is the complement of [Structural] within the defined bits.
+// Material is the half of [Structural] that is a request PARAMETER rather than
+// a shape: the target has the field's meaning nowhere, and dropping it changes
+// the answer or the price rather than the presentation.
+//
+// Membership is argued one at a time, because "it changes the answer" proves
+// too much — every sampling knob changes the answer — and refusing more
+// requests is a real cost. A caller trained to set `x-dorang-allow-lossy` on
+// everything has been given a mechanism that reports nothing.
+//
+//   - CapStopSequences — a stop sequence is a stated TERMINATOR: the caller has
+//     said the text will not continue past it. Dropped, generation runs on, the
+//     caller is billed for tokens they excluded, and a client that splits the
+//     answer on the sequence never fires. Nothing in the response says the
+//     terminator was not applied, which is exactly §10.1's "the caller cannot
+//     find out".
+//
+//   - CapMultipleChoices — `n` is a stated RESPONSE SHAPE. This one was already
+//     misclassified under the old reading, never mind the new one: `n: 4` and
+//     one choice back is the response having a different shape from the one
+//     requested, and `choices[3]` is an index error in the client rather than
+//     an actionable error from the gateway. It costs the everyday caller
+//     nothing, because [Request.RequiredCapabilities] raises the bit only for
+//     n > 1 — `n: 1` is the default spelled out and is not a capability claim.
+//
+//   - CapLogprobs — `logprobs: true` asks for a MEMBER OF THE RESPONSE. Dropped,
+//     the body comes back without the thing it was asked for and with a 200 to
+//     say it went well. It is the same class as `n` and it was on the same
+//     wrong side; it was not in the review that found the others.
+//
+//   - CapServiceTier — a tier selects a PRICE BAND. Dropping it runs the request
+//     in a band the caller did not choose and bills them for it, which is the
+//     same reason CapCacheBreakpoints has always been structural. Only a tier
+//     that selects something counts: "auto" means "the provider decides", which
+//     is precisely what omitting the field means, so
+//     [Request.RequiredCapabilities] raises no bit for it.
+//
+// Deliberately NOT here, and the reasoning is the load-bearing part:
+//
+//   - CapLogitBias — a bias is a PRIOR OVER SAMPLING, in the same family as
+//     top_k and the penalties, and no vendor promises a distribution. The answer
+//     under a dropped bias is an answer to the same question, in the same shape,
+//     at the same price, and it is indistinguishable from an ordinary re-draw of
+//     the same request WITH the bias. There is no postcondition to violate.
+//     Refusing on it would commit dorang to refusing on top_k and on
+//     frequency_penalty by the identical argument, and dropping top_k on the way
+//     to an OpenAI target is an everyday, harmless conversion.
+//     TestLogitBiasStaysDroppableBecauseTheAnswerIsTheSameKind pins this.
+//   - CapParallelToolCalls — a target that cannot express it does not MAKE
+//     parallel tool calls, so `false` is already satisfied there and `true` is a
+//     permission rather than a requirement. The constraint holds by default.
+//   - CapSeed — reproducibility is vendor-documented as best effort; the same
+//     seed does not promise the same bytes.
+//   - CapReasoningControl — §10.2 decides this one normatively: an unverified
+//     reasoning capability is OMITTED and reported, never guessed.
+//   - CapPriority — §10.5 makes ignoring a client hint the DEFAULT policy, not a
+//     capability gap; refusing would refuse the configured behaviour.
+//   - CapMetadata, CapUser — labels for the vendor's own dashboards. They do not
+//     enter the answer, its shape, or its price.
+const Material = CapLogprobs | CapMultipleChoices | CapStopSequences | CapServiceTier
+
+// Droppable is the complement of [Structural] within the defined bits: a knob
+// dorang did not apply, reported by name in x-dorang-dropped-params, with the
+// request continuing because it still means what it meant.
 const Droppable = CapParallelToolCalls | CapReasoningControl | CapSeed | CapLogitBias |
-	CapLogprobs | CapPenalties | CapTopK | CapMultipleChoices | CapPriority |
-	CapMetadata | CapUser | CapStopSequences | CapServiceTier
+	CapPenalties | CapTopK | CapPriority | CapMetadata | CapUser
+
+// ServiceTierAuto is the tier that selects nothing: it delegates the choice to
+// the provider, which is what omitting the field already does. It is the one
+// value of the field that is safe to drop, and it is named rather than spelled
+// inline because it is the difference between a correct request and a 400.
+const ServiceTierAuto = "auto"
 
 // Has reports whether every bit of want is present in c.
 func (c Capability) Has(want Capability) bool { return c&want == want }
@@ -96,8 +187,13 @@ func (c Capability) Has(want Capability) bool { return c&want == want }
 // Missing returns the bits of want that c lacks.
 func (c Capability) Missing(want Capability) Capability { return want &^ c }
 
-// Structural returns the structural subset of c.
+// Structural returns the structural subset of c — what §10.1 refuses without an
+// opt-in. It includes [Capability.Material].
 func (c Capability) Structural() Capability { return c & Structural }
+
+// Material returns the subset of c that is refused and reported by parameter
+// name rather than located. See [Material].
+func (c Capability) Material() Capability { return c & Material }
 
 // Droppable returns the droppable subset of c.
 func (c Capability) Droppable() Capability { return c & Droppable }
@@ -129,15 +225,15 @@ var capNames = []capName{
 	{CapReasoningControl, "reasoning", []string{"reasoning"}},
 	{CapSeed, "seed", []string{"seed"}},
 	{CapLogitBias, "logit_bias", []string{"logit_bias"}},
-	{CapLogprobs, "logprobs", []string{"logprobs", "top_logprobs"}},
+	{CapLogprobs, ConstructLogprobs, []string{"logprobs", "top_logprobs"}},
 	{CapPenalties, "penalties", []string{"frequency_penalty", "presence_penalty"}},
 	{CapTopK, "top_k", []string{"top_k"}},
-	{CapMultipleChoices, "n", []string{"n"}},
+	{CapMultipleChoices, ConstructMultipleChoices, []string{"n"}},
 	{CapPriority, "priority", []string{"priority"}},
 	{CapMetadata, "metadata", []string{"metadata"}},
 	{CapUser, "user", []string{"user"}},
-	{CapStopSequences, "stop", []string{"stop"}},
-	{CapServiceTier, "service_tier", []string{"service_tier"}},
+	{CapStopSequences, ConstructStopSequences, []string{"stop"}},
+	{CapServiceTier, ConstructServiceTier, []string{"service_tier"}},
 }
 
 // Construct ids. These are the values a caller lists in x-dorang-allow-lossy and
@@ -153,6 +249,17 @@ const (
 	ConstructRichStopReason       = "rich_stop_reason"
 	ConstructToolCalls            = "tool_calls"
 	ConstructJSONSchema           = "json_schema"
+
+	// The [Material] four. Their construct id IS their wire parameter name,
+	// which the located constructs above have no equivalent of — that is the
+	// whole difference between the two halves of [Structural]. They are named
+	// here rather than spelled inline because they are now what a 400 body
+	// carries and what x-dorang-allow-lossy accepts, and a vocabulary that
+	// exists only as a string literal in a table drifts.
+	ConstructLogprobs        = "logprobs"
+	ConstructMultipleChoices = "n"
+	ConstructStopSequences   = "stop"
+	ConstructServiceTier     = "service_tier"
 )
 
 // Names returns the construct id of every set bit, low bit first.
@@ -356,6 +463,10 @@ func (r *Request) RequiredCapabilities() Capability {
 	if r.TopK != nil {
 		c |= CapTopK
 	}
+	// n: 1 is the default written down, not a claim on a capability. Only a
+	// caller who asked for more than one choice is asking for something a target
+	// without `n` cannot give them, which is why reclassifying [CapMultipleChoices]
+	// as structural costs the "always sends n: 1" caller nothing.
 	if r.N != nil && *r.N > 1 {
 		c |= CapMultipleChoices
 	}
@@ -371,10 +482,52 @@ func (r *Request) RequiredCapabilities() Capability {
 	if len(r.Stop) > 0 {
 		c |= CapStopSequences
 	}
-	if r.ServiceTier != "" {
+	// Same rule as n: 1 above. "auto" delegates the band to the provider, and so
+	// does sending no field at all, so dropping it is not a change and must not
+	// become a refusal. Case-insensitively, because a caller who spells it
+	// "Auto" has still selected nothing and a 400 for casing would be absurd.
+	if r.ServiceTier != "" && !strings.EqualFold(r.ServiceTier, ServiceTierAuto) {
 		c |= CapServiceTier
 	}
 	return c
+}
+
+// MaterialLoss records into l every [Material] capability that a target holding
+// `have` cannot express, one [Downgrade] each.
+//
+// It exists separately from [Request.Downgrades] because the encoders build
+// their loss report as they walk, and this half needs no walk — the capability
+// mask decides it outright. Both entry points call it, so the two cannot drift.
+//
+// Note the receiver argument, same trap as Downgrades: Missing reports what the
+// RECEIVER lacks, so the target's capabilities go on the left.
+func (r *Request) MaterialLoss(have Capability, l *LossReport) {
+	if r == nil || l == nil {
+		return
+	}
+	missing := have.Missing(r.RequiredCapabilities()) & Material
+	if missing == 0 {
+		return
+	}
+	// Detail is the value the caller wrote, because "n was dropped" is not
+	// actionable and "n: 4" is — the same reason [Downgrade.Detail] exists for
+	// the located half.
+	if missing&CapStopSequences != 0 {
+		l.Downgrade(ConstructStopSequences, "stop: "+itoa(len(r.Stop))+" sequence(s) the target cannot honour")
+	}
+	if missing&CapMultipleChoices != 0 && r.N != nil {
+		l.Downgrade(ConstructMultipleChoices, "n: "+itoa(*r.N))
+	}
+	if missing&CapLogprobs != 0 {
+		if r.TopLogprobs != nil {
+			l.Downgrade(ConstructLogprobs, "top_logprobs: "+itoa(*r.TopLogprobs))
+		} else {
+			l.Downgrade(ConstructLogprobs, "logprobs")
+		}
+	}
+	if missing&CapServiceTier != 0 {
+		l.Downgrade(ConstructServiceTier, "service_tier: "+r.ServiceTier)
+	}
 }
 
 // messageCapabilities is the per-message half of RequiredCapabilities.
@@ -468,7 +621,11 @@ func contentCapabilities(c Content) Capability {
 }
 
 // Downgrades reports the structural losses that converting this request for a
-// backend with capability set `have` would cause, each located.
+// backend with capability set `have` would cause.
+//
+// The shape half is located to the instance; the [Material] half is named by
+// parameter and carries the value the caller wrote, because there is no
+// instance to point at — `service_tier` appears once and means one thing.
 //
 // Droppable losses are NOT reported here: they are reported by name, and the
 // name is all there is to say about them. Callers get those from
@@ -556,7 +713,11 @@ func (r *Request) Downgrades(have Capability) []Downgrade {
 	if r.ResponseFormat != nil && r.ResponseFormat.Kind == FormatJSONSchema {
 		add(CapJSONSchema, ConstructJSONSchema, "response_format")
 	}
-	return out
+
+	// The named half. One implementation, two entry points (see [Request.MaterialLoss]).
+	var ml LossReport
+	r.MaterialLoss(have, &ml)
+	return append(out, ml.Downgrades...)
 }
 
 func (t *ToolUse) nameOrEmpty() string {

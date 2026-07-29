@@ -1284,15 +1284,20 @@ func decodeLeaseKey(scope, scopeKey, window, metric string) (CounterKey, error) 
 
 // readCounter returns the committed value of a counter.
 //
-// For a budget it is spent plus reserved: internal/store's synchronous
-// ReserveBudget writes reserved_nano, and a block drawn without counting it
-// would let the two mechanisms hand out the same money.
+// For a budget it is spent_nano and nothing else. It used to read
+// `spent_nano + reserved_nano`, to interlock with internal/store's synchronous
+// ReserveBudget so that a block drawn without counting a hold could not let two
+// mechanisms hand out the same money. There was never a second mechanism:
+// ReserveBudget had no non-test caller, reserved_nano was zero in every row, and
+// the term was an unreachable guard that read like a live one. It and its
+// columns are gone (migration 0006); this ledger is the only thing that writes
+// a budget counter.
 func (l *Ledger) readCounter(ctx context.Context, t tx, k CounterKey) (int64, error) {
 	var v int64
 	var err error
 	if k.Kind == CounterBudget {
 		err = t.queryRow(ctx, `
-			SELECT spent_nano + reserved_nano FROM budget_state
+			SELECT spent_nano FROM budget_state
 			 WHERE subject_kind = ? AND subject_id = ? AND period = ? AND period_start = ?`,
 			k.Scope, k.ID, k.Window.String(), store.Micros(k.PeriodStart)).Scan(&v)
 	} else {
@@ -1321,8 +1326,8 @@ func (l *Ledger) addCounter(ctx context.Context, t tx, k CounterKey, delta int64
 	if k.Kind == CounterBudget {
 		_, err := t.exec(ctx, `
 			INSERT INTO budget_state
-			    (subject_kind, subject_id, period, period_start, spent_nano, reserved_nano, reserved_until, updated_at)
-			VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
+			    (subject_kind, subject_id, period, period_start, spent_nano, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT (subject_kind, subject_id, period, period_start) DO UPDATE SET
 			    spent_nano = `+g+`(budget_state.spent_nano + ?, 0),
 			    updated_at = ?`,

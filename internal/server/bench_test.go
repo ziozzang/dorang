@@ -9,11 +9,13 @@ import (
 	"testing"
 )
 
-// The gateway-overhead budget is DESIGN §15.1's warm-local p50 of 200 µs for
-// the whole gateway — auth, routing, capacity, pricing, parameter conversion
-// and metering enqueue. This package is the HTTP surface only, so what these
-// benchmarks report is how much of that budget the surface consumes before the
-// router or the upstream have done anything.
+// The gateway-overhead budget is DESIGN §15.1's warm-local p50 for the whole
+// gateway — auth, routing, capacity, pricing, parameter conversion and metering
+// enqueue — MEASURED at 480 µs by testing/perf, against 200 µs published. This
+// package is the HTTP surface only, so what these benchmarks report is how much
+// of that budget the surface consumes before the router or the upstream have
+// done anything, and the answer is: almost none of it. The whole non-streaming
+// handler with a nop dispatcher is ~1.6 µs, a third of one percent.
 
 // benchWriter is a response writer that neither allocates nor keeps anything,
 // so a benchmark measures the handler rather than a recorder.

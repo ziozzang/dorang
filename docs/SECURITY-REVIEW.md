@@ -854,7 +854,7 @@ them converts three latent findings into live ones on the same commit.
 | `Limits.TPMLimit` | `internal/auth/principal.go:49` | `principal.go:168`, same | per-key/user/team token rate is unlimited |
 | `Limits.MaxParallel` | `internal/auth/principal.go:52` | nothing — the identifier does not occur in `internal/capacity` | per-subject concurrency ceiling is unlimited; the doc comment claiming capacity enforces it is false |
 | `capacity.{global,provider_groups,credential_groups,models,principals}.{rpm,tpm,max_queue,max_queue_wait}` | `internal/config/config.go:193-198`, `:235-241`, validated at `validate.go:388-407` | only `MaxConcurrency`/`MaxConcurrent` is copied (`internal/app/build.go:95-107`); `capacity.Config` has no such fields | four ceilings on every capacity axis load cleanly, warn about nothing, and enforce nothing |
-| `providers[].usage_probe.*` | validated at `internal/config/validate.go:314-316` | `quota.NewRegistry` and `Meter.AttachTracker` have no non-test callers | `usage_probe.enabled: true` is accepted and inert; every quota decision silently runs local-only, understating usage for any credential also used outside dorang (DESIGN §6.2) |
+| `providers[].usage_probe.*` | validated in `internal/config/validate.go` | ~~`quota.NewRegistry` and `Meter.AttachTracker` have no non-test callers~~ → `internal/app/usageprobe.go` | ~~`usage_probe.enabled: true` is accepted and inert; every quota decision silently runs local-only, understating usage for any credential also used outside dorang (DESIGN §6.2)~~ **Closed 2026-07-29.** A prober per enabled provider, a `quota.Tracker` per credential with a rule to gate, polled off the request path; a `fetcher` no prober exists for is a start-up refusal. `TestProviderReportedQuotaReachesTheMeter` in `internal/app` drives a provider-reported figure to a credential's own refusal with no local traffic at all |
 | `router.Request.Tenant` | `internal/router/request.go:82-84` | `router.go:642`; assigned only in `testing/scenario/harness.go:421` | session pins are shared across tenants (finding above) |
 | `budgetGate` on the batch path | `internal/app/budget.go` | `internal/app/dispatch.go:117` only | batch spend is unbudgeted (finding above) |
 | `Result.QuotaUsedPct` | `internal/server/deps.go:327-349` | `headers.go:258` | the `x-dorang-quota-*-used-pct` headers are never emitted; latent header-*name* injection if it is ever fed from provider-reported window names |
@@ -1549,8 +1549,11 @@ later — the mechanism `internal/quota` already implements, one package over.
 4. **Eleven further settings that load and do nothing**, found by the recurrence
    guard on its first run and listed in `knownUnwired` in
    `internal/config/consumed_test.go`: `providers[].usage_probe` (§6.2, the
-   fetchers exist and nothing constructs one), `providers[].metrics.interval`
-   (§12.4), `providers[].params.drop` and `.drop_unsupported` (§10.3 — the two
+   fetchers exist and nothing constructs one — **closed 2026-07-29**, see the
+   control table above), `providers[].metrics.interval` (§12.4 — **the whole
+   `metrics` block is a load error now**: nothing scrapes a backend, so it is
+   refused rather than left inert, naming the strategies that need no scrape),
+   `providers[].params.drop` and `.drop_unsupported` (§10.3 — the two
    knobs that say *which* parameters to drop never reach the conversion path),
    `routing.prefix.checkpoints` (§7.4b), `models[].deployments[].stream_timeout`,
    `key_rotation.providers[].affinity_group` (not even validated),

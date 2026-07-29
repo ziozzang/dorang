@@ -229,10 +229,22 @@ type App struct {
 	models       *modelList
 	quota        *quotaSet
 	budget       *budgetGate
+	// probes is DESIGN §6.2's provider usage probes. It is an atomic pointer
+	// because a reload rebuilds the whole set — the trackers are bound to the
+	// meters they difference against, and those are rebuilt too — while the
+	// background loop is reading it. Nil when no provider enables one, which is
+	// the default and costs nothing.
+	probes atomic.Pointer[probeSet]
 	// responses is the Responses API's server-side state (DESIGN §9.2
 	// [R1-C7]). Nil when no store is configured, which makes `store: true`
 	// answer a named 501 rather than silently not storing.
 	responses *responsesStore
+
+	// client is the upstream HTTP client, shared by the backend and the usage
+	// probes. It refuses redirects (backend.NewClient), which is a property a
+	// probe needs as much as a request does: following one resends the
+	// credential to whatever answered.
+	client *http.Client
 
 	logf func(string, ...any)
 	now  func() time.Time
@@ -488,6 +500,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if client == nil {
 		client = backend.NewClient()
 	}
+	// Kept so a reload can rebuild the usage probes against the same client
+	// rather than minting a second connection pool per SIGHUP.
+	a.client = client
 	// The OAuth credential set (DESIGN §11.2b). It is built before the
 	// dispatcher because the dispatcher resolves through it, and its background
 	// loops start with the rest of them in startBackground — nothing on the
@@ -517,6 +532,20 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		anthropicTotalTokens: anthropicTotalTokens(cfg),
 	})
 	a.models = newModelList(cfg)
+
+	// 6b. Provider usage probes (DESIGN §6.2). Built after the dispatcher and
+	//     the OAuth manager because a probe resolves its credential through
+	//     both, and before the background loop that polls it.
+	//
+	//     Local metering counts what went through dorang; a provider's own
+	//     figure counts what did not. Without this half a shared key reads as
+	//     having quota left while the account is exhausted, which is the
+	//     failure §6.2 exists to describe.
+	ps, err := a.buildProbes(cfg, qs, client)
+	if err != nil {
+		return nil, err
+	}
+	a.probes.Store(ps)
 
 	// 7. Batch. Its Store, Blobs, Executor, Reserver and ModelResolver are all
 	//    interfaces internal/batch declares; the adapters are in batch.go.
@@ -741,6 +770,24 @@ func (a *App) Reload(cfg *config.Config) error {
 	a.Catalog = cat
 	a.cfg.Store(cfg)
 
+	// The probes are rebuilt with the meters, not carried across (§6.2). A
+	// tracker differences against the meter it was built with, and a meter that
+	// has been replaced records nothing — so a carried tracker sees a frozen
+	// local delta and the provider's figure becomes authoritative, which is the
+	// revision-1 behaviour §6.2 was corrected away from.
+	//
+	// It runs after the swap rather than before, because a failure here must
+	// not leave the gateway serving the old router with the new meters. A probe
+	// that cannot be rebuilt is reported and the previous set is dropped: the
+	// alternative is polling credentials the running configuration no longer
+	// has.
+	ps, perr := a.buildProbes(cfg, qs, a.client)
+	if perr != nil {
+		a.probes.Store(nil)
+		return fmt.Errorf("app: usage probes: %w", perr)
+	}
+	a.probes.Store(ps)
+
 	if err := a.Server.Reload(a.serverOptions(cfg)); err != nil {
 		return fmt.Errorf("app: http reload: %w", err)
 	}
@@ -939,10 +986,29 @@ func (a *App) startBackground() error {
 			defer at.Stop()
 			accuracy = at.C
 		}
+		// DESIGN §6.2's poll round. The cadence is resolved once, like every
+		// other interval in this loop; per-provider spacing is the prober's own
+		// MinInterval, which replays its last snapshot rather than re-reading,
+		// so a shorter tick here cannot poll any provider faster than it was
+		// configured for. A nil channel blocks forever, so a gateway with no
+		// probe pays one dead case in a loop it already runs.
+		var probes <-chan time.Time
+		if every := a.probeInterval(); every > 0 {
+			pt := time.NewTicker(every)
+			defer pt.Stop()
+			probes = pt.C
+		}
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-probes:
+				// Off the request path, and bounded: a provider that stops
+				// answering must not hold this loop, because the sticky purge
+				// and the budget lease renewal share it.
+				pctx, cancel := context.WithTimeout(ctx, time.Minute)
+				a.pollProbes(pctx)
+				cancel()
 			case <-accuracy:
 				// Conflict first. A node that has been superseded is not going
 				// to lead again and should stop being routed to; refreshing the

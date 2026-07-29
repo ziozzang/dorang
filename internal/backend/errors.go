@@ -51,6 +51,17 @@ const (
 	CodeResponseEncode = "response_encode"
 	// CodeConversionFailed is a request the target deployment cannot express.
 	CodeConversionFailed = "conversion_failed"
+	// CodeUnsupportedConstruct is DESIGN §10.1's refusal: the chosen deployment
+	// cannot express a construct whose loss would change the answer or the
+	// price, and the caller did not opt in.
+	//
+	// It is spelled identically to internal/router's constant on purpose. The
+	// two raise it at different moments — routing raises it when NO deployment
+	// of the model can express the request, this package when the one that was
+	// chosen cannot — and a client branching on the code is asking the same
+	// question in both cases and takes the same action. Two spellings for one
+	// condition would make that branch depend on which layer noticed first.
+	CodeUnsupportedConstruct = "unsupported_construct"
 	// CodeCredentialUnavailable is a credential dorang holds but cannot use —
 	// an OAuth token that failed to refresh, most often.
 	CodeCredentialUnavailable = "credential_unavailable"
@@ -381,6 +392,66 @@ func encodeError(err error) *server.Error {
 	return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
 		"the request cannot be expressed by the selected deployment: "+err.Error()).
 		WithCode(CodeConversionFailed)
+}
+
+// materialRefusal is DESIGN §10.1's 400 for a loss that would change the answer
+// or the price: the chosen deployment cannot express one of [canonical.Material],
+// and the caller did not name it in x-dorang-allow-lossy.
+//
+// It is written here rather than left to routing because §10.1 states the two
+// as separate obligations. Routing PREFERS a deployment that can express the
+// request and refuses when none of them can; this is the other one — "the
+// chosen backend cannot express it" — and it is the only one of the two that
+// sees the request as it will actually be encoded, after the engine
+// normalizations of selfhosted.go have run.
+//
+// Everything about the refusal is written to be acted on rather than read:
+//
+//   - the construct id appears twice, once in prose and once after the header
+//     name, so the retry is a copy rather than a translation;
+//   - Param carries the wire parameter, which for this half of [canonical.Structural]
+//     IS a real request field — unlike `thinking_block`, which is a capability
+//     and would send a field-locating SDK to a member that does not exist;
+//   - the status is 400 and not 502, because nothing upstream has been asked
+//     anything yet.
+func materialRefusal(missing canonical.Capability) *server.Error {
+	constructs := missing.Names()
+	params := missing.Params()
+	e := server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
+		"the deployment selected for this request cannot express "+strings.Join(constructs, ", ")+
+			", and dropping it would change the answer or the price rather than only the presentation; "+
+			"retry with x-dorang-allow-lossy: "+strings.Join(constructs, ",")).
+		WithCode(CodeUnsupportedConstruct)
+	if len(params) > 0 {
+		e = e.WithParam(params[0])
+	}
+	return e
+}
+
+// refuseMaterialLoss is the gate [materialRefusal] documents, applied to one
+// prepared exchange. Nil means the request can be encoded without changing what
+// it asks for.
+//
+// It runs on the PREPARED request, which matters in one specific case that
+// looks like a hole and is not: selfhosted.go clears service_tier for a
+// self-hosted engine, so a caller who names a tier on a vLLM deployment is not
+// refused here. That is correct — a self-hosted engine has no price bands to
+// select between, and §4.4's own reasoning for clearing the field is that
+// emitting it would express nothing. Refusing before preparation would turn
+// that documented normalization into a 400.
+//
+// A token count is exempt for the same kind of reason: it generates nothing and
+// bills no generation, so no member of [canonical.Material] can change its
+// answer.
+func refuseMaterialLoss(x *exchange) *server.Error {
+	if x.req == nil || x.call.Op == OpCountTokens {
+		return nil
+	}
+	missing := x.capabilities().Missing(x.req.RequiredCapabilities()).Material() &^ x.call.AllowLossy
+	if missing == 0 {
+		return nil
+	}
+	return materialRefusal(missing)
 }
 
 // credentialError is a credential dorang holds but cannot use.

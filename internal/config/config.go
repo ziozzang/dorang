@@ -461,6 +461,52 @@ type UsageProbe struct {
 	Enabled  bool     `yaml:"enabled"`
 	Fetcher  string   `yaml:"fetcher,omitempty"`
 	Interval Duration `yaml:"interval,omitempty"`
+	// Allowances declare what a provider's window actually is, in the units
+	// this deployment's rules are written in. See [UsageProbeAllowance].
+	Allowances []UsageProbeAllowance `yaml:"allowances,omitempty"`
+}
+
+// UsageProbeAllowance files one provider-reported window under a configured
+// rule's key, and optionally states how large it is (§6.2).
+//
+// It exists because of the shape provider quota endpoints actually have. The
+// common one is a percentage with no ceiling — "37% of your 5-hour allowance",
+// never "3,700 of 10,000" — and §6.2's correction
+//
+//	effective_used = max(reported, reported_at_last_poll + local_delta_since)
+//
+// is unit-homogeneous arithmetic. A percentage is not in the metric's units, so
+// without `limit` the window carries its RESET INSTANT only: enough for
+// §7.5a(c)'s expiring-quota score, which is zero for a rolling window until a
+// provider says when it resets, and not enough to gate anything.
+//
+// `limit` is the operator's assertion about their own plan and is never
+// inferred. Deriving it from the deployment's `tpm` would be the confident
+// guess internal/probe exists to refuse: a `tpm` is dorang's ceiling on this
+// credential, not the provider's allowance, and reading a percentage against
+// the wrong denominator produces a usage figure that is wrong in whichever
+// direction the two differ.
+//
+// `window` and `metric` are what make the figure reach a rule at all. Quota is
+// keyed by (window, metric); a provider window filed under a key no rule uses
+// is inert — no gate, no urgency, no error — and that silence is the quiet
+// failure mode of this whole feature.
+type UsageProbeAllowance struct {
+	// Label is the provider's own name for the window, as internal/probe
+	// normalizes it: "tokens_limit:5h", "five_hour". Matched
+	// case-insensitively. `dorangctl` prints the labels a provider reported
+	// that were not filed under any key.
+	Label string `yaml:"label"`
+	// Window is the rule key's window: a duration for a rolling window (`5h`),
+	// or `daily`, `weekly`, `monthly`.
+	Window string `yaml:"window"`
+	// Metric is the rule key's metric: cost_usd, tokens_total, tokens_input,
+	// tokens_output or requests.
+	Metric string `yaml:"metric"`
+	// Limit is the allowance's absolute size in the metric's units. Omitted
+	// leaves the window percent-only, which carries its reset and gates
+	// nothing.
+	Limit int64 `yaml:"limit,omitempty"`
 }
 
 // ProviderMetrics declares a backend metrics endpoint to scrape (§12.4).

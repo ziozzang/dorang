@@ -24,7 +24,7 @@ at three levels. They have very different costs.
 |---|---|---|
 | **Wire** | Client SDKs work unmodified against dorang. Byte-level contracts, covered by golden tests | None — it either works or it is a bug ([COMPATIBILITY.md](COMPATIBILITY.md)) |
 | **Configuration** | `dorangctl import config` converts a declarative model-list file and reports what it could not represent | An afternoon, plus the warnings |
-| **Credentials** | Existing keys keep working during a bounded window; expiry and revocation are honoured | A day, and it needs a decision about the window |
+| **Credentials** | `dorangctl import keys` migrates them from the incumbent's database (§3.5); existing keys keep working during a bounded window; expiry and revocation are honoured | A day, and it needs a decision about the window |
 | **Administrative** | Shape-compatible management paths so existing scripts keep working | **Partial** — the credential lifecycle, spend, capacity, catalog, health history and the UI are served; users, teams, models and budgets answer 501. The list is §1.2. *(This cell said "Not in this build")* |
 
 Before planning, size the surface. An audit of a live 505-path proxy deployment against its
@@ -279,7 +279,8 @@ Two things the importer deliberately does **not** copy:
 The report accounts for everything: rows scanned, imported, imported-as-expired, blocked,
 missing-team, missing-user, already-present, skipped — plus a per-row reason for every row that
 did not migrate, and a per-column reason for every source column that was deliberately not
-carried. **Nothing is dropped silently.** A dry-run mode reads and reports without writing.
+carried. **Nothing is dropped silently.** Reading and reporting without writing is the
+default; §3.5 is how you run it.
 
 ### 3.4 The legacy verification window
 
@@ -305,26 +306,44 @@ that use is what upgrades it. A month of traffic is a reasonable default; check
 legacy verification is refused and the configuration refuses to start until you remove or extend
 it — which is the forcing function, and it is deliberate.
 
-### 3.5 ⚠️ There is no CLI entry point for credential import
+### 3.5 Running the import
 
-**`dorangctl import config` imports a configuration file. It does not import credentials.**
+**`dorangctl import config` imports a configuration file. `dorangctl import keys` imports
+credentials.** They are separate verbs over separate sources, deliberately: the first writes
+YAML to stdout, the second writes rows into this deployment's store and therefore grants
+access.
 
-The credential importer is implemented in the store layer, is tested, and reads a
-`LiteLLM_VerificationToken`-shaped source table. It has **no `dorangctl` subcommand and no
-administrative endpoint** in this build, which means there is no supported way for an operator
-to invoke it.
+```
+dorangctl import keys --from postgres://user:pass@host/litellm          # reads and reports
+dorangctl import keys --from postgres://user:pass@host/litellm --commit # writes
+```
 
-Until there is, the options are:
+**It reports by default and writes only with `--commit`.** That is not caution for its own
+sake — the report *is* the deliverable. It names every row that did not migrate and why, every
+source column that was not carried and why, and how many rows came in already expired, which
+per §3.1 is usually most of them. Read it before you commit; it frequently changes the answer
+to "is this worth importing at all".
 
-1. **Reissue.** Given that most stored credentials in a real deployment are already expired,
-   reissuing the live ones with `dorangctl key create` is usually a smaller job than it sounds —
-   and it is the only path that gets you `dorang_v1` hashing from the first request, with no
-   window to close later.
-2. **Wait for the entry point.** The mechanism, the expiry rule, the fail-open field list and
-   the report all exist; only the operator-facing invocation is missing.
+| Flag | |
+|---|---|
+| `--from <dsn>` | required. A `postgres://` URL or a path to a SQLite file |
+| `--from-driver` | `postgres` or `sqlite`. Inferred from `--from` when unset |
+| `--commit` | write. Without it nothing is written and the report is identical |
+| `--table` | source table, default `LiteLLM_VerificationToken` |
+| `--on-missing-team` | `skip` (default) refuses a key whose team is absent — see §3.3 for why that failure is the safe one — or `orphan` to import it with the team dropped |
+| `--limit` | read at most N source rows, for a first look at a large table |
+| `--expect-admin-key` | say so if you believe the administrative credential is among the rows. It never is, and the report will explain why |
 
-Plan for (1). If you were counting on (2), that is the finding this document exists to deliver
-early rather than at cutover.
+Re-running is safe: a key already present is left untouched and counted, so a re-import cannot
+undo a revocation you made in between.
+
+> **This section used to say the opposite, and it was right at the time.** It read *"There is
+> no CLI entry point for credential import … no `dorangctl` subcommand and no administrative
+> endpoint … Plan for reissuing."* The importer was complete and tested and had no operator-
+> facing invocation, so the honest thing was to say so before a cutover rather than during
+> one. The invocation exists now. **Reissuing is still a legitimate choice** — it is the only
+> path that gets you `dorang_v1` hashing from the first request, with no §3.4 window to close
+> later — but it is no longer the only one.
 
 ---
 

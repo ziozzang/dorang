@@ -10,6 +10,7 @@ import (
 	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/capacity"
+	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
@@ -62,8 +63,15 @@ import (
 //     per-MODEL breakdown, and no materialization is keyed on two dimensions at
 //     once. /global/spend/report answers the single-dimension question and
 //     /spend/logs the per-request one; a cube would be the bloat §9.4 refuses.
-//   - CredentialReporter, Pricer, Reloader: the objects exist in this process
-//     but are not reachable from App as it stands.
+//   - CredentialReporter, Reloader: the objects exist in this process but are
+//     not reachable from App as it stands.
+//
+// Pricer was on that last line and is wired now. It had the worst shape of the
+// three: `POST /admin/pricing/preview` and `POST /spend/calculate` are complete
+// in internal/admin and answered `501 dependency_unavailable` in every
+// deployment, so §8.4's "one engine, one answer" held for `dorangctl price` and
+// for the ledger and for neither of the two HTTP surfaces §8.4 names. See
+// [adminPricer].
 
 // adminRoutePrefixes are the path families the administration surface owns.
 //
@@ -180,6 +188,7 @@ func (a *App) buildAdmin() (*admin.API, error) {
 
 		Capacity: &adminCapacityReporter{b: a.Broker},
 		Catalog:  &adminCatalog{c: a.Catalog},
+		Pricing:  &adminPricer{d: a.dispatch},
 		Health:   admin.NewMemoryHealthHistory(1024, a.now()),
 
 		Now: a.now,
@@ -887,6 +896,130 @@ func (a *adminCatalog) UnverifiedModels() []string {
 		return nil
 	}
 	return a.c.UnverifiedModels()
+}
+
+// ---------------------------------------------------------------------------
+// Pricing
+// ---------------------------------------------------------------------------
+
+// adminPricer is §8.4's "one engine, one answer" for the two HTTP surfaces that
+// were missing it.
+//
+// `POST /admin/pricing/preview` and `POST /spend/calculate` have a complete
+// implementation in internal/admin behind a `Pricing` dependency this package
+// never set, so both answered `501 dependency_unavailable` in every deployment
+// — while `dorangctl price` and the request path priced through the same engine
+// perfectly well. §8.4 names the two endpoints; there was one answer and two of
+// the three surfaces could not reach it.
+//
+// It reads the catalog off [dispatcher.state] rather than capturing one, for
+// the reason [App.Reload] gives: the price catalog is immutable by construction
+// and swapped by pointer on SIGHUP, so a captured one would keep quoting the
+// configuration the process started with. That is not a cosmetic staleness —
+// picking up an edited `pricing.catalog` is the main reason an operator sends a
+// SIGHUP at all, and the preview is where they would go to check that it took.
+type adminPricer struct{ d *dispatcher }
+
+// errNoPriceCatalog is a running process with no loaded price catalog, which is
+// a fault rather than a configuration.
+var errNoPriceCatalog = errors.New("app: the price catalog is not loaded")
+
+func (p *adminPricer) Explain(_ context.Context, req admin.PriceRequest) (admin.PriceExplanation, error) {
+	if p.d == nil {
+		return admin.PriceExplanation{}, errNoPriceCatalog
+	}
+	st := p.d.state()
+	if st == nil || st.pricing == nil {
+		// Unreachable rather than merely unlikely: [New] swaps a dispatch state
+		// carrying a non-nil catalog before it builds this surface, and
+		// [App.Reload] only ever swaps in another one. It is a fault and is
+		// reported as one — answering "no pricing engine" would say the
+		// dependency is absent by configuration, which is the thing that was
+		// wrong here for every deployment and must not be reintroduced as a
+		// fallback.
+		return admin.PriceExplanation{}, errNoPriceCatalog
+	}
+	x := st.pricing.Explain(pricing.Request{
+		Provider:         req.Provider,
+		Model:            req.Model,
+		Credential:       req.Credential,
+		Deployment:       req.Deployment,
+		InputTokens:      req.InputTokens,
+		OutputTokens:     req.OutputTokens,
+		CacheReadTokens:  req.CacheReadTokens,
+		CacheWriteTokens: req.CacheWriteTokens,
+		ReasoningTokens:  req.ReasoningTokens,
+		Requests:         req.Requests,
+		Characters:       req.Characters,
+		// admin.PriceRequest has one `seconds`, and internal/pricing has two.
+		// It maps to compute seconds — the request's own wall time — and NOT to
+		// audio seconds, because the two are different billable quantities and
+		// substituting one for the other is how a ten-minute recording was
+		// billed as the eight seconds the transcription took (§10.7). A
+		// per_audio_second rule therefore reports `no_price` here rather than
+		// being quoted from the wrong quantity, which is the honest answer for
+		// a figure the caller did not supply.
+		Seconds: req.Seconds,
+		At:      req.At,
+	})
+	if x.Err != "" {
+		return admin.PriceExplanation{}, errors.New(x.Err)
+	}
+	return viewExplanation(x), nil
+}
+
+func viewExplanation(x pricing.Explanation) admin.PriceExplanation {
+	out := admin.PriceExplanation{
+		Currency:         x.Currency,
+		MarginalNano:     x.Cost.MarginalNano,
+		SubscriptionNano: x.Cost.SubscriptionNano,
+		AdjustmentNano:   x.Cost.AdjustmentNano,
+		TotalNano:        x.Cost.TotalNano,
+		Components:       viewComponents(x.Cost.Components),
+		Missing:          x.Cost.Missing,
+		Notes:            x.Notes,
+		Notional: admin.PriceNotional{
+			RuleID:     x.Notional.RuleID,
+			Source:     x.Notional.Source,
+			AsOf:       x.Notional.AsOfText,
+			AgeSeconds: int64(x.Notional.Age / time.Second),
+			Nano:       x.Notional.Nano,
+			Components: viewComponents(x.Notional.Components),
+			Missing:    x.Notional.Missing,
+		},
+	}
+	for _, a := range x.Cost.AppliedRules {
+		out.Applied = append(out.Applied, admin.PriceRule{
+			RuleID: a.RuleID, Class: a.Class.String(), Level: a.Level.String(),
+			Priority: a.Priority, Order: a.Order, Why: a.Why(),
+		})
+	}
+	for _, ct := range x.Classes {
+		t := admin.PriceClassTrace{Class: ct.Class.String()}
+		for _, c := range ct.Considered {
+			t.Considered = append(t.Considered, admin.PriceConsidered{
+				RuleID: c.RuleID, Level: c.Level.String(), Priority: c.Priority,
+				Order: c.Order, Eligible: c.Eligible, Selected: c.Selected,
+				Reason: c.Reason,
+			})
+		}
+		out.Classes = append(out.Classes, t)
+	}
+	return out
+}
+
+func viewComponents(cs []pricing.Component) []admin.PriceComponent {
+	if len(cs) == 0 {
+		return nil
+	}
+	out := make([]admin.PriceComponent, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, admin.PriceComponent{
+			Name: c.Name, RuleID: c.RuleID, Rate: c.Rate, Unit: c.Unit.String(),
+			Quantity: c.Quantity, Scale: c.Scale, SubtotalNano: c.SubtotalNano,
+		})
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

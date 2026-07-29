@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -27,202 +26,52 @@ type Subject struct {
 	ID   string
 }
 
-// ReserveRequest asks to hold budget before spending it.
+// BudgetState is one budget_state row: the durable spend counter for a
+// subject's period.
 //
-// The limit is passed in rather than read from the row because the hot path
-// already holds the authorization snapshot the limit comes from (DESIGN 9.1),
-// and re-reading it here would put a second query on the gate.
-type ReserveRequest struct {
-	Subject     Subject
-	Period      string
-	PeriodStart time.Time
-
-	// AmountNano is the upper-bound estimate: exact input tokens priced, plus
-	// output priced at max_tokens (DESIGN 6.4).
-	AmountNano int64
-
-	// LimitNano is the budget ceiling. nil means unlimited.
-	LimitNano *int64
-
-	// Until is when this hold expires if nobody settles it. Required:
-	// a reservation with no expiry is the bug R1-5 is about.
-	Until time.Time
-}
-
-// Reservation is a hold that must later be settled or released.
-type Reservation struct {
-	Subject     Subject
-	Period      string
-	PeriodStart time.Time
-	AmountNano  int64
-	Until       time.Time
-}
-
-// BudgetState is one budget_state row.
+// # Why there is no reserved_nano beside spent_nano
+//
+// There was, and the pair was a second reservation mechanism (ReserveBudget /
+// SettleBudget / ReleaseReservation / SweepExpiredReservations) that this
+// package shipped, tested, and never had a caller for. The one that runs is
+// [github.com/ziozzang/dorang/internal/cluster.Ledger]: DESIGN 9.6 makes budget
+// the one write that cannot be deferred and then makes it cheap by holding
+// units in a per-node lease block guarded by an atomic, so the store sees a
+// write per BLOCK rather than a write per request. Reserving here would have
+// been the write-per-request arrangement 9.6 exists to avoid.
+//
+// The safety net the reserved_until column carried — a process killed between
+// reserve and settle must not lock that amount forever — is carried by the
+// block lease instead. A block is charged to spent_nano in full when it is
+// drawn, its `quota_leases` row has an expires_at, and the leader's
+// lease-reclaim pass returns the unspent part of every lease whose TTL has
+// passed. That is the same pattern with the same failure mode, and it covers
+// the crash the reservation columns covered, plus the one they did not: a node
+// that dies holding a block it had already been charged for.
+//
+// Migration 0006 dropped both columns. See DESIGN 6.4 and 9.6.
 type BudgetState struct {
-	Subject       Subject
-	Period        string
-	PeriodStart   time.Time
-	SpentNano     int64
-	ReservedNano  int64
-	ReservedUntil time.Time
-	UpdatedAt     time.Time
+	Subject     Subject
+	Period      string
+	PeriodStart time.Time
+	SpentNano   int64
+	UpdatedAt   time.Time
 }
 
-// Available reports how much of limit is still reservable.
+// Available reports how much of limit is still spendable.
 func (b BudgetState) Available(limitNano int64) int64 {
-	return limitNano - b.SpentNano - b.ReservedNano
+	return limitNano - b.SpentNano
 }
 
 const budgetKeyPredicate = `subject_kind = ? AND subject_id = ? AND period = ? AND period_start = ?`
 
-// ReserveBudget holds AmountNano against a budget, atomically, so concurrent
-// requests cannot overshoot (DESIGN 6.4).
-//
-// Returns ErrBudgetExceeded when spent + reserved + amount would pass the
-// limit. That is the correct outcome, not a fallback condition: DESIGN 7.6
-// gives budget_exceeded an empty fallback list on purpose.
-func (s *Store) ReserveBudget(ctx context.Context, req ReserveRequest) (Reservation, error) {
-	if req.Subject.Kind == "" {
-		return Reservation{}, errors.New("store: reservation needs a subject kind")
-	}
-	if req.AmountNano < 0 {
-		return Reservation{}, fmt.Errorf("store: negative reservation %d", req.AmountNano)
-	}
-	if err := checkAmount(req.AmountNano, "reservation"); err != nil {
-		return Reservation{}, err
-	}
-	if req.Until.IsZero() {
-		// Refusing here is the whole point of R1-5. A hold with no expiry is
-		// indistinguishable from a leak the moment the process dies.
-		return Reservation{}, errors.New("store: reservation requires a non-zero Until")
-	}
-	if req.Period == "" {
-		req.Period = "none"
-	}
-	if req.LimitNano != nil && req.AmountNano > *req.LimitNano {
-		return Reservation{}, fmt.Errorf("%w: %d > limit %d", ErrBudgetExceeded, req.AmountNano, *req.LimitNano)
-	}
-
-	now := Micros(s.now())
-	until := Micros(req.Until)
-	args := []any{
-		string(req.Subject.Kind), req.Subject.ID, req.Period, Micros(req.PeriodStart),
-		req.AmountNano, until, now,
-		// DO UPDATE
-		req.AmountNano, until, until, now,
-	}
-
-	q := `
-		INSERT INTO budget_state
-		    (subject_kind, subject_id, period, period_start, spent_nano, reserved_nano, reserved_until, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?)
-		ON CONFLICT (subject_kind, subject_id, period, period_start) DO UPDATE SET
-		    reserved_nano  = budget_state.reserved_nano + ?,
-		    reserved_until = CASE
-		                       WHEN budget_state.reserved_until IS NULL THEN ?
-		                       WHEN budget_state.reserved_until < ? THEN excluded.reserved_until
-		                       ELSE budget_state.reserved_until
-		                     END,
-		    updated_at     = ?`
-	if req.LimitNano != nil {
-		q += `
-		WHERE budget_state.spent_nano + budget_state.reserved_nano + ? <= ?`
-		args = append(args, req.AmountNano, *req.LimitNano)
-	}
-
-	res, err := s.exec(ctx, q, args...)
-	if err != nil {
-		return Reservation{}, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return Reservation{}, err
-	}
-	if n == 0 {
-		return Reservation{}, ErrBudgetExceeded
-	}
-	return Reservation{
-		Subject:     req.Subject,
-		Period:      req.Period,
-		PeriodStart: req.PeriodStart,
-		AmountNano:  req.AmountNano,
-		Until:       req.Until,
-	}, nil
-}
-
-// SettleBudget converts a hold into spend. actualNano is what the request
-// actually cost; the difference between it and the reservation is released.
-func (s *Store) SettleBudget(ctx context.Context, r Reservation, actualNano int64) error {
-	if err := checkAmount(actualNano, "settlement"); err != nil {
-		return err
-	}
-	return s.adjustReservation(ctx, r, actualNano)
-}
-
-// ReleaseReservation refunds a hold in full.
-//
-// DESIGN 6.4 / R1-6: a request may reserve at the gate and then be rejected
-// while waiting for capacity, never reaching an upstream. Anything that fails
-// before dispatch releases the whole amount, so the hold is soft until capacity
-// is acquired and hard only afterwards.
-func (s *Store) ReleaseReservation(ctx context.Context, r Reservation) error {
-	return s.adjustReservation(ctx, r, 0)
-}
-
-func (s *Store) adjustReservation(ctx context.Context, r Reservation, spendNano int64) error {
-	// reserved_nano is floored at zero: a sweep may already have cleared this
-	// hold, and settling afterwards must add the spend without driving the
-	// reservation negative.
-	const q = `
-		UPDATE budget_state
-		   SET reserved_nano  = CASE WHEN reserved_nano > ? THEN reserved_nano - ? ELSE 0 END,
-		       spent_nano     = spent_nano + ?,
-		       reserved_until = CASE WHEN reserved_nano > ? THEN reserved_until ELSE NULL END,
-		       updated_at     = ?
-		 WHERE ` + budgetKeyPredicate
-	res, err := s.exec(ctx, q,
-		r.AmountNano, r.AmountNano, spendNano, r.AmountNano, Micros(s.now()),
-		string(r.Subject.Kind), r.Subject.ID, r.Period, Micros(r.PeriodStart))
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-// SweepExpiredReservations releases holds whose reserved_until has passed and
-// reports how many rows it cleared.
-//
-// Without this, a process killed between reserve and settle locks that amount
-// forever, and reserved-but-never-settled amounts eventually exhaust a budget
-// that nothing actually spent (DESIGN 6.4, R1-5). It is the same safety net
-// capacity has in DESIGN 5.3, and the leader runs it on the same schedule.
-//
-// budget_state carries one reserved_until for the whole row, which is the
-// design's shape. Concurrent holds therefore share the latest expiry: the
-// sweep fires only once every outstanding hold on that row has expired. That
-// direction is the safe one -- it can be late, never early, so a live
-// reservation is never released out from under a request in flight.
-func (s *Store) SweepExpiredReservations(ctx context.Context, now time.Time) (int64, error) {
-	res, err := s.exec(ctx, `
-		UPDATE budget_state
-		   SET reserved_nano = 0, reserved_until = NULL, updated_at = ?
-		 WHERE reserved_nano > 0 AND reserved_until IS NOT NULL AND reserved_until <= ?`,
-		Micros(now), Micros(now))
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
 // GetBudgetState reads one budget row.
+//
+// The counter it reads runs up to one lease block AHEAD of what has actually
+// been spent, by design: a node charges the whole block before it hands out a
+// unit of it, which is what makes a crash under-spend rather than overspend
+// (DESIGN 9.6). A report that must agree with the ledger reads the rollups,
+// not this.
 func (s *Store) GetBudgetState(ctx context.Context, sub Subject, period string, periodStart time.Time) (BudgetState, error) {
 	if period == "" {
 		period = "none"
@@ -230,15 +79,14 @@ func (s *Store) GetBudgetState(ctx context.Context, sub Subject, period string, 
 	var (
 		b     BudgetState
 		start int64
-		until sql.NullInt64
 		upd   int64
 	)
 	err := s.queryRow(ctx, `
-		SELECT subject_kind, subject_id, period, period_start, spent_nano, reserved_nano, reserved_until, updated_at
+		SELECT subject_kind, subject_id, period, period_start, spent_nano, updated_at
 		  FROM budget_state WHERE `+budgetKeyPredicate,
 		string(sub.Kind), sub.ID, period, Micros(periodStart)).
 		Scan((*string)(&b.Subject.Kind), &b.Subject.ID, &b.Period, &start,
-			&b.SpentNano, &b.ReservedNano, &until, &upd)
+			&b.SpentNano, &upd)
 	if errors.Is(err, sql.ErrNoRows) {
 		return BudgetState{}, ErrNotFound
 	}
@@ -246,7 +94,6 @@ func (s *Store) GetBudgetState(ctx context.Context, sub Subject, period string, 
 		return BudgetState{}, err
 	}
 	b.PeriodStart = TimeAt(start)
-	b.ReservedUntil = TimeAt(nullInt(until))
 	b.UpdatedAt = TimeAt(upd)
 	return b, nil
 }

@@ -85,6 +85,59 @@ func TestCapacityRateCeilingsAreRefused(t *testing.T) {
 	}
 }
 
+// TestBackendMetricsAreRefused. `providers[].metrics` was the largest thing on
+// the inert list and the best disguised: the flag was checked, an endpoint was
+// REQUIRED when the flag was on, the load succeeded — and the only reader of
+// any of the three fields in the whole repository was that requirement.
+// §12.4's queue-depth and cache-utilization routing signals had no collector,
+// and VLLM.md and SGLANG.md documented four engine-specific traps in numbers
+// nothing fetched.
+//
+// It is refused on any of the three fields, not only on `enabled`. Writing an
+// endpoint and leaving the flag off is how an operator stages a change, and
+// answering that with silence is what let this one survive.
+func TestBackendMetricsAreRefused(t *testing.T) {
+	cases := []struct{ name, provider string }{
+		{"enabled with an endpoint",
+			"  - {name: p2, kind: openai, metrics: {enabled: true, endpoint: \"http://127.0.0.1:8000/metrics\"}}\n"},
+		{"enabled with nothing else",
+			"  - {name: p2, kind: openai, metrics: {enabled: true}}\n"},
+		{"an endpoint staged with the flag off",
+			"  - {name: p2, kind: openai, metrics: {endpoint: \"http://127.0.0.1:8000/metrics\"}}\n"},
+		{"an interval alone",
+			"  - {name: p2, kind: openai, metrics: {interval: 15s}}\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := loadFragments(t, fragments{providers: c.provider})
+			mustRefuse(t, err, "providers[1].metrics", "no backend metrics scraper")
+			// A refusal that does not name a working alternative is a wall
+			// rather than a diagnosis — and here there IS one, which is the
+			// whole reason refusing costs the operator nothing.
+			for _, want := range []string{"least_busy", "highest_tps", "models[].strategy"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not mention %q: %v", want, err)
+				}
+			}
+		})
+	}
+}
+
+// TestTheStrategiesTheMetricsRefusalRecommendsAreReal is the other half of that
+// refusal, and it is the assertion that keeps it honest: a refusal naming an
+// alternative is only a diagnosis if the alternative loads.
+func TestTheStrategiesTheMetricsRefusalRecommendsAreReal(t *testing.T) {
+	c, err := loadFragments(t, fragments{
+		models: "    strategy: [least_busy, highest_tps]\n",
+	})
+	if err != nil {
+		t.Fatalf("the strategies the metrics refusal recommends must load: %v", err)
+	}
+	if got := c.Models[0].Strategy; len(got) != 2 {
+		t.Fatalf("models[0].strategy = %v, want both strategies carried", got)
+	}
+}
+
 // TestCapacityQueueCeilingsAreAccepted is the other half: max_queue and
 // max_queue_wait are wired now, so they must still load.
 func TestCapacityQueueCeilingsAreAccepted(t *testing.T) {

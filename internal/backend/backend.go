@@ -119,6 +119,18 @@ type Target struct {
 	// this engine has none. It is refused for a self-hosted engine regardless
 	// of configuration; see selfhosted.go.
 	PriorityTier string
+	// Capabilities is what THIS deployment can express (§10.1). Zero means the
+	// wire shape's own set, which is what [wireCapabilities] answers and what
+	// internal/app puts in the routing table today, so leaving it unset keeps
+	// the two layers in agreement.
+	//
+	// It is on the Target rather than the Call because it is a property of the
+	// deployment, and a fail-back hop lands on a different one. It exists so a
+	// deployment that expresses LESS than its family — a self-hosted engine
+	// without stop sequences, a shape added later — is refused rather than
+	// silently downgraded, and so that the set the router filtered on is the
+	// set the encoder converts against.
+	Capabilities canonical.Capability
 }
 
 // Call is one client request, decoded once and reusable across fail-back hops.
@@ -307,6 +319,10 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 	x := &exchange{call: c, target: &t, prov: p, attempt: 1}
 	if c.Op.ChatShaped() {
 		x.req = prepareRequest(x)
+		if err := refuseMaterialLoss(x); err != nil {
+			res.Err = err
+			return res
+		}
 	}
 
 	payload, err := p.ad.encode(x)

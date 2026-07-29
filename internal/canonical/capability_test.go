@@ -96,8 +96,13 @@ func TestRequiredCapabilitiesPerConstruct(t *testing.T) {
 		{
 			"droppable knobs",
 			&Request{Seed: ptr(int64(1)), TopK: ptr(5), Priority: ptr(2),
-				LogitBias: map[string]float64{"a": 1}, User: "u", Stop: []string{"x"}},
-			CapSeed | CapTopK | CapPriority | CapLogitBias | CapUser | CapStopSequences,
+				LogitBias: map[string]float64{"a": 1}, User: "u"},
+			CapSeed | CapTopK | CapPriority | CapLogitBias | CapUser,
+		},
+		{
+			"material parameters",
+			&Request{Stop: []string{"x"}, N: ptr(4), Logprobs: ptr(true), ServiceTier: "flex"},
+			CapStopSequences | CapMultipleChoices | CapLogprobs | CapServiceTier,
 		},
 	}
 	for _, c := range cases {
@@ -112,6 +117,12 @@ func TestRequiredCapabilitiesPerConstruct(t *testing.T) {
 // TestStructuralAndDroppableAreDisjoint is the invariant behind DESIGN §10.1's
 // two-kinds-of-loss split: a capability is one or the other, never both and
 // never neither.
+//
+// [Material] is a sub-mask of [Structural] rather than a third policy: the
+// question "does dorang refuse this" still has two answers. What it names is
+// how the refusal is REPORTED — by parameter rather than located — and that
+// distinction has to hold, because a material construct with no parameter name
+// would produce a 400 the caller cannot act on.
 func TestStructuralAndDroppableAreDisjoint(t *testing.T) {
 	if Structural&Droppable != 0 {
 		t.Fatalf("overlap: %v", Structural&Droppable)
@@ -129,6 +140,115 @@ func TestStructuralAndDroppableAreDisjoint(t *testing.T) {
 			t.Errorf("droppable %q names no parameter", n.construct)
 		}
 	}
+	if Material&^Structural != 0 {
+		t.Errorf("material bits outside the refusal mask would be dropped silently: %v", Material&^Structural)
+	}
+	if Material&Droppable != 0 {
+		t.Errorf("a capability cannot be both refused and dropped: %v", Material&Droppable)
+	}
+	// A material refusal names the wire parameter, and its construct id is that
+	// parameter — which is what lets a 400 body set `param` at all, and what the
+	// located half has no equivalent of.
+	for _, n := range capNames {
+		if Material&n.bit == 0 {
+			continue
+		}
+		if len(n.params) == 0 {
+			t.Errorf("material %q names no parameter, so its 400 cannot locate anything", n.construct)
+		}
+		if !containsString(n.params, n.construct) {
+			t.Errorf("material %q is not among its own parameters %v; the construct id a caller "+
+				"puts in x-dorang-allow-lossy should be the field they wrote", n.construct, n.params)
+		}
+	}
+}
+
+// TestMaterialCapabilitiesAreClaimedOnlyWhenTheyChangeSomething is the cost side
+// of the reclassification, and the reason it is not a blanket refusal on the
+// field being present.
+//
+// `n: 1` and `service_tier: auto` are the values that mean "do the default".
+// Dropping them changes nothing, so raising a bit for them would refuse
+// requests dorang serves correctly — which is how a safety mechanism turns into
+// noise and callers learn to set x-dorang-allow-lossy on everything.
+func TestMaterialCapabilitiesAreClaimedOnlyWhenTheyChangeSomething(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *Request
+		want Capability
+	}{
+		{"n: 1 is the default written down", &Request{N: ptr(1)}, 0},
+		{"n: 2 is a claim on the response shape", &Request{N: ptr(2)}, CapMultipleChoices},
+		{"service_tier: auto delegates, exactly as omitting it does",
+			&Request{ServiceTier: ServiceTierAuto}, 0},
+		{"casing does not turn a delegation into a refusal", &Request{ServiceTier: "Auto"}, 0},
+		{"a named band is a price the caller chose", &Request{ServiceTier: "flex"}, CapServiceTier},
+		{"service_tier: default forces standard pricing, which is a choice",
+			&Request{ServiceTier: "default"}, CapServiceTier},
+		{"logprobs asks for a member of the response", &Request{Logprobs: ptr(true)}, CapLogprobs},
+		{"top_logprobs alone asks for it too", &Request{TopLogprobs: ptr(5)}, CapLogprobs},
+		{"an empty stop list states no terminator", &Request{Stop: nil}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.req.RequiredCapabilities(); got != c.want {
+				t.Fatalf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestMaterialLossCarriesTheValueTheCallerWrote: a downgrade exists to be acted
+// on, and "service_tier was dropped" is not actionable in the way
+// "service_tier: flex" is. The located half of the mask has an index to point
+// at; this half has the value.
+func TestMaterialLossCarriesTheValueTheCallerWrote(t *testing.T) {
+	req := &Request{
+		Messages:    []Message{TextMessage(RoleUser, "hi")},
+		Stop:        []string{"a", "b"},
+		N:           ptr(4),
+		TopLogprobs: ptr(5),
+		ServiceTier: "flex",
+	}
+	// A target with none of the four — the Messages family, plus a deployment
+	// without stop sequences.
+	ds := req.Downgrades(0)
+	byConstruct := map[string]string{}
+	for _, d := range ds {
+		byConstruct[d.Construct] = d.Detail
+	}
+	for construct, want := range map[string]string{
+		ConstructStopSequences:   "2",
+		ConstructMultipleChoices: "4",
+		ConstructLogprobs:        "5",
+		ConstructServiceTier:     "flex",
+	} {
+		detail, ok := byConstruct[construct]
+		if !ok {
+			t.Errorf("%q is not reported as a downgrade at all: %+v", construct, ds)
+			continue
+		}
+		if !strings.Contains(detail, want) {
+			t.Errorf("%q detail = %q, does not carry %q", construct, detail, want)
+		}
+	}
+
+	// A target that has them all reports nothing, so the refusal cannot fire on
+	// a deployment that serves the request as written.
+	if ds := req.Downgrades(req.RequiredCapabilities()); len(ds) != 0 {
+		t.Errorf("a capable target reported a downgrade: %+v", ds)
+	}
+}
+
+// containsString is the test's own membership check; the package deliberately
+// has no such helper on the hot path.
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMissingIsRelativeToWhatIsHeld(t *testing.T) {

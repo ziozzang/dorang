@@ -127,6 +127,13 @@ pre-computed path from §1.1, using the signature only as a backstop.
 
 ## 3. Load signals
 
+> **This section is a specification for R17, not a description of a running path.** dorang
+> ships **no metrics scraper** and `providers[].metrics` is refused at load (CONFIG §6.2), so
+> nothing below is being read today. `least_busy` ranks on dorang's own live capacity
+> occupancy and `highest_tps` on measured output tokens per second — neither needs a poll, and
+> for a vLLM fleet serving only dorang traffic that is the more accurate signal anyway. Read
+> on if you are building R17, or if your fleet also serves traffic from outside dorang.
+
 ### 3.1 Metrics worth scraping
 
 All names carry `{model_name, engine}`. The `engine` label is the data-parallel rank and is

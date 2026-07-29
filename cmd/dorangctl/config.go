@@ -91,10 +91,23 @@ func (e env) configLint(args []string) int {
 	return 0
 }
 
-// runImport implements `import config`.
+// runImport implements `import config` and `import keys`.
+//
+// The two are deliberately separate verbs over separate sources. `import
+// config` converts a declarative file and writes YAML to stdout; `import keys`
+// reads a foreign DATABASE and writes rows into this deployment's store. An
+// operator who conflates them grants access by accident, which is why the
+// mismatch below is a usage error rather than a default.
 func (e env) runImport(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(e.stderr, "usage: dorangctl import config <file> | import keys --from <dsn>")
+		return 2
+	}
+	if args[0] == "keys" {
+		return e.importKeys(args[1:])
+	}
 	if len(args) < 2 || args[0] != "config" {
-		fmt.Fprintln(e.stderr, "usage: dorangctl import config <file>")
+		fmt.Fprintln(e.stderr, "usage: dorangctl import config <file> | import keys --from <dsn>")
 		return 2
 	}
 	path := args[1]

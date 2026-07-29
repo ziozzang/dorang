@@ -292,3 +292,90 @@ func TestPostgresBudgetSurvivesARestart(t *testing.T) {
 		t.Fatalf("after a restart the budget shows %d nano spent, want %d", got, spent)
 	}
 }
+
+// TestPostgresDeadlockIsRetriedNotReturned is the busy-retry contract stated
+// against the dialect whose contention it was never written for.
+//
+// [conn.withTx] retries "a store that refused the write for a reason another
+// attempt can resolve", and until this test [isBusy] recognised only SQLite's
+// three message strings. PostgreSQL produces none of them. A transaction the
+// SERVER aborted so that another could proceed -- already rolled back, and by
+// definition retryable -- was therefore delivered to a caller of this package
+// as a permanent error, on the one dialect where concurrent writers exist and
+// so on the one dialect where it can happen at all.
+//
+// The deadlock is induced rather than waited for, because a test that hoped for
+// one would be a test that usually proves nothing. Two transactions take two
+// row locks in opposite orders, each waiting for the other to hold its first;
+// PostgreSQL detects the cycle and kills one of them with 40P01. The assertion
+// is that BOTH callers still see success: the victim is retried by withTx and
+// commits on the attempt after the winner has gone.
+func TestPostgresDeadlockIsRetriedNotReturned(t *testing.T) {
+	b := pgBackendOnly(t)
+	ctx := context.Background()
+	dsn := b.env(t)
+	clk := newClock(epoch)
+	s := openStore(t, b, dsn, clk.Now)
+	c := newConn(s)
+
+	// Two rows to contend over. They are ordinary registry rows: the mechanism
+	// under test is the transaction helper, not the table.
+	for _, id := range []string{"row-x", "row-y"} {
+		if _, err := c.exec(ctx, `
+			INSERT INTO nodes (node_id, address, version, started_at, last_heartbeat, is_leader, metadata)
+			VALUES (?, '', '', ?, ?, ?, '')`,
+			id, store.Micros(clk.Now()), store.Micros(clk.Now()), false); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	lockRow := func(ctx context.Context, tr tx, id string) error {
+		var got string
+		return tr.queryRow(ctx, `SELECT node_id FROM nodes WHERE node_id = ? FOR UPDATE`, id).Scan(&got)
+	}
+
+	// Each side signals once it holds its first row and then waits for the
+	// other, so the cycle is closed deliberately. Only the FIRST attempt takes
+	// part in the handshake: a retry that waited on an already-consumed channel
+	// would hang rather than commit.
+	readyA, readyB := make(chan struct{}), make(chan struct{})
+	var attemptsA, attemptsB atomic.Int32
+
+	side := func(first, second string, ready chan struct{}, peer chan struct{}, attempts *atomic.Int32) error {
+		return c.withTx(ctx, func(ctx context.Context, tr tx) error {
+			n := attempts.Add(1)
+			if err := lockRow(ctx, tr, first); err != nil {
+				return err
+			}
+			if n == 1 {
+				close(ready)
+				<-peer
+			}
+			return lockRow(ctx, tr, second)
+		})
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); errs[0] = side("row-x", "row-y", readyA, readyB, &attemptsA) }()
+	go func() { defer wg.Done(); errs[1] = side("row-y", "row-x", readyB, readyA, &attemptsB) }()
+	wg.Wait()
+
+	total := attemptsA.Load() + attemptsB.Load()
+	if total < 3 {
+		// Both sides committed on their first attempt, so no cycle formed and
+		// there is nothing to have retried. Say so rather than pass silently.
+		t.Skipf("no deadlock formed (%d attempts in total); the fixture proved nothing", total)
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("side %d failed with %v; PostgreSQL aborted this transaction so the "+
+				"other could proceed, and withTx must retry it rather than hand the "+
+				"caller a permanent error (attempts: %d and %d)",
+				i, err, attemptsA.Load(), attemptsB.Load())
+		}
+	}
+	t.Logf("MEASURED: a PostgreSQL deadlock was retried to success in %d attempts across the two sides",
+		total)
+}

@@ -114,6 +114,11 @@ func EncodeRequest(req *canonical.Request, opt *EncodeOptions) (*Request, error)
 	// the target does not have, by wire name.
 	missing := caps.Missing(req.RequiredCapabilities())
 	loss.DropCapability(missing.Droppable())
+	// The MATERIAL half of the same subtraction — stop, n, logprobs,
+	// service_tier — is a downgrade rather than a dropped knob, because its
+	// absence changes the answer or the price (canonical.Material). It is
+	// recorded, not refused: this encoder still does not decide policy.
+	req.MaterialLoss(caps, loss)
 
 	out := &Request{
 		Model:  req.Model,

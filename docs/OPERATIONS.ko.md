@@ -895,7 +895,14 @@ effective_used = max( provider_reported_used ,
 1. **실패한 조회는 절대 크리덴셜을 비활성화하지 않는다.** 실패한 읽기는 소진된 쿼터가 아니다. 마지막
    정상 스냅샷이 유지되고 낡음 정도가 노출된다.
 2. 보고 퍼센트는 마지막 폴 + 로컬 델타에서 오므로 폴 사이에 뒤처져 보이는 것이 정상이다. 그 간극이
-   중요하면 `usage_probe.interval`을 줄일 것.
+   중요하면 `usage_probe.interval`을 줄일 것. 이 값은 한 크리덴셜을 읽는 간격의 하한이기도 해서, 그 안의
+   두 번째 폴은 요청을 쓰지 않고 마지막 스냅샷을 재생한다.
+2a. ⚠️ **프로브가 아무것도 바꾸지 않는 것처럼 보이면 이 둘을 먼저 확인할 것.** 프로바이더는 메트릭의 단위로
+   보고해야 하는데 대부분은 크기를 공개하지 않는 할당량의 퍼센트를 보고한다 — 그런 윈도는
+   `usage_probe.allowances[].limit`로 크기를 선언하기 전까지 **리셋 시각만** 나른다(영문 CONFIG §6.1a).
+   그리고 그 수치가 게이트할 규칙이 크리덴셜에 있어야 한다: 쿼터는 (윈도, 메트릭)으로 키가 잡히고 규칙은
+   `models[].deployments[].limits[]`에서 온다. 규칙 없는 크리덴셜에 프로브가 켜져 있으면 기동 시 정확히
+   그렇게 로그된다.
 3. 응답의 `x-dorang-quota-<window>-used-pct`(`X-Dorang-Detail: full`과 함께)가 그 요청에 대해 라우터가 본
    값이다.
 4. ⚠️ **롤링 윈도우는 `capacity_mode: local`에서만 정확하다.** 롤링 5시간 허용량에는 자연스러운 period
@@ -961,9 +968,9 @@ effective_used = max( provider_reported_used ,
 | **Lua** | Lua는 샌드박스 안에서 요청 경로 위를 **돈다**. VM은 gopher-lua, 순수 Go다. 플러그인은 `filters.plugins[].path`로 하나씩, 스캔이 아니라 이름으로 선언한다. `extensions.lua.dir`이 담는 것은 total 정책 언어인 `*.policy`이고, **그 디렉터리 아래의** `.lua` 파일은 여전히 **로드 에러**다 — 안에 나타나는 것을 무엇이든 실행하는 디렉터리는 코드 실행 프리미티브이기 때문이지, 조용히 무시하려는 것이 아니다. 컴파일된 Go `Native`가 세 번째다. [CONFIG.ko.md](CONFIG.ko.md) §16·§17. ⚠️ **이 행은 2026-07-29까지 "Lua 인터프리터가 없다"라고 적혀 있었다** — `a0d5871` 이후 거짓이고, 운영자가 없는 줄 알고 우회 설계를 하게 되는 종류의 오류다. 이 표는 정확히 그것을 막으려고 있다 |
 | `on_route`에서의 재라우팅 | 훅은 선택된 배포를 보고 거부할 수 있지만 다른 것을 요구할 수는 없다 |
 | 최상위 `quotas:`, `budget:` 블록 | 스키마에 없다. 예산은 `dorangctl key create --budget-usd`로 키별 |
-| 기존 데이터베이스로부터의 크리덴셜 임포트 | 스토어에 구현돼 있고 **CLI 진입점이 없다** — [MIGRATION.ko.md](MIGRATION.ko.md) §3 |
+| 기존 데이터베이스로부터의 크리덴셜 임포트 | `dorangctl import keys --from <dsn>`. 기본은 보고, `--commit` 으로 기록 — [MIGRATION.ko.md](MIGRATION.ko.md) §3.5. ⚠️ **이 행은 2026-07-29까지 "CLI 진입점이 없다"였고 사실이었다** |
 | prefix / cluster 메트릭 | 상태는 존재하고 아무것도 export하지 않는다. capacity와 health는 `/admin/capacity`, `/health/history`에서 읽을 수 있다 |
-| `providers[].usage_probe`, **`providers[].metrics` 블록 전체**, `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
+| `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. ⚠️ **`providers[].usage_probe`는 2026-07-29에 이 행에서 빠졌다** — 배선되었다(§6.2). `providers[].metrics`도 빠졌고, 반대 방향이다: 로드에서 거부된다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
 | **백엔드 메트릭 스크레이핑** | 스크레이퍼가 없다. `providers[].metrics.enabled`와 `.endpoint`는 검증되고 아무것도 읽지 않으므로, §12.4의 `least_busy`·`highest_tps`용 큐 깊이·캐시 사용률 신호에는 수집기가 없다. 신규 행: 그 전까지는 "폴링 간격만 읽히지 않는다"로 축소돼 있었다 |
 
 ---

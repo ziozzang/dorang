@@ -71,7 +71,7 @@ not add hot-path cost. That is precisely why §10.1 uses a neutral intermediate 
 | R14 | Two or more nodes, highly available | §13 |
 | R15 | chat/completions, messages, responses; metadata and reasoning-level mapping | §10 |
 | R16 | Cost and statistics in extension headers | §10.4 |
-| R17 | Backend metrics integration | §12.4 |
+| R17 | Backend metrics integration — **not built**; `providers[].metrics` is refused at load and §12.4 names what serves `least_busy`/`highest_tps` instead | §12.4 |
 | R18 | Pass scheduling priority through to the backend | §7.5, §10.5 |
 | R19 | Batch API | §11.1 |
 | R20 | Go, with rigorous unit and scenario tests | §14 |
@@ -692,7 +692,7 @@ one is a place a plausible reading produces broken behavior.
    11 in the worst case, against a hole that was previously unbounded. Cost is one idled unit
    per claimed axis key, and measured **+5.3%** on the mixed contended workload that provokes
    it, nil on single-axis contention (which never claims). On by default; capacity acquisition
-   is ~450 ns against §15.1's 200 µs budget, so the trade is a liveness guarantee for a
+   is ~450 ns against §15.1's measured 480 µs budget, so the trade is a liveness guarantee for a
    fraction of a percent of the gateway.
 
 6. **Check order.** §5.3 and §5.7 stated different orders. §5.7's is authoritative because it
@@ -832,11 +832,31 @@ is deliberately an upper bound: exact input tokens priced, plus output priced at
 
 Two corrections from review:
 
-- **Reservations expire [R1-19].** `budget_state` carries `reserved_until`. A process killed
-  between reserve and settle would otherwise lock that amount forever, and over time
-  reserved-but-never-settled amounts would exhaust a budget nothing actually spent. The
-  leader sweeps expired reservations, exactly as §5.3 does for capacity. The two mechanisms
-  are the same pattern and now have the same safety net.
+- **Reservations expire [R1-19].** A process killed between reserve and settle would
+  otherwise lock that amount forever, and over time reserved-but-never-settled amounts would
+  exhaust a budget nothing actually spent. The leader reclaims expired holds, exactly as §5.3
+  does for capacity. The two mechanisms are the same pattern and have the same safety net.
+
+  > **Where the expiry lives, and where it does not.** This rule read "`budget_state` carries
+  > `reserved_until`", and there were two columns and four store methods to match —
+  > `ReserveBudget`, `SettleBudget`, `ReleaseReservation`, `SweepExpiredReservations` — with a
+  > leader job sweeping them every tick. None of it ever ran. `ReserveBudget` had no caller
+  > outside its own tests, so `reserved_nano` was zero in every row of every deployment, and
+  > the sweep's `WHERE reserved_nano > 0` was a store round trip per tick against a predicate
+  > that could not match.
+  >
+  > The hold that exists is §9.6's **lease block**: a node draws a block, `spent_nano` is
+  > charged for the whole of it before a unit is handed out, and the units are held in memory
+  > behind an atomic. The expiry is the block lease's own `expires_at` in `quota_leases`, and
+  > the leader's lease-reclaim pass returns `amount - used` for every lease whose TTL has
+  > passed. That net is strictly wider than the one it replaces: it also covers a node that
+  > **dies holding a block already charged**, which is the state a killed process actually
+  > leaves and which no reservation sweep could have reclaimed.
+  >
+  > The two could not both be kept, and not merely on tidiness grounds: charging a block to
+  > `spent_nano` **and** reserving against `reserved_nano` counts the same money twice, which
+  > is why `Ledger.readCounter` summed both columns. The reservation code, its columns
+  > (migration `0006`), its sweep job and this paragraph's earlier text are gone.
 - **Unexecuted requests are refunded in full [R1-20].** A request may reserve budget at the
   gate and then be rejected while waiting for capacity, never reaching an upstream. Revision
   1 defined settlement only for completion. Revision 2 makes budget a **soft hold** at the
@@ -1563,8 +1583,8 @@ usage_by_key_hour · usage_by_model_hour · usage_by_team_day   -- purpose-built
 
 quota_buckets(scope, scope_key, window, metric, bucket_start, value)
 quota_leases(node_id, scope, scope_key, window, metric, amount, expires_at)   [R1-14]
-budget_state(subject_kind, subject_id, period, period_start,
-             spent, reserved, reserved_until)                                 [R1-5]
+budget_state(subject_kind, subject_id, period, period_start, spent)
+  -- spend only. The hold lives in quota_leases, not here; see §6.4 and §9.6
 subscription_state(rule_id, period_start, attributed_atto, updated_at)        -- §8.1
 credential_state(credential_id, health, unavailable_until, quota_snapshot, updated_at)
 
@@ -1718,11 +1738,23 @@ Three rules that follow, and are testable:
    instead. This is the one place where losing data is the correct answer, because the
    alternative is losing the request.
 
-> **Known gap.** Quota and budget state are currently in-memory only. A restart therefore
-> resets the windows, which is safe for concurrency (nothing is over-granted) but wrong for
-> accounting — a monthly budget would silently start over. Persisting them through the lease
-> mechanism above is required before the clustering milestone, since a lease that does not
-> outlive its node is not a lease.
+> **This gap is closed, and it is the only budget mechanism.** It read: *"Quota and budget
+> state are currently in-memory only. A restart therefore resets the windows … Persisting
+> them through the lease mechanism above is required before the clustering milestone."* The
+> lease mechanism is `cluster.Ledger` and the gate reserves against it before every upstream
+> call; §17's W9 row carries the measurements.
+>
+> What is worth saying here, because this is the section that classifies writes: there is no
+> second budget write. `budget_state` used to carry `reserved_nano` and `reserved_until` with
+> a synchronous `ReserveBudget` over them — a write to the store per request per subject,
+> which is precisely the arrangement this section exists to avoid — and it had no caller
+> anywhere outside its own tests. It is deleted, columns included (migration `0006`). The row
+> is a spend counter; the hold is the block lease.
+>
+> A consequence for anything reading `budget_state.spent_nano` directly: it runs up to one
+> block **ahead** of what has been spent, because the block is charged before it is handed
+> out. That is what makes a crash under-spend rather than overspend, and it is why the
+> per-key `spend` field reads the rollups instead.
 
 ## 10. Protocols
 
@@ -1740,8 +1772,9 @@ Revision 1 said losses are "enumerated in a response header". A header carries a
 of parameter names, which is adequate for one kind of loss and useless for the other.
 
 **Droppable parameters** — a knob the backend does not have (`logit_bias`, `seed`,
-`top_logprobs`, an unsupported reasoning control). The request still means what it meant.
-Listed in `x-dorang-dropped-params`. This is the revision 1 behavior and it is correct here.
+`top_k`, the penalties, an unsupported reasoning control). The request still means what it
+meant. Listed in `x-dorang-dropped-params`. This is the revision 1 behavior and it is correct
+here.
 
 **Structural downgrades** — the request cannot be expressed at all:
 
@@ -1753,8 +1786,47 @@ Listed in `x-dorang-dropped-params`. This is the revision 1 behavior and it is c
 | richer stop reasons → a smaller enumeration | which specific terminal condition occurred |
 | structured system blocks with per-block attributes → one system message | per-block attributes |
 
-Returning `200` after silently discarding a PDF or destroying a caching strategy is **worse
-than an error**: the caller has no way to know. Revision 2 therefore:
+> ⚠️ **"Can the target represent it" was the wrong axis, and four parameters were filed on
+> the wrong side of it.** Read as a statement about shape, that test put `stop`, `n`,
+> `logprobs` and `service_tier` among the droppable knobs — so a dropped stop sequence let
+> generation run past the terminator the caller stated and billed them for the extra tokens;
+> `n: 4` returned one choice, and `choices[3]` became an index error in the client rather
+> than an error from the gateway; `logprobs: true` returned a body without the member it
+> asked for; and `service_tier: flex` ran in a band the caller did not select and charged
+> them for it. Each answered `200` with the parameter listed in `x-dorang-dropped-params`,
+> which is not consent — it is a header nobody parses, carrying news that the answer is not
+> the one that was requested.
+>
+> The shape reading was never what the table above contained either. **Prompt-cache
+> breakpoints are here because losing them changes the BILL**, and richer stop reasons
+> because collapsing an enumeration loses *which* condition occurred. Neither is about shape.
+> So the axis is restated as the question that was always deciding it:
+>
+> **Does the absence change what the caller RECEIVES or is CHARGED, or only which knobs
+> dorang applied on the way?** A knob is droppable. Everything else needs the caller's word
+> for it.
+>
+> That does **not** make every parameter structural, and the discipline is the point. A
+> sampling prior — `logit_bias`, `top_k`, `frequency_penalty` — states no postcondition: no
+> vendor promises a distribution, the same request returns different text on every call, and
+> the answer under a dropped prior is indistinguishable from an ordinary re-draw of the
+> request that carried it. Refusing on "the distribution is not the one requested" would
+> commit dorang to refusing `top_k` on every crossing into the OpenAI family, which is an
+> everyday, harmless conversion, and a caller trained to set `x-dorang-allow-lossy` on
+> everything has been given a mechanism that reports nothing. The **cost of refusing more**
+> is paid down where the parameter has a value that means "do the default": `n: 1` and
+> `service_tier: auto` raise no capability at all, because dropping them changes nothing.
+>
+> The refusal set therefore has two halves, which differ in how a loss is REPORTED and not in
+> whether it is refused. The **located** half is the table above — a construct with an index
+> to point at (`messages[2].content[1]: application/pdf`). The **material** half is `stop`,
+> `n`, `logprobs` and `service_tier` — a parameter, reported by name with the value the caller
+> wrote (`service_tier: flex`), which is also what lets the `400` body fill `param` at all.
+> COMPATIBILITY §7.9 is the table; `canonical.Material` is the mask.
+
+Returning `200` after silently discarding a PDF, destroying a caching strategy or ignoring a
+stop sequence is **worse than an error**: the caller has no way to know. Revision 2
+therefore:
 
 - **Fails fast with `400`** and a machine-readable body naming the unsupported construct,
   when the request actually contains one of these and the chosen backend cannot express it.
@@ -1765,8 +1837,15 @@ than an error**: the caller has no way to know. Revision 2 therefore:
   routing filter (§7.1), so a request using constructs only one protocol family supports is
   routed there when such a deployment exists, and only fails when none does.
 
-The full construct list is a versioned table in the compatibility document, and every entry
-has a conversion test in both directions.
+The first and the third are separate obligations and both are implemented. Routing answers
+"does any deployment of this model express it"; the backend answers "does the one that was
+chosen", against the capability set that deployment declared and after the engine
+normalizations of §4.4 have run — which is the only point at which the request that will
+actually be encoded exists. A gateway that gated only at routing would refuse correctly for
+as long as the two capability sets agree, and silently downgrade the day they do not.
+
+The full construct list is a versioned table in the compatibility document (§7.9), and every
+entry has a conversion test in both directions.
 
 ### 10.2 Reasoning level mapping
 
@@ -2419,8 +2498,14 @@ is **whatever the market already does**, because the value of this table is that
 clients keep working, not that it is elegant.
 
 Canonical names below are the field names in `CanonicalRequest` / `CanonicalResponse`.
-`—` means the family has no equivalent, which is a §10.1 structural-loss case, not a
-droppable parameter.
+`—` means the family has no equivalent. It does **not** by itself say what dorang does about
+it: `Seed`, `TopK` and `Store` are dashes that are dropped and named, and `Stop`, `Logprobs`,
+`ServiceTier` and `N` are dashes that are refused. §10.1's classification decides, and the
+sentence that used to stand here — "a dash is a structural-loss case, not a droppable
+parameter" — asserted the opposite of what the mask contained for four of these rows while
+the mask asserted the opposite of the sentence for four others. Two documents disagreeing
+about the same rows is how the misclassification survived a review: each looked correct
+against the other half.
 
 #### Request
 
@@ -2441,6 +2526,7 @@ droppable parameter.
 | `Reasoning` | `reasoning_effort` | `reasoning{effort,summary}` | `thinking{type,budget_tokens}` |
 | `Seed` | `seed` | — | — |
 | `Logprobs` | `logprobs`,`top_logprobs` | — | — |
+| `N` | `n` | — | — |
 | `EndUser` | `user` | `user` | `metadata.user_id` |
 | `Metadata` | `metadata` | `metadata` | `metadata` |
 | `PreviousResponseID` | — | `previous_response_id` | — |
@@ -3228,6 +3314,27 @@ A provider may declare a metrics endpoint to scrape. Queue depth and cache utili
 become routing signals for `least_busy` and `highest_tps`. Collection ships first; using it
 for routing is opt-in behind a flag.
 
+> **R17 is not built, and `providers[].metrics` is refused at load rather than left inert.**
+> The configuration block existed — `enabled`, `endpoint`, `interval`, with a validator that
+> required an endpoint when the flag was set — and the validator was its only reader anywhere
+> in the tree. Nothing fetched the URL. That is §17.1's dominant defect class in its most
+> convincing disguise: the key was checked, so it looked wired, and CONFIG §6.2's four
+> engine-specific traps read as operational advice for a live path.
+>
+> Refusing costs the operator nothing here, which is why it is the right disposition rather
+> than a strict one. **Both strategies this section names are implemented and neither depends
+> on a scrape**: `least_busy` ranks on `internal/capacity`'s live occupancy of the axis the
+> request would reserve — dorang's own count, exact, with no poll interval to be stale over —
+> and `highest_tps` on `internal/health`'s measured output tokens per second from completed
+> requests. Both treat "no samples" as no opinion (§7.5a), so an unused deployment is neither
+> favoured nor punished. The refusal names them.
+>
+> What a scrape adds is the **engine's** view rather than dorang's, and it is a better signal
+> in exactly one case: a self-hosted backend also serving traffic that did not come through
+> this gateway. That case is real and is what R17 is for. The traps below are why a collector
+> is not the hard part of it — a vLLM started with `--disable-log-stats` answers `200` with
+> zero series, which a naive scraper reads as *idle* and routes toward.
+
 For vLLM specifically — a **day-zero** backend, not an afterthought — the metric names,
 their four traps, the per-response load header that beats polling, and the load endpoint
 that returns an attractive-looking zero forever when unconfigured are all specified in
@@ -3404,6 +3511,7 @@ never returns them, so the quota is leaked until someone notices and clears it b
 | Integration | SQLite and PostgreSQL, migrations, rollup correctness, partition rollover across midnight |
 | Scenario | below |
 | Benchmark | per-milestone gates (§15.3) |
+| Load | `testing/perf` — the assembled gateway over a real socket against a fake backend with a known fixed delay, with §15.1's overhead boundary instrumented per request. This is where the published latency, allocation and footprint numbers come from |
 | Soak | 24 h; zero leaked goroutines, reservations, or memory |
 
 Required scenarios, all automated:
@@ -3486,19 +3594,19 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 
 | Profile | p50 | p99 | Notes |
 |---|---|---|---|
-| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | 200 µs | 2 ms | headline |
+| `warm-local` — auth cached, local capacity, prefix on, ≤4 KiB body | **480 µs** | 2 ms | headline, **measured**; was published as 200 µs, see below |
 | `cold-auth` — auth cache miss, one store read | — | 15 ms | |
 | `shared-redis` — clustered exact capacity | — | 5 ms | +1 RTT, deliberate |
 | `external-auth` — delegated auth | — | governed by the callee | stated, not promised |
 | `lua-enabled` — hooks active | — | +hook ceiling | ceiling is configured |
-| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | 6 ms / 60 ms | scales with body size, stated separately |
+| `prefix-1MiB` / `prefix-16MiB` — large bodies | — | **55 ms / 852 ms** | **measured**; published as 6 ms / 60 ms, and misnamed — see below |
 
-| Other | Target |
-|---|---|
-| Added TTFT, streaming | p99 < 1 ms |
-| Idle RSS, notebook profile | < 100 MB |
-| 1000 concurrent streams | < 300 MB **including** the replay budget (§15.4) |
-| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.074%** of the 200 µs warm-local p50 |
+| Other | Target | Measured |
+|---|---|---|
+| Added TTFT, streaming | p99 < 1 ms | **p99 648 µs** — holds |
+| Idle RSS, notebook profile | < 100 MB | **62 MB** including the load generator and a fake backend in the same process — holds |
+| 1000 concurrent streams | < 300 MB **including** the replay budget (§15.4) | **256 MB** for three participants in one address space — holds, with the gateway's own share strictly less |
+| Metering on vs off | **< 5% of the gateway-overhead budget** (see note below). Measured **+148 ns** steady, **+110 ns** at a full buffer = **0.031%** of the measured 480 µs warm-local p50 |  |
 
 > **"5%" needed a denominator.** An earlier draft said only "metering on vs off < 5%", which never
 > said 5% *of what*. Measured against a no-op meter the ratio is **7.6×** — but the no-op returns after
@@ -3507,12 +3615,84 @@ scope. Targets are stated per profile, and the measurement boundary is fixed:
 > Both numbers are reported, and the gate asserts steady state **and** a full buffer — at which point
 > metering is *cheaper* (110 ns), because a failed ring push skips the payload copy while the numeric
 > path does identical work. That asymmetry is the two-queue split (§12.1) behaving as designed.
+>
+> The gate's absolute bound stayed at **10 µs** when the budget above was corrected from 200 µs to
+> 480 µs. 5% of the corrected figure would be 24 µs, and a bound that loosens because the thing it
+> is a fraction of got slower is a ratchet pointing the wrong way.
+
+#### The 200 µs p50 was never measured, and it does not hold
+
+`testing/perf` is the harness that measures it: the assembled gateway (`internal/app`, over a
+real socket) against a fake backend with a known fixed delay, with the boundary above
+instrumented per request rather than inferred. Gateway overhead is the time inside the handler
+minus every nanosecond spent waiting for the upstream — measured as the time inside `RoundTrip`
+with a connection in hand plus the time blocked in a `Read` of the upstream body. That
+subtraction is per request, so a p99 means something; subtracting two *distributions*, or a
+fixed sleep, would not survive a streaming relay whose work is interleaved with the upstream's.
+
+Measured on a 16-core AMD Ryzen 7 8745HS, warm, prefix on, metering with traces at full
+sampling, 100 pricing rules loaded, two deployments competing, four concurrent clients:
+
+| request body | p50 | p90 | p99 |
+|---|---|---|---|
+| 256 B | 191 µs | 276 µs | 367 µs |
+| 1 KiB | 248 µs | 337 µs | 457 µs |
+| **4 KiB** (the profile's stated ceiling) | **492 µs** | 656 µs | **855 µs** |
+| 16 KiB (outside the profile) | 1.27 ms | 1.65 ms | 2.03 ms |
+
+So the published 200 µs held for a request of a few hundred bytes and was never true at the
+4 KiB the profile names. The p99 of 2 ms holds with better than a factor of two, and the p99 is
+the number an operator notices: a p50 is a story about the machine, a p99 is a story about a
+client that timed out.
+
+**Where it goes.** Every configurable feature is free: measured with each of prefix affinity,
+trace metering, a 100-rule price catalog and a second deployment turned on and off in turn, no
+arm moved the p50 outside the noise (341 µs bare, 344 µs with all four). The cost is the four
+JSON passes a cross-protocol gateway makes over the body — decode the client's request into the
+canonical form, encode the upstream's, decode the upstream's response, encode the client's —
+and they are ~85% of the CPU the request path burns. `internal/wire/openai.DecodeRequest` alone
+runs at **31 MB/s with 143 allocations per KiB**, because each wire type's `UnmarshalJSON`
+parses its own bytes twice: once into the struct and once into a `map[string]json.RawMessage`
+to split the unmodelled members out (`wirejson.SplitExtra`). That is the whole of the slope in
+the table above, and it is where a p50 improvement would have to come from.
+
+**The measurement depends on the offered rate, and the profile should say so.** The same gateway
+doing the same work measured 259 µs at 1585 req/s, 347 µs at 558 req/s and 510 µs at 344 req/s
+per client, because between sparse requests the caches go cold and the CPU drops clock. The
+figures above are all at a stated concurrency and rate for that reason; a latency number quoted
+without one is the kind of unfalsifiable number the top of this section refuses.
+
+#### The large-body rows were wrong by an order of magnitude, and misnamed
+
+| profile | published p99 | measured p99 |
+|---|---|---|
+| 256 KiB | — | 17.8 ms |
+| `prefix-1MiB` | 6 ms | **55 ms** |
+| `prefix-16MiB` | 60 ms | **852 ms** |
+
+The name is the more useful defect. **The prefix chain is about 1% of these figures.** Its own
+benchmark puts a 16 MiB chain at **7.1 ms and 728 B in 17 allocations**, running at 2.36 GB/s —
+exactly the O(log n) digests over one hash pass §7.4b promises, and one of the few numbers in
+this document that was measured before it was published. The other 99% is the codec. A profile
+named after the cheap component invites precisely the wrong optimization, so the rows keep their
+configuration names and this note says what is actually in them.
 
 ### 15.2 Techniques
 
 1. **Immutable routing snapshot** — configuration swaps by pointer; the read path takes no lock.
-2. **No allocation on the hot path** — pooled request structures; only the fields needed
-   (`model`, `stream`, size markers) are scanned, never a full unmarshal.
+2. **No allocation in the gate** — pooled request structures; only the fields needed
+   (`model`, `stream`, size markers) are scanned before the request is routed, never a full
+   unmarshal. `BenchmarkGateOnly` measures route lookup plus authentication plus authorization
+   at **0 allocs/op**, and `internal/server/peek.go` is why.
+
+   > **This says "gate", not "hot path", and the change is a correction.** It read "no
+   > allocation on the hot path", which was never true of a request that gets dispatched.
+   > Measured end to end (`testing/perf`, `BenchmarkGatewayRequest` minus its no-gateway
+   > control) one 4 KiB non-streaming request allocates about **390 objects and 71 KB** — 16×
+   > the request body. Essentially all of it is the four JSON passes of §15.1's note, and none
+   > of it is in the gate. The claim was true about the code it was written about and false
+   > about the sentence it was written in, which is the failure mode this document exists to
+   > avoid.
 3. **Single-pass, no-decode streaming relay [R1-C1]** — upstream SSE frames are scanned,
    never fully decoded. `Accept-Encoding: identity` is requested upstream. The scanner
    rewrites only the `model` value and reads only the terminal usage frame, carrying a
@@ -3534,6 +3714,57 @@ state. Two numbers are reported separately and both must hold:
 
 - **Served throughput** — what the request path sustains.
 - **Durable throughput** — what the storage layer absorbs without growing a backlog.
+
+#### Where the ceiling is, measured
+
+`testing/perf`'s `TestThroughputCeiling` drives the assembled gateway against a fake backend
+with a 5 ms think time and 4 KiB bodies, and reports where it stops scaling. On a 16-core
+Ryzen 7 8745HS, with the load generator and the fake backend in the same process:
+
+| concurrent clients | req/s | overhead p50 | overhead p99 |
+|---|---|---|---|
+| 1 | 155 | 711 µs | 1.13 ms |
+| 16 | 2 419 | 793 µs | 1.45 ms |
+| 64 | 10 138 | 407 µs | 1.24 ms |
+| **128** | **19 607** | 423 µs | 3.21 ms |
+| 256 | 20 417 | 424 µs | 5.99 ms |
+| 512 | 19 606 | 435 µs | 18.50 ms |
+
+Throughput is linear in offered concurrency to about 128 clients and flat after it. The knee is
+sharper in the p99 than in the throughput, which is what an operator sees first: past it, extra
+concurrency buys queueing and nothing else.
+
+**What holds it there is CPU, and the CPU is JSON.** At the knee the three participants together
+saturate the machine, and 85% of the request path's own cycles are the four codec passes of
+§15.1. It is not a lock. Mutex profiles taken in steady state at the knee — after warm-up, so
+the connection-pool and SQLite cold starts are excluded — put the largest identified contention
+inside `capacity.Broker`, reached three or more times per request (`TryAcquire`, `Release`, and
+once per candidate from `least_busy`), and even that is smaller than the Go allocator's heap
+lock, which is itself a consequence of the 390 allocations per request rather than a cause.
+None of `internal/prefix`'s table, `internal/meter`'s ring or the auth snapshot appears at all.
+
+> **`least_busy` takes one turn at the broker's single mutex per candidate**, so the routing
+> decision's lock traffic scales with the size of the model group —
+> `BenchmarkRouteParallelByCandidates` measures 1.4 µs/op at one candidate, 1.9 at four and
+> 3.8 at sixteen. Batching it into one acquisition was written, measured and **reverted**: both
+> shapes were slower, because the staged query carries strings and writing it into a reused
+> heap slice costs a GC write barrier per candidate, and because doubling the work done while a
+> saturated mutex is *held* costs more than the turns it saves. The comment on that benchmark
+> records both numbers. On the assembled gateway it is not the ceiling — throughput was flat at
+> 19-20k req/s from one deployment to eight — because a real request spends ~400 µs elsewhere
+> and touches that lock about 1% of the time.
+
+**Footprint follows the allocation rate, not the concurrency.** At the knee the heap in use is
+about 600 MB against 66 MB live after collection — Go's pacer doing its job against a 1.3 GB/s
+allocation rate (20k req/s × 65 KB), not a leak. With a thousand streams held genuinely open
+the resident set is 256 MB (§15.1). An operator who needs a smaller heap at high throughput
+sets `GOGC` or `GOMEMLIMIT`; an operator who needs both wants the codec passes reduced.
+
+> The first version of this measurement reported 2.7 GB, and it was the harness: `testing/fake`
+> retains every request it has served — verbatim body, cloned header — which is what makes a
+> scenario able to assert on what reached the wire, and which is a gigabyte of bookkeeping after
+> a hundred thousand 4 KiB requests. It was being read as the gateway's. Every arm now resets the
+> fakes before it starts and before it reports.
 
 ### 15.4 Replay memory is budgeted process-wide **[R1-6]**
 
@@ -3562,7 +3793,7 @@ pkg/catalog          provider defaults, model catalog, base pricing
 ui/                  embedded admin SPA
 deploy/              compose for tests, Dockerfile, examples
 docs/                DESIGN, REVIEW, CONFIG, COMPATIBILITY (+ .ko)
-testing/             fake upstreams, scenario harness
+testing/             fake upstreams, scenario harness, §15.3 workload, load harness (perf)
 ```
 
 ---
@@ -3714,7 +3945,7 @@ oldest thing still open on this page.**
 |---|---|---|---|
 | scan a relayed stream for an in-band `"error"` frame and report a failed outcome | `backend.relay` copied it through and returned nil | the failure reached neither `internal/health` nor §7.6's committed-stream boundary; a backend that failed every stream after the first frame kept its full share of traffic | **closed** — `errorFrame`/`errorMember` in `internal/backend/stream.go`, applied on the relay scan and again on the terminal check, with `internal/backend/streamfail_test.go` |
 | surface `*anthropic.OpaqueError` to the caller | `backend.encodeError` flattened it to a message string under `conversion_failed`, with no `Unwrap` | the `Construct` id that `x-dorang-allow-lossy` takes never reached the caller, so §10.1's "refuse, and say what to opt into" was prose only | **closed** — `internal/backend/errors.go` matches `*anthropic.OpaqueError` with `errors.As` rather than flattening it |
-| read `x-ratelimit-reset-requests` into `Outcome.ResetAt` | **nothing sets `Outcome.ResetAt` from an upstream at all** | a provider-signalled window reset cannot reach the cooldown or `Retry-After`; only dorang's own quota source can | **open**, and re-verified at `8e6016d`. `router.Outcome.ResetAt` (`internal/router/request.go`) has no producer anywhere in the tree, test or otherwise: `internal/router/router.go`'s `st.resetAt = o.ResetAt` is its only reader, so the `CauseQuotaExhausted` cooldown and the four terminal fail-back errors read a field nothing writes. `backend.Result` carries no reset instant for `backendResult` to assign. **The test that closes it must drive a 429 carrying only a reset header and read `Retry-After` off the client's response** — asserting on `Outcome` would pass throughout the defect, which is rule 1 above applied to its own fix |
+| read `x-ratelimit-reset-requests` into `Outcome.ResetAt` | **nothing sets `Outcome.ResetAt` from an upstream at all** | an upstream 429 that signals its reset with a rate-limit header and no `Retry-After` reaches neither the deployment cooldown nor the client's `Retry-After` | **open**, re-verified at `ef94f58`. `router.Outcome.ResetAt` has no producer anywhere in the tree, test or otherwise, because `backend.Result` carries no reset instant for `backendResult` to assign — `retryAfter()` in `internal/backend/errors.go` reads `Retry-After` and nothing else. **Two corrections to the disposition itself**, both found by re-deriving it rather than reading it: (1) the row understated the gap by naming only `Outcome`. The client-facing half is `upstreamError`, which fills `server.Error.RetryAfterSeconds` from `Retry-After` alone, so §11.4's header is the thing actually missing on a reset-header-only 429; (2) the row overstated the consumer chain. `st.resetAt` feeds the four terminal errors in `canFallBack`, and **`canFallBack` runs only when `req.Previous != nil`** — which in `internal/app`'s dispatch loop is exactly the case where `lastErr != nil` and the router's error is discarded in favour of the upstream's (`dispatch.go`, and the comment there defends it: "a hop that cannot be taken reports the failure that made us look for one"). So those four assignments are unreachable from the assembled gateway even once the field has a producer, and a fix that stops at `Outcome` closes nothing. What remains reachable and worth having: the `CauseQuotaExhausted` cooldown in `Router.Report`, and `Retry-After` on the client's response. **The change is therefore in `internal/backend`**: parse the reset headers beside `Retry-After` into a `Result.ResetAt`, prefer `Retry-After` when both are present, fill `RetryAfterSeconds` from the reset instant when it is not, and assign the field in `backendResult`. **The test that closes it must drive a 429 carrying only a reset header and read `Retry-After` off the client's response** — asserting on `Outcome` would pass throughout the defect, which is rule 1 above applied to its own fix |
 
 One duplication survives, and it is worth naming so it is not mistaken for a clean result.
 `internal/app`'s `backendResult` and `backendCause` — the mapping from a `backend.Result` onto

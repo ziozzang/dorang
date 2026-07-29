@@ -24,7 +24,15 @@ import (
 // §12.1 behaving as designed, and a suite that measured only steady state would
 // not notice it disappearing.
 
-// warmLocalP50 is the headline gateway-overhead budget of DESIGN §15.1.
+// warmLocalP50 is the headline gateway-overhead budget of DESIGN §15.1, as it
+// was published when this gate was written.
+//
+// testing/perf has since MEASURED it end to end at 480 µs — the 200 µs was
+// never measured and does not hold at the profile's 4 KiB body. This constant
+// stays where it was on purpose: it is the denominator of a bound, and 5% of
+// the corrected figure would be 24 µs. A gate that loosens itself because the
+// thing it is a fraction of got slower is a ratchet pointing the wrong way, so
+// the percentages reported below are the pessimistic reading.
 const warmLocalP50 = 200 * time.Microsecond
 
 // meteringBudget is 5% of it — the bound the added cost of metering must stay

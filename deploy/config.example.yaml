@@ -83,9 +83,15 @@ providers:
       backoff: exponential        # exponential | linear | constant
       base: 500ms
     usage_probe:
-      enabled: false              # poll the provider's own view of quota (§6.2)
-      fetcher: glm
-      interval: 60s
+      enabled: false              # poll the provider's own view of quota (§6.2).
+      fetcher: glm                # zai | anthropic | deepseek (glm is a zai alias).
+      interval: 60s               # also the floor on how often one credential is read.
+      # Without an allowance a percent-reporting provider carries its RESET INSTANT
+      # only — enough for quota_urgency, not enough to gate. The limit is your
+      # assertion about your own plan and is never inferred from tpm, which is
+      # dorang's ceiling rather than the provider's allowance. CONFIG §6.1a.
+      allowances:
+        - {label: "tokens_limit:5h", window: 5h, metric: tokens_total, limit: 12000000}
     prefix_ttl: until_evicted     # a self-hosted engine evicts prefix blocks by
                                   # memory pressure, never by a clock (§7.4b)
 
@@ -98,10 +104,12 @@ providers:
     prefix_ttl: 5m                # this vendor's automatic prompt cache is minutes,
                                   # so an hour of affinity would pin conversations
                                   # to a node that no longer holds the prefix
-    metrics:
-      enabled: false              # scrape backend metrics for least_busy / highest_tps (§12.4)
-      endpoint: http://127.0.0.1:8000/metrics
-      interval: 15s
+    # There is no `metrics:` block here on purpose. §12.4's backend metrics
+    # scrape has no collector in this build and the key is REFUSED at load,
+    # naming what to use instead. least_busy and highest_tps do not need it:
+    # the first ranks on this gateway's live capacity occupancy, the second on
+    # output tokens per second measured from completed requests. Put the
+    # strategy in routing.strategy and nothing needs scraping.
 
 credentials:
   # A credential is the unit quotas and concurrency actually attach to (§3).

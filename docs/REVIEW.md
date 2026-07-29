@@ -143,8 +143,16 @@ The importer must therefore read credentials *before* any key rotation, and say 
    same reserve-then-settle pattern, but only one had a safety net. A process killed between
    reserving and settling locks that amount forever, and over time a budget is exhausted by
    money nobody spent — a false stop with no way to diagnose it.
-   → Revision 2 gives `budget_state` a `reserved_until` and a leader-run sweep, matching
-   §5.3. Same pattern, same net.
+   → Revision 2 gives the budget hold an expiry and a leader-run reclaim, matching §5.3.
+   Same pattern, same net.
+   → **Correction.** Revision 2 put the expiry on `budget_state.reserved_until`, swept by a
+   leader job. That mechanism was implemented, tested and never called — `ReserveBudget` had
+   no caller outside its own tests — so the sweep queried a predicate that could not match.
+   The hold that exists is §9.6's lease block, whose `quota_leases.expires_at` the leader's
+   lease-reclaim pass already honours; the reservation code and its two columns are deleted
+   (migration `0006`). The net is wider than the one described here: it also returns a block
+   held by a node that died after the block was charged, which the reservation sweep could
+   not reach. See DESIGN §6.4.
 
 20. **A request could consume budget without ever reaching an upstream.** Budget was reserved
     at the gate; the request can then be refused while waiting for capacity and never

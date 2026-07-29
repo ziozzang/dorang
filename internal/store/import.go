@@ -130,7 +130,8 @@ func (r *ImportReport) warn(format string, a ...any) {
 	r.Warnings = append(r.Warnings, msg)
 }
 
-// Summary renders the report as one human-readable block, for `dorang import`.
+// Summary renders the report as one human-readable block, for
+// `dorangctl import keys`.
 func (r ImportReport) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "import from %s: scanned %d, imported %d (%d expired, %d blocked), skipped %d\n",
@@ -197,8 +198,48 @@ var refusedColumns = map[string]string{
 	"key_name": "stores trailing characters of the secret; dorang derives a non-reversible label instead",
 }
 
+// OpenSource opens a read-only handle on a foreign database for [ImportKeys].
+//
+// It exists so that the driver names live in one place. [Open] knows that
+// "sqlite" and "pgx" are what the two blank imports at the top of store.go
+// register; a caller that needed a second handle had to know it too, and a
+// second copy of that knowledge is how a build without one of the drivers turns
+// into a runtime "unknown driver" at the moment of a cutover.
+//
+// No migration is applied and no schema is assumed: the source belongs to
+// another product, and [ImportKeys] enumerates its columns before selecting any
+// of them.
+func OpenSource(ctx context.Context, driver Dialect, dsn string) (*sql.DB, error) {
+	var (
+		db  *sql.DB
+		err error
+	)
+	switch driver {
+	case DialectSQLite:
+		db, err = sql.Open("sqlite", sqliteDSN(dsn))
+	case DialectPostgres:
+		db, err = sql.Open("pgx", dsn)
+	default:
+		return nil, fmt.Errorf("store: unknown source driver %q", driver)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: open %s source: %w", driver, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		// The DSN is deliberately absent from the message: it is the one string
+		// in an import that routinely carries a password, and this error is the
+		// one an operator pastes into a ticket.
+		return nil, fmt.Errorf("store: cannot reach the %s source database: %w", driver, err)
+	}
+	return db, nil
+}
+
 // ImportKeys migrates credentials from a foreign LiteLLM_VerificationToken-shaped
 // table into api_keys.
+//
+// [OpenSource] opens src, and `dorangctl import keys` is the operator-facing
+// invocation.
 //
 // # How the secret is not needed
 //

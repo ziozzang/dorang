@@ -68,6 +68,19 @@ func (x *exchange) toolNames() *openai.ToolNames {
 	return x.names
 }
 
+// capabilities is what this exchange's deployment can express: the target's own
+// declaration when it made one, and its wire shape's set otherwise.
+//
+// One accessor, read by both the §10.1 gate and the encoders, because the two
+// answering the question separately is exactly how a request gets refused
+// against one capability set and encoded against another.
+func (x *exchange) capabilities() canonical.Capability {
+	if x.target.Capabilities != 0 {
+		return x.target.Capabilities
+	}
+	return wireCapabilities(x.prov.api)
+}
+
 // boundary returns this exchange's multipart boundary, generating it on first
 // use.
 //
@@ -160,6 +173,24 @@ func adapterFor(api catalog.API, kind string) (adapter, error) {
 		}, nil
 	}
 	return nil, errors.New("backend: no adapter for wire shape " + string(api))
+}
+
+// wireCapabilities is what a deployment of this wire shape can express
+// (DESIGN §10.1). It answers the same question internal/app answers when it
+// builds a routing table, from the same two constants, and it has to: routing
+// PREFERS a deployment that can express the request, and this is the gate that
+// runs once one has been chosen. Two answers to one question is how a request
+// gets routed on one capability set and encoded against another.
+//
+// The default is deliberately the permissive set. A shape whose real
+// capabilities are unknown must not acquire refusals it never had — an
+// overstated capability drops a knob and says so, which is the old behaviour,
+// while an understated one turns working traffic into 400s.
+func wireCapabilities(api catalog.API) canonical.Capability {
+	if api == catalog.APIAnthropicMessages {
+		return anthropic.DefaultCapabilities
+	}
+	return openai.DefaultCapabilities
 }
 
 // errNoOperation is the shape-level refusal an adapter returns for an operation

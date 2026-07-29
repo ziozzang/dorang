@@ -111,36 +111,42 @@ func MaintenanceJob(s *store.Store, ret store.RetentionPolicy, every time.Durati
 	}
 }
 
-// ReservationSweepJob reclaims reservations that outlived their deadline: both
-// kinds.
+// CapacitySweepJob reclaims capacity reservations that outlived their deadline.
 //
 // DESIGN 5.3 gives every capacity reservation a deadline so that a panic or a
-// leaked goroutine cannot permanently consume capacity. DESIGN 6.4 gives every
-// budget reservation a reserved_until so that a process killed between reserve
-// and settle does not lock that amount forever. Revision 1 of the design had
-// only the first. They are the same pattern with the same failure mode, which
-// is why they are swept together here and not in two places that drift apart.
+// leaked goroutine cannot permanently consume capacity. Reaching that deadline
+// is the only thing that returns the unit, because the broker's hot path is
+// deliberately unable to notice time passing.
 //
-// sweepCapacity may be nil on a node with no broker; the budget half still runs.
-func ReservationSweepJob(s *store.Store, sweepCapacity func() int, every time.Duration, now func() time.Time) Job {
-	if s == nil && sweepCapacity == nil {
+// # The budget half that used to be here
+//
+// This was ReservationSweepJob and it swept two kinds, because DESIGN 6.4 R1-19
+// gave `budget_state` a `reserved_until` for the same reason capacity has a
+// deadline, and a sweep that does one of two identical patterns silently leaks
+// the other. That argument was sound and its second half had nothing to sweep:
+// `store.ReserveBudget` was the only writer of `reserved_nano` and had no
+// non-test caller anywhere in the tree, so `WHERE reserved_nano > 0` was a
+// store round trip per tick against a predicate that could not match.
+//
+// The budget path that runs is the lease block ([Ledger]), and its expiry net
+// is [LeaseReclaimJob] — which returns the unspent part of every block lease
+// whose TTL has passed, including one held by a node that died mid-request.
+// That is the same pattern again, and it is where the budget half of this job
+// went rather than being dropped: the two jobs run on the same tick, from the
+// same leader, and between them every held-and-abandoned unit in the system has
+// something that returns it.
+//
+// sweepCapacity may be nil on a node with no broker, which leaves no work.
+func CapacitySweepJob(sweepCapacity func() int, every time.Duration) Job {
+	if sweepCapacity == nil {
 		return Job{}
 	}
-	if now == nil {
-		now = time.Now
-	}
 	return Job{
-		Name:  "reservation-sweep",
+		Name:  "capacity-reservation-sweep",
 		Every: every,
-		Run: func(ctx context.Context) error {
-			if sweepCapacity != nil {
-				sweepCapacity()
-			}
-			if s == nil {
-				return nil
-			}
-			_, err := s.SweepExpiredReservations(ctx, now())
-			return err
+		Run: func(context.Context) error {
+			sweepCapacity()
+			return nil
 		},
 	}
 }

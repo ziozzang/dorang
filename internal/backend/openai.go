@@ -84,6 +84,9 @@ func (openaiAdapter) encode(x *exchange) ([]byte, error) {
 	case OpChat, OpResponses:
 		return openai.MarshalRequest(x.req, &openai.EncodeOptions{
 			Model: x.target.UpstreamModel,
+			// The set the §10.1 gate cleared this request against; see the same
+			// line in the anthropic adapter.
+			Capabilities: x.capabilities(),
 			// The SAME registry the decoders read. Shortening into a mapping
 			// nobody keeps is what turns COMPATIBILITY 5.3 into a one-way
 			// destruction of any tool name over 64 bytes.

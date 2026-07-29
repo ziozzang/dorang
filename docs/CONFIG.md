@@ -463,7 +463,7 @@ providers:
       default: {}
     retry: {max_attempts: 2, backoff: exponential, base: 500ms}
     usage_probe: {enabled: false, fetcher: glm, interval: 60s}
-    metrics: {enabled: false, endpoint: http://127.0.0.1:8000/metrics, interval: 15s}
+    # No `metrics:` block: it is refused at load, because nothing scrapes one. §6.2.
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
@@ -482,11 +482,10 @@ providers:
 | `retry.backoff` | `exponential` \| `linear` \| `constant` | `exponential` | Retry spacing | Anything else is refused |
 | `retry.base` | duration | `500ms` | First retry interval | Negative is refused |
 | `usage_probe.enabled` | bool | `false` | Polls the provider's own view of remaining quota | Without it, quota is metered locally only, and local metering under-counts by exactly the traffic that did not go through dorang |
-| `usage_probe.fetcher` | string | `""` | Which provider-specific fetcher to use | Required when the probe is enabled |
-| `usage_probe.interval` | duration | `0` | Poll interval | Negative is refused. A poll is up to one interval stale — see §6.1 below |
-| `metrics.enabled` | bool | `false` | Scrapes a backend metrics endpoint for `least_busy` / `highest_tps` | See §6.2 |
-| `metrics.endpoint` | string | `""` | The scrape URL | Required when `metrics.enabled` is true |
-| `metrics.interval` | duration | `0` | Scrape interval | — |
+| `usage_probe.fetcher` | string | `""` | Which provider-specific fetcher to use: `zai` (aliases `z.ai`, `glm`, `zhipu`, `bigmodel`), `anthropic`, `deepseek` | Required when the probe is enabled. **A fetcher no prober exists for stops the gateway at start-up**, naming the ones that do — the schema cannot check this itself, and the alternative is a provider that silently never reports |
+| `usage_probe.interval` | duration | `60s` | Poll interval, and the floor on how often ONE credential is read | Negative is refused. A poll is up to one interval stale — see §6.1. A second read inside the interval replays the last snapshot rather than spending a request |
+| `usage_probe.allowances[]` | list | `[]` | Files a provider's reported window under a rule's key, and declares how large it is | **Without one, a percent-reporting provider gates nothing** — see §6.1a. A window filed under a key no rule uses is inert |
+| `metrics.*` — the whole block | — | — | **Nothing. It is refused at load** (§23.2): §12.4's backend metrics scrape has no collector in this build | Writing any of `enabled`, `endpoint` or `interval` fails validation, naming what to use instead. `least_busy` and `highest_tps` do not need it — see §6.2 |
 
 ### 6.0 What `base_url` means, and what dorang appends to it
 
@@ -545,19 +544,95 @@ local delta, so a lagging poll cannot erase a burst. Fetches run off the request
 per-provider timeouts, and **a failed fetch never disables a credential** — a failed read is not
 an exhausted quota. The last good snapshot is retained and its staleness is exposed.
 
-### 6.2 Backend metrics have engine-specific traps
+### 6.1a `allowances` — without one, a percentage gates nothing
 
-Enabling `metrics` does not by itself make `least_busy` correct. Both self-hosted engines have
-metrics that are misnamed, dead, or reset:
+The formula above is unit-homogeneous arithmetic, and the shape providers actually publish is
+not. z.ai reports *"37% of your 5-hour allowance"* and never *"3,700 of 10,000"*; Anthropic
+reports a utilization percentage of a subscription window. A percentage is not in the metric's
+units, and adding a token delta to one produces a number that is neither — and, because the sum
+is monotone while a rolling window is not, it grows past any configured limit and parks the
+credential in a cooldown nothing can clear.
 
-- vLLM's `kv_cache_usage_perc` is a fraction 0–1 despite the name, and
-  `--disable-log-stats` leaves `/metrics` returning **200 with zero series** — indistinguishable
-  from idle while meaning the opposite. [VLLM.md](VLLM.md) §3.
-- SGLang's `/metrics` **404s** when `--enable-metrics` is unset, which is the honest failure,
-  and its `sglang:cache_hit_rate` is hard-reset to `0.0` on every decode report so the gauge
-  spends most of its time at zero. [SGLANG.md](SGLANG.md) §4.3.
+So a window with no absolute figure carries its **reset instant only**. That is not nothing —
+§7.5a(c)'s expiring-quota score is zero for a rolling window until a provider says when it
+resets, so this is what makes `quota_urgency` score anything at all for a subscription
+credential — but it gates no traffic.
 
-Read the engine's section before you route on its numbers.
+`allowances` is how you close it. It is the operator's assertion about their own plan, and it
+is never inferred: deriving the ceiling from the deployment's `tpm` would read the percentage
+against the wrong denominator, because a `tpm` is *dorang's* ceiling on the credential and not
+the provider's allowance.
+
+```yaml
+providers:
+  - name: plan-a
+    kind: zai
+    usage_probe:
+      enabled: true
+      fetcher: zai
+      interval: 60s
+      allowances:
+        # "37% consumed" of a 5-hour window becomes 4,440,000 of 12,000,000 tokens,
+        # filed under the key a `5h`/`tokens_total` rule uses.
+        - {label: "tokens_limit:5h", window: 5h, metric: tokens_total, limit: 12000000}
+```
+
+| Field | |
+|---|---|
+| `label` | the provider's own name for the window, as internal/probe normalizes it — the type lowercased, qualified by the window's length: `tokens_limit:5h`, `five_hour`. Matched case-insensitively |
+| `window` | the rule key's window: a rolling duration of at least one minute (`5h`, `1m`), or `daily`/`weekly`/`monthly` |
+| `metric` | the rule key's metric: `cost_usd`, `tokens_total`, `tokens_input`, `tokens_output`, `requests` |
+| `limit` | the allowance's absolute size in the metric's units. Omit it to file the window under the key without declaring a size, which is worth doing on its own: it is what carries the reset instant to the right rule |
+
+**Two things to check when a probe appears to do nothing.** First, the credential needs a rule
+for the figure to gate — quota is keyed by (window, metric), and a rule comes from
+`models[].deployments[].limits[]` with `metric: rpm` or `tpm`. A probe enabled for a credential
+with no rule is logged at start-up saying exactly that. Second, the label has to match; a
+provider window filed under no key is inert, and that silence is this feature's quiet failure
+mode.
+
+**One limitation, stated rather than discovered.** There is no key for the probe's own host, so
+a deployment that fronts a provider behind a private hostname probes the vendor's documented
+endpoint. `providers[].base_url` is deliberately not reused for it: on every provider with a
+prober the quota endpoint is a different service, and pointing a quota read at an inference host
+produces a 404 that the prober's backoff then treats as a provider fault.
+
+### 6.2 There is no backend metrics scrape, and `least_busy` does not need one
+
+**`providers[].metrics` is refused at load.** §12.4 specifies a scrape whose queue-depth and
+cache-utilization figures become routing inputs — that is requirement R17, and no collector was
+ever built. The block validated and did nothing for as long as it existed, which is the failure
+mode this file's §23.1 is a ledger of: the flag was checked, an endpoint was *required* when it
+was set, the configuration loaded, and nothing ever fetched the URL.
+
+**The two strategies §12.4 names work today, from dorang's own measurements.**
+
+| Strategy | Ranks on |
+|---|---|
+| `least_busy` | `internal/capacity`'s live occupancy of the axis this request would reserve — dorang's own count of what it has in flight against that deployment. Exact, with no poll interval to be stale over |
+| `highest_tps` | `internal/health`'s measured output tokens per second, from completed requests through this gateway |
+
+Both treat "no samples yet" as *no opinion* rather than as a zero, so an unused deployment is
+neither favoured nor punished. Name them in `models[].strategy` and nothing needs scraping.
+
+What a scrape would add is the **engine's own** view rather than dorang's, and that is a better
+signal in exactly one case: a self-hosted backend also serving traffic that did not come
+through this gateway. If you have that case, the constraint is real and R17 is what closes it.
+
+> **If R17 is built, these traps come with it**, and they are recorded here rather than lost
+> with the refused key. Both self-hosted engines have metrics that are misnamed, dead, or
+> reset:
+>
+> - vLLM's `kv_cache_usage_perc` is a fraction 0–1 despite the name, and `--disable-log-stats`
+>   leaves `/metrics` returning **200 with zero series** — indistinguishable from idle while
+>   meaning the opposite. [VLLM.md](VLLM.md) §3.
+> - SGLang's `/metrics` **404s** when `--enable-metrics` is unset, which is the honest failure,
+>   and its `sglang:cache_hit_rate` is hard-reset to `0.0` on every decode report so the gauge
+>   spends most of its time at zero. [SGLANG.md](SGLANG.md) §4.3.
+>
+> Note that the first of those — a 200 with no series, reading as idle — would have made a
+> scraper that shipped without reading the engine's section route *toward* a backend that had
+> been told to stop reporting. A collector is not the hard part of R17.
 
 ---
 
@@ -1242,7 +1317,8 @@ droppable, with the drop counted.
 | `flush_interval` | duration | `250ms` | How often counters merge and the spool ships | Zero or negative is refused. It is also the window over which a crash loses precision: quota rings and rollups are reconstructible from their last upsert plus the ledger, so losing the tail costs precision rather than correctness, and this interval is how much |
 
 **Measured cost of metering:** +148 ns steady state and **+110 ns at a full buffer**, which is
-0.074% of the 200 µs warm-local p50 budget. The full buffer being *cheaper* is the split working
+0.031% of the measured 480 µs warm-local p50 budget (DESIGN §15.1; it was published as
+200 µs and never measured until `testing/perf` measured it). The full buffer being *cheaper* is the split working
 as designed — a failed ring push skips the payload copy while the numeric path does identical
 work. Note that "metering on vs off < 5%" needed a denominator: against a no-op meter the ratio
 is 7.6×, but the no-op returns after one branch, so dividing by it measures nothing about a real
@@ -1777,8 +1853,6 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 | Key | Status |
 |---|---|
 | `models[].deployments[].limits[]` with `metric: max_concurrent` or `max_queue` | Only `rpm` and `tpm` are consumed, and as a per-credential quota (§10.2) |
-| `providers[].usage_probe` | §6.2's fetchers exist in `internal/probe`; nothing constructs one from configuration |
-| `providers[].metrics` — the **whole block**, `enabled`, `endpoint` and `interval` alike | Nothing scrapes a backend. The only reader in the repository is `validate.go`, which requires an endpoint when the flag is on; no HTTP client anywhere fetches one. §12.4's queue-depth and cache-utilization routing signals for `least_busy` and `highest_tps` have no collector, and §6.2's four engine traps are documented against nothing |
 | `providers[].params.drop`, `.drop_unsupported` | §10.3's two knobs never reach the conversion path — only the kind's own capability set decides what is dropped |
 | `routing.prefix.checkpoints` | The chain is cut logarithmically; `fixed` validates and selects nothing |
 | `models[].deployments[].stream_timeout` | Only the non-stream timeout reaches the upstream call |
@@ -1795,13 +1869,17 @@ from the list. It cannot see the rows whose Go field name is too common to searc
 still written down here, and it is the whole reason this table exists beside the guard rather
 than being replaced by it.
 
-> **The `providers[].metrics` row said the wrong thing, in the direction that costs most.** It
-> read *"The endpoint and the enabled flag are read; the poll interval is not"*, and neither
-> half was true: no reader for any of the three exists outside `internal/config`. The guard
-> could not contradict it, because `Enabled`, `Endpoint` and `Interval` are all names that
-> occur elsewhere in the tree — the vacuity `consumed_test.go`'s own doc comment warns about,
-> firing on a whole block rather than on one field. A prose ledger whose entries the guard
-> cannot check has to be re-derived by hand, and this row had not been.
+> **`providers[].metrics` was on this table twice over, and is now refused instead.** The row
+> first read *"The endpoint and the enabled flag are read; the poll interval is not"*, and
+> neither half was true: no reader for any of the three existed outside `internal/config`. The
+> guard could not contradict it, because `Enabled`, `Endpoint` and `Interval` are all names
+> that occur elsewhere in the tree — the vacuity `consumed_test.go`'s own doc comment warns
+> about, firing on a whole block rather than on one field. Corrected, the row still described
+> a block that loaded cleanly and did nothing, with §6.2's engine traps reading as advice for
+> a live path. **The block is a load error now** (§23.2), which is the disposition this
+> section keeps arguing for and the one the guard cannot reach. Note what it cost to leave it
+> inert instead: two wrong statements about the same block, in the same table, over two
+> passes.
 
 ### 23.1a Closed since the last pass
 
@@ -1809,6 +1887,7 @@ Everything below used to be in the table above.
 
 | Key | What it does now |
 |---|---|
+| `providers[].usage_probe` | **Wired.** §6.2's fetchers had been implemented, tested and imported by nothing at all — `internal/probe` had zero importers in the tree — so every quota decision ran on dorang's own view of dorang's own traffic, which §6.2 exists to say is not enough. `internal/app` now builds a prober per enabled provider, a tracker per credential that has a rule to gate, and polls off the request path. A `fetcher` no prober exists for is a start-up refusal naming the ones that do, because the schema cannot check it and a silent never-reporting probe is the state this closed. `allowances[]` is new alongside it and is what turns a reported percentage into a figure a rule can gate (§6.1a) |
 | `capacity.*.max_queue`, `capacity.principals.<id>.max_queue`, `.max_queue_wait` | Wired. `max_queue` bounds the wait queue per axis and refuses past it; `max_queue_wait` bounds how long one of a principal's requests may wait, and a **pinned** request is the one that uses it — an unpinned one spills or falls back rather than queueing (§7.4a2, §7.6). Batch is exempt: it is the work that is meant to wait (§11.1) |
 | `capacity.*.rpm`, `.tpm` on every group, on `global`, on `models[]` and on `principals` | **Refused**, with the working home named. A capacity axis counts concurrent reservations, released when a request finishes; a rate needs a time window, which `internal/quota` owns. Put a per-deployment rate on `models[].deployments[].limits[]` and a per-caller rate on the api key's own `rpm_limit`/`tpm_limit` |
 | `key_rotation.strategy` | Wired. All four names now choose the preferred credential; a credential pin and a sticky entry still outrank the rotation |
@@ -1862,7 +1941,21 @@ One more of the same shape, outside these two types: **`admin.Config.Pricing` is
 answer" holds for `dorangctl price` and for the ledger; the two HTTP surfaces it names have a
 complete implementation behind a dependency nobody injects.
 
-### 23.2 Designed and not in the schema at all
+### 23.2 Designed, in the schema, and refused at load
+
+A key that loads and does nothing is worse than a key that is refused: the operator who wrote
+it believes it took effect. These parse — so that the refusal can name the key and say what to
+use instead, rather than reading as a typo — and then fail validation.
+
+| Key | The refusal, and where the capability actually lives |
+|---|---|
+| `providers[].metrics` — the **whole block**, any of `enabled`, `endpoint`, `interval` | **§12.4's backend metrics scrape has no collector. R17 is not built.** Nothing in the repository fetches the endpoint. The refusal names the working alternative, and it costs nothing: `least_busy` and `highest_tps` are implemented and do not depend on a scrape — the first ranks on this gateway's own live capacity occupancy of the axis the request would reserve, the second on output tokens per second measured from completed requests (§7.5a), and both treat "no samples yet" as no opinion rather than as a zero. Name them in `models[].strategy`. What a scrape would ADD is the engine's own queue depth and KV-cache utilization, which is a better signal in exactly one case: a self-hosted backend also serving traffic that did not come through dorang. Refused on the endpoint alone as well as on the flag, because writing an endpoint with the flag off is how a change is staged and answering that with silence is how the block survived two documentation passes |
+| `credentials[].key_ref` and every other `*_ref` | No secret resolver ships. Use `key_env` or `key_file`; a vault agent that writes a file or exports a variable satisfies both |
+| `capacity.*.rpm`, `.tpm` | A rate is not a gauge. `models[].deployments[].limits[]` for a per-deployment rate, the key's own `rpm_limit`/`tpm_limit` for a per-caller one |
+| `cluster.capacity_mode: shared-redis` | The protocol ships and no client speaks it. Use `shared-pg`, which has the same published overshoot of `0` |
+| `metering.numeric.enabled: false` | Numeric accounting cannot be turned off. Reduce `metering.trace.sample_rate` |
+
+### 23.2a Designed and not in the schema at all
 
 | Design section | What is missing |
 |---|---|
@@ -1993,7 +2086,9 @@ providers:
     timeout: 120s
     max_concurrency: 24
     capacity_group: cloud-a-pool
-    usage_probe: {enabled: true, fetcher: openai, interval: 60s}
+    # No usage_probe: OpenAI publishes org-level historical spend behind an Admin
+    # key, which is a different subject from "what is left of THIS key" — so there
+    # is deliberately no `openai` fetcher, and naming one is a start-up error (§6.1).
   - name: plan-a
     kind: glm
     base_url: https://api.example-plan-a.invalid
@@ -2067,7 +2162,10 @@ Notes that matter at this tier:
 - The `plan-a` numbers are the shape the axes exist for: 7 per model *and* 7 per account means
   two models can reach 14 concurrent on one key while the account ceiling still holds at the
   provider-group level.
-- `usage_probe` on `cloud-a` is what makes quota reflect traffic that did not go through dorang
+- `usage_probe` is what makes quota reflect traffic that did not go through dorang, and it is
+  absent here because neither provider in this file has a prober. The three that do are `zai`,
+  `anthropic` (an OAuth subscription, §11.2b) and `deepseek`; see §6.1a for the `allowances`
+  that turn a reported percentage into a figure a rule can gate
   (§6.1). It is also what makes expiring-quota reporting meaningful at all.
 
 ### 24.3 Enterprise — two dependencies
@@ -2105,14 +2203,18 @@ providers:
     timeout: 300s
     max_concurrency: 256
     capacity_group: fleet
-    metrics: {enabled: true, endpoint: http://vllm.internal:8000/metrics, interval: 15s}
+    # No `metrics:` here: §12.4's scrape is refused at load (§6.2, §23.2). The
+    # least_busy below ranks on dorang's own occupancy of this provider's axis,
+    # which is exact and needs no poll.
   - name: cloud-a
     kind: openai
     base_url: https://api.example-cloud-a.invalid/v1
     timeout: 120s
     max_concurrency: 128
     capacity_group: cloud
-    usage_probe: {enabled: true, fetcher: openai, interval: 60s}
+    # No usage_probe: OpenAI publishes org-level historical spend behind an Admin
+    # key, which is a different subject from "what is left of THIS key" — so there
+    # is deliberately no `openai` fetcher, and naming one is a start-up error (§6.1).
 
 credentials:
   - {id: fleet-1, provider: fleet-vllm, key_file: /run/secrets/fleet.key, capacity_group: fleet-acct}

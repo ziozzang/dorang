@@ -117,6 +117,10 @@ HTTP는 Prometheus 스크레이프 포트뿐이다. 백엔드로 도달 불가�
 
 ## 3. 부하 신호
 
+> **이 절은 R17의 명세이지, 돌고 있는 경로의 서술이 아니다.** dorang에는 메트릭 스크레이퍼가
+> **없고** `providers[].metrics`는 로드에서 거부된다(CONFIG §6.2). `least_busy`는 dorang 자신의
+> 실시간 용량 점유율로, `highest_tps`는 측정된 초당 출력 토큰으로 순위를 매기며 둘 다 폴이 필요 없다.
+
 ### 3.1 스크레이프할 가치가 있는 메트릭
 
 모든 이름이 `{model_name, engine}`을 갖는다. `engine` 라벨은 data-parallel rank이며 **vLLM 자체

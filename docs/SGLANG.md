@@ -576,6 +576,10 @@ There is no per-request deadline field. Two global env vars, both disabled by de
 
 ## 4. Metrics
 
+> **This section is a specification for R17, not a description of a running path.** dorang
+> ships no metrics scraper and `providers[].metrics` is refused at load (CONFIG §6.2). `least_busy`
+> and `highest_tps` rank on dorang's own occupancy and measured throughput and need no poll.
+
 ### 4.1 The gate, and why it is better than vLLM's
 
 ```python
