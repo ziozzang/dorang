@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"math/bits"
 	"net/http"
 	"strings"
@@ -29,6 +30,46 @@ const (
 	DefaultRequestTimeout = 6000 * time.Second
 	// DefaultShutdownGrace is how long in-flight requests get after a SIGTERM.
 	DefaultShutdownGrace = 30 * time.Second
+
+	// DefaultReadHeaderTimeout bounds the client that connects and then says
+	// nothing at all. That client never reaches a handler, so it costs no
+	// capacity slot — what it exhausts is the listener's accept queue, which is
+	// why this is the shortest of the three.
+	DefaultReadHeaderTimeout = 30 * time.Second
+	// DefaultReadTimeout bounds the WHOLE request read — headers and body —
+	// measured from the moment the connection produced its first byte.
+	//
+	// It is the deadline the slow-body client needs, and that client is worse
+	// than the silent one: by the time a body is dribbling, the request has been
+	// admitted, [Server.ServeHTTP] has taken its in-flight slot, and the handler
+	// is parked inside Body.read. Without this it stayed there forever, holding
+	// the capacity reservation the drain and dorang_inflight_requests both count.
+	//
+	// Two minutes, and the number is the UPLOAD budget, not the generation
+	// budget. Thirty seconds of it can be spent waiting for headers; the
+	// remaining ninety carry a body up to [DefaultMaxBodyBytes], which is 32 MiB
+	// — about 2.9 Mbit/s for a maximal body, and hundreds of times the margin a
+	// normal chat completion needs. A deployment that accepts large audio or
+	// batch-input uploads from slow links raises it, which is what
+	// [Options.ReadTimeout] is for.
+	//
+	// It is emphatically NOT a write deadline. A legitimate response streams for
+	// minutes and a WriteTimeout would cut it; net/http clears the read deadline
+	// the moment the request body hits EOF (and again on Hijack, which is what
+	// keeps the WebSocket relay working), so a read deadline bounds only the
+	// half that is genuinely finished long before the answer begins.
+	DefaultReadTimeout = 2 * time.Minute
+	// DefaultIdleTimeout bounds a keep-alive connection between requests.
+	//
+	// Go's default for this is ReadTimeout, which would silently make the two
+	// one setting; they answer different questions and are set apart.
+	//
+	// Two minutes, chosen to be LONGER than the idle timeout of whatever sits in
+	// front: 60s on an AWS ALB, 75s for nginx's keepalive_timeout. The side that
+	// closes an idle connection should be the side that knows it is idle. If the
+	// gateway closes first, the proxy discovers the close by reusing a dead
+	// connection, and the client gets a 502 for a request that never left.
+	DefaultIdleTimeout = 2 * time.Minute
 	// DefaultOwnedBy fills the owned_by field of a model with no owner.
 	DefaultOwnedBy = "dorang"
 
@@ -115,6 +156,22 @@ type Options struct {
 	ReplayBudgetBytes int64
 	// RequestTimeout bounds one request; 0 uses [DefaultRequestTimeout].
 	RequestTimeout time.Duration
+	// ReadHeaderTimeout bounds reading the request headers; 0 uses
+	// [DefaultReadHeaderTimeout]. Negative removes the bound.
+	ReadHeaderTimeout time.Duration
+	// ReadTimeout bounds reading the whole request, body included; 0 uses
+	// [DefaultReadTimeout]. Negative removes the bound, which is what a
+	// deployment fronted by a proxy that already enforces one would say, and is
+	// the only way back to the unbounded behaviour.
+	//
+	// Raise it for large uploads over slow links; it does not bound the
+	// response, so a long generation is unaffected by it. See
+	// [DefaultReadTimeout] for why a read deadline is the right tool here and a
+	// write deadline is not.
+	ReadTimeout time.Duration
+	// IdleTimeout bounds a keep-alive connection between requests; 0 uses
+	// [DefaultIdleTimeout]. Negative removes the bound.
+	IdleTimeout time.Duration
 	// ShutdownGrace bounds the drain; 0 uses [DefaultShutdownGrace].
 	ShutdownGrace time.Duration
 	// PreStopDelay is how long [Server.Serve] keeps serving after readiness
@@ -177,6 +234,11 @@ type snapshot struct {
 	requestTimeout time.Duration
 	shutdownGrace  time.Duration
 	preStopDelay   time.Duration
+	// The three connection deadlines, already resolved: a negative Option is
+	// stored here as zero, which is what net/http spells "no deadline".
+	readHeaderTimeout time.Duration
+	readTimeout       time.Duration
+	idleTimeout       time.Duration
 
 	alwaysFull    bool
 	legacyHeaders bool
@@ -242,10 +304,15 @@ func (s *Server) Reload(opts Options) error {
 		requestTimeout: opts.RequestTimeout,
 		shutdownGrace:  opts.ShutdownGrace,
 		preStopDelay:   opts.PreStopDelay,
-		alwaysFull:     opts.AlwaysFullHeaders,
-		legacyHeaders:  opts.LegacyHeaders,
-		now:            opts.Now,
-		logf:           opts.Logf,
+
+		readHeaderTimeout: orDeadline(opts.ReadHeaderTimeout, DefaultReadHeaderTimeout),
+		readTimeout:       orDeadline(opts.ReadTimeout, DefaultReadTimeout),
+		idleTimeout:       orDeadline(opts.IdleTimeout, DefaultIdleTimeout),
+
+		alwaysFull:    opts.AlwaysFullHeaders,
+		legacyHeaders: opts.LegacyHeaders,
+		now:           opts.Now,
+		logf:          opts.Logf,
 	}
 	if snap.meter == nil {
 		snap.meter = nopMeter{}
@@ -269,6 +336,17 @@ func (s *Server) Reload(opts Options) error {
 	}
 	if snap.preStopDelay < 0 {
 		snap.preStopDelay = 0
+	}
+	if snap.readTimeout > 0 && snap.readTimeout < snap.readHeaderTimeout {
+		// net/http measures both from the same instant, so a read timeout inside
+		// the header timeout makes the header timeout unreachable. Saying so is
+		// better than silently honouring the smaller number under the other
+		// name.
+		return fmt.Errorf("server: ReadTimeout (%s) is shorter than ReadHeaderTimeout "+
+			"(%s); both are measured from the connection's first byte, so the header "+
+			"timeout could never fire and the whole-request deadline would be "+
+			"enforcing it instead",
+			snap.readTimeout, snap.readHeaderTimeout)
 	}
 	if snap.now == nil {
 		snap.now = time.Now
@@ -367,6 +445,20 @@ func appendHex64(dst []byte, v uint64) []byte {
 		dst = append(dst, hexDigits[(v>>uint(i))&0xf])
 	}
 	return dst
+}
+
+// orDeadline resolves one connection deadline. Zero is absence and takes the
+// default; negative is the explicit "no deadline" and becomes the zero net/http
+// reads as one. They are different answers for the same reason
+// [Options.PreStopDelay]'s zero is.
+func orDeadline(v, def time.Duration) time.Duration {
+	switch {
+	case v == 0:
+		return def
+	case v < 0:
+		return 0
+	}
+	return v
 }
 
 // ServeHTTP implements [net/http.Handler].

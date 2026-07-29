@@ -51,6 +51,13 @@
 // exclusions are counted separately and do NOT raise Degraded: they are the
 // configured policy working, not a failure.
 //
+// The numeric path loses a count in exactly one place, and it is counted there
+// too: an event handed to a meter that has already been closed. Close runs the
+// last flush there will ever be, so a Record after it has nowhere to land; it is
+// refused, counted in Stats.RecordsRefusedClosed, and raises Degraded with
+// ReasonClosed. The window is shutdown, where the drain races this meter's own
+// close, which is precisely where a silent drop would be hardest to notice.
+//
 // # Cost on the hot path
 //
 // Record must not block, must not allocate, and must not take a contended

@@ -63,6 +63,10 @@ type Meter struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
+	// closed is raised by Close BEFORE it stops anything, so there is no
+	// interval in which a Record can be accepted by a meter that will never
+	// flush again. See Record and Close.
+	closed atomic.Bool
 
 	st        statsCounters
 	degraded  atomic.Uint32
@@ -76,6 +80,7 @@ type statsCounters struct {
 	tracesBudgetDropped atomic.Int64
 	droppedQueue        atomic.Int64
 	droppedSpool        atomic.Int64
+	refusedClosed       atomic.Int64
 	spooled             atomic.Int64
 	tracesFlushed       atomic.Int64
 	bucketsFlushed      atomic.Int64
@@ -218,8 +223,20 @@ func (m *Meter) lockShard() *shard {
 // carries a request id, survives sampling and fits the daily byte budget --
 // and if it is dropped for any other reason, the drop is counted and Degraded
 // rises.
+//
+// After Close the event is REFUSED rather than accepted. It is the one place
+// the numeric path can lose a count, and it used not to be visible: the event
+// was added to a shard nothing would merge again and counted as recorded, so
+// the drop happened at the moment it was hardest to notice -- shutdown, with
+// the drain racing this meter's own close -- and metering_degraded, the single
+// signal that exists so a loss is never silent, could not see it. Now it can.
 func (m *Meter) Record(ev Event) {
 	if m == nil || m.off {
+		return
+	}
+	if m.closed.Load() {
+		m.st.refusedClosed.Add(1)
+		m.setDegraded(ReasonClosed)
 		return
 	}
 
@@ -462,8 +479,11 @@ func (m *Meter) ship(ctx context.Context) error {
 // maybeRecover clears Degraded once a whole ship cycle has completed with the
 // spool empty and no new drop since the previous cycle. One cycle of
 // hysteresis keeps a steady drop rate from flapping the health signal.
+// The closed refusals are in the total, so a Record that lands during Close's
+// own final ship keeps the signal raised rather than being cleared by the very
+// cycle it happened inside.
 func (m *Meter) maybeRecover() {
-	total := m.st.droppedQueue.Load() + m.st.droppedSpool.Load()
+	total := m.st.droppedQueue.Load() + m.st.droppedSpool.Load() + m.st.refusedClosed.Load()
 	if total == m.dropsSeen.Load() {
 		m.degraded.Store(uint32(ReasonNone))
 		return
@@ -507,7 +527,9 @@ func (m *Meter) Stats() Stats {
 	deg, reason := m.Degraded()
 
 	return Stats{
-		Recorded:            m.st.recorded.Load(),
+		Recorded:             m.st.recorded.Load(),
+		RecordsRefusedClosed: m.st.refusedClosed.Load(),
+
 		TracesRecorded:      m.st.tracesRecorded.Load(),
 		TracesSampledOut:    m.st.tracesSampledOut.Load(),
 		TracesBudgetDropped: m.st.tracesBudgetDropped.Load(),
@@ -546,6 +568,14 @@ func (m *Meter) Close() error {
 		return nil
 	}
 	m.closeOnce.Do(func() {
+		// Raised first, and before anything is stopped. The final flush below
+		// is the LAST thing that will ever move a count out of this meter, so
+		// an event accepted after this point is an event with nowhere to go;
+		// refusing it here is what makes the loss a number instead of a
+		// silence. A caller still holding a request at this moment has a race
+		// with the drain, and the drain is where that is fixed -- but it has to
+		// be VISIBLE first, which is what this is.
+		m.closed.Store(true)
 		close(m.stop)
 		m.wg.Wait()
 

@@ -68,6 +68,17 @@ func (c *AuthCollector) Collect(w *Writer) {
 		"Store reads issued for a credential miss.")
 	w.Uint(st.StoreCalls)
 
+	w.Metric("dorang_auth_lookup_throttled_total", Counter,
+		"Credential lookups refused WITHOUT consulting the store because the "+
+			"unknown-key budget was empty. Every distinct unknown key used to be one "+
+			"database round trip an unauthenticated caller could buy for nothing; this "+
+			"is what that amplifier costs now. Read against "+
+			"dorang_auth_store_calls_total: this one rising while that one flattens is "+
+			"the bound holding. A sustained non-zero value with no attack means the "+
+			"authenticator's miss budget is below the deployment's real rate of lookups "+
+			"that find nothing — a client retrying a key that was revoked, most likely.")
+	w.Uint(st.LookupsThrottled)
+
 	w.Metric("dorang_auth_coalesced_total", Counter,
 		"Misses that joined an in-flight store read instead of issuing their own. A "+
 			"cold start on a hot key should produce one store call, not a thundering herd.")

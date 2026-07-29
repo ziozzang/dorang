@@ -69,6 +69,26 @@ const (
 	DefaultStoreTimeout = 2 * time.Second
 	DefaultRehashQueue  = 256
 
+	// DefaultMissRate and DefaultMissBurst bound the store lookups an
+	// unauthenticated caller can force (see missbudget.go).
+	//
+	// The numbers are chosen against what a LEGITIMATE unknown key costs,
+	// because that is the only traffic the bound can hurt. A lookup that finds
+	// its row refunds its token immediately, so the only thing these limit is
+	// fruitless lookups: a key that was never created, or was deleted. A
+	// deployment provisions keys at human rates and deletes them at human
+	// rates, so 100 fruitless lookups per second is four orders of magnitude
+	// above the real rate and still turns "one database round trip per request,
+	// unbounded" into "100 per second, whatever the request rate".
+	//
+	// The burst is five seconds of the rate. It has to absorb the one
+	// legitimate cluster of fruitless lookups there is — a client that keeps
+	// retrying a key an operator has just revoked, on a node that has not
+	// cached the refusal yet — without the sustained rate having to be sized
+	// for it.
+	DefaultMissRate  = 100.0
+	DefaultMissBurst = 500
+
 	// mergeThreshold is how many PROMOTABLE entries may accumulate in the
 	// overlay before they are folded into the lock-free snapshot. Folding
 	// copies the snapshot, so it is done in batches: a flood of unknown keys
@@ -154,6 +174,18 @@ type Config struct {
 	Tiers *TierSet
 	// StoreTimeout bounds one store lookup.
 	StoreTimeout time.Duration
+	// MissRate bounds, per second, the store lookups that may be spent on index
+	// keys the store does not know. 0 uses [DefaultMissRate]; negative removes
+	// the bound, which restores the amplifier and is only sensible in a test
+	// that is measuring something else.
+	//
+	// It bounds FRUITLESS lookups only: a lookup that returns a row gives its
+	// token straight back, so first use of a real credential — the whole of a
+	// cold node's traffic — is not rate limited at all. See missbudget.go for
+	// why that asymmetry is the entire design.
+	MissRate float64
+	// MissBurst is the depth of that bucket; 0 uses [DefaultMissBurst].
+	MissBurst int
 	// RehashQueue is the depth of the asynchronous upgrade queue.
 	RehashQueue int
 	// Now overrides the clock, for tests.
@@ -218,6 +250,16 @@ type Stats struct {
 	// NegativeCached counts entries cached at the short TTL because the row was
 	// found and refusing. It is what makes rule 3 observable.
 	NegativeCached uint64
+	// LookupsThrottled counts credential lookups refused WITHOUT consulting the
+	// store because the unknown-key budget was empty.
+	//
+	// It is the number that says the amplifier is being pushed on. StoreCalls
+	// stops rising and this one starts, which is the whole shape of the bound:
+	// a miss storm past the budget costs the database nothing and costs the
+	// caller a 503. A sustained non-zero value on a deployment with no attacker
+	// means the budget is sized below the deployment's real rate of fruitless
+	// lookups, and [Config.MissRate] is the knob.
+	LookupsThrottled uint64
 	// Merges counts how many times the overlay has been folded into a fresh
 	// snapshot. Each fold copies the whole snapshot under the exclusive lock,
 	// so this is the number an unknown-key flood must not be able to drive:
@@ -262,6 +304,10 @@ type Authenticator struct {
 
 	fl flight[Lookup, *entry]
 
+	// budget bounds the store lookups an unknown index key can force. Nil means
+	// unbounded, which is what MissRate below zero asks for.
+	budget *missBudget
+
 	rehashCh   chan rehashJob
 	rehashDone chan struct{}
 	closeOnce  sync.Once
@@ -269,7 +315,7 @@ type Authenticator struct {
 	hits, misses, storeCalls, coalesced, rejected, masterHits atomic.Uint64
 	rehashQueued, rehashDropped, rehashOK                     atomic.Uint64
 	invalidations, dropped, published, publishFails, rejoins  atomic.Uint64
-	negativeCached, refreshes                                 atomic.Uint64
+	negativeCached, refreshes, throttled                      atomic.Uint64
 }
 
 // ErrNegativeTTLTooLong reports a configuration that holds a refusal for longer
@@ -326,6 +372,18 @@ func New(cfg Config) (*Authenticator, error) {
 	if a.negTTL > a.entTTL {
 		return nil, fmt.Errorf("%w: NegativeTTL %s > EntryTTL %s", ErrNegativeTTLTooLong, a.negTTL, a.entTTL)
 	}
+	// A negative rate is the explicit "no bound" and is honoured; zero is
+	// absence and takes the default. The two have to stay different answers,
+	// for the reason PreStopDelay's zero does.
+	rate := cfg.MissRate
+	if rate == 0 {
+		rate = DefaultMissRate
+	}
+	burst := cfg.MissBurst
+	if burst <= 0 {
+		burst = DefaultMissBurst
+	}
+	a.budget = newMissBudget(rate, burst, now())
 	empty := map[Lookup]*entry{}
 	a.snap.Store(&empty)
 
@@ -450,13 +508,14 @@ func (a *Authenticator) Stats() Stats {
 		SnapshotSize:  len(*a.snap.Load()),
 		OverlaySize:   ov,
 
-		Invalidations:  a.invalidations.Load(),
-		Dropped:        a.dropped.Load(),
-		Published:      a.published.Load(),
-		PublishFailed:  a.publishFails.Load(),
-		Rejoins:        a.rejoins.Load(),
-		Refreshes:      a.refreshes.Load(),
-		NegativeCached: a.negativeCached.Load(),
+		Invalidations:    a.invalidations.Load(),
+		Dropped:          a.dropped.Load(),
+		Published:        a.published.Load(),
+		PublishFailed:    a.publishFails.Load(),
+		Rejoins:          a.rejoins.Load(),
+		Refreshes:        a.refreshes.Load(),
+		NegativeCached:   a.negativeCached.Load(),
+		LookupsThrottled: a.throttled.Load(),
 	}
 }
 
@@ -657,6 +716,20 @@ func (a *Authenticator) fetch(ctx context.Context, l Lookup) (*entry, error) {
 		return nil, refuse(ReasonUnavailable, "", "request cancelled")
 	}
 	e, err, shared := a.fl.do(l, func() (*entry, error) {
+		// The budget is taken INSIDE the flight, so it is charged once per
+		// distinct index key in flight rather than once per caller: coalesced
+		// followers share the leader's answer and must share its cost too, or
+		// a burst on one key would spend the bound that exists for a burst on
+		// many.
+		if !a.budget.take(a.now()) {
+			a.throttled.Add(1)
+			// Not ReasonUnknownKey: the store was never asked. Answering "no
+			// such key" for a key nobody looked up is a lie that a client
+			// cannot retry past, and it would be wrong for the newly created
+			// key that arrives during a flood.
+			return nil, refuse(ReasonUnavailable, "",
+				"credential lookups for unknown keys are rate limited; retry")
+		}
 		// The leader's work is detached from its caller's context: a follower's
 		// result must not depend on whether an unrelated caller cancelled.
 		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.stoTO)
@@ -665,12 +738,19 @@ func (a *Authenticator) fetch(ctx context.Context, l Lookup) (*entry, error) {
 		rec, err := a.store.LoadByLookup(c, l.Hex())
 		switch {
 		case errors.Is(err, ErrNotFound):
+			// The token stays spent. This is the lookup the bound is for.
 			ne := &entry{expires: a.now().Add(a.negTTL).UnixNano()}
 			a.insert(l, ne)
 			return ne, nil
 		case err != nil:
+			// Also stays spent: a store that cannot answer is a store that must
+			// not be asked without limit either.
 			return nil, refuse(ReasonUnavailable, "", "")
 		}
+		// A real credential's first use on this node. It gives the token back,
+		// so a cold snapshot resolving thousands of live keys is not throttled
+		// and never has been the thing this bound is about.
+		a.budget.refund()
 		p := rec.Principal
 		// §11.2c rule 3. A row that was found but REFUSES is a negative answer,
 		// and it is cached for the negative lifetime rather than the serving

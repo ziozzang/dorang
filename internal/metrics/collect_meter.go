@@ -29,7 +29,7 @@ func (c *MeterCollector) CollectorName() string { return "meter" }
 // reason the health states are.
 var meterReasons = [...]meter.Reason{
 	meter.ReasonNone, meter.ReasonQueueFull, meter.ReasonSpoolFull,
-	meter.ReasonSpoolError, meter.ReasonSinkError,
+	meter.ReasonSpoolError, meter.ReasonSinkError, meter.ReasonClosed,
 }
 
 // Collect implements [Collector].
@@ -40,6 +40,15 @@ func (c *MeterCollector) Collect(w *Writer) {
 		"Events accepted by the numeric path. Exact: DESIGN §12.1 gives the numeric path "+
 			"no drop at all, so cost, tokens and error counts survive any back-pressure.")
 	w.Int(st.Recorded)
+
+	w.Metric("dorang_meter_records_refused_closed_total", Counter,
+		"Completed requests handed to the meter after it was closed, and refused. The "+
+			"only way the numeric path of DESIGN §12.1 can lose a count, and the reason "+
+			"it is a counter rather than a silence: the window is shutdown, where the "+
+			"drain races the meter's own close. Any non-zero value raises "+
+			"dorang_metering_degraded with reason meter_closed, and means requests "+
+			"finished after the ledger stopped listening.")
+	w.Int(st.RecordsRefusedClosed)
 
 	w.Metric("dorang_meter_dropped_total", Counter,
 		"Trace payloads lost (DESIGN §12.3). The sum of the queue and spool drops below. "+

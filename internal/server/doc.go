@@ -30,6 +30,23 @@
 //     and never holds a whole body; TestStreamRelayDoesNotBuffer moves 16 MiB
 //     through it and asserts total allocation stays under a megabyte.
 //
+// # Connection deadlines
+//
+// Three, and each bounds a different client. [Options.ReadHeaderTimeout] bounds
+// the one that connects and says nothing — it never reaches a handler, and what
+// it exhausts is the accept queue. [Options.ReadTimeout] bounds its sibling, the
+// one that sends complete headers and then dribbles a body: that request has
+// been admitted, holds an in-flight slot and a handler, and is the more
+// expensive of the two. [Options.IdleTimeout] bounds a keep-alive connection
+// between requests.
+//
+// There is deliberately no write deadline. A legitimate response streams for
+// minutes, and net/http measures a WriteTimeout from the start of the request,
+// so it would cut exactly the traffic this gateway exists to carry. A READ
+// deadline does not have that problem: net/http clears it the moment the request
+// body reaches EOF, and again on Hijack, so it bounds only the half of the
+// exchange that finishes long before the answer begins.
+//
 // # Surface
 //
 // The eleven T0 paths of COMPATIBILITY §0 are registered by [New]. Everything

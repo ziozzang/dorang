@@ -59,6 +59,16 @@
 // runtime expire by TTL; the snapshot itself is replaced by [Authenticator.Load]
 // or dropped by [Authenticator.Invalidate].
 //
+// The store lookup a miss performs is BUDGETED, because a cache alone cannot
+// bound it: a negative entry is keyed by the index key, so a caller presenting
+// distinct invented credentials never hits one and every request was a database
+// round trip bought for free. [Config.MissRate] bounds the lookups that find
+// nothing; a lookup that returns a row gives its token straight back, so first
+// use of a real credential — a cold node's entire traffic — is never throttled.
+// Past the budget the answer is [ReasonUnavailable], not [ReasonUnknownKey]: the
+// store was not asked, so "no such key" is not something the gateway knows. See
+// missbudget.go.
+//
 // Verification recomputes the digest on every request from a stack buffer:
 // one sha256 of the token yields both the index key and the legacy digest,
 // and two more compressions yield the HMAC. The uncontended path allocates

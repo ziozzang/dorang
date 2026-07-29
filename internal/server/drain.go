@@ -85,15 +85,7 @@ func (s *Server) serveListener(ctx context.Context, impatient <-chan struct{}, l
 	baseCtx, cancelInFlight := context.WithCancelCause(context.Background())
 	defer cancelInFlight(ErrShuttingDown)
 
-	hs := &http.Server{
-		Handler:     s,
-		BaseContext: func(net.Listener) context.Context { return baseCtx },
-		// The gateway's own request timeout bounds the handler; a
-		// ReadHeaderTimeout bounds the client that connects and then says
-		// nothing, which is a different failure and the one that exhausts a
-		// listener's accept queue.
-		ReadHeaderTimeout: 30 * time.Second,
-	}
+	hs := s.newHTTPServer(baseCtx)
 	errc := make(chan error, 1)
 	go func() {
 		err := hs.Serve(ln)
@@ -130,6 +122,42 @@ func (s *Server) serveListener(ctx context.Context, impatient <-chan struct{}, l
 	drainErr := s.drain(hs, cancelInFlight)
 	<-errc
 	return drainErr
+}
+
+// newHTTPServer builds the [net/http.Server] the listener is served with.
+//
+// It is a function rather than a literal inside serveListener so that the
+// connection deadlines can be asserted as CONFIGURATION as well as behaviour: a
+// deadline that is set correctly and never reaches net/http is the same outage
+// as one that was never set.
+func (s *Server) newHTTPServer(baseCtx context.Context) *http.Server {
+	cfg := s.snap.Load()
+	return &http.Server{
+		Handler:     s,
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
+		// The gateway's own request timeout bounds the handler; a
+		// ReadHeaderTimeout bounds the client that connects and then says
+		// nothing, which is a different failure and the one that exhausts a
+		// listener's accept queue.
+		ReadHeaderTimeout: cfg.readHeaderTimeout,
+		// And ReadTimeout bounds that client's sibling, which is worse: the one
+		// that sends complete headers and then DRIBBLES a body. It is past the
+		// accept queue, past the gate, holding an in-flight slot and parked in
+		// Body.read, and before this it held all of that for as long as it cared
+		// to. net/http applies this to the whole request read and clears it when
+		// the body hits EOF, so it costs a streaming response nothing: the body
+		// is finished long before the first token comes back.
+		ReadTimeout: cfg.readTimeout,
+		// IdleTimeout is set explicitly because net/http's default for it is
+		// ReadTimeout, and a keep-alive connection sitting between requests is a
+		// different question from a request being read.
+		IdleTimeout: cfg.idleTimeout,
+		// Deliberately no WriteTimeout. It is measured from the start of the
+		// request and would cut a legitimate long generation mid-stream, which
+		// is the failure this gateway exists to avoid; the read half above is
+		// the part that can be bounded without lying about how long an answer
+		// takes.
+	}
 }
 
 // ServeSignals is Serve with SIGINT and SIGTERM wired to the drain.

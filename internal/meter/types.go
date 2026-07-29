@@ -420,6 +420,17 @@ const (
 	// ReasonSinkError means the sink rejected a write. Traces are still
 	// durable in the spool; this is a warning, not a loss.
 	ReasonSinkError
+	// ReasonClosed means an event was handed to a meter that had already been
+	// closed, and was refused.
+	//
+	// It is a degradation and not a programming error, because the window it
+	// describes is a real one that a correct caller can land in: shutdown, where
+	// the drain is racing the meter's own close. Before this existed, such an
+	// event was counted as recorded, written into an accumulator nothing would
+	// flush again, and lost — the numeric path's "no drop at all" quietly
+	// stopped being true at exactly the moment nobody was looking. A refusal
+	// that raises this is a refusal an operator can see.
+	ReasonClosed
 	numReasons
 )
 
@@ -429,6 +440,7 @@ var reasonNames = [numReasons]string{
 	ReasonSpoolFull:  "spool_full",
 	ReasonSpoolError: "spool_error",
 	ReasonSinkError:  "sink_error",
+	ReasonClosed:     "meter_closed",
 }
 
 func (r Reason) String() string {
@@ -443,8 +455,20 @@ func (r Reason) String() string {
 // in practice.
 type Stats struct {
 	// Recorded is the number of events accepted by the numeric path. It is
-	// exact: the numeric path has no drop.
+	// exact: the numeric path has no drop while the meter is open, and an event
+	// handed to a closed one is counted in RecordsRefusedClosed rather than
+	// here.
 	Recorded int64
+
+	// RecordsRefusedClosed is the number of events refused because [Meter.Close]
+	// had already run. Any non-zero value raises Degraded with ReasonClosed.
+	//
+	// It is a failure counter and not a policy one. There is no configuration
+	// under which losing a completed request's cost is correct, so it reaches
+	// the same signal a dropped trace does — the whole reason it exists is that
+	// the alternative, which is what shipped, was to count the event as recorded
+	// and let it vanish.
+	RecordsRefusedClosed int64
 
 	// TracesRecorded is the number of events that carried a trace payload and
 	// survived sampling and the byte budget.
