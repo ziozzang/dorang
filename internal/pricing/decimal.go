@@ -102,6 +102,79 @@ func (a u128) mul(b uint64) (u128, bool) {
 	return q, ok
 }
 
+// divmod divides by a 64-bit value, returning the quotient and the remainder. It is exact:
+// the two Div64 steps carry the remainder of the high limb into the low one.
+func (a u128) divmod(d uint64) (u128, uint64) {
+	q1, r := bits.Div64(0, a.hi, d) // 0 < d always, so Div64 cannot panic here
+	q0, r2 := bits.Div64(r, a.lo, d)
+	return u128{hi: q1, lo: q0}, r2
+}
+
+// digitChunk is the largest power of ten that fits in a uint64, so [u128.text] emits
+// nineteen digits per division instead of one.
+const digitChunk = 10_000_000_000_000_000_000
+
+// text renders a u128 as decimal digits, with no sign and no separators.
+//
+// It exists because a subscription accumulator has to cross a process boundary
+// ([Catalog.SnapshotState]) and the value it carries is atto-scaled: a 100 USD plan is
+// 10^20 atto, which is five times larger than a uint64 can hold. Rendering it as digits
+// keeps the durable form exact AND legible to whoever reads the table, where a pair of
+// 64-bit limbs would be neither.
+func (a u128) text() string {
+	if a.isZero() {
+		return "0"
+	}
+	// 2^128-1 is 39 digits.
+	var buf [40]byte
+	i := len(buf)
+	for {
+		q, r := a.divmod(digitChunk)
+		if q.isZero() {
+			// The most significant chunk: no leading zeros. r > 0 here, because
+			// a quotient and a remainder that are both zero mean a was zero.
+			for r > 0 {
+				i--
+				buf[i] = byte('0' + r%10)
+				r /= 10
+			}
+			return string(buf[i:])
+		}
+		// An inner chunk keeps its leading zeros, or 1000000000000000000001 loses
+		// the digits between the ones that survived.
+		for n := 0; n < 19; n++ {
+			i--
+			buf[i] = byte('0' + r%10)
+			r /= 10
+		}
+		a = q
+	}
+}
+
+// parseU128 reads back what [u128.text] wrote. An empty string is zero, so a durable row
+// whose value was never written reads as "nothing attributed" rather than as an error.
+func parseU128(s string) (u128, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return u128{}, nil
+	}
+	var v u128
+	for i := 0; i < len(t); i++ {
+		if t[i] < '0' || t[i] > '9' {
+			return u128{}, errBadDecimal
+		}
+		m, ok := v.mul(10)
+		if !ok {
+			return u128{}, ErrOverflow
+		}
+		v, ok = m.add(u64To128(uint64(t[i] - '0')))
+		if !ok {
+			return u128{}, ErrOverflow
+		}
+	}
+	return v, nil
+}
+
 // amt is a signed exact amount in atto-units. Sign-magnitude keeps the 128-bit primitives
 // unsigned and makes the discount case (a negative adjustment) explicit rather than a
 // wraparound waiting to happen.

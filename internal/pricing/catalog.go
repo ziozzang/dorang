@@ -298,6 +298,147 @@ func (c *Catalog) AdoptState(prev *Catalog) {
 	c.carryMu.Unlock()
 }
 
+// SubscriptionState is one subscription rule's accumulator as it crosses a PROCESS
+// boundary. [Catalog.AdoptState] carries the same thing across a configuration reload,
+// which is a different boundary and needs no serialization.
+//
+// It is the whole durable form: which period is open, and how much of that period's plan
+// cost has already been attributed to rows. Attributed is atto-scaled decimal digits
+// rather than a number, because a 100 USD plan is 10^20 atto and no 64-bit integer holds
+// it; see [u128.text].
+type SubscriptionState struct {
+	// RuleID is the fixed_subscription rule this belongs to. State is carried per rule
+	// id, so a catalog that no longer declares the rule simply ignores the row.
+	RuleID string
+	// PeriodStart is the beginning of the period the accumulator is open on, in the
+	// rule's own location.
+	PeriodStart time.Time
+	// Attributed is the plan cost this period has already attributed, in atto-units of
+	// the catalog currency, as exact decimal digits. An empty string is zero.
+	Attributed string
+}
+
+// SnapshotState renders the running accumulators for a caller that will persist them.
+//
+// It projects each accumulator forward to `at` rather than reporting where it stands.
+// That is deliberate and it is DESIGN §9.6's rule applied to a second counter: **the
+// durable record is advanced before the amount it covers is spent, so it is always at or
+// ahead of reality.** A process that dies between checkpoints therefore resumes having
+// attributed slightly MORE than it really did — the period attributes a little less than
+// the plan cost, which §8.1 allows — instead of resuming behind and attributing a slice
+// of the period twice, which §8.1 forbids outright.
+//
+// A caller checkpointing on a timer passes now + one interval; a caller checkpointing on
+// a clean shutdown passes now, because nothing is about to be lost.
+//
+// It mutates nothing: the in-memory accumulator keeps attributing normally inside the
+// projected window, and a process that survives the interval loses nothing at all.
+func (c *Catalog) SnapshotState(at time.Time) []SubscriptionState {
+	if len(c.subs) == 0 {
+		return nil
+	}
+	out := make([]SubscriptionState, 0, len(c.subs))
+	for id, st := range c.subs {
+		snap := st.snap.Load()
+		if snap == nil {
+			// Nothing has settled against this rule in this process. There is no
+			// accumulator to carry, and writing a zero would pull a shared record
+			// backwards on a node that has one.
+			continue
+		}
+		attributed := snap.attributed
+		if r := st.rule; r != nil && !at.Before(snap.periodStart) {
+			_, end := periodBounds(r.period, snap.periodStart, r.loc)
+			if ahead, err := accrue(r.amountAtto, at, snap.periodStart, end); err == nil &&
+				ahead.cmp(attributed) > 0 {
+				attributed = ahead
+			}
+		}
+		out = append(out, SubscriptionState{
+			RuleID:      id,
+			PeriodStart: snap.periodStart,
+			Attributed:  attributed.text(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RuleID < out[j].RuleID })
+	return out
+}
+
+// RestoreState adopts accumulators that were persisted by an earlier process.
+//
+// This is the process-boundary half of [Catalog.AdoptState], and without it a restart is
+// a billing event in exactly the way a reload used to be: the accumulator lives in
+// memory, a new process builds an empty one, and the open period attributes its whole
+// elapsed share again. Measured before this existed: **180.46 USD attributed of a 100.00
+// USD monthly plan across two process starts**, with the second start's whole 90.23 USD
+// share landing on the first request after the restart — which internal/app reserves
+// against THAT request's budget, so a brand-new key with a 1.00 USD ceiling was refused
+// `400 budget_exceeded` on its first ever request.
+//
+// # The clock check here is the one that can disagree
+//
+// `now` is this process's reading of the present. `s.PeriodStart` was stamped by whatever
+// process wrote the row, which may be a different process on a different host with a
+// different clock — and that is what makes the comparison below a real test rather than a
+// tautology. The same comparison inside [Catalog.Settle] is not: there the row's stamp and
+// the catalog's clock are two readings of ONE clock, taken in order, so the stamp can
+// never be the later of the two and the clamp there can never fire in a default
+// deployment. An NTP step, a VM resume or a bad RTC moves both of those readings together;
+// it does not move this one, because the other observation is already written down.
+//
+// A stored period that has not begun yet is re-dated to the open one rather than dropped.
+// Dropping it would let the open period attribute its whole plan cost again on top of
+// whatever the future-stamped writer already booked; re-dating keeps the attributed total
+// as a bound, so the open period attributes only the remainder and the next period still
+// opens at zero.
+//
+// It returns the number of accumulators adopted, for the caller's log line.
+func (c *Catalog) RestoreState(states []SubscriptionState, now time.Time) (int, error) {
+	adopted := 0
+	for _, s := range states {
+		st := c.subs[s.RuleID]
+		if st == nil {
+			// A rule the running configuration no longer declares. Its row stays in
+			// the store — a rule that comes back should find its period where it
+			// left it — and nothing here needs it.
+			continue
+		}
+		attributed, err := parseU128(s.Attributed)
+		if err != nil {
+			return adopted, fmt.Errorf("pricing: subscription state for %q: %w", s.RuleID, err)
+		}
+		start := s.PeriodStart
+		if start.IsZero() {
+			continue
+		}
+		if r := st.rule; r != nil {
+			// The clamp. Two observations: the stamp the stored row carries, and
+			// this process's own present.
+			if openStart, _ := periodBounds(r.period, now, r.loc); start.After(openStart) {
+				start = openStart
+			}
+			// And never above one plan cost, whatever the row says: a stored value
+			// larger than the plan the running configuration declares would make the
+			// period attribute nothing for the rest of its life.
+			if attributed.cmp(r.amountAtto) > 0 {
+				attributed = r.amountAtto
+			}
+		}
+		st.mu.Lock()
+		cur := st.snap.Load()
+		// A restore never pulls an accumulator backwards. A node that has already
+		// settled rows in this period holds the more advanced figure, and adopting a
+		// staler durable row over it would re-attribute the difference.
+		if cur == nil || start.After(cur.periodStart) ||
+			(start.Equal(cur.periodStart) && attributed.cmp(cur.attributed) > 0) {
+			st.snap.Store(&subSnapshot{periodStart: start, attributed: attributed})
+			adopted++
+		}
+		st.mu.Unlock()
+	}
+	return adopted, nil
+}
+
 // carrySet holds the sub-nano remainder of each rounded field for one settlement bucket.
 type carrySet struct {
 	marginal     int64
@@ -315,6 +456,10 @@ type carrySet struct {
 type subState struct {
 	mu   sync.Mutex
 	snap atomic.Pointer[subSnapshot]
+	// rule is the compiled rule this accumulator belongs to, so that the state can be
+	// projected and clamped ([Catalog.SnapshotState], [Catalog.RestoreState]) without a
+	// scan over every rule in the catalog. It is written once, at compile time.
+	rule *rule
 }
 
 // subSnapshot is what a period has already attributed, not what it has already used.
@@ -833,7 +978,7 @@ func (c *Catalog) buildIndex() {
 			ix.defaults = append(ix.defaults, r)
 		}
 		if r.class == ClassSubscription {
-			c.subs[r.id] = &subState{}
+			c.subs[r.id] = &subState{rule: r}
 		}
 	}
 	c.appliedCap = 1

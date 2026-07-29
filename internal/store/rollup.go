@@ -21,6 +21,13 @@ type UsageDelta struct {
 	ReasoningTokens  int64
 	TotalTokens      int64
 	CostNano         int64
+	// MarginalNano and SubscriptionNano decompose CostNano by pricing class
+	// (DESIGN §8.1). They are two columns and not one derived from the other:
+	// the classes compose as marginal + subscription, THEN adjustments in
+	// order, so neither can be recovered from the total once a discount rule
+	// exists.
+	MarginalNano     int64
+	SubscriptionNano int64
 	LatencyMSSum     int64
 }
 
@@ -34,6 +41,8 @@ func (d *UsageDelta) Add(o UsageDelta) {
 	d.ReasoningTokens += o.ReasoningTokens
 	d.TotalTokens += o.TotalTokens
 	d.CostNano += o.CostNano
+	d.MarginalNano += o.MarginalNano
+	d.SubscriptionNano += o.SubscriptionNano
 	d.LatencyMSSum += o.LatencyMSSum
 }
 
@@ -96,6 +105,10 @@ func (b RollupBatch) Observe(r RequestLog) {
 		ReasoningTokens:  r.ReasoningTokens,
 		TotalTokens:      r.TotalTokens,
 		CostNano:         r.CostNano,
+		// The decomposition travels with the total here too, or an aggregate
+		// built from ledger rows would disagree with the rows it was built from.
+		MarginalNano:     r.MarginalCostNano,
+		SubscriptionNano: r.SubscriptionCostNano,
 		LatencyMSSum:     r.LatencyMS,
 	}
 	if r.Status >= 400 {
@@ -217,7 +230,7 @@ func sortRollupRows(rows []rollupRow) {
 }
 
 const rollupCounters = `requests, errors, prompt_tokens, completion_tokens, cached_tokens,
-	reasoning_tokens, total_tokens, cost_nano, latency_ms_sum`
+	reasoning_tokens, total_tokens, cost_nano, marginal_nano, subscription_nano, latency_ms_sum`
 
 func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol string, rows []rollupRow, now int64) error {
 	if len(rows) == 0 {
@@ -230,22 +243,23 @@ func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol 
 	}
 	sortRollupRows(rows)
 
-	// 12 bound parameters per row; chunked well under SQLite's per-statement
+	// 14 bound parameters per row; chunked well under SQLite's per-statement
 	// parameter ceiling.
 	for chunk := range chunks(rows, 500) {
 		var b strings.Builder
 		b.WriteString("INSERT INTO " + table + " (bucket_start, " + dimCol + ", " + rollupCounters + ", updated_at) VALUES ")
-		args := make([]any, 0, len(chunk)*12)
+		args := make([]any, 0, len(chunk)*14)
 		for i := range chunk {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(valuesTuple(12))
+			b.WriteString(valuesTuple(14))
 			r := &chunk[i]
 			args = append(args, r.bucket, r.dim,
 				r.d.Requests, r.d.Errors, r.d.PromptTokens, r.d.CompletionTokens,
 				r.d.CachedTokens, r.d.ReasoningTokens, r.d.TotalTokens,
-				r.d.CostNano, r.d.LatencyMSSum, now)
+				r.d.CostNano, r.d.MarginalNano, r.d.SubscriptionNano,
+				r.d.LatencyMSSum, now)
 		}
 		b.WriteString(`
 			ON CONFLICT (bucket_start, ` + dimCol + `) DO UPDATE SET
@@ -257,6 +271,8 @@ func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol 
 			  reasoning_tokens  = ` + table + `.reasoning_tokens  + excluded.reasoning_tokens,
 			  total_tokens      = ` + table + `.total_tokens      + excluded.total_tokens,
 			  cost_nano         = ` + table + `.cost_nano         + excluded.cost_nano,
+			  marginal_nano     = ` + table + `.marginal_nano     + excluded.marginal_nano,
+			  subscription_nano = ` + table + `.subscription_nano + excluded.subscription_nano,
 			  latency_ms_sum    = ` + table + `.latency_ms_sum    + excluded.latency_ms_sum,
 			  updated_at        = excluded.updated_at`)
 		if _, err := s.txExec(ctx, tx, b.String(), args...); err != nil {
@@ -279,6 +295,71 @@ func (s *Store) ReadModelHour(ctx context.Context, k ModelHourKey) (UsageDelta, 
 // ReadTeamDay reads one usage_by_team_day row.
 func (s *Store) ReadTeamDay(ctx context.Context, k TeamDayKey) (UsageDelta, error) {
 	return s.readRollup(ctx, "usage_by_team_day", "team_id", Micros(k.Day), k.TeamID)
+}
+
+// KeySpendRange sums one or more keys' cost over a bounded window, from the
+// per-key rollup of DESIGN §9.4.
+//
+// It exists because `api_keys.spend_nano` has no writer on the request path.
+// Budget enforcement lives in the durable counter (`budget_state`), and that
+// counter is DRAWN rather than spent — a node charges a whole block before it
+// spends a unit of it, so it runs up to one block ahead of reality and is the
+// wrong number to print next to a ceiling on an operator screen. This
+// materialization is the one that agrees with the ledger row for row, which is
+// why /global/spend/report answers from it too.
+//
+// One statement for the whole page. The index added beside this query is
+// (api_key_id, bucket_start), so a key's window is a seek and a walk rather
+// than the scan the (bucket_start, api_key_id) primary key would make of it.
+//
+// Unlike [Store.ReadRollupRange] this does not enforce MaxTimeRange: the window
+// is not a caller's search, it is one subject's budget period, and refusing to
+// report a yearly budget's spend because a year is wider than the ledger search
+// cap would refuse the only question the endpoint is for.
+func (s *Store) KeySpendRange(ctx context.Context, ids []string, r TimeRange) (map[string]int64, error) {
+	if len(ids) == 0 {
+		return map[string]int64{}, nil
+	}
+	if !r.End.After(r.Start) {
+		return nil, ErrUnboundedRange
+	}
+	out := make(map[string]int64, len(ids))
+	// Chunked for the same reason every other IN list here is: a page of keys is
+	// bounded by the administration surface's MaxListLimit, and a bind-variable
+	// ceiling is a thing a driver has and a caller does not know about.
+	for chunk := range chunks(ids, 500) {
+		q := `SELECT api_key_id, SUM(cost_nano) FROM usage_by_key_hour
+		       WHERE bucket_start >= ? AND bucket_start < ? AND api_key_id IN (` +
+			placeholders(len(chunk)) + `) GROUP BY api_key_id`
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, Micros(r.Start), Micros(r.End))
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		if err := s.scanKeySpend(ctx, q, args, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) scanKeySpend(ctx context.Context, q string, args []any, out map[string]int64) error {
+	rows, err := s.query(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id   string
+			cost sql.NullInt64
+		)
+		if err := rows.Scan(&id, &cost); err != nil {
+			return err
+		}
+		out[id] = cost.Int64
+	}
+	return rows.Err()
 }
 
 // RollupDim names one of the three materializations DESIGN §9.4 keeps.
@@ -413,6 +494,7 @@ func (s *Store) ReadRollupRange(ctx context.Context, q RollupQuery) ([]RollupRow
 		if err := rows.Scan(&day, &dim, &r.Usage.Requests, &r.Usage.Errors,
 			&r.Usage.PromptTokens, &r.Usage.CompletionTokens, &r.Usage.CachedTokens,
 			&r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.CostNano,
+			&r.Usage.MarginalNano, &r.Usage.SubscriptionNano,
 			&r.Usage.LatencyMSSum); err != nil {
 			return nil, UsageDelta{}, err
 		}
@@ -442,6 +524,7 @@ var sumCols = []string{
 	"COALESCE(SUM(prompt_tokens),0)", "COALESCE(SUM(completion_tokens),0)",
 	"COALESCE(SUM(cached_tokens),0)", "COALESCE(SUM(reasoning_tokens),0)",
 	"COALESCE(SUM(total_tokens),0)", "COALESCE(SUM(cost_nano),0)",
+	"COALESCE(SUM(marginal_nano),0)", "COALESCE(SUM(subscription_nano),0)",
 	"COALESCE(SUM(latency_ms_sum),0)",
 }
 
@@ -451,7 +534,8 @@ func (s *Store) rollupTotal(ctx context.Context, table string, start, end int64)
 		"SELECT "+strings.Join(sumCols, ", ")+" FROM "+table+
 			" WHERE bucket_start >= ? AND bucket_start < ?", start, end).
 		Scan(&d.Requests, &d.Errors, &d.PromptTokens, &d.CompletionTokens, &d.CachedTokens,
-			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano, &d.LatencyMSSum)
+			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano,
+			&d.MarginalNano, &d.SubscriptionNano, &d.LatencyMSSum)
 	if err != nil && err != sql.ErrNoRows {
 		return UsageDelta{}, err
 	}
@@ -464,7 +548,8 @@ func (s *Store) readRollup(ctx context.Context, table, dimCol string, bucket int
 		"SELECT "+rollupCounters+" FROM "+table+" WHERE bucket_start = ? AND "+dimCol+" = ?",
 		bucket, dim).
 		Scan(&d.Requests, &d.Errors, &d.PromptTokens, &d.CompletionTokens, &d.CachedTokens,
-			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano, &d.LatencyMSSum)
+			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano,
+			&d.MarginalNano, &d.SubscriptionNano, &d.LatencyMSSum)
 	if err == sql.ErrNoRows {
 		return UsageDelta{}, ErrNotFound
 	}

@@ -1,43 +1,53 @@
 # LiteLLM parity, and the cutover
 
-## Verdict — 2026-07-29, `94de856`
+## Verdict — 2026-07-29, `a8a0ca1`
 
-**Still not — but the reason has changed, and it is now a smaller surface with a larger number
-behind it: all five defects that blocked the last verdict are fixed and verified against the wire,
-and what blocks this one is that the `pricing:` block the cutover checklist tells an operator to
-write bills the cached prefix and the reasoning tokens twice — 27% over on DESIGN §8.5's own
-example rates, several-fold on the cache-heavy agentic traffic this gateway exists to aggregate —
-while a priced streamed request publishes `x-litellm-response-cost: 0` and records the real cost in
-the ledger.**
+**Yes. dorang can replace this LiteLLM deployment.** The request surface has not moved in three
+runs, the token column has one rule and six readers that agree with it, and **the money column now
+equals the vendor's own arithmetic to the nano on every case that was wrong before** — measured
+through the running gateway against hand-computed invoices, and measured again on the previous
+binary so the change is a before/after and not a claim. A priced streamed request no longer
+publishes a cost of zero.
 
-The token column is right now. The money column is not, and money is the column a replacement is
-judged on. `Tokens.Total()` was fixed and the same subset-added-again rule survives in two places
-the sweep did not reach: `internal/pricing`'s component quantities, and the token guard's feed.
+The two blockers of the last verdict are closed, and both were verified at the level they were
+reported — off the wire and out of the ledger, one gateway process per column:
 
-What closed, and what it took:
+| | `94de856` charged | `a8a0ca1` charges | the vendor's invoice, by hand |
+|---|---:|---:|---:|
+| DESIGN §8.5's own card, prompt 100 (40 cached) / completion 20 | `$0.0001606` | **`$0.0001266`** | `$0.0001266` |
+| a 90%-cached agent turn, 1000 (900 cached) / 0 | `$0.002725` | **`$0.000475`** | `$0.000475` |
+| every sub-rate declared, 100 (40 read, 10 written) / 20 (8 reasoning) | `$0.000000165` | **`$0.000000099`** | `$0.000000099` |
+| a card with a cache rate the backend never exercises | `$0.000153` | `$0.000153` | `$0.000153` |
+| live, through this LiteLLM: `gpt-oss:20b`, 68 / 8 | — | **`$0.000085`** | `$0.000085` |
 
-| | Was | Is |
-|---|---|---|
-| C1 ledger `total_tokens` | 120 on the wire, 128 in the ledger; 30,929 against 30,355 over a session | **120/120, 146/146, 133/133, 38,416/38,416** — measured against the response body of the same request |
-| C2 unfiltered `/spend/logs` | `500 internal_error`, message discarded | **`501 not_implemented`**, naming the four working filters |
-| A1 `server.max_body_bytes` | refusal named a knob that did not exist | **configurable**; a 1 MiB cap refuses at 1,048,576 and passes 512 KiB |
-| C3/C4 `deployment_id`, `streamed` | columns with no producer | **both populated**, on the mock and on five live agent turns |
-| C5 cost mirror | absent on an unpriced request; `x-dorang-spend-usd` flat $0.00 | **`0` and always present**; `x-dorang-cost-usd` still absent, and the pair discriminates. Spend now moves: `$0.0000493` → `$0.0002099` |
+26.9% over, 5.74× over and 66.7% over are now 0.0% over, three times. The fourth row is the
+degenerate case and it was never wrong: a rule whose `cache_read` rate meets a backend reporting no
+cached tokens bills the whole prompt at the `input` rate, which is what that vendor charges.
 
-What blocks, in one line each — §D has the measurements:
+**The streamed cost header.** At `94de856` a priced streamed request published
+`x-litellm-response-cost: 0` while its ledger row recorded `160600` nano. At `a8a0ca1` the header
+is **absent**, the ledger row for that request id carries the real figure, and the §10.4 usage
+event on the same stream carries it too — `cost_usd: "0.0001266"` on the rig, `"0.000085"` on the
+live deployment, both equal to their ledger rows. §7.7a's four states were driven and all four are
+distinct.
 
-1. **`pricing` charges `input` against the whole inclusive input and `cache_read` against the cached
-   part of it again**, and `output` against the whole output and `reasoning` against its subset
-   again. DESIGN §10.7 warned about exactly this shape — *"a mis-mapped cache field does not produce
-   a visible error, it produces a wrong invoice"* — and the invoice is in `internal/pricing`.
-2. **A priced request that streams publishes `x-litellm-response-cost: 0`** while its ledger row
-   records the real cost, because headers are stamped before usage is known. Every agent turn
-   streams. Before C5's fix the header was absent and asserted nothing.
-3. **The token guard is still fed `Input + Output + Reasoning`** — 128 for the request whose own
-   answer said 120, which is the exact pair C1 was named for.
+What an operator must do to cut over, and what to watch in the first hour, is §E. It is three
+configuration decisions and one dashboard re-point; none of it is a code change.
 
-Neither the request table nor the cutover can see any of the three. That is the same sentence the
-last verdict ended on, and it is still the finding that matters most about this harness.
+**What is still wrong, and why none of it blocks.** The ranked list is at the end. The largest item
+is new and was found by this run: a **process restart re-attributes a `fixed_subscription` period's
+elapsed share**, so two process starts put **$180.46 on a $100 plan**, and the first request after
+a restart was refused `400 budget_exceeded` on a key that had never spent anything. It does not
+block a cutover from LiteLLM because LiteLLM has no subscription class to reproduce — **but do not
+declare a `fixed_subscription` rule until it is fixed.** The other two are a `/key/info` that
+reports `spend: 0` for every key while the ledger and the rollups carry the right number, and a
+cost decomposition that files a plan share under `marginal_spend`. Both are reporting surfaces with
+a correct source behind them, and both were invisible until a configuration declared prices.
+
+Measured against `a8a0ca1`; the binary reports `v0.0.0-20260728230432-a8a0ca14351c`. The suite was
+re-run once during this pass — `go test -race -count=1 ./...`, exit 0, 35 packages `ok`, no `FAIL`
+and no `DATA RACE` — on a tree that had moved to `c6b1f08`, whose entire delta is 45 lines of
+`testing/scenario/metering_test.go`. Nothing measured below is on that path.
 
 ---
 
@@ -45,6 +55,25 @@ last verdict ended on, and it is still the finding that matters most about this 
 
 Superseded verdicts are kept rather than overwritten. A record that shows only the current state
 cannot be audited.
+
+### 2026-07-29, `94de856` — superseded
+
+> **Still not — but the reason has changed, and it is now a smaller surface with a larger number
+> behind it: all five defects that blocked the last verdict are fixed and verified against the
+> wire, and what blocks this one is that the `pricing:` block the cutover checklist tells an
+> operator to write bills the cached prefix and the reasoning tokens twice — 27% over on DESIGN
+> §8.5's own example rates, several-fold on the cache-heavy agentic traffic this gateway exists to
+> aggregate — while a priced streamed request publishes `x-litellm-response-cost: 0` and records
+> the real cost in the ledger.**
+>
+> The token column is right now. The money column is not, and money is the column a replacement is
+> judged on.
+
+Its two blockers were D1 (the pricing convention) and D2 (the streamed cost header). Both were
+fixed at `6004a98` and both are re-measured in §C below against a hand-computed vendor figure and
+against the previous binary, not read off the commit. Its item 3 (the token guard's fourth spelling
+of "tokens consumed") and its item 4 (`/global/spend/report` → `501`) are also closed, and are
+re-verified in §D.
 
 ### 2026-07-29, `e515a48` — superseded
 
@@ -58,9 +87,10 @@ cannot be audited.
 > Everything standing in the way is in §C, ranked at the end. None of it is on the request path,
 > and none of it was reachable from the request table.
 
-Its five blockers were C1, A1, C2, C5 and C3/C4. All five were fixed at `15cf9ae` and `94de856`,
-and all five are re-verified in §C below at the level they were reported — off the wire and out of
-the ledger, not by reading the commits.
+Its five blockers were C1, A1, C2, C5 and C3/C4. All five were fixed at `15cf9ae` and `94de856`
+and re-verified in that round — off the wire and out of the ledger, not by reading the commits.
+They are not re-billed here, except where a later change could have disturbed them: §D re-checks
+every reader of the token total, which is what C1 was about.
 
 ---
 
@@ -68,7 +98,7 @@ the ledger, not by reading the commits.
 
 | File | What it is |
 |---|---|
-| `dorang.yaml.tmpl` | The 39-model LiteLLM surface reproduced on dorang **as a front proxy**, with that same LiteLLM as the single upstream. One upstream behind both gateways, so every difference the harness reports is the gateway's |
+| `dorang.yaml.tmpl` | The 39-model LiteLLM surface reproduced on dorang **as a front proxy**, with that same LiteLLM as the single upstream. One upstream behind both gateways, so every difference the harness reports is the gateway's. **It now declares prices** — see below |
 | `dorang-direct.yaml.tmpl` | The cutover shape — dorang against the real providers. It loads; it is **not validated against the live surface**. See gap G3 |
 | `parity.py` | The differential harness: one request to each gateway per case, structural comparison of the two answers |
 | `run.sh` | Renders the config, starts dorang on a scratch state directory, runs the harness, stops dorang |
@@ -84,37 +114,40 @@ It compares **shape**, not text: field presence, JSON types, SSE framing, usage 
 envelopes. Two calls to one model differ by nature, so nothing here compares generated bytes. A
 case is `PASS` only when the statuses match and the structural diff is empty.
 
-It cannot see a conversation. That is what §B exists for. It cannot see an invoice either, and that
-is what §C and §D exist for — **every finding in this report that blocks a cutover was invisible to
-both.**
+It cannot see a conversation. That is what §B exists for.
+
+**The configurations now declare prices, and that is the change that matters most about this
+harness.** The last verdict's finding was that neither runner could see a pricing defect because
+both priced everything at zero, so every run compared zero against zero. They no longer do, and
+§B's cost column is now a measurement that can be checked against a rate card by hand — it was. The
+blind spot is narrowed, not closed: **the priced configuration still cannot discriminate the two
+pricing conventions on live traffic** (gap G5), so §C's discriminating evidence is still a
+controlled upstream, and says so.
 
 ---
 
-# §A — The request table, re-measured at `94de856`
+# §A — The request table, re-measured at `a8a0ca1`
 
-Measured **2026-07-29** against `94de856`, binary built from a clean tree at that commit.
-`go build`, `go vet` and `gofmt` clean; `go test -race -count=1 ./...` exit 0, 35 packages `ok`,
-no `FAIL` and no `DATA RACE`. LiteLLM `1.93.0`.
+Measured **2026-07-29**. `go test -race -count=1 ./...` exit 0, 35 packages `ok`, no `FAIL` and no
+`DATA RACE`. LiteLLM `1.93.0`.
 
 ```
                      40 cases
 before (87cbe21)     PASS 13   DIFF 27   FAIL 0     58 divergences, 21 at high severity
-prev   (e515a48)     PASS 13   DIFF 27   FAIL 0     41 divergences, 18 at high severity
-now    (94de856)     PASS 13   DIFF 27   FAIL 0     41 divergences, 18 at high severity
+       (e515a48)     PASS 13   DIFF 27   FAIL 0     41 divergences, 18 at high severity
+prev   (94de856)     PASS 13   DIFF 27   FAIL 0     41 divergences, 18 at high severity
+now    (a8a0ca1)     PASS 14   DIFF 26   FAIL 0     40 divergences, 17 at high severity
 ```
 
-**Nothing moved.** Not one verdict, not one divergence count, not one path. The single row that
-differs from the previous run is `nim:deepseek-v4-flash [stream]`, where **LiteLLM itself** went
-`200` → `500` — the flaky NIM upstream of A9 again, this time refusing the incumbent's call
-instead of dorang's, which leaves the row status-identical rather than split.
+**One row moved, and it is A9's again.** `nim:deepseek-v4-flash [stream]` answered `200` on both
+gateways this time, where the previous run had LiteLLM answering `500` and the run before that had
+dorang answering `500`. Three runs, three different answers on one model, every one of them the
+upstream's — see A9. Nothing else in the table changed by a single divergence.
 
-That is the expected result and it is worth saying rather than burying: **none of the five fixes is
-on the request path**, so a request table cannot register them. The table's job here was to prove
-that five accounting changes landed without disturbing the surface, and it did.
-
-The column below is `94de856`. The `before`/`after` attribution of the previous pass — 17
-divergences closed by the eight fixes measured at `e515a48`, and the six of those eight the request
-table could not see — is unchanged and is not repeated.
+That is the expected result and it is worth saying rather than burying: **none of the fixes since
+`94de856` is on the request path**, so a request table cannot register them. The table's job here
+was to prove that a change to the number every subsystem consumes landed without disturbing the
+surface, and it did.
 
 | Group | Case | LiteLLM | dorang | Verdict | Diffs |
 |---|---|---:|---:|---|---:|
@@ -134,7 +167,7 @@ table could not see — is unchanged and is not repeated.
 | chat-stream | `POST /chat/completions glm-5 [stream]` | 500 | 500 | DIFF | 1 |
 | chat-stream | `POST /chat/completions zai:glm-5-turbo [stream]` | 502 | 502 | DIFF | 1 |
 | chat-stream | `POST /chat/completions deepseek-v3.2 [stream]` | 500 | 500 | DIFF | 1 |
-| chat-stream | `POST /chat/completions nim:deepseek-v4-flash [stream]` | 500 | 500 | DIFF | 1 |
+| chat-stream | `POST /chat/completions nim:deepseek-v4-flash [stream]` | 200 | 200 | **PASS** | 0 |
 | chat-stream | `POST /chat/completions gemini-3-flash-preview [stream]` | 500 | 500 | DIFF | 1 |
 | chat-stream | `POST /chat/completions kimi-k2.5 [stream]` | 200 | 200 | PASS | 0 |
 | chat-stream | `POST /chat/completions minimax-m2.7 [stream]` | 200 | 200 | PASS | 0 |
@@ -164,31 +197,21 @@ table could not see — is unchanged and is not repeated.
 **LiteLLM's own upstream failures are parity evidence, not defects.** Five of the ten sampled chat
 models fail on LiteLLM *directly*: `glm-5`, `deepseek-v3.2`, `gemini-3-flash-preview` and
 `qwen3-coder-next` answer `500` carrying `"<model> was retired at 2026-07-15"` from the backend, and
-`zai:glm-5-turbo` answers `502`. dorang reproduces every one with the same status. Ten of the 27
+`zai:glm-5-turbo` answers `502`. dorang reproduces every one with the same status. Ten of the 26
 DIFFs are those five models × (streaming, non-streaming), and in each the only divergence is the
 error *envelope*, which is A3.
 
-### A1 — 32 MiB body cap: LiteLLM `400`, dorang `413` — **the cap is now configurable**
+### A1 — 32 MiB body cap: LiteLLM `400`, dorang `413` — the cap is configurable
 
-The half of this that could break a working client is closed. `server.max_body_bytes` exists, is
-wired through `internal/app`'s `server.Options` literal, and is honoured. Measured with a
-deliberately small cap so the *configured* value is what is being tested rather than the default:
-
-```
-server: {max_body_bytes: 1MiB}
-
-2 MiB body   → 413  {"error":{"message":"request body exceeds max_body_bytes (1048576 bytes)", …}}
-512 KiB body → 200
-```
-
-The refusal now names a knob that exists, and reports the operator's number rather than the
-built-in one. `TestConfigBodyCapDefaultMatchesTheServers` pins the duplicated 32 MiB default across
-`internal/config` and `internal/server`, which is the only way those two can disagree.
+Closed as a capability at `94de856` and unchanged: `server.max_body_bytes` exists, is wired through
+`internal/app`'s `server.Options` literal, and is honoured — a configured 1 MiB cap refuses a 2 MiB
+body at `1048576` and passes 512 KiB, and `TestConfigBodyCapDefaultMatchesTheServers` pins the
+duplicated 32 MiB default across `internal/config` and `internal/server`.
 
 **What remains is the status.** dorang refuses over-cap with `413 request_too_large`; LiteLLM has no
 cap and forwards the 33 MiB body to its router, which rejects it for an unrelated reason with `400`.
-That is COMPATIBILITY §11.2 and is defensible — and it is now a difference an operator can route
-around by raising the cap, rather than one requiring a rebuild.
+That is COMPATIBILITY §11.2 and is defensible — and it is a difference an operator can route around
+by raising the cap, rather than one requiring a rebuild.
 
 ### A2 — Unknown model: LiteLLM `400`, dorang `404`
 
@@ -288,17 +311,17 @@ dorang   content: [{"type":"thinking","thinking":"…"}]
 
 ### A9 — `nim:deepseek-v4-flash`: the row that changes between runs, and never because of dorang
 
-Three runs, three different answers on this model's `[stream]` case, all of them the upstream's:
+Four runs, four different pairs on this model's `[stream]` case, all of them the upstream's:
 
 | Run | LiteLLM | dorang |
 |---|---:|---:|
 | `87cbe21` | timeout | 200 |
 | `e515a48` | 200 | 500 (`ResourceExhausted: Worker local total request limit reached (651/48)`) |
 | `94de856` | 500 | 500 |
+| `a8a0ca1` | 200 | 200 |
 
-**Flaky upstream, faithfully surfaced** — the non-streaming case for the same model answered `200`
-on both gateways in this run. This model also takes ~5 minutes to answer an 8-token request, on both
-gateways.
+**Flaky upstream, faithfully surfaced.** This model also takes minutes to answer an 8-token request,
+on both gateways. It is the single row that separates this run's counts from the previous one's.
 
 ### A10 — additive members, no risk
 
@@ -324,9 +347,10 @@ Every generative case uses a two-token prompt and `max_tokens: 8`, one call per 
 
 ---
 
-# §B — The cutover, re-run at `94de856`
+# §B — The cutover, re-run at `a8a0ca1`
 
-Parity on a request table is not replacement. This is the part that is.
+Parity on a request table is not replacement. This is the part that is — and this is the first run
+in which it has a **money column**.
 
 ## What was run
 
@@ -361,273 +385,252 @@ true}`, which is the one setting a cutover needs and a request table cannot see.
 | | dorang leg | LiteLLM leg |
 |---|---|---|
 | exit | 0 | 0 |
-| upstream turns | 5 | 5 |
-| tool calls | 4 — `file.list`, `file.read`, `file.apply_patch`, `file.read` | 4 — `file.list`, `file.read`, `file.write`, `file.read` |
+| upstream turns | 4 | 4 |
+| tool calls | 3 — `file.read`, `file.write`, `file.read` | 3 — `file.read`, `file.write`, `file.read` |
 | `summary.md` written | `notes.txt has 5 lines` | `notes.txt has 5 lines` |
 | final answer | correct | correct |
-| wall clock | 10.0 s | 9.9 s |
+| wall clock | 12.1 s | 10.2 s |
 | model name in the client's result event | `gpt-oss:20b` | `gpt-oss:20b` |
 
-The dorang leg reached for `file.apply_patch` where the LiteLLM leg used `file.write`; both wrote
-the same file with the same contents. The same model makes different tool choices between runs —
-the previous pair differed the same way, in the other direction. Everything the task required
-happened on both.
+`dorang_requests_total{status="200",endpoint="chat_completions"}` reads **4**, and there is no other
+chat status on the counter. No hang, no crash, no orphaned process. **Nothing was silently lost** —
+content, tool calls, tool results and the final answer all survived the gateway.
 
-`dorang_requests_total{status="200",endpoint="chat_completions"}` reads **5**, and there is no other
-chat status on the counter.
+The four claims about the *shape* of the traffic — that streaming was on with
+`stream_options.include_usage`, that a tool call assembled across three SSE frames survives, that
+the multi-turn round trip carries an assistant turn with `tool_calls` and no content back up, and
+that the legacy header mirror emits `X-Litellm-Call-Id`, `X-Litellm-Model-Id`,
+`X-Dorang-Real-Model` and the two detail-gated names — were established against a **recording
+upstream** in the previous round and are unchanged. They are not re-billed here.
 
-Four claims are verified against a **recording upstream** rather than inferred from a transcript, so
-they cost nothing and are facts:
-
-- **Streaming was on.** Every provider call carries `"stream": true` and
-  `"stream_options": {"include_usage": true}`. Worth knowing for anyone repeating this: a control
-  run *without* `--include-partial-messages` sends `"stream": false`, so a cutover test that omits
-  that flag is not testing the streaming path at all.
-- **Tool calls assembled across streamed chunks survive dorang.** The recording upstream split one
-  call's `arguments` across three SSE frames; the client reassembled the complete JSON through
-  dorang.
-- **The multi-turn round trip survives dorang.** Turn 2's request carries
-  `[system, developer, user, assistant, tool, user]` with `tool_calls` on the assistant turn — so
-  the assistant turn that has a tool call and no content went back up through dorang and was
-  accepted.
-- **The legacy header mirror works.** With `compat.legacy_headers: true`, a response carries
-  `X-Litellm-Call-Id`, `X-Litellm-Model-Id`, `X-Dorang-Real-Model` and — under
-  `x-dorang-detail: full` — `X-Litellm-Attempted-Retries` and `X-Litellm-Response-Duration-Ms`.
-
-No hang, no crash, no orphaned process; dorang exited on signal. Long-run memory was not
-instrumented, so "no leak" is not claimed beyond that.
-
-**Nothing was silently lost.** Content, tool calls, tool results and the final answer all survived
-the gateway.
-
-## What the ledger says about that session — the half a client cannot see
-
-This is where the previous run's blockers lived, and it is the same query re-run:
+## What the ledger says about that session — and what it now costs
 
 | | Value |
 |---|---|
-| rows | 5, all `status: 200` |
-| `streamed` | **`true` on all five** — was `false` on every row |
-| `deployment_id` | **`gpt-oss:20b\|litellm\|gpt-oss:20b` on all five** — was `""` on every row |
-| unfiltered `/spend/logs` | **`501`**, `"a ledger query needs a filter: key_id, team_id, trace_id, tag or errors_only"` — was `500 internal_error` |
-
-And the session rollup, which is the number C1 was named for:
-
-| | prompt | completion | reasoning | `total_tokens` |
-|---|---:|---:|---:|---:|
-| dorang's `usage_by_model_hour` | 37,778 | 638 | 461 | **38,416** |
-| dorang's `usage_by_key_hour` | 37,778 | 638 | 461 | **38,416** |
-| sum of the per-request ledger rows | 37,778 | 638 | 461 | **38,416** |
-| what the wire reported (`prompt + completion`) | 37,778 | 638 | — | **38,416** |
-| what the old rule would have recorded | | | | 38,877 |
-
-**Four accumulators, one number.** The previous run's equivalent read 30,929 against 30,355.
-
-# §C — The five defects, re-verified
-
-Verified off the wire and out of the ledger, not by reading the commits. Where a controlled upstream
-was enough, one was used: it costs nothing, and it can report a usage object in which every
-breakdown field is a strict subset — which is what makes the two arithmetics distinguishable at all.
-
-The controlled shape is `prompt 100 / completion 20 / cached 40 / cache-write 10 / reasoning 8`.
-The client is owed `100 + 20 = 120`. The old rule sums all five and gets **178**.
-
-### C1 — the ledger's `total_tokens` against the answer the client got — **closed**
-
-| Case | wire `usage.total_tokens` | ledger row, same request | old rule |
-|---|---:|---:|---:|
-| controlled, non-streaming | 120 | **120** | 178 |
-| controlled, streamed (`include_usage`) | 120 | **120** | 178 |
-| controlled, `77 / 69 / reasoning 59` | 146 | **146** | 205 |
-| live, one request through this LiteLLM | 133 | **133** | 133 |
-| live agent session, 5 streamed turns | 38,416 | **38,416** | 38,877 |
-
-The third row is the shape the previous report took from a direct probe of this deployment and
-predicted the ledger would compute as 205. It records 146.
-
-The fourth row is the instruction taken literally — `usage.total_tokens` off the wire and the ledger
-row for that same request id — and it is a *weak* confirmation on its own: this LiteLLM's
-`gpt-oss:20b` reports no `completion_tokens_details.reasoning_tokens` on the non-streaming path, so
-old rule and new rule coincide at 133. Saying so matters more than quoting it. The discriminating
-live evidence is the fifth row, where five streamed turns carried 461 reasoning tokens and the
-rollup still equals `prompt + completion`.
-
-`meter.Tokens.Total()` is now `Input + Output`, the same function as `canonical.Usage.TotalTokens`,
-with the convention stated on the struct rather than left to a comment elsewhere.
-`internal/app/metrics.go`'s `totalTokens` — the TPM ceiling's feed — carries the same rule, and
-prefers the dispatcher's stated total when it has one.
-
-**The rollups reconcile.** On the controlled rig, `usage_by_model_hour` and `usage_by_key_hour`
-equal the sum of `request_logs.total_tokens`, per model and overall (`480 / 146 / 120`, key total
-`746`), with `cost_nano` summing the same way (`660 + 215 = 875` nano). Under the old rule the
-`mock-controlled` bucket would have read 712 against the wire's 480.
-
-### C2 — unfiltered `/spend/logs` — **closed**
+| rows | 4, all `status: 200` |
+| `streamed` | `true` on all four |
+| `deployment_id` | `gpt-oss:20b\|litellm\|gpt-oss:20b` on all four |
+| unfiltered `/spend/logs` | `501`, `"a ledger query needs a filter: key_id, team_id, trace_id, tag or errors_only"` |
 
 ```
-GET /spend/logs?start_date=…&end_date=…&limit=100
-→ 501 {"error":{"message":"a ledger query needs a filter: key_id, team_id, trace_id, tag or errors_only",
-                "type":"not_implemented_error","param":null,"code":"not_implemented"}}
+row  prompt  completion  reasoning   total       spend
+ 1    7,678         99         83    7,777   $0.0068629
+ 2    7,466         89         57    7,555   $0.0066487
+ 3    7,398         90         59    7,488   $0.0065943
+ 4    7,137        569        540    7,706   $0.00800105
+                                    ------   -----------
+                                    30,526   $0.02810695
 ```
 
-Reproduced twice: on the controlled rig and on the live cutover. `admin.Unsupported` wraps the
-sentinel instead of interpolating it as text, so `errors.Is(err, admin.ErrUnsupported)` holds, the
-`501` case matches, and the message an operator can act on is the message they get. With a filter
-the endpoint still answers `200` with the rows. The refusal is itself recorded in the ledger, as a
-`501` row on `admin_spend`.
+**Four accumulators, one number, and now a fifth:**
 
-### A1 — `server.max_body_bytes` — **closed**
+| | value |
+|---|---:|
+| sum of the per-request ledger rows | 30,526 tokens / `$0.02810695` |
+| `dorang_tokens_total{input}` + `{output}` | 29,679 + 847 = **30,526** |
+| `dorang_cost_nano_total` | **28,106,950** nano = `$0.02810695` |
 
-The fifth of the five, measured in §A-remaining A1 above because its residue is a request-table row:
-a configured 1 MiB cap refuses a 2 MiB body at `1048576` and passes 512 KiB.
+And the money is checkable by hand, which is what pricing the configuration bought. Row 1's model
+declares `input: 0.85`, `output: 3.40` and the upstream reports no cached tokens:
 
-### C3 / C4 — `deployment_id` and `streamed` — **closed**
+```
+7,678 x $0.85/1M  =  $0.0065263
+   99 x $3.40/1M  =  $0.0003366
+                     ----------
+                     $0.0068629     — the ledger row, exactly
+```
 
-Measured on the controlled rig with five served requests, two of them streamed:
+Row 4 the same way: `7,137 x 0.85 + 569 x 3.40 = $0.00800105`. Note what row 4 also shows: 540 of
+its 569 completion tokens were reasoning, and it is charged for 569 output tokens and no more,
+because this rule declares no `reasoning` rate. That is CONFIG §13.1a's degenerate case on live
+traffic.
 
-| request | `streamed` | `deployment_id` | matches header |
-|---|---|---|---|
-| non-streaming ×3 | `false` | `mock-controlled\|mock\|mock-controlled` | `x-dorang-deployment`, `x-litellm-model-id` |
-| streamed ×2 | **`true`** | same | same |
+**What this run still cannot see.** Those reasoning counts are the only breakdown this deployment
+reports, and `gpt-oss:20b`'s rule declares no `reasoning` rate — so the carve-out never fires, and
+the live legs still cannot tell the two pricing conventions apart. Gap G5.
 
-and on the live cutover, where all five rows are `streamed: true` against requests that carried
-`"stream": true`, an SSE body and a tool call reassembled from three frames, and all five carry
-`gpt-oss:20b|litellm|gpt-oss:20b` where every row was empty before.
+# §C — The two blockers, re-measured
 
-`Event.Streamed` is taken from the content type actually written, not from the `stream: true` the
-request asked for, so a request that asks to stream and is refused before the first frame is not
-recorded as one.
+Verified with a controlled upstream, because a controlled upstream is the only way to get a usage
+object in which every breakdown field is a **strict subset** of the count it belongs to — which is
+what makes the two arithmetics distinguishable at all. Every figure below is one request through a
+running gateway, read off its response headers and out of its ledger, and compared against an
+invoice computed by hand from the rate card.
 
-### C5 — the cost mirror — **closed for the non-streaming path**; see D2 for what it opened
+The **before** column is not quoted from the previous verdict. `94de856` was built into a worktree
+and run against the same mock, the same configuration and the same rates, so the two columns differ
+only in the binary.
 
-Measured on one instance carrying a priced model and an unpriced one:
+### C1 — the pricing convention — **closed**
+
+The rig declares four cards and the mock reports four usage objects:
+
+| card | rates per 1M | usage (dorang's inclusive counts) |
+|---|---|---|
+| `card-model` | `input 0.85, output 3.40, cache_read 0.19` — DESIGN §8.5's own | `100 (40 cached) / 20` |
+| `cache90-model` | `input 2.50, cache_read 0.25` — OpenAI-shaped | `1000 (900 cached) / 0` |
+| `reasoning-model` | `input .001, output .002, cache_read .0001, cache_write .0005, reasoning .002` | `100 (40 read, 10 written) / 20 (8 reasoning)` |
+| `plain-model` | `input 0.85, output 3.40, cache_read 0.19` | `100 / 20`, **no breakdown reported at all** |
+
+| case | `94de856` | `a8a0ca1` | the vendor's invoice, by hand | ledger row |
+|---|---:|---:|---|---:|
+| §8.5's card | `0.0001606` | **`0.0001266`** | `60×0.85 + 40×0.19 + 20×3.40` = `0.0001266` | `0.0001266` |
+| 90% cached | `0.002725` | **`0.000475`** | `100×2.50 + 900×0.25` = `0.000475` | `0.000475` |
+| every sub-rate | `0.000000165` | **`0.000000099`** | `50×.001 + 40×.0001 + 10×.0005 + 12×.002 + 8×.002` = `0.000000099` | `9.9e-08` |
+| nothing reported cached | `0.000153` | `0.000153` | `100×0.85 + 20×3.40` = `0.000153` | `0.000153` |
+
+`0.0001606 ÷ 0.0001266 = 1.2686` and `0.002725 ÷ 0.000475 = 5.7368` — the 27% and the 5.7× of the
+last verdict, reproduced on the old binary and then measured away. `x-dorang-cost-usd`,
+`x-litellm-response-cost` and the ledger row carry the same figure in every row.
+
+The fourth row is the one that proves the rule degrades correctly rather than merely differently: a
+model whose backend never mentions a cache is billed for its whole prompt at the `input` rate even
+though its rule declares `cache_read`, because the carve-out is driven by the measured quantity and
+that quantity is zero. CONFIG §13.1a states the convention an author reads — `input` is charged on
+`input_tokens − cache_read − cache_write`, `output` on `output_tokens − reasoning`, each
+subtraction applying only when the rule declares that sub-rate.
+
+Live, through this LiteLLM with the harness's own card: `gpt-oss:20b`, `68 / 8`, header
+`x-dorang-cost-usd: 0.000085` = `x-litellm-response-cost` = ledger row = `68×0.85/1M + 8×3.40/1M`.
+That row is a **weak** confirmation on its own and is recorded as such — no cached tokens, no
+declared reasoning rate, so old rule and new rule coincide on it. The discriminating evidence is the
+controlled rig above.
+
+The package's own assertion is against the same hand-computed constant rather than against another
+dorang function: `TestChargedAmountMatchesTheVendorInvoice` fails on `160_600` by name and requires
+`126_600`. A test that compares two internal functions cannot catch a convention error, because both
+of them agreed — which is how this survived two clean parity runs.
+
+### C2 — the streamed cost header — **closed**, and §7.7a's four states discriminate
+
+At `94de856`, one streamed priced request:
+
+```
+wire:    x-litellm-response-cost: 0        x-dorang-cost-usd: absent
+ledger:  cost_nano = 160600                streamed = 1
+```
+
+At `a8a0ca1`, the same request on the same rig:
+
+```
+wire:    x-litellm-response-cost: absent   x-dorang-cost-usd: absent
+sse:     event: dorang.usage
+         {"request_id":"032ab157…","cost_usd":"0.0001266", …}
+ledger:  spend = 0.0001266                 streamed = true
+```
+
+They agree, or the header is absent. All four of §7.7a's states were driven on one instance carrying
+a priced model, an unpriced model and a zero-rated model, and they are mutually distinct:
 
 | request | `x-litellm-response-cost` | `x-dorang-cost-usd` | §7.7a reading |
 |---|---|---|---|
-| priced, non-streaming | `0.0001606` | `0.0001606` | priced at *n* — correct |
-| unpriced, non-streaming | **`0`** | *absent* | not priced — correct |
-| priced but zero-rated | `0` | `0` | priced and free — correct |
+| priced, non-streaming | `0.0001266` | `0.0001266` | priced at *n* |
+| unpriced, non-streaming | `0` | *absent* | no price rule matched |
+| priced but zero-rated, non-streaming | `0` | `0` | priced, and free |
+| **priced, streamed** | *absent* | *absent* | **the answer streamed — read the usage event or the ledger** |
+| unpriced, streamed | *absent* | *absent* | the answer streamed (the same state; it makes no claim about pricing) |
 
-The pair discriminates exactly as documented, and the mirror no longer vanishes on a deployment with
-no `pricing:` block. dorang still logs `no marginal price rule matched …; the request is unpriced`
-once per request, which is how an operator finds the gap.
+The remedy the fourth state points at was driven too, on the rig and on the live deployment: the
+`dorang.usage` SSE event carries a `cost_usd` equal to the ledger row in both — `0.0001266` and
+`0.000085`. The flag is computed from the `Content-Type` the dispatcher actually set rather than
+from the request's `stream: true`, so a request that asked to stream and was answered with a
+complete body still publishes its cost.
 
-**`Result.SpendNanoUSD` has a producer.** On a key minted with `max_budget: 0.01`, two successive
-priced requests:
-
-```
-request 1   x-dorang-spend-usd: 0.0000493   x-litellm-key-spend: 0.0000493
-            x-dorang-budget-usd: 0.01       x-dorang-budget-remaining-usd: 0.0099507
-request 2   x-dorang-spend-usd: 0.0002099   x-litellm-key-spend: 0.0002099
-            x-dorang-budget-usd: 0.01       x-dorang-budget-remaining-usd: 0.0097901
-```
-
-It was a flat `$0.00` on every response of every budgeted deployment. It now moves, and it is the
-spend of the binding subject — the one whose ceiling `x-dorang-budget-usd` reports — so the pair is
-two numbers about one budget rather than two budgets' halves.
-
-**The notional header** is gated on `NotionalPriced` rather than `Priced`, so a billed request with
-no list rate publishes nothing instead of the `$0.00` DESIGN §8.5 rule 5 forbids by name. Read in
-the code and pinned by `TestNotionalHeaderIsAbsentWhenThereIsNoListRate`; not separately
-re-measured out-of-process, because it needs a `notional_rate` rule the parity configuration does
-not carry.
-
-**The third convention `15cf9ae` found** — `server.scanUsage`, where the Anthropic family's
-`input_tokens` is cache-*exclusive* — is normalized to dorang's inclusive convention before it
-reaches the ledger, so a metered passthrough is no longer short by the whole cached prefix.
-`TestUsageScanning` asserts `{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":2}` →
-`Input 5, Output 4, CacheRead 2, Total 9`. Verified by reading the test and the code; not reproduced
-out-of-process, because this configuration declares no passthrough prefix.
+One documentation residue: §7.7a's mirror table still marks `x-litellm-response-cost` **"yes,
+always"** in its *Always on?* column, three rows above the four-state table that says it is absent
+on a stream. The two tables now disagree on the page.
 
 ---
 
-# §D — What the fixes did not reach, and what one of them opened
+# §D — What the change to the number every subsystem consumes did not break
 
-Five accounting changes landed at once. These are what checking their interactions found.
+Six readers of "how many tokens was that" and every reader of "what did it cost" were checked
+against the ledger, from outside the process wherever the ceiling could be observed from outside.
 
-### D1 — `pricing` charges the cached prefix twice, and the reasoning tokens twice
+### D1 — the tokens-per-minute ceiling counts what the ledger counts — **verified on the wire**
 
-**This is the one that stops the cutover.**
-
-`internal/pricing`'s `quantityOf` maps each rate component to a measured quantity:
-
-```go
-case cInput:      q = req.InputTokens        // the WHOLE prompt count
-case cCacheRead:  q = req.CacheReadTokens    // …and the cached part of it, again
-case cOutput:     q = req.OutputTokens       // the WHOLE completion count
-case cReasoning:  q = req.ReasoningTokens    // …and the reasoning part of it, again
-```
-
-`InputTokens` is inclusive of both cache counts and `OutputTokens` is inclusive of reasoning. DESIGN
-§10.7 states both, and states the consequence of getting it wrong in its own words:
-
-> **Token accounting is the part that must be exactly right**, because it feeds cost, quota, and
-> budget — a mis-mapped cache field does not produce a visible error, it produces a wrong invoice.
-
-Measured, using **DESIGN §8.5's own example rate block** (`input 0.85`, `output 3.40`,
-`cache_read 0.19` per 1M — a vendor's published list rates, carrying the `source:` and `as_of:` that
-section requires) against usage of `prompt 100 (40 cached) / completion 20`:
-
-| | per 1M units | USD |
-|---|---:|---:|
-| dorang charges | `100×0.85 + 20×3.40 + 40×0.19` = 160.6 | **`0.0001606`** — the figure on `x-dorang-cost-usd` and in the ledger row |
-| the vendor bills for that usage | `60×0.85 + 40×0.19 + 20×3.40` = 126.6 | `0.0001266` |
-
-**26.9% over**, on the documentation's own example. With a `reasoning` rate declared as well
-(`input 0.001 / output 0.002 / cached_read 0.0001 / cache_write 0.0005 / reasoning 0.002` against
-`100 (40 cached, 10 written) / 20 (8 reasoning)`) dorang charges `0.165` per 1M against a true
-`0.099` — **66.7% over**, measured on the same rig. On the agentic traffic this gateway exists to
-aggregate, where the cached fraction is most of the prompt, an OpenAI-shaped
-`input 2.50 / cache_read 0.25` at a 90% cache hit charges `2.725` against a true `0.475` — **5.7×**.
-
-This is the same defect as C1, one column over. C1 was tokens, which nobody bills against; this is
-the invoice. The previous report saw half of it and scoped it away —
-
-> cost is unaffected unless a `reasoning` rate is configured, in which case it would be charged twice
-
-— and the cache half was never named. Writing a `pricing:` block is item 2 on this report's own
-cutover checklist (§E), so an operator who follows the checklist with a real vendor rate table
-over-bills.
-
-**Why it blocks**: reconciliation against LiteLLM's cost figures cannot succeed, it fails silently,
-and it fails in the over-charging direction on exactly the workload the gateway is for. It is the
-sentence the last verdict used about tokens, now true about money.
-
-### D2 — a priced streamed request publishes `x-litellm-response-cost: 0`
-
-C5 made the legacy cost mirror unconditional. Response headers are stamped when the status line goes
-out, which on a streamed response is **before the upstream has reported any usage**. So:
+The fourth reader the last sweep found was `app/metrics.go` preferring a backend-stated `Total`. The
+rig has a model for exactly that: the mock reports `total_tokens: 99` against `prompt 10,
+completion 5`.
 
 ```
-priced model, "stream": true
-  wire:    x-litellm-response-cost: 0        x-dorang-cost-usd: absent
-                                             x-dorang-spend-usd, x-dorang-budget-usd: absent
-  ledger:  spend = 0.0001606
+key with tpm_limit: 20        request 1 -> 200
+                              request 2 -> 200
+                              request 3 -> 429  auth: rate limit exceeded (key: tpm)
 ```
 
-Measured on the budgeted-key rig: the streamed request's ledger row carries the same `0.0001606`
-its two non-streamed siblings do, and the response asserted `0`.
+Two admitted then refused is 15 per request. Had the ceiling taken the backend's 99, the *second*
+request would have been refused. The client was told `total_tokens: 15` and the ledger row says
+`10 / 5 / 15`. Three readers, one number, and the discriminating one is observable from outside.
 
-COMPATIBILITY §7.7a's discriminator table has three rows and none of them covers this one. Read
-literally, `x-litellm-response-cost: 0` with `x-dorang-cost-usd` absent means *"no price rule matched
-this model — the number is unknown, not zero"*, which is the wrong answer about a priced request that
-cost money. **Every agent turn streams**, so on the traffic §B measures this is not the edge case.
+### D2 — the token guard reads the same function — verified in process
 
-What changed and what did not: before the fix the header was **absent** on a stream, and §7.7a's own
-argument is that an exporter treats absence as zero — so the exporter's *number* is unchanged. What
-changed is that dorang now makes an affirmative claim where it previously stayed silent, and the
-documented way to tell "unpriced" from "priced" now misclassifies. The incumbent has the same
-constraint and resolves it the other way: **LiteLLM emits no `x-litellm-response-cost` at all** on
-this deployment's streamed *or* non-streamed successes (D3).
+Not observable from the wire: the guard compares a rate against a baseline and its default action is
+reversible. `TestTokenTotalHasOneRule` asks all six readers the same question about a request whose
+every breakdown field is non-zero and none equal to its parent (`120 / 15`, cache-read 40,
+cache-write 10, reasoning 5) and requires `135` from each — naming `140` as "adds Reasoning" and
+`190` as "sums all five" so a failure names the defect rather than a delta. The guard's answer goes
+through the **real** `meterAdapter.Record` into a real `keyguard` with a capturing history, because
+the defect was a caller that had written the sum out for itself and only the caller's own path can
+show that. `TestNoSecondTokenTotalRuleIsWrittenAnywhere` then AST-scans every non-test file in the
+module for a `+` chain mixing a cache or reasoning term with an input or output term, exempting the
+normalization case structurally rather than by list. Both pass.
 
-The limitation is inherent — a cost cannot be in a header that precedes the body. Asserting `0`
-rather than staying silent is a choice, and §7.7a should either carry the fourth row or the mirror
-should stay absent when the cost is not yet knowable.
+### D3 — budgets agree with the ledger — **verified on the wire**
 
-### D3 — the four cost header names the incumbent actually emits are still unmirrored
+On a key minted with `max_budget: 0.01`, after 18 priced requests:
 
-Re-measured this run, on both the streaming and non-streaming `gpt-oss:20b` cases and on a direct
-probe of the deployment:
+```
+x-dorang-spend-usd:              0.001762598
+x-litellm-key-spend:             0.001762598
+x-dorang-budget-remaining-usd:   0.008237402   (= 0.01 - 0.001762598)
+sum of the key's ledger rows:    0.001762598
+```
+
+Exact, to the nano, and it includes the streamed rows whose responses published no cost header. The
+header lags its own request by that request's *reservation* rather than its settled cost — a request
+that will cost `0.0001266` moves the reported spend by an estimate first — so the two agree at rest
+and not mid-flight, which is what a reservation is.
+
+Enforcement is durable across a restart: a key with `max_budget: 0.0003` was served twice, refused
+`400 budget_exceeded` on the third, and after a full process restart was **still** refused on its
+next request. The ledger and the enforced budget do not disagree.
+
+### D4 — the rollups and the metrics agree with the ledger — **verified on the wire**
+
+`/global/spend/report` answered `501` at `94de856` — re-confirmed on the old binary during this run.
+It answers now, over the three §9.4 materializations, and it reconciles:
+
+```
+/global/spend/report?group_by=model    total spend 0.001762598   total tokens 3,920   18 requests
+/global/spend/report?group_by=key      one key     0.001762598               3,920
+sum of /spend/logs rows                            0.001762598               3,920
+```
+
+per model as well: `card-model` 4 requests × `0.0001266` = `0.0005064`; `cache90-model` 2 ×
+`0.000475` = `0.00095`; `plain-model` 2 × `0.000153` = `0.000306`. On the live cutover,
+`dorang_cost_nano_total` equalled the ledger sum to the nano (§B).
+
+### D5 — the subscription reload residual is closed; a restart still re-attributes
+
+A `fixed_subscription` rule of `100.00` monthly on the credential, driven late in the period:
+
+```
+first request of a fresh process        x-dorang-cost-usd: 90.225883054   (the elapsed share)
+next request, ~3 s later                                    0.000239050
+20 x SIGHUP, then a request                                 0.000259001   (a ~3.5 s slice)
+next request, 3 s later                                     0.000239062
+```
+
+**Twenty reloads attribute nothing.** `Catalog.AdoptState` carries the period's attributed total
+across the swap, and the measurement shows it: the request after twenty reloads is a time slice, not
+a plan share. The `1,050 USD of a 100 USD plan` is gone.
+
+**A process restart is not covered, and it is worse than the reload was** — N1.
+
+### D6 — the cost header names the incumbent actually emits — unchanged, re-measured
+
+A direct probe of the deployment this run, on a `gpt-oss:20b` success:
 
 ```
 x-litellm-response-cost-original:         0.0
@@ -638,69 +641,140 @@ x-litellm-key-spend:                      0.0
 (no x-litellm-response-cost)
 ```
 
-`x-litellm-response-cost` — the one name §7.7a models and now always emits — is **not on these
-responses at all**. A cost exporter pointed at this deployment is reading one of the four dorang
-does not model. §7.7a now names them with reasons, which is the right treatment; the gap itself is
-unchanged.
-
-### D4 — the token guard still carries the rule C1 was named for
-
-`internal/app/metering.go`, seventy lines above the line C1 fixed:
-
-```go
-if tokens := r.Tokens.Input + r.Tokens.Output + r.Tokens.Reasoning; tokens > 0 && ev.KeyID != "" {
-    _ = a.guard.Observe(context.Background(), ev.KeyID, tokens, a.now())
-}
-```
-
-Reasoning is a subset of output. Measured through `meterAdapter.Record` into a real
-`keyguard.MemHistory`, for the controlled request:
-
-| reader | value |
-|---|---:|
-| what the wire said | 120 |
-| ledger `total_tokens` | 120 |
-| TPM ceiling (`metrics.totalTokens`) | 120 |
-| **token guard `Observe`** | **128** |
-
-That is the exact `120` against `128` C1 was named for. It did not go away; it moved. There are now
-three definitions of "tokens consumed" in the binary, and the guard holds a fourth spelling — it
-adds reasoning but not the cache counts, so it matches neither the old rule nor the new one.
-
-**Why it is not a blocker**: the guard compares an observed rate against a baseline computed the same
-way, so a *steady* reasoning fraction cancels in the `factor` test, and nothing a customer sees is
-affected. **Why it is still a defect**: `trigger.min_absolute` is an absolute token count compared
-against an inflated number, so the guard arms earlier than configured; and a key that moves to a
-reasoning-heavy model can nearly double its measured rate with no change in real consumption —
-which, under the default `action: pend`, is an automatic key suspension on a false signal.
-
-### D5 — `/global/spend/report` answers `501`
-
-```
-GET /global/spend/report?start_date=…&end_date=…&group_by=model
-→ 501 {"message":"aggregate spend reporting has no rollup query behind it in this build;
-                  /spend/logs serves the per-request ledger", …}
-```
-
-The rollups are written and, as of C1, correct — they are just not readable through the
-administration surface. The endpoint an operator would naturally reach for to reconcile a month
-against LiteLLM's is the one that is not there; `/spend/logs` with a filter plus client-side
-aggregation is the workaround, and it works. Pre-existing, not a regression, and worth naming
-because C1's whole subject was reconciliation.
+`x-litellm-response-cost` — the one name §7.7a models — is **not on this deployment's responses at
+all**, streamed or not. A cost exporter pointed at this deployment is reading one of the four dorang
+does not mirror. §7.7a names them with reasons; the gap itself is unchanged from the last two runs.
 
 ---
 
-# §E — What a cutover must configure that this directory does not
+## What this run found
 
-Not defects; the checklist the runs produced.
+All four are only reachable through a `pricing:` block — the previous verdict's blind spot, which
+is why they are new — and the first two only through a `fixed_subscription` rule, which no
+configuration in this directory declares.
+
+### N1 — a restart re-attributes the whole elapsed share of a subscription period
+
+The accumulator "lives for the life of this Catalog", and a restart builds one from nothing. There
+is no store behind it.
+
+```
+after the first process, ledger total       $ 90.227737838   of a $100.00 monthly plan
+restart, one request                        $ 90.229299890   attributed again, on one row
+after the second process, ledger total      $180.458128041
+```
+
+DESIGN §8.1 states the invariant this breaks in its own words: *"the shares a period attributes sum
+to the plan cost, and never to more."* Two process starts, 1.8 plan costs. N restarts in a period —
+or N nodes in a cluster, each with its own accumulator — attribute N times.
+
+**It is client-visible, not merely an accounting figure.** internal/app reserves the settled cost
+against the requesting key's budget, so the re-attributed share lands on whoever sends the first
+request after the restart:
+
+```
+fresh process, brand-new key, max_budget: 1.00, never used
+POST /v1/chat/completions  ->  400  {"code":"budget_exceeded",
+    "message":"the key budget for this credential is exhausted for the current monthly period"}
+```
+
+A key that has never spent anything is refused on its first request, because a plan share it has no
+relationship to was booked against it.
+
+**Why it does not block this cutover**: LiteLLM has no subscription class, so a configuration that
+reproduces this deployment declares none and the defect is unreachable. **Do not declare a
+`fixed_subscription` rule until it is fixed.** `6004a98` identified the single-request share as
+known and deliberate — a plan already paid for is attributed to the traffic that used it — and what
+is not deliberate is that the running total resets to zero with the process.
+
+### N2 — a plan share is filed under `marginal_spend`, and `subscription_spend` has no producer
+
+The same subscription request, read back out of the ledger:
+
+```
+"spend": 90.22929989,  "marginal_spend": 90.22929989,  "subscription_spend": 0
+```
+
+`internal/app/metering.go` writes `MarginalCostNano: t.CostNano` — the whole cost — and nothing ever
+writes `SubscriptionCostNano`, because `meter.Trace` carries a single `CostNano` and `pricing.Cost`'s
+three-way split is dropped at that boundary. `/spend/logs` and `/global/spend/report` both report it,
+so the decomposition is wrong in both. The **total** is right everywhere.
+
+DESIGN §8.1: *"The two are separate fields, never conflated."* They are conflated. Pre-existing —
+`git log -S` puts the line at `cb898a1`, long before any of the pricing work — and **unobservable
+until a configuration declared a plan**, which is the previous verdict's blind spot one class over.
+
+### N3 — `/key/info` reports `spend: 0` for every key
+
+```
+GET /key/info?key_id=…      "spend": 0,  "max_budget": 0.01
+the key's ledger rows                    0.001889198
+the key's own response header            0.001889198
+/global/spend/report by key              0.001889198
+```
+
+`api_keys.spend_nano` is read by `/key/info` and written by nothing on the request path — the budget
+accounting lives in the quota gate, which is why enforcement works and this column does not. It is a
+**silent zero on the endpoint a per-key spend dashboard is most likely to read**, which is precisely
+the failure mode COMPATIBILITY §7.7a exists to prevent, on a route §7.7a does not cover. Whether the
+incumbent's own value moves could not be observed: the client key available here gets `403` on
+LiteLLM's `/key/info`, the same limitation as G2 and G3.
+
+The number is reachable — `/spend/logs` and `/global/spend/report` both carry it and both agree with
+the ledger — so this is a re-point, not a hole. §E says so.
+
+### N4 — the first zero-cost request after a start reports an unhydrated budget
+
+```
+immediately after a restart, a zero-rated request:
+    x-dorang-spend-usd: 0        x-dorang-budget-remaining-usd: 0.01
+the same key's true spend at that moment:   0.001889198   (remaining 0.008110802)
+the next priced request on that key:
+    x-dorang-spend-usd: 0.001938498         (= 0.001889198 + its own reservation)
+a zero-rated request after that:
+    x-dorang-spend-usd: 0.002142398         = the ledger total, exactly
+```
+
+A request whose estimated cost is zero takes no reservation, so the budget hold is never hydrated
+from the store and `Consumed()` answers from an empty one. One request per subject per process
+start, on zero-estimate traffic only, and enforcement is unaffected. Low, and named because it is
+the same shape as everything else on this page: a header answering `0` for a number it has not
+looked up.
+
+---
+
+# §E — Cutting over
+
+Not defects; the checklist the runs produced. The first three lines changed with this verdict.
 
 | | Why |
 |---|---|
 | `compat: {legacy_headers: true}` | Off by default. Without it a dashboard reading `x-litellm-*` silently reports zero. `cutover.sh` sets it; `dorang.yaml.tmpl` deliberately does not, so the parity table measures dorang's own surface |
-| a `pricing:` block | Every model is unpriced without one — and **see D1 before writing one**: declaring a vendor's `cache_read` or `reasoning` rate alongside its `input`/`output` rates over-bills |
+| a `pricing:` block | Every model is unpriced without one. **Writing one is now mechanical**: transcribe the vendor's card, each published price under its own name, and write nothing for the components the vendor does not price separately (CONFIG §13.1a). The warning that used to be on this line is closed |
+| **no `fixed_subscription` rule yet** | N1. A restart re-attributes the period's elapsed share and books it against one request's budget. LiteLLM has no equivalent, so a faithful reproduction declares none |
+| per-key spend from `/spend/logs` or `/global/spend/report` | N3. `/key/info` reports `spend: 0` for every key. Both other routes agree with the ledger to the nano |
+| a cost exporter that understands an absent header | §7.7a state 4. On agent traffic every turn streams, so **every turn publishes no cost header**. Read the `dorang.usage` event, or join the ledger on `x-dorang-request-id`. Note also that this deployment emits four `x-litellm-response-cost-*` names dorang does not mirror, and does not emit the one it does |
 | `context_window` per model | A4. Without it `GET /models` drops `max_input_tokens` |
-| `server: {max_body_bytes: …}` | Now possible (A1). Raise it if a client posts bodies over 32 MiB today |
+| `server: {max_body_bytes: …}` | Raise it if a client posts bodies over 32 MiB today |
 | `compat: {anthropic_total_tokens: false}` | A8, if `/v1/messages` clients must see this LiteLLM's exact usage object |
+
+## The first hour
+
+Five checks, in the order they fail:
+
+1. **`no marginal price rule matched <provider>/<model>; the request is unpriced`** in the log, one
+   per request. This is how a missing rate is found, and a missing rate is silent everywhere else.
+   It should stop appearing within minutes of the cutover.
+2. **`/global/spend/report?group_by=model` against the incumbent's spend for the same window.** They
+   should differ by the rate cards, not by a factor. A factor of 1.27 or of 5.7 is §C's defect
+   returning; a factor of 2 on one model is a card transcribed into the wrong component.
+3. **`dorang_cost_nano_total` against the sum of `/spend/logs`.** They agreed to the nano here. If
+   they drift, the meter is dropping events rather than mispricing them.
+4. **The 429 rate on the tokens-per-minute ceiling.** It now counts `input + output` and nothing
+   else, so keys throttled against an inflated count will have more headroom than they did. More
+   traffic admitted is the *expected* direction; less means something else changed.
+5. **`404` where clients expected `400`** in their own error logs (A2), and `KeyError: usage` in any
+   strict transcription client (A5). Both are one line in a client, and neither is silent.
 
 ---
 
@@ -733,34 +807,49 @@ not visible from a client key, so `dorang.yaml.tmpl` disables class fallback rat
 chain it cannot see. `x-litellm-attempted-fallbacks: 0` on every observed response is consistent
 with none firing and is not proof that none are configured.
 
+**G5 — the priced configurations still cannot discriminate the pricing convention on live
+traffic.** This is new, and it is the residue of the blind spot the last verdict named. The configs
+now declare prices, which is what gives §B a cost column that can be checked against a card — and it
+was, by hand, on every row. But a carve-out only fires when a sub-rate is *both* declared and
+measured, and on this deployment the two never meet: `gpt-oss:20b`, the one model the cutover drives,
+declares `cache_read` and `cache_write` and the upstream reports `cached_tokens: 0` on every turn;
+the one rule carrying a `reasoning` rate is `glm-5`'s, and `glm-5` is retired upstream and answers
+`500`. So the live legs verify that dorang charges the declared card correctly, and the controlled
+rig in §C remains the only thing that can tell the two conventions apart. **The harness's blind spot
+is narrowed, not closed.**
+
 ---
 
 # What remains, ranked
 
 | # | What | Where | Blocks a replacement? |
 |---|---|---|---|
-| 1 | `pricing` charges `input` against the whole inclusive input and `cache_read` against the cached part again; same for `output` and `reasoning`. 27% over on DESIGN §8.5's own example rates, 5.7× on a 90%-cached workload | D1 | **Yes.** Silent, in the over-charging direction, on the traffic the gateway is for, and reached by following this report's own checklist |
-| 2 | A priced streamed request publishes `x-litellm-response-cost: 0` while the ledger records the real cost; §7.7a's discriminator reads that pair as "not priced" | D2 | **Yes**, for a cost exporter, and silently. Every agent turn streams |
-| 3 | The token guard is fed `Input + Output + Reasoning` — 128 for the request whose answer said 120 | D4 | No customer effect. Can pend a key on a false signal under the default action |
-| 4 | `/global/spend/report` → `501`; the rollups are correct but not readable through the admin surface | D5 | No — `/spend/logs` plus client-side aggregation does it |
-| 5 | Four `x-litellm-response-cost-*` names this deployment emits are unmirrored, and dorang now always emits the one name it does not | D3 | Mildly, for an exporter built on this deployment |
+| 1 | A process restart re-attributes a `fixed_subscription` period's elapsed share. $180.46 attributed of a $100 plan across two starts; the first request after a restart refused `400 budget_exceeded` on a key that had never spent | N1 | **Not this cutover** — LiteLLM has no subscription class, so a faithful configuration declares none. It blocks *using* dorang's subscription accounting, and it is the largest defect on this page |
+| 2 | `/key/info` reports `spend: 0` for every key; the column has no producer on the request path | N3 | No — `/spend/logs` and `/global/spend/report` both carry the number and both agree with the ledger. But it is a **silent** zero, on the route a spend dashboard reaches for first |
+| 3 | A plan share is recorded as `marginal_spend`; `subscription_spend` is always `0`. The total is right | N2 | No, and unreachable without a subscription rule |
+| 4 | Four `x-litellm-response-cost-*` names this deployment emits are unmirrored, and the one dorang models is not on this deployment's responses at all | D6 | Mildly, for an exporter built on this deployment |
+| 5 | On a stream there is no cost header at all — by design, and every agent turn streams | §C2 | No, once the exporter reads the usage event or the ledger. It must be told |
 | 6 | `GET /models` drops `max_input_tokens` / `max_output_tokens`; `owned_by` changes | A4 | Mildly, and it is configuration |
-| 7 | Oversized body: `413` where LiteLLM answers `400` | A1 | No longer — the cap is configurable, so the status is the only difference left |
-| 8 | Unknown model `400 → 404` | A2 | Only a client branching on status; dorang matches the vendor |
-| 9 | `/v1/messages` omits the empty text block LiteLLM appends on a truncated turn | A8 | Only a client indexing `content[-1].text`; dorang matches the vendor |
-| 10 | `usage` present-and-null becomes absent on transcriptions | A5 | Only a client using `[]` rather than `.get()` |
-| 11 | Error `type` / `param` vocabulary | A3 | No — LiteLLM's values are `null` and the string `"None"`; nothing could branch on them |
-| 12 | §7.7a's discriminator table has no row for a streamed priced request; §6.8's claim about the reference implementation's `total_tokens` | D2, A8 | Documentation — and item 12's first half is what makes item 2 misread rather than merely incomplete |
+| 7 | §7.7a's mirror table says `x-litellm-response-cost` is "always on" three rows above the table that says it is absent on a stream; §6.8's claim about the reference implementation's `total_tokens` | §C2, A8 | Documentation |
+| 8 | The first zero-cost request after a process start reports an unhydrated spend of `0` and a full budget | N4 | No |
+| 9 | Oversized body: `413` where LiteLLM answers `400` | A1 | No — the cap is configurable, so the status is the only difference left |
+| 10 | Unknown model `400 → 404` | A2 | Only a client branching on status; dorang matches the vendor |
+| 11 | `/v1/messages` omits the empty text block LiteLLM appends on a truncated turn | A8 | Only a client indexing `content[-1].text`; dorang matches the vendor |
+| 12 | `usage` present-and-null becomes absent on transcriptions | A5 | Only a client using `[]` rather than `.get()` |
+| 13 | Error `type` / `param` vocabulary | A3 | No — LiteLLM's values are `null` and the string `"None"`; nothing could branch on them |
 
-**Closed since the previous verdict**, each re-verified in §C rather than taken from a commit
-message: C1 (ledger `total_tokens`), C2 (unfiltered `/spend/logs`), A1 (body-cap configurability),
-C3 and C4 (`deployment_id`, `streamed`), C5 (the cost mirror on the non-streaming path,
-`Result.SpendNanoUSD`'s producer, and the notional header's gate).
+**Closed since the previous verdict**, each re-verified above by measurement rather than from a
+commit message: the pricing convention (§C1, with the old binary as the before column), the streamed
+cost header and §7.7a's fourth state (§C2), the tokens-per-minute ceiling's preference for a
+backend-stated total (D1, discriminated on the wire), the token guard's fourth spelling of "tokens
+consumed" (D2), `/global/spend/report`'s `501` (D4), and the subscription reload residual (D5).
 
-Items 1 and 2 are what now stand between "serves the traffic" and "replaces the deployment". As
-before, **neither is on the request path, and neither would have been found by a request table** —
-and item 1 would not have been found by the cutover either, because the configuration both runs use
-declares no prices. The harness that found the last five blockers could not have found this one.
+**What found what.** The request table found none of it, in four consecutive runs. The cutover found
+none of it. Every defect in the last three verdicts was found by driving a controlled upstream
+against a configuration built to make one specific number wrong in a visible way — and the four
+found this round were found by declaring prices the harness does not declare, three of them a
+*subscription* price that no configuration in this directory carries. The pattern is four for four:
+**the harness sees what it has configured.**
 
 ---
 
@@ -777,14 +866,23 @@ DORANG_BIN=/path/to/older ./run.sh    # a before/after column
 run against a `mktemp -d` state directory, and remove or report it on exit. Neither writes into the
 repository and neither touches anything under the operator's home directory.
 
-§C's and §D's controlled-upstream measurements are not scripted here. They need a stub upstream that
-reports a usage object in which every breakdown field is a strict subset, and a configuration
-carrying a priced model, an unpriced model, a budgeted key, a vendor-shaped rate block and a
-deliberately small `max_body_bytes`. The shape is stated precisely enough above to rebuild, and the
-unit tests that pin each conclusion are named where they exist:
-`TestLedgerTotalTokensEqualsTheAnswerTheClientGot`, `TestStreamedRequestIsRecordedAsStreamed`,
-`TestConfiguredBodyCapIsHonoured`, `TestUnfilteredSpendLogsIsNotImplementedRatherThanInternalError`,
-`TestUnpricedRequestStillMirrorsTheCostHeaderAsZero`, `TestPricedRequestMirrorsTheCostHeaderExactly`,
-`TestNotionalHeaderIsAbsentWhenThereIsNoListRate`, `TestUsageScanning`.
+§C's and §D's controlled measurements are not scripted here. The rig is:
 
-**Nothing in D1, D2 or D4 has a test.** That is the point of naming them.
+- a stub OpenAI-compatible upstream serving a **fixed** usage object per model, in which every
+  breakdown field is a strict subset — `prompt_tokens_details.cached_tokens`,
+  `cache_creation_input_tokens`, `completion_tokens_details.reasoning_tokens` — plus one model that
+  states a `total_tokens` contradicting its own parts and one that reports no breakdown at all;
+- a dorang configuration declaring the four cards of §C1, an unpriced model, a zero-rated model, a
+  key with `max_budget`, a key with `tpm_limit: 20`, and — for D5 and N1 — a `fixed_subscription`
+  rule of `100.00` monthly;
+- the same configuration run under a binary built from the previous commit, for the before column.
+
+The unit tests that pin each conclusion are named where they exist:
+`TestChargedAmountMatchesTheVendorInvoice`, `TestAnAgenticCacheHitIsNotBilledAsAFreshPrompt`,
+`TestReasoningIsNotBilledAsOutputAndAgainAsReasoning`,
+`TestAnUndeclaredSubRateLeavesItsTokensWithTheParent`,
+`TestGraduatedBracketsChargeTheCachedPrefixOnce`, `TestStreamedRequestDoesNotPublishACostOfZero`,
+`TestTheDiscriminatorStillDistinguishesUnpricedFromPriced`, `TestTokenTotalHasOneRule`,
+`TestNoSecondTokenTotalRuleIsWrittenAnywhere`.
+
+**N1, N2, N3 and N4 have no test.** That is the point of naming them.

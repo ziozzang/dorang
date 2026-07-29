@@ -1298,18 +1298,63 @@ grows**, and a request's recorded share is the increment that brings it up to da
   rotated `key_file` secret, none of which the configuration file's own mtime says anything
   about. *"Nothing in the file changed"* is not *"nothing changed"*, so the reload stays
   unconditional and is made free instead.
+- **A restart is not a billing event either, and this was the larger half.** The line above
+  closed the reload and left the process boundary open: the accumulator was in memory and
+  nowhere else, so a new process built an empty one and the open period attributed its whole
+  elapsed share again. Measured on a live reproduction of a 100 USD monthly plan driven late in
+  the period: **180.46 USD attributed across two process starts**, the second start's 90.23 USD
+  landing entirely on the first request after the restart — and because the budget hold reserves
+  the settled cost against the *requesting* key, **a brand-new key with `max_budget: 1.00` was
+  refused `400 budget_exceeded` on its first ever request**. N restarts in a period attribute N
+  times, and so did N nodes, each with an accumulator of its own.
+
+  The accumulator is now written down, in `subscription_state`, one row per rule id. Three
+  properties make it cheap and make it safe:
+
+  - **It is checkpointed, not written per request.** A store write per settlement is the
+    arrangement §9.6 exists to avoid. The checkpoint runs on the same background loop as the
+    budget-lease maintenance and once more on a clean shutdown.
+  - **The checkpoint is projected forward by one interval**, so the durable figure is always at
+    or *ahead* of what has really been attributed — the same rule §9.6 applies to a budget
+    block, for the same reason. A crash therefore leaves a little of the period unattributed
+    rather than resuming behind and attributing a slice of it twice: the direction this section
+    permits, never the one it forbids. At the default interval that residue is 0.0012% of a
+    monthly plan.
+  - **The merge is monotone.** A later period replaces the row, the same period keeps the larger
+    attributed total, an earlier one is dropped. Two nodes converge on the high-water mark
+    instead of overwriting each other, which bounds the *fleet* rather than each node
+    separately.
+
+  The row is also the second observation the clamp below needs. See §17.1.
 - **A settlement stamped in the future is clamped to the present.** The accumulator only moves
   forward, so a row stamped ahead of now attributes everything the plan will have accrued by
   that instant and leaves the real remainder of the period attributing nothing; a stamp that
   lands in the *next* period moves the period marker forward as well, so every later row of
   the real period takes the late-row branch below and the next period opens already depressed.
-  Measured: one such row left **10.00 USD attributed to a 100.00 USD July**. This is the mirror
-  of the late-row guard and it is reachable without anything malicious — one node in a cluster
-  with a clock that runs ahead is enough. It is clamped rather than refused, because a refusal
-  fails the whole pricing call and takes the request's real marginal cost with it; the plan
-  share is the only figure a bad clock can distort, so it is the only one adjusted. Only
-  settlement is clamped: `Price` and `Explain` mutate nothing, and pricing a future instant is
-  what a preview is for.
+  Measured: one such row left **10.00 USD attributed to a 100.00 USD July**. It is clamped
+  rather than refused, because a refusal fails the whole pricing call and takes the request's
+  real marginal cost with it; the plan share is the only figure a bad clock can distort, so it
+  is the only one adjusted. Only settlement is clamped: `Price` and `Explain` mutate nothing,
+  and pricing a future instant is what a preview is for.
+
+  > **This clamp said "one node in a cluster with a clock that runs ahead is enough", and inside
+  > `Settle` that was not true.** internal/app hands the catalog `a.now` and stamps the request
+  > `At: d.now()` from the same `a.now`, read first: two readings of one clock, in order, so the
+  > stamp is never the later of the two and the comparison cannot be true in a default
+  > deployment. The triggers named — an NTP step, a VM resume, a bad RTC — move *both* readings
+  > together, which is exactly why comparing them finds nothing. A control that is reached and
+  > whose condition can never hold is the §17.1 class in a form worth naming separately.
+  >
+  > **A clock check needs two observations, not two readings.** The second observation is the
+  > durable accumulator above: its period stamp was written by whichever process held it last,
+  > which may be another process on another host, and this process's clock did not produce it.
+  > The comparison therefore lives at the *process boundary* as well — a stored period that has
+  > not begun is re-dated to the open one, keeping its attributed total, so the open period
+  > attributes only the remainder and the next one still opens at zero. Re-dating rather than
+  > dropping is what keeps the fleet's shares for one period summing to one plan cost. Inside
+  > `Settle` the clamp stays, and its scope is now stated honestly: it covers a caller whose
+  > `At` did not come from this catalog's clock — a replayed or imported row, `dorangctl price
+  > --at` — and not the gateway's own request path, where it is a tautology.
 - **A share is never negative**, and a row that arrives out of order inside the open period
   attributes zero rather than clawing back what a settled row already took.
 - **A period with no requests attributes nothing**, and a period whose traffic stopped early
@@ -1503,12 +1548,15 @@ request_logs(...)            -- ledger; daily partitions (PostgreSQL); retention
 request_traces(request_id, ts, excerpt)   -- separate, sampled, byte-budgeted  [R1-3]
 
 usage_by_key_hour · usage_by_model_hour · usage_by_team_day   -- purpose-built  [R1-13]
-  (each carries notional_nano as its own column, never folded into cost_nano — §8.5)
+  (each carries notional_nano as its own column, never folded into cost_nano — §8.5,
+   and marginal_nano/subscription_nano beside cost_nano — §8.1's two classes stay two
+   numbers in the aggregate as well as in the row)
 
 quota_buckets(scope, scope_key, window, metric, bucket_start, value)
 quota_leases(node_id, scope, scope_key, window, metric, amount, expires_at)   [R1-14]
 budget_state(subject_kind, subject_id, period, period_start,
              spent, reserved, reserved_until)                                 [R1-5]
+subscription_state(rule_id, period_start, attributed_atto, updated_at)        -- §8.1
 credential_state(credential_id, health, unavailable_until, quota_snapshot, updated_at)
 
 responses_store(response_id, created_at, expires_at, owner_key_id,
@@ -1519,6 +1567,15 @@ nodes · capacity_leases · files · batches · batch_requests · audit_logs
   batches         also: errors (why a failed batch failed, after a restart), expired_at
   batch_requests  also: response_body, input_offset, input_length
 ```
+
+**`subscription_state` is one row per `fixed_subscription` rule, not one per node.** §8.1's
+invariant is about a *period*, and a per-node row would make it an invariant about a node —
+which is what it accidentally was while the accumulator lived in memory. It is also not keyed by
+node because a node id is generated per process when `cluster.node_id` is unset, so a per-node
+row would be written by a process that never reads it again, which is the restart the table
+exists for. `attributed_atto` is decimal **digits**: the value is atto-scaled, a 100 USD plan is
+10^20, and the alternatives were a pair of 64-bit limbs (exact, illegible) or a float (legible,
+not exact).
 
 **`responses_store` is not optional [R1-C7].** The Responses API carries server-side
 conversation state — `store: true` plus `previous_response_id`. Revision 1 promised strict
@@ -1792,7 +1849,7 @@ Every removal is reported.
 | `x-dorang-tokens-*` | input, output, cache read/write, reasoning |
 | `x-dorang-cost-usd` | this request |
 | `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
-| `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative |
+| `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative. The ceiling comes from the authorization snapshot and is always known; the SPEND comes from the budget hold, which is hydrated by the reservation, so a request that reserves nothing (a zero-rated one) omits `-spend-usd` and `-budget-remaining-usd` rather than reporting a `0` nobody looked up. Same rule as the streamed cost header: absent claims nothing, zero claims a measurement |
 | `x-dorang-quota-*-used-pct` | credential quota windows |
 | `x-dorang-dropped-params` | what conversion removed |
 | `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form |
@@ -3553,6 +3610,39 @@ than under a heading of its own:
    the one that reads `usage.total_tokens` out of the response body and compares it to the
    ledger row for that request id — which is what the named test above does, with a fixture
    carrying cache and reasoning counts precisely so the two rules give different answers.
+
+#### The variant: a control that is reached and can never fire
+
+The next cutover reproduction found three more of the wired-to-nothing shape on the same
+surface — `request_logs.subscription_cost_nano` had a column, a JSON name on `/spend/logs` and
+no producer *and the same conflation one materialization up*, where `/global/spend/report`
+answered `marginal_spend` from `cost_nano`; `/key/info` rendered `spend` from a column nothing
+on the request path writes; a budget hold that takes no reservation reported an unhydrated `0`
+as a measurement — and then a fourth that is worth separating, because it is not a value nobody
+reads.
+
+**§8.1's future-settlement clamp is reached on every settlement and its condition can never be
+true.** It compares the row's stamp against the catalog's clock, and internal/app supplies both
+from `a.now` — the stamp first, the catalog's reading after. The rule was written for an NTP
+step, a VM resume, a bad RTC and a fast node in a cluster; the first three move both readings
+together, and the fourth never reached this process at all because the accumulator was in
+memory. Re-driven with the clocks coupled the way the app couples them, the defect the clamp
+was written for reproduced to the cent — a stray 50.00 USD, a July attributing 10.00 USD of
+100.00 USD, an August opening at 49.00 USD — while the clamp did nothing.
+
+Three things follow, and the third is the one that generalizes:
+
+1. A guard whose inputs come from one source is not a guard. **Two readings of one clock, taken
+   in order, cannot disagree**, and no amount of testing at the call site changes that.
+2. **A fixture that injects the two inputs independently proves the comparison, not the
+   deployment.** The original test set the catalog's clock and the row's stamp separately, which
+   is a thing no gateway process does; it passed against a tautology. The replacement drives
+   whole processes, each with exactly one clock, which is the arrangement `internal/app` has.
+3. The generalization: **for any control of the form "A disagrees with B", the reviewer's first
+   question is where A and B were each observed.** If the answer is "the same place, twice", the
+   control is documentation. The fix is not to strengthen the comparison but to find the reading
+   that can actually differ — here, a stamp that crossed a process boundary, which only exists
+   because §8.1's accumulator was made durable in the first place.
 
 ## 18. Open risks
 

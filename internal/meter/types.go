@@ -249,8 +249,26 @@ type Event struct {
 
 	Tokens   Tokens
 	CostNano int64
-	Latency  time.Duration
-	TTFT     time.Duration
+	// MarginalCostNano and SubscriptionCostNano are CostNano's decomposition by
+	// pricing class (DESIGN §8.1): what this request's own usage cost, and what
+	// share of a flat plan's period cost it carried. They are carried beside the
+	// total rather than derived from it because neither can be computed from the
+	// other, and because §8.1 requires them to be separate fields — "never
+	// conflated".
+	//
+	// They existed as columns in the ledger, were read by /spend/logs, and had
+	// no producer: this boundary carried one CostNano, so internal/app wrote the
+	// whole cost to `marginal_cost_nano` and `subscription_cost_nano` was zero on
+	// every row of every deployment. Unobservable until a configuration declared
+	// a plan, which no configuration in the parity suite did.
+	//
+	// They need not sum to CostNano. An `adjustment` rule is a third class and
+	// applies on top of both (§8.1: cost = marginal + subscription, then
+	// adjustments in order), so the difference is the net adjustment.
+	MarginalCostNano     int64
+	SubscriptionCostNano int64
+	Latency              time.Duration
+	TTFT                 time.Duration
 
 	Trace TraceInfo
 }
@@ -289,6 +307,10 @@ type Bucket struct {
 	Errors   int64
 	Tokens   Tokens
 	CostNano int64
+	// MarginalCostNano and SubscriptionCostNano decompose CostNano by pricing
+	// class. See [Event].
+	MarginalCostNano     int64
+	SubscriptionCostNano int64
 
 	// LatencySum and TTFTSum are sums, not averages; the store divides by
 	// Requests and TTFTCount respectively. Summing keeps merges associative.
@@ -304,6 +326,8 @@ func (b *Bucket) addCounters(c *counters) {
 	b.Errors += c.errors
 	b.Tokens.add(c.tokens)
 	b.CostNano += c.costNano
+	b.MarginalCostNano += c.marginalNano
+	b.SubscriptionCostNano += c.subscriptionNano
 	b.LatencySum += time.Duration(c.latencySum)
 	b.TTFTSum += time.Duration(c.ttftSum)
 	b.TTFTCount += c.ttftCount
@@ -314,6 +338,8 @@ func (b *Bucket) addBucket(o *Bucket) {
 	b.Errors += o.Errors
 	b.Tokens.add(o.Tokens)
 	b.CostNano += o.CostNano
+	b.MarginalCostNano += o.MarginalCostNano
+	b.SubscriptionCostNano += o.SubscriptionCostNano
 	b.LatencySum += o.LatencySum
 	b.TTFTSum += o.TTFTSum
 	b.TTFTCount += o.TTFTCount
@@ -364,6 +390,10 @@ type Trace struct {
 
 	Tokens   Tokens
 	CostNano int64
+	// MarginalCostNano and SubscriptionCostNano are the ledger row's cost
+	// decomposition. See [Event] for why they travel beside the total.
+	MarginalCostNano     int64
+	SubscriptionCostNano int64
 
 	Retries        int
 	FallbackReason string

@@ -244,8 +244,29 @@ func (g *budgetGate) reserveFor(ctx context.Context, subs []budgetSubject,
 		// It is the spend of the BINDING subject, the one whose ceiling
 		// x-dorang-budget-usd reports, so that the pair "spent / limit" is two
 		// numbers about one budget rather than two budgets' halves.
+		//
+		// # When the figure means nothing, and how that is said
+		//
+		// Consumed reads the block this node holds: the durable counter as of
+		// this node's last DRAW, less what it has not yet spent. A block is only
+		// ever drawn by a reservation of a positive amount, so a request whose
+		// estimated cost is zero — an unpriced model, a zero-rated one — takes no
+		// reservation and finds an empty block. Its two loads then answer zero,
+		// and zero is not this subject's spend, it is the absence of one.
+		//
+		// Measured: the first zero-rated request after a process start reported
+		// `x-dorang-spend-usd: 0` and a full `x-dorang-budget-remaining-usd` for
+		// a key whose true spend was 0.001889198 of a 0.01 ceiling.
+		//
+		// Two facts prove the figure was looked up, and either is enough:
+		// this request drew or took against a live block (amount > 0), or the
+		// block already reports consumption (spent > 0). Neither can be true of
+		// an empty block, so there is no reading here that claims a spend the
+		// counter never supplied. Enforcement is untouched either way — a
+		// reservation of zero was always admitted.
 		if binding && rq != nil {
 			rq.Result.SpendNanoUSD = spent
+			rq.Result.SpendKnown = amount > 0 || spent > 0
 		}
 	}
 	return h, minLimit, nil

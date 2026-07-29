@@ -608,14 +608,31 @@ func (c *Catalog) subscriptionShare(r *rule, at time.Time, mutate bool) (amt, er
 		// takes the backfill branch below and the next period opens already depressed.
 		// Measured: one such row attributed 10.00 USD of a 100.00 USD July.
 		//
-		// This is the mirror of the backfill guard and it is reachable without anything
-		// malicious: one node in a cluster with a clock that runs ahead is enough.
 		// Clamping rather than refusing, because a refusal fails the whole pricing call
 		// and takes the request's real marginal cost down with it — the plan share is the
 		// only figure a bad clock can distort, so it is the only one adjusted.
 		//
 		// Only settlement is clamped. Price and Explain mutate nothing, and pricing a
 		// future instant is exactly what a preview is for.
+		//
+		// # What this line does NOT cover, and where the cover is
+		//
+		// It covers a caller that stamps `At` from something other than this catalog's
+		// clock: an imported or replayed row, a batch row re-priced from its recorded
+		// instant, `dorangctl price --at`. It does NOT cover the gateway's own request
+		// path, and the comment that used to stand here claimed it did — "one node in a
+		// cluster with a clock that runs ahead is enough". internal/app gives this
+		// catalog `a.now` and stamps `At: d.now()` from that SAME `a.now`, read first.
+		// Two readings of one clock, in order: `at` is never the later of the two, so in
+		// a default deployment this comparison cannot be true. The triggers the rule was
+		// written for — an NTP step, a VM resume, a bad RTC — move both readings
+		// together, which is precisely why they cannot be caught by comparing them.
+		//
+		// A clock check needs two OBSERVATIONS, not two readings. The second observation
+		// exists at the process boundary, where the stamp was written down by whichever
+		// process held the accumulator before this one: [Catalog.RestoreState] makes the
+		// same comparison there, against a stamp this process's clock did not produce,
+		// and that one can disagree.
 		if now := c.nowInstant(); at.After(now) {
 			at = now
 		}

@@ -220,6 +220,7 @@ func (c *call) userInfo() error {
 			return err
 		}
 		keys = c.keepKeysInScope(keys)
+		c.hydrateSpend(keys...)
 		views := make([]keyView, 0, len(keys))
 		for _, k := range keys {
 			views = append(views, viewKey(k))

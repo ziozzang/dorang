@@ -10,6 +10,7 @@ import (
 	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/capacity"
+	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -175,6 +176,7 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		Hasher: adminHasherOrNil(hasher),
 		Audit:  &adminAuditor{st: a.Store, newID: admin.NewID},
 		Ledger: &adminLedger{st: a.Store},
+		Spend:  &adminSpendReporter{st: a.Store, now: a.now},
 
 		Capacity: &adminCapacityReporter{b: a.Broker},
 		Catalog:  &adminCatalog{c: a.Catalog},
@@ -657,6 +659,78 @@ func (l *adminLedger) Report(ctx context.Context, q admin.ReportQuery) (admin.Re
 	return out, nil
 }
 
+// adminSpendReporter answers "what has this key spent" from the per-key rollup
+// of DESIGN §9.4.
+//
+// It is the producer `/key/info`'s `spend` never had. The field was rendered
+// from `api_keys.spend_nano`, which is written by imports and by nothing on the
+// request path, so **every key on every deployment reported `"spend": 0`** —
+// while the same key's ledger rows, its own `x-dorang-spend-usd` header and
+// `/global/spend/report?group_by=key` all agreed on a different number. A silent
+// zero on the route a per-key spend dashboard asks first is worse than an error,
+// because an error is noticed.
+//
+// # Why the rollup and not the durable budget counter
+//
+// `budget_state.spent_nano` is what enforcement reads, and it is deliberately
+// not what a key has spent: a node charges a whole lease block to it BEFORE
+// spending a unit of it (§9.6), so it runs up to one block ahead of reality
+// while a block is live. Printing that next to `max_budget` would show an
+// operator a number that jumps by the block size and settles back. The rollup
+// is what agrees with the ledger row for row, which is why the report endpoint
+// answers from it too.
+//
+// # The window
+//
+// A key's spend is measured over the period its ceiling is enforced over, which
+// is the same window and the same period start the budget gate derives — an
+// unparseable `budget_duration` falls back to monthly in both places, so the
+// figure and the ceiling beside it cannot disagree about which month they mean.
+type adminSpendReporter struct {
+	st  *store.Store
+	now func() time.Time
+}
+
+// KeySpend implements admin.SpendReporter.
+//
+// One query per distinct budget window, not one per key: a page of keys usually
+// shares a window, and a query per row is how an operator list becomes a store
+// outage at the page size operators actually use.
+func (r *adminSpendReporter) KeySpend(ctx context.Context, keys []admin.KeySpendRef) (map[string]int64, error) {
+	if r == nil || r.st == nil || len(keys) == 0 {
+		return nil, nil
+	}
+	now := r.now()
+	byWindow := make(map[quota.Window][]string, 2)
+	for _, k := range keys {
+		if k.ID == "" {
+			continue
+		}
+		w, err := quota.ParseWindow(k.Period)
+		if err != nil || !w.Valid() {
+			// The same fallback budgetSubjectsOf takes. A period that does not
+			// parse must not become "no window at all", or the spend beside a
+			// ceiling would be measured over a window nothing enforces.
+			w = quota.Monthly
+		}
+		byWindow[w] = append(byWindow[w], k.ID)
+	}
+	out := make(map[string]int64, len(keys))
+	for w, ids := range byWindow {
+		got, err := r.st.KeySpendRange(ctx, ids, store.TimeRange{
+			Start: w.PeriodStart(now),
+			End:   w.PeriodEnd(now),
+		})
+		if err != nil {
+			return nil, adminStoreError(err)
+		}
+		for id, v := range got {
+			out[id] = v
+		}
+	}
+	return out, nil
+}
+
 // rollupPlan maps a requested grouping onto the materialization that carries it.
 func rollupPlan(groups []admin.GroupBy) (dim store.RollupDim, byDay, byDim bool, err error) {
 	// The default materialization for a time-only report is the per-model one:
@@ -699,18 +773,26 @@ func rollupPlan(groups []admin.GroupBy) (dim store.RollupDim, byDay, byDim bool,
 //
 // NotionalKnown stays false and NotionalNano stays zero: the rollup tables have
 // no notional column, and DESIGN §8.5 rule 5 requires a missing list rate to be
-// reported as missing rather than as a flattering zero. SubscriptionCostNano
-// stays zero for the same reason — the rollups carry one cost column. Marginal
-// mirrors it, exactly as adminLogRow does for a ledger row, because on this
-// build metering writes the same figure to both.
+// reported as missing rather than as a flattering zero.
+//
+// The cost DECOMPOSITION is read from its own columns. It used to be
+// `MarginalCostNano: d.CostNano` — the whole total reported as marginal usage —
+// which is the same conflation §8.1 forbids by name, one aggregate up from the
+// ledger row where it was also happening. It matters here for a reason it does
+// not matter on a single row: `/global/spend/report?group_by=model` is what an
+// operator compares models by, and routing compares the marginal figure
+// precisely so that a sunk plan cost cannot make a saturated plan look cheap.
+// Rows written before the columns existed report 0 for both, which is honest —
+// the split was never recorded and there is nothing to recover it from.
 func rollupUsage(d store.UsageDelta) admin.Usage {
 	return admin.Usage{
 		Requests: d.Requests, Errors: d.Errors,
 		PromptTokens: d.PromptTokens, CompletionTokens: d.CompletionTokens,
 		CachedTokens: d.CachedTokens, ReasoningTokens: d.ReasoningTokens,
 		TotalTokens: d.TotalTokens,
-		CostNano:    d.CostNano, MarginalCostNano: d.CostNano,
-		LatencyMSSum: d.LatencyMSSum,
+		CostNano:    d.CostNano, MarginalCostNano: d.MarginalNano,
+		SubscriptionCostNano: d.SubscriptionNano,
+		LatencyMSSum:         d.LatencyMSSum,
 	}
 }
 

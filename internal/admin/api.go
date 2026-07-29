@@ -56,6 +56,10 @@ type Config struct {
 	Models    ModelRegistry
 	Budgets   BudgetStore
 	Ledger    Ledger
+	// Spend re-points the per-key `spend` field at the counter that has it.
+	// Optional; nil leaves the stored column, which is zero on every
+	// deployment. See [SpendReporter].
+	Spend SpendReporter
 
 	// Audit persists the trail. Required for any mutation: a mutation that
 	// cannot be audited is refused before it happens (see [API.mutate]).

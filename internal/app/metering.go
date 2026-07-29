@@ -78,9 +78,11 @@ func (a *meterAdapter) Record(ev server.Event) {
 			CacheWrite: r.Tokens.CacheWrite,
 			Reasoning:  r.Tokens.Reasoning,
 		},
-		CostNano: r.CostNanoUSD,
-		Latency:  time.Duration(ev.DurationNS),
-		TTFT:     time.Duration(r.TTFTNS),
+		CostNano:             r.CostNanoUSD,
+		MarginalCostNano:     r.MarginalNanoUSD,
+		SubscriptionCostNano: r.SubscriptionNanoUSD,
+		Latency:              time.Duration(ev.DurationNS),
+		TTFT:                 time.Duration(r.TTFTNS),
 		Trace: meter.TraceInfo{
 			RequestID:     ev.RequestID,
 			UpstreamModel: r.UpstreamModel,
@@ -129,6 +131,8 @@ func (s *storeSink) WriteRollups(ctx context.Context, buckets []meter.Bucket) er
 			ReasoningTokens:  bk.Tokens.Reasoning,
 			TotalTokens:      bk.Tokens.Total(),
 			CostNano:         bk.CostNano,
+			MarginalNano:     bk.MarginalCostNano,
+			SubscriptionNano: bk.SubscriptionCostNano,
 			LatencyMSSum:     bk.LatencySum.Milliseconds(),
 		}
 		// The bucket's hour is already the accumulator key, so it is used as
@@ -193,14 +197,21 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			ReasoningTokens:  t.Tokens.Reasoning,
 			TotalTokens:      t.Tokens.Total(),
 			CostNano:         t.CostNano,
-			MarginalCostNano: t.CostNano,
-			LatencyMS:        t.Latency.Milliseconds(),
-			TTFTMS:           t.TTFT.Milliseconds(),
-			QueueMS:          t.QueueWait.Milliseconds(),
-			CapacityWaitMS:   t.CapacityWait.Milliseconds(),
-			UpstreamMS:       t.UpstreamConnect.Milliseconds(),
-			FallbackCount:    t.Retries,
-			TraceID:          t.TraceID,
+			// The decomposition as pricing computed it, not the total copied
+			// twice. `MarginalCostNano: t.CostNano` is the line that gave
+			// `subscription_cost_nano` a column, a reader in /spend/logs and no
+			// producer, and it filed a flat plan's share under `marginal_spend`
+			// — which DESIGN §8.1 forbids by name, because routing compares the
+			// marginal figure and a sunk plan cost must not enter it.
+			MarginalCostNano:     t.MarginalCostNano,
+			SubscriptionCostNano: t.SubscriptionCostNano,
+			LatencyMS:            t.Latency.Milliseconds(),
+			TTFTMS:               t.TTFT.Milliseconds(),
+			QueueMS:              t.QueueWait.Milliseconds(),
+			CapacityWaitMS:       t.CapacityWait.Milliseconds(),
+			UpstreamMS:           t.UpstreamConnect.Milliseconds(),
+			FallbackCount:        t.Retries,
+			TraceID:              t.TraceID,
 		})
 		if t.Excerpt != "" {
 			rows = append(rows, store.RequestTrace{

@@ -301,9 +301,14 @@ func (m *Meter) recordTrace(ev *Event, ts time.Time) {
 		UpstreamConnect: ev.Trace.UpstreamConnect,
 		Tokens:          ev.Tokens,
 		CostNano:        ev.CostNano,
-		Retries:         ev.Trace.Retries,
-		FallbackReason:  ev.Trace.FallbackReason,
-		ErrorMessage:    ev.Trace.ErrorMessage,
+		// The cost decomposition travels with the row it describes. Dropping it
+		// here is how `subscription_spend` came to have a column, a reader and
+		// no producer.
+		MarginalCostNano:     ev.MarginalCostNano,
+		SubscriptionCostNano: ev.SubscriptionCostNano,
+		Retries:              ev.Trace.Retries,
+		FallbackReason:       ev.Trace.FallbackReason,
+		ErrorMessage:         ev.Trace.ErrorMessage,
 	}
 	if !m.ring.push(&t, excerpt) {
 		m.smpl.refund(size)

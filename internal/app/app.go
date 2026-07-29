@@ -41,6 +41,7 @@ import (
 	"github.com/ziozzang/dorang/internal/metrics"
 	"github.com/ziozzang/dorang/internal/notify"
 	"github.com/ziozzang/dorang/internal/prefix"
+	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
 	"github.com/ziozzang/dorang/internal/server"
@@ -313,9 +314,18 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The catalog settles against this node's clock, not the wall clock, so a
-	// settlement stamped ahead of the present is recognizable as such.
+	// The catalog settles against this node's clock, not the wall clock, so
+	// every instant in the pricing engine comes from the one place a test can
+	// move. It is NOT what makes the future-settlement clamp work — see
+	// [App.restorePricingState] and pricing.Catalog.RestoreState for the
+	// comparison that can actually disagree.
 	prices.SetClock(a.now)
+	// A restart must not be a billing event either. The subscription period
+	// accumulator lives with the catalog, a new process builds an empty one, and
+	// without this the open period attributes its whole elapsed share a second
+	// time — 180.46 USD of a 100.00 USD plan across two starts, with the second
+	// start's 90.23 USD landing on one request's budget.
+	a.restorePricingState(ctx, prices)
 	qs, err := newQuotaSet(cfg, a.now)
 	if err != nil {
 		return nil, err
@@ -612,6 +622,17 @@ func (a *App) Reload(cfg *config.Config) error {
 	if prev := a.dispatch.state(); prev != nil && prev.pricing != nil {
 		prices.AdoptState(prev.pricing)
 	}
+	// And the durable half, for a rule this reload has just introduced: the
+	// running catalog has no accumulator to hand over for it, and an earlier
+	// process may have left one. RestoreState never pulls an accumulator
+	// backwards, so running it after AdoptState cannot undo the line above.
+	//
+	// Bounded, because a reload is a SIGHUP and an operator waiting on one must
+	// not be waiting on a store that has stopped answering. A timeout leaves the
+	// in-memory accumulator, which is the one the running process was using.
+	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	a.restorePricingState(rctx, prices)
+	rcancel()
 	qs, err := newQuotaSet(cfg, a.now)
 	if err != nil {
 		return err
@@ -695,6 +716,91 @@ func (a *App) Reload(cfg *config.Config) error {
 	return nil
 }
 
+// subscriptionCheckpoint is how often the subscription period accumulator is
+// written down, and — because [pricing.Catalog.SnapshotState] projects the
+// figure forward by exactly one interval — how much of a period a crash may
+// leave UNattributed.
+//
+// Thirty seconds of a monthly plan is 0.0012% of it: 0.0012 USD of a 100 USD
+// plan, and in the direction §8.1 permits ("less, never more"). Making it
+// shorter buys a smaller residue at the cost of a store write per rule per
+// interval; making it per-request would put a synchronous store write on the
+// settlement path, which is the arrangement §9.6 exists to avoid.
+const subscriptionCheckpoint = 30 * time.Second
+
+// restorePricingState carries the subscription period accumulators of whatever
+// process held them last into this catalog.
+//
+// This is the process-boundary half of the reload's AdoptState, and DESIGN
+// §8.1's invariant does not survive without it: the accumulator is in memory,
+// a restart builds an empty one, and the open period attributes its whole
+// elapsed share again. It is also where the future-settlement clamp becomes a
+// real test rather than a tautology — the stored instant was stamped by another
+// process, so it is an observation this process's clock did not produce.
+//
+// A failure is logged and not fatal. Refusing to start because the accumulator
+// could not be read would take the whole gateway down over a figure that
+// affects one accounting column, and starting with an empty accumulator is
+// exactly the behaviour of every build before this one.
+func (a *App) restorePricingState(ctx context.Context, prices *pricing.Catalog) {
+	if a.Store == nil || prices == nil {
+		return
+	}
+	rows, err := a.Store.LoadSubscriptionState(ctx)
+	if err != nil {
+		a.logf("app: subscription accumulator could not be read; the open period "+
+			"may attribute its elapsed share again: %v", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	states := make([]pricing.SubscriptionState, 0, len(rows))
+	for _, r := range rows {
+		states = append(states, pricing.SubscriptionState{
+			RuleID: r.RuleID, PeriodStart: r.PeriodStart, Attributed: r.Attributed,
+		})
+	}
+	n, err := prices.RestoreState(states, a.now())
+	if err != nil {
+		a.logf("app: subscription accumulator: %v", err)
+		return
+	}
+	if n > 0 {
+		a.logf("app: carried %d subscription period accumulator(s) across the restart", n)
+	}
+}
+
+// checkpointPricingState writes the subscription accumulators down.
+//
+// `ahead` is how far the written figure is projected past the present. On the
+// periodic tick it is one interval, so the durable record is always at or ahead
+// of what has really been attributed and a crash costs a little attribution
+// rather than duplicating some — the same rule §9.6 applies to a budget block.
+// On a clean shutdown it is zero: nothing is about to be lost.
+func (a *App) checkpointPricingState(ctx context.Context, ahead time.Duration) {
+	if a.Store == nil {
+		return
+	}
+	st := a.dispatch.state()
+	if st == nil || st.pricing == nil {
+		return
+	}
+	states := st.pricing.SnapshotState(a.now().Add(ahead))
+	if len(states) == 0 {
+		return
+	}
+	rows := make([]store.SubscriptionState, 0, len(states))
+	for _, s := range states {
+		rows = append(rows, store.SubscriptionState{
+			RuleID: s.RuleID, PeriodStart: s.PeriodStart, Attributed: s.Attributed,
+		})
+	}
+	if _, err := a.Store.SaveSubscriptionState(ctx, rows, a.now()); err != nil {
+		a.logf("app: subscription accumulator checkpoint: %v", err)
+	}
+}
+
 // startBackground runs the periodic sweeps that are nobody's request path:
 // expired sticky pins, expired capacity reservations, budget-lease renewal, and
 // — on PostgreSQL — tomorrow's ledger partitions.
@@ -775,6 +881,8 @@ func (a *App) startBackground() {
 		defer g.Stop()
 		r := time.NewTicker(reload)
 		defer r.Stop()
+		s := time.NewTicker(subscriptionCheckpoint)
+		defer s.Stop()
 		var accuracy <-chan time.Time
 		if clustered {
 			at := time.NewTicker(a.clusterTick())
@@ -823,6 +931,12 @@ func (a *App) startBackground() {
 					}
 					cancel()
 				}
+			case <-s.C:
+				// Projected one interval ahead: the durable figure must be at
+				// or ahead of reality, never behind it.
+				sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				a.checkpointPricingState(sctx, subscriptionCheckpoint)
+				cancel()
 			case <-m.C:
 				if a.Ledger != nil {
 					mctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -889,6 +1003,12 @@ func (a *App) Close(ctx context.Context) error {
 			a.bgCancel()
 			<-a.bgDone
 		}
+		// The last checkpoint, at the present rather than projected: a clean
+		// shutdown loses nothing, so the next process resumes exactly where this
+		// one stopped instead of skipping the interval a crash would have cost.
+		// It runs before the store closes and after the background loop stops,
+		// so it is the final word on the accumulator.
+		a.checkpointPricingState(ctx, 0)
 		if a.Invalidator != nil {
 			a.Invalidator.Close()
 		}

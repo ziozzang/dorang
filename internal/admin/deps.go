@@ -155,6 +155,47 @@ type KeyFilter struct {
 	Offset  int
 }
 
+// KeySpendRef names one key whose spend is wanted, and the budget period the
+// answer must be measured over.
+//
+// The period travels with the id because the answer depends on it: a key's
+// spend is what it has spent in the window its ceiling is enforced over, and
+// asking for "the spend" without saying over what is how a daily ceiling gets
+// compared against a month of consumption.
+type KeySpendRef struct {
+	ID string
+	// Period is the key's budget_duration ("daily", "monthly", …). Empty means
+	// the deployment's default window, which is what the gate itself falls back
+	// to for a key whose period does not parse.
+	Period string
+}
+
+// SpendReporter answers what a key has actually spent.
+//
+// It exists because `api_keys.spend_nano` — the column [Key.SpendNano] carries
+// and /key/info reported — is written by nothing on the request path. Budget
+// enforcement lives in the durable counter the gate reserves against, which is
+// why enforcement worked while the column stayed at zero, and **/key/info
+// answered `"spend": 0` for every key on every deployment** while the same
+// key's ledger rows, its own response headers and /global/spend/report all
+// agreed on a different number.
+//
+// A silent zero is the specific failure this surface exists to avoid, and this
+// is the route a per-key spend dashboard reaches for first. The figure is
+// therefore taken from the counter that has it, and the stored column is left
+// to the audit trail, where an operator's mutation is being diffed and a
+// number that moves on its own is noise.
+//
+// Optional: a deployment with no counter behind it keeps the stored column. It
+// is a batch call because /key/list renders a page of them and a query per row
+// is how an operator page becomes a store outage.
+type SpendReporter interface {
+	// KeySpend returns spend in nano-currency, keyed by key id. A key with no
+	// counter row is absent from the map rather than present at zero — the
+	// caller then has an unhydrated column and knows it.
+	KeySpend(ctx context.Context, keys []KeySpendRef) (map[string]int64, error)
+}
+
 // KeyStore is the credential half of the store.
 type KeyStore interface {
 	// CreateKey inserts a key together with its verifier. It returns

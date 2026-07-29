@@ -20,13 +20,19 @@ type bucketKey struct {
 // counters is one key's accumulated numbers. It lives in a shard-owned arena,
 // never on the heap per-key, so admitting a new key allocates nothing.
 type counters struct {
-	requests   int64
-	errors     int64
-	tokens     Tokens
-	costNano   int64
-	latencySum int64
-	ttftSum    int64
-	ttftCount  int64
+	requests int64
+	errors   int64
+	tokens   Tokens
+	costNano int64
+	// marginalNano and subscriptionNano decompose costNano by pricing class
+	// (DESIGN §8.1). The rollup carries the split for the same reason the ledger
+	// row does: /global/spend/report answers `marginal_spend` from it, and
+	// answering it from the TOTAL reports a flat plan's share as marginal usage.
+	marginalNano     int64
+	subscriptionNano int64
+	latencySum       int64
+	ttftSum          int64
+	ttftCount        int64
 
 	// idle counts consecutive flushes in which this slot saw no event. A slot
 	// is returned to the free list only after EvictAfterFlushes idle flushes,
@@ -41,7 +47,8 @@ func (c *counters) reset() {
 
 func (c *counters) isZero() bool {
 	return c.requests == 0 && c.errors == 0 && c.tokens.IsZero() &&
-		c.costNano == 0 && c.latencySum == 0 && c.ttftSum == 0 && c.ttftCount == 0
+		c.costNano == 0 && c.marginalNano == 0 && c.subscriptionNano == 0 &&
+		c.latencySum == 0 && c.ttftSum == 0 && c.ttftCount == 0
 }
 
 func (c *counters) add(ev *Event) {
@@ -51,6 +58,8 @@ func (c *counters) add(ev *Event) {
 	}
 	c.tokens.add(ev.Tokens)
 	c.costNano += ev.CostNano
+	c.marginalNano += ev.MarginalCostNano
+	c.subscriptionNano += ev.SubscriptionCostNano
 	c.latencySum += int64(ev.Latency)
 	if ev.TTFT > 0 {
 		c.ttftSum += int64(ev.TTFT)

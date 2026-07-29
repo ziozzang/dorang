@@ -102,6 +102,47 @@ func viewKey(k *Key) keyView {
 	}
 }
 
+// hydrateSpend replaces the stored spend column with what the keys have
+// actually spent, in place, before they are rendered.
+//
+// It is done here rather than inside [viewKey] because viewKey also builds the
+// before/after documents of the audit trail, and those must keep the value the
+// operator's mutation actually wrote. An audit diff whose `spend` moves on its
+// own describes traffic, not the change being audited.
+//
+// A reporter that fails is logged into the response by NOT changing anything:
+// the error is swallowed deliberately, because /key/info's job is to describe a
+// credential and refusing to describe it over a spend lookup would take an
+// incident-response route down for an accounting figure. A key the reporter has
+// no row for keeps its stored value for the same reason — absent is not zero,
+// and the counter has nothing to say about a key that has never been budgeted.
+func (c *call) hydrateSpend(keys ...*Key) {
+	if c.a.cfg.Spend == nil || len(keys) == 0 {
+		return
+	}
+	refs := make([]KeySpendRef, 0, len(keys))
+	for _, k := range keys {
+		if k != nil && k.ID != "" {
+			refs = append(refs, KeySpendRef{ID: k.ID, Period: k.BudgetPeriod})
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	spend, err := c.a.cfg.Spend.KeySpend(c.ctx(), refs)
+	if err != nil {
+		return
+	}
+	for _, k := range keys {
+		if k == nil {
+			continue
+		}
+		if v, ok := spend[k.ID]; ok {
+			k.SpendNano = v
+		}
+	}
+}
+
 // orEmpty renders a nil slice as [] rather than null. A script doing
 // `for m in key["models"]` breaks on null and not on [], and the two mean the
 // same thing here.
@@ -436,6 +477,7 @@ func (c *call) keyInfo() error {
 	if err != nil {
 		return err
 	}
+	c.hydrateSpend(k)
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": viewKey(k)})
 	return nil
 }
@@ -595,6 +637,10 @@ func (c *call) keyList() error {
 		return err
 	}
 	keys = c.keepKeysInScope(keys)
+	// One batched lookup for the page, not one per row: a per-row query is how
+	// a list endpoint becomes a store outage at the page size an operator
+	// actually uses.
+	c.hydrateSpend(keys...)
 	out := make([]keyView, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, viewKey(k))

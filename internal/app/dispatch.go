@@ -825,6 +825,24 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 			dec.Provider, dec.UpstreamModel)
 	} else {
 		rq.Result.CostNanoUSD = cost.TotalNano
+		// The decomposition of the number on the line above, by pricing class —
+		// and it travels WITH that number rather than beside it, so a row can
+		// never report a plan share larger than the total it is part of.
+		//
+		// This is what gives `subscription_spend` a producer. Before it, the
+		// meter carried a single CostNano, internal/app wrote it to BOTH the
+		// total and `marginal_cost_nano`, and a flat plan's share was filed
+		// under `marginal_spend` on every row: DESIGN §8.1's "the two are
+		// separate fields, never conflated", conflated. The column, its reader
+		// in /spend/logs and its JSON name all existed; nothing wrote it.
+		//
+		// An unpriced model records no cost at all, plan share included. That is
+		// §8.3's existing rule — the log line above is how it is reported — and
+		// it stays here rather than being quietly widened, because a row whose
+		// `spend` is zero and whose `subscription_spend` is not would be a
+		// second wrong answer rather than a fix.
+		rq.Result.MarginalNanoUSD = cost.MarginalNano
+		rq.Result.SubscriptionNanoUSD = cost.SubscriptionNano
 		rq.Result.Priced = true
 	}
 	if !cost.NotionalMissing {

@@ -29,11 +29,12 @@ import (
 // lost, which DESIGN §9.6 rule 2 already prices as "precision, not
 // correctness", and nothing is reported as damage.
 const (
-	spoolMagic     = "DRSP"
-	spoolVersion   = 4
+	spoolMagic = "DRSP"
+	// Version 5 adds the trace's cost decomposition (marginal and subscription).
+	spoolVersion   = 5
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 4
+	traceCodecVer  = 5
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -42,10 +43,11 @@ const (
 	// its own version, so a rollup record can never be mistaken for a trace
 	// record and a field-list change to either one does not invalidate the
 	// other. An unrecognised header is discarded exactly as a segment's is.
-	carryMagic     = "DRRU"
-	carryVersion   = 1
+	carryMagic = "DRRU"
+	// Version 2 adds the bucket's cost decomposition.
+	carryVersion   = 2
 	carryHeaderLen = 8
-	bucketCodecVer = 1
+	bucketCodecVer = 2
 )
 
 var (
@@ -113,6 +115,8 @@ func appendBucket(dst []byte, b *Bucket) []byte {
 	dst = binary.AppendVarint(dst, b.Tokens.CacheWrite)
 	dst = binary.AppendVarint(dst, b.Tokens.Reasoning)
 	dst = binary.AppendVarint(dst, b.CostNano)
+	dst = binary.AppendVarint(dst, b.MarginalCostNano)
+	dst = binary.AppendVarint(dst, b.SubscriptionCostNano)
 	dst = binary.AppendVarint(dst, int64(b.LatencySum))
 	dst = binary.AppendVarint(dst, int64(b.TTFTSum))
 	return binary.AppendVarint(dst, b.TTFTCount)
@@ -163,6 +167,8 @@ func decodeBucket(p []byte) (Bucket, error) {
 	b.Tokens.CacheWrite = num()
 	b.Tokens.Reasoning = num()
 	b.CostNano = num()
+	b.MarginalCostNano = num()
+	b.SubscriptionCostNano = num()
 	b.LatencySum = time.Duration(num())
 	b.TTFTSum = time.Duration(num())
 	b.TTFTCount = num()
@@ -242,6 +248,8 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = binary.AppendVarint(dst, t.Tokens.CacheWrite)
 	dst = binary.AppendVarint(dst, t.Tokens.Reasoning)
 	dst = binary.AppendVarint(dst, t.CostNano)
+	dst = binary.AppendVarint(dst, t.MarginalCostNano)
+	dst = binary.AppendVarint(dst, t.SubscriptionCostNano)
 	dst = binary.AppendVarint(dst, int64(t.Retries))
 
 	dst = appendStr(dst, t.FallbackReason)
@@ -304,6 +312,8 @@ func decodeTrace(p []byte) (Trace, error) {
 	t.Tokens.CacheWrite = num()
 	t.Tokens.Reasoning = num()
 	t.CostNano = num()
+	t.MarginalCostNano = num()
+	t.SubscriptionCostNano = num()
 	t.Retries = int(num())
 
 	if err != nil {
