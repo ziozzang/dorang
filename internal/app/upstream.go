@@ -54,6 +54,14 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 				Backoff:     p.Retry.Backoff,
 				Base:        p.Retry.Base.Duration(),
 			},
+			// providers[].params.drop. Without this line the whole mechanism —
+			// the validated list, the refusals, the neutral-request removal and
+			// the x-dorang-dropped-params report — is live and no configuration
+			// file can reach it (DESIGN §17.1). backend.NewProvider validates
+			// the list against this provider's wire shape, so an undroppable
+			// name is a START-UP error naming the provider rather than a 400
+			// from the upstream on the first request.
+			DropParams: p.Params.Drop,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("app: provider %q (kind %q): %w", p.Name, p.Kind, err)

@@ -30,6 +30,13 @@ type counters struct {
 	// answering it from the TOTAL reports a flat plan's share as marginal usage.
 	marginalNano     int64
 	subscriptionNano int64
+	// notionalNano sums the list-rate equivalent (DESIGN §8.5),
+	// notionalRequests counts the requests that contributed to it, and
+	// notionalMissing the ones that reached pricing without one. The two counts
+	// are what keep the sum honest: see [store.UsageDelta.NotionalKnown].
+	notionalNano     int64
+	notionalRequests int64
+	notionalMissing  int64
 	latencySum       int64
 	ttftSum          int64
 	ttftCount        int64
@@ -48,6 +55,7 @@ func (c *counters) reset() {
 func (c *counters) isZero() bool {
 	return c.requests == 0 && c.errors == 0 && c.tokens.IsZero() &&
 		c.costNano == 0 && c.marginalNano == 0 && c.subscriptionNano == 0 &&
+		c.notionalNano == 0 && c.notionalRequests == 0 && c.notionalMissing == 0 &&
 		c.latencySum == 0 && c.ttftSum == 0 && c.ttftCount == 0
 }
 
@@ -60,6 +68,13 @@ func (c *counters) add(ev *Event) {
 	c.costNano += ev.CostNano
 	c.marginalNano += ev.MarginalCostNano
 	c.subscriptionNano += ev.SubscriptionCostNano
+	c.notionalNano += ev.NotionalCostNano
+	if ev.NotionalKnown {
+		c.notionalRequests++
+	}
+	if ev.NotionalMissing {
+		c.notionalMissing++
+	}
 	c.latencySum += int64(ev.Latency)
 	if ev.TTFT > 0 {
 		c.ttftSum += int64(ev.TTFT)

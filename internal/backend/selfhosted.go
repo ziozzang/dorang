@@ -8,8 +8,9 @@ import (
 )
 
 // prepareRequest applies everything that depends on the chosen deployment
-// rather than on the caller: the priority field, the service tier, and the
-// self-hosted engine normalizations of DESIGN §4.4.
+// rather than on the caller: the operator's parameter drops, the priority
+// field, the service tier, and the self-hosted engine normalizations of
+// DESIGN §4.4.
 //
 // It copies rather than mutates. A fail-back hop re-prepares from the caller's
 // original request, and a hop that inherited the previous engine's priority
@@ -22,6 +23,25 @@ func prepareRequest(x *exchange) *canonical.Request {
 	}
 	req := *src
 	engine := x.prov.engine
+
+	// The operator's `providers[].params.drop` (§10.3), applied FIRST and
+	// therefore to what the CALLER sent rather than to what dorang is about to
+	// add. Dropping the tier dorang selected below, or the priority number
+	// internal/router computed, would report a parameter back to a caller who
+	// never wrote one.
+	//
+	// It runs ahead of refuseMaterialLoss (see [Backend.exchange]'s caller) on
+	// purpose. `stop`, `n`, `logprobs` and `service_tier` are canonical.Material
+	// — a 400 when the target cannot express them — and an operator who has
+	// named one in the drop list has answered that question for this provider
+	// already. Clearing the field first means the gate never sees the
+	// requirement, so the request is served and the removal is reported,
+	// instead of the operator's own instruction producing a refusal.
+	if names := x.prov.drop; len(names) > 0 {
+		if dropped := req.DropParams(names); len(dropped) > 0 {
+			x.loss.DropParam(dropped...)
+		}
+	}
 
 	// The engine's own priority field, ALREADY direction-normalized for this
 	// engine by internal/router (§7.5). Extra is the neutral request's

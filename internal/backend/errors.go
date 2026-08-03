@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/redact"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -201,8 +202,10 @@ func normalizedFailure(frame []byte, secrets []string) *relayFailure {
 // two non-chat vendors, x-api-key for messages, x-goog-api-key for Gemini.
 var credentialHeaders = [...]string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"}
 
-// redacted replaces a credential in text that is about to leave dorang.
-const redacted = "[redacted]"
+// redacted replaces a credential in text that is about to leave dorang. It is
+// internal/redact's constant rather than a second spelling of it: two
+// placeholders would make a test that asserts on one silent about the other.
+const redacted = redact.Placeholder
 
 // collectSecrets reads back what was actually applied to an outbound request.
 //
@@ -237,16 +240,19 @@ func collectSecrets(h http.Header) []string {
 // sk-…" or a 500 HTML page rendering the request headers lands the credential in
 // the client's hands, and neither needs an attacker: a helpful error message is
 // enough.
+//
+// The rule is stated once, in internal/redact, and this is a call rather than a
+// copy. The copy that used to live here differed from it in both directions:
+// it searched the plain spelling only, so a credential echoed back inside a
+// quoted URL survived it; and it had no minimum length, so a short key —
+// `vllm serve --api-key test` is an ordinary way to bring a self-hosted
+// deployment up — matched inside ordinary words and mangled the message. On the
+// streaming path that second one is not cosmetic: [relayWatch] treats a
+// rewritten frame as proof the upstream echoed the credential, so a short key
+// made dorang corrupt an error frame the client reads and believe it had
+// stopped a leak.
 func scrub(s string, secrets []string) string {
-	if s == "" {
-		return s
-	}
-	for _, secret := range secrets {
-		if secret != "" && strings.Contains(s, secret) {
-			s = strings.ReplaceAll(s, secret, redacted)
-		}
-	}
-	return s
+	return redact.Text(s, secrets...)
 }
 
 // scrubBytes is [scrub] over a body that is relayed rather than parsed.

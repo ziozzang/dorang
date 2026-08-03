@@ -56,9 +56,16 @@ func TestRollupsMergeRatherThanAccumulateWrites(t *testing.T) {
 		want := UsageDelta{
 			Requests: n, PromptTokens: 2 * n, CompletionTokens: 3 * n,
 			TotalTokens: 5 * n, CostNano: 100 * n, LatencyMSSum: 10 * n,
+			// None of these rows carried a list rate, so all 500 count against
+			// the notional figure's completeness (DESIGN §8.5 rule 5).
+			NotionalMissing: n,
 		}
 		if got != want {
 			t.Fatalf("usage_by_key_hour = %+v, want %+v", got, want)
+		}
+		if got.NotionalKnown() {
+			t.Error("a bucket whose every request lacked a list rate reports its " +
+				"notional sum as known; §8.5 rule 5 requires it to be reported missing")
 		}
 	})
 }

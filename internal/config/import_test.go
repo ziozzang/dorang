@@ -754,7 +754,7 @@ router_settings: {routing_strategy: vibes}
 }
 
 func TestImportDropParamsList(t *testing.T) {
-	c, _, err := ImportProxyConfig([]byte(`
+	c, warnings, err := ImportProxyConfig([]byte(`
 model_list:
   - model_name: g
     litellm_params:
@@ -769,8 +769,15 @@ litellm_settings:
 		t.Fatalf("import: %v", err)
 	}
 	p, _ := c.Provider("openai")
-	if p.Params.DropsUnsupported() {
-		t.Error("drop_params: false was not carried over")
+	// drop_params: false is NOT carried over, and the warning is the reason.
+	// It used to be copied straight in, which produced a file that refuses to
+	// load the moment the setting stopped being inert — and an operator whose
+	// very next step is `config lint` reads that as a bug in the import.
+	if !p.Params.DropsUnsupported() {
+		t.Error("drop_params: false was imported into a key that cannot act on it")
+	}
+	if !warningsContain(warnings, "litellm_settings.drop_params", "NOT imported") {
+		t.Errorf("drop_params: false was discarded in silence:\n%s", warningStrings(warnings))
 	}
 	if len(p.Params.Drop) != 2 || p.Params.Drop[0] != "logprobs" {
 		t.Errorf("params.drop = %v", p.Params.Drop)

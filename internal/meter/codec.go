@@ -30,11 +30,12 @@ import (
 // correctness", and nothing is reported as damage.
 const (
 	spoolMagic = "DRSP"
-	// Version 6 adds the utilization disclosure (factor, occupancy, source).
-	spoolVersion   = 6
+	// Version 7 adds the list-rate equivalent and whether there was one
+	// (DESIGN §8.5). Version 6 added the utilization disclosure.
+	spoolVersion   = 7
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 6
+	traceCodecVer  = 7
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -44,10 +45,11 @@ const (
 	// record and a field-list change to either one does not invalidate the
 	// other. An unrecognised header is discarded exactly as a segment's is.
 	carryMagic = "DRRU"
-	// Version 2 adds the bucket's cost decomposition.
-	carryVersion   = 2
+	// Version 3 adds the bucket's notional sum and its missing count. Version 2
+	// added the cost decomposition.
+	carryVersion   = 3
 	carryHeaderLen = 8
-	bucketCodecVer = 2
+	bucketCodecVer = 3
 )
 
 var (
@@ -117,6 +119,9 @@ func appendBucket(dst []byte, b *Bucket) []byte {
 	dst = binary.AppendVarint(dst, b.CostNano)
 	dst = binary.AppendVarint(dst, b.MarginalCostNano)
 	dst = binary.AppendVarint(dst, b.SubscriptionCostNano)
+	dst = binary.AppendVarint(dst, b.NotionalCostNano)
+	dst = binary.AppendVarint(dst, b.NotionalRequests)
+	dst = binary.AppendVarint(dst, b.NotionalMissingCount)
 	dst = binary.AppendVarint(dst, int64(b.LatencySum))
 	dst = binary.AppendVarint(dst, int64(b.TTFTSum))
 	return binary.AppendVarint(dst, b.TTFTCount)
@@ -169,6 +174,9 @@ func decodeBucket(p []byte) (Bucket, error) {
 	b.CostNano = num()
 	b.MarginalCostNano = num()
 	b.SubscriptionCostNano = num()
+	b.NotionalCostNano = num()
+	b.NotionalRequests = num()
+	b.NotionalMissingCount = num()
 	b.LatencySum = time.Duration(num())
 	b.TTFTSum = time.Duration(num())
 	b.TTFTCount = num()
@@ -250,6 +258,8 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = binary.AppendVarint(dst, t.CostNano)
 	dst = binary.AppendVarint(dst, t.MarginalCostNano)
 	dst = binary.AppendVarint(dst, t.SubscriptionCostNano)
+	dst = binary.AppendVarint(dst, t.NotionalCostNano)
+	dst = appendBool(dst, t.NotionalKnown)
 	dst = binary.AppendVarint(dst, t.UtilMultiplierPPM)
 	dst = binary.AppendVarint(dst, t.UtilPPM)
 	dst = binary.AppendVarint(dst, int64(t.Retries))
@@ -317,6 +327,8 @@ func decodeTrace(p []byte) (Trace, error) {
 	t.CostNano = num()
 	t.MarginalCostNano = num()
 	t.SubscriptionCostNano = num()
+	t.NotionalCostNano = num()
+	t.NotionalKnown = num() != 0
 	t.UtilMultiplierPPM = num()
 	t.UtilPPM = num()
 	t.Retries = int(num())

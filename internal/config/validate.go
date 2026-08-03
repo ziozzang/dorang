@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/canonical"
 )
 
 // FieldError is one problem, at the YAML path it was found at.
@@ -655,9 +657,41 @@ func (c *Config) validateProviders(col *collector, providers map[string]*Provide
 		validateProbeAllowances(col, path+".usage_probe", p.UsageProbe)
 		refuseBackendMetrics(col, path, p.Metrics)
 		checkCacheTTL(col, path+".prefix_ttl", p.PrefixTTL, false)
+		if !p.Params.DropsUnsupported() {
+			// REFUSED rather than left inert, and the reason is that dorang
+			// CONVERTS. `false` asks for a parameter the target's wire shape has
+			// no field for to be forwarded anyway, and there is nowhere to put
+			// it: the encoder writes struct fields, and the knob it lacks is a
+			// field that does not exist. The reference proxy this spelling comes
+			// from re-emits the caller's own JSON, which is the only shape in
+			// which the setting means anything.
+			//
+			// Its neighbour `params.drop` is live, which is exactly why this one
+			// cannot stay accepted-and-inert: two adjacent keys where one takes
+			// effect and one does not is the most misleading state available.
+			col.add(path+".params.drop_unsupported",
+				"cannot be false: dorang converts rather than relaying, so a parameter the target's "+
+					"wire shape has no field for cannot be forwarded — there is nothing to forward it "+
+					"into. Every such removal is already reported in x-dorang-dropped-params, and a "+
+					"construct whose loss changes the answer is REFUSED rather than dropped (§10.1) "+
+					"unless the caller sends x-dorang-allow-lossy. Use providers[].params.drop to "+
+					"remove a named parameter this upstream rejects")
+		}
+		if p.Params.MaxTokensField != "" {
+			mustBeOneOf(col, path+".params.max_tokens_field", p.Params.MaxTokensField, MaxTokensFields)
+		}
 		for j, d := range p.Params.Drop {
-			if strings.TrimSpace(d) == "" {
-				col.add(fmt.Sprintf("%s.params.drop[%d]", path, j), "must not be empty")
+			// The vocabulary is internal/canonical's, not a second list here.
+			// §10.3's drop is applied to the neutral request by that package,
+			// and a validator with its own copy of what may be dropped is the
+			// two-lists-that-must-agree defect this file has produced before.
+			if err := canonical.CheckDropParam(d); err != nil {
+				var de *canonical.DropParamError
+				if errors.As(err, &de) {
+					col.add(fmt.Sprintf("%s.params.drop[%d]", path, j), "%s", de.Reason)
+				} else {
+					col.add(fmt.Sprintf("%s.params.drop[%d]", path, j), "%v", err)
+				}
 			}
 		}
 	}
@@ -1186,6 +1220,20 @@ func (c *Config) validateModels(col *collector, providers map[string]*Provider,
 			nonNegative(col, dpath+".priority", int64(d.Priority))
 			nonNegative(col, dpath+".timeout", int64(d.Timeout))
 			nonNegative(col, dpath+".stream_timeout", int64(d.StreamTimeout))
+			// Zero is "not set" and negative is meaningless, but so is a
+			// ceiling of zero: it refuses every request that names any ceiling
+			// at all, which no operator wrote on purpose and which reads at
+			// runtime as the deployment having vanished.
+			if d.MaxOutputTokens < 0 {
+				col.add(dpath+".max_output_tokens", "must not be negative")
+			}
+			// Only the two spellings exist. A typo here is the worst possible
+			// silent failure — it would fall back to `max_tokens` and the
+			// operator would read their own file as saying the opposite — so
+			// the set is closed and the refusal names both members.
+			if d.MaxTokensField != "" {
+				mustBeOneOf(col, dpath+".max_tokens_field", d.MaxTokensField, MaxTokensFields)
+			}
 			checkCacheTTL(col, dpath+".prefix_ttl", d.PrefixTTL, false)
 			for k, l := range d.Limits {
 				lpath := fmt.Sprintf("%s.limits[%d]", dpath, k)

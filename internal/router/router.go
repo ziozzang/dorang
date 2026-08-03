@@ -342,22 +342,29 @@ func (r *Router) compile(d *Deployment, g *Group) error {
 	d.gname, d.gclass = g.Name, g.Class
 	d.interned = r.deps.Interner.ID(d.ID)
 
+	// Read before the catalog fills anything: a non-zero ceiling HERE is one an
+	// operator wrote, and only that one is enforced.
+	d.enforceOut = d.MaxOutputTokens > 0
+
 	if r.deps.Catalog != nil {
 		if d.Family == "" {
 			if kd, ok := r.deps.Catalog.Kind(d.Kind); ok {
 				d.Family = string(kd.API)
 			}
 		}
-		if d.ContextWindow == 0 || d.MaxOutputTokens == 0 {
-			// The model name goes in byte-identical and comes back
-			// byte-identical: pkg/catalog never splits it (§2.1).
-			mi := r.deps.Catalog.Model(d.Kind, d.UpstreamModel)
-			if d.ContextWindow == 0 {
-				d.ContextWindow = mi.ContextWindow
-			}
-			if d.MaxOutputTokens == 0 {
-				d.MaxOutputTokens = mi.MaxOutputTokens
-			}
+		// The model name goes in byte-identical and comes back byte-identical:
+		// pkg/catalog never splits it (§2.1).
+		//
+		// The lookup is now unconditional because modelKnown needs it whether or
+		// not the two figures below were declared. It is one composition per
+		// deployment per compile, not per request.
+		mi := r.deps.Catalog.Model(d.Kind, d.UpstreamModel)
+		d.modelKnown = mi.ModelKnown
+		if d.ContextWindow == 0 {
+			d.ContextWindow = mi.ContextWindow
+		}
+		if d.MaxOutputTokens == 0 {
+			d.MaxOutputTokens = mi.MaxOutputTokens
 		}
 	}
 	if d.Family == "" {
@@ -719,9 +726,11 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 		nFamily    int
 		nCap       int
 		nCtx       int
+		nOut       int
 		nQuota     int
 		nTried     int
 		largest    int
+		largestOut int
 		needed     int64
 		quotaReset time.Time
 		quotaCred  string
@@ -747,6 +756,24 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 		union |= d.Capabilities
 		if !d.Capabilities.Has(need) {
 			nCap++
+			continue
+		}
+		// The operator's own output ceiling, which is a decision rather than a
+		// description and is therefore the one that refuses. It is checked
+		// before the fit check because it is the more specific statement: "this
+		// deployment will not be asked for more than N" answers the request
+		// without reference to how long the prompt is.
+		//
+		// It REFUSES rather than clamping. A clamp would answer 200 with a
+		// truncated completion and no signal a client reliably branches on, and
+		// it could never fail back — a request over one deployment's ceiling is
+		// served here by the sibling with a higher one, and by §7.6's chain when
+		// there is no sibling.
+		if d.enforceOut && req.MaxOutputTokens > int64(d.MaxOutputTokens) {
+			nOut++
+			if d.MaxOutputTokens > largestOut {
+				largestOut = d.MaxOutputTokens
+			}
 			continue
 		}
 		// The fit check is per deployment, because its output half is: a caller
@@ -812,6 +839,15 @@ func (r *Router) filter(sc *scratch, req *Request, st *sessionState, p pins,
 		return nil, &Error{Status: 400, Code: CodeUnsupportedConstruct, terminal: true,
 			Constructs: union.Missing(need).Names(),
 			Message:    "no deployment of this model can express the request; it is not downgraded silently"}
+	case nOut > 0 && nCap == 0 && nCtx == 0 && nQuota == 0:
+		// The number the caller has to get under is the LARGEST ceiling that
+		// still refused them, for the same reason the context refusal reports
+		// the largest window: any smaller one is not the limit they are up
+		// against and would send them to a value lower than they need.
+		return nil, &Error{Status: 400, Code: CodeOutputCeiling, Cause: CauseContextWindow,
+			Message: "the request asks for " + strconv.FormatInt(req.MaxOutputTokens, 10) +
+				" output tokens and the largest ceiling the operator set on this model is " +
+				strconv.Itoa(largestOut) + "; dorang refuses rather than silently generating less"}
 	case nCtx > 0 && nQuota == 0 && nCap == 0:
 		return nil, &Error{Status: 400, Code: CodeContextWindow, Cause: CauseContextWindow,
 			Estimated: !req.InputTokensExact, EstimateMethod: req.InputTokensMethod,
@@ -1260,6 +1296,7 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 		Provider:      c.dep.Provider,
 		Credential:    res.CredentialID(),
 		UpstreamModel: c.dep.UpstreamModel,
+		ModelKnown:    c.dep.modelKnown,
 		Reservation:   res,
 		Attempt:       st.attempts + 1,
 		Group:         c.dep.gname,
@@ -1267,9 +1304,11 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 		Kind:          c.dep.Kind,
 		Family:        c.dep.Family,
 		Capabilities:  c.dep.Capabilities,
-		PrefixDepth:   c.prefixDepth,
-		Stream:        req.Stream,
-		interned:      c.dep.interned,
+		// Carried, never consulted: see [Deployment.MaxTokensField].
+		MaxTokensField: c.dep.MaxTokensField,
+		PrefixDepth:    c.prefixDepth,
+		Stream:         req.Stream,
+		interned:       c.dep.interned,
 	}
 	if d.Credential == "" {
 		d.Credential = c.preferred

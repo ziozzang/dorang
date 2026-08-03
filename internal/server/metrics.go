@@ -10,12 +10,22 @@ import (
 // durationBuckets are the cumulative histogram bounds in seconds.
 //
 // They are dense around the warm-local p50 and p99 of DESIGN §15.1 — measured
-// at 480 µs and 2 ms — because a histogram whose lowest bucket is 5 ms cannot
+// at 249 µs and 2 ms — because a histogram whose lowest bucket is 5 ms cannot
 // tell anyone whether that target is being met, which is the only question this
-// histogram exists to answer. The bounds were chosen when §15.1 published a
-// 200 µs p50 and are left alone now it is measured at 480 µs: resolving BELOW
-// the target is the requirement, and 100 µs / 200 µs / 500 µs / 1 ms brackets
-// the corrected figure at least as well as the old one.
+// histogram exists to answer.
+//
+// The bounds were chosen when §15.1 published a 200 µs p50, and the figure has
+// been corrected three times since: to 480 µs when it was first measured, then
+// to 375 µs and 249 µs as the codec got faster twice. They are left alone
+// anyway, and the honest reason is not that they still bracket it well — they
+// do not. 249 µs falls in (200 µs, 500 µs], a bucket 2.5× wide, and interpolating
+// across it recovers the median about 29% high. It is left alone because this
+// block is the zero-configuration fallback: [handleMetrics] serves it only when
+// no [Options.Metrics] registry is configured, and every assembled gateway wires
+// one. internal/metrics.DurationBounds is what an operator actually scrapes, it
+// has bounds at 50/100/150/200/300 µs, and it recovers the same median within
+// 2%. Sharpening a fallback nobody scrapes would buy nothing and would change
+// an exported bucket layout.
 var durationBuckets = [...]float64{
 	0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025,
 	0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,

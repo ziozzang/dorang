@@ -758,8 +758,13 @@ func (s *Server) fail(rw *responseWriter, rq *Request, err error) {
 // outage undebuggable, which is the failure mode §11.3's own excerpt rule exists
 // to avoid.
 //
-// The text is already scrubbed: internal/backend runs internal/redact over it
-// with the exact secret that request carried, before it ever reaches here.
+// The text is already scrubbed: internal/backend removes the exact secret that
+// request carried — read back off the outbound headers, so a refreshed OAuth
+// token counts too — before the error ever reaches here. internal/redact is the
+// authoritative statement of that rule; this comment names the caller rather
+// than the package because an auditor following it must land on the code that
+// actually runs, and until internal/backend imports internal/redact the two are
+// not the same file.
 func (s *Server) logUpstreamError(rq *Request, e *Error) {
 	if e == nil || (e.NativeMessage == "" && e.NativeType == "" && e.NativeCode == "") {
 		return

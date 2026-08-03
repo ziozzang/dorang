@@ -245,7 +245,20 @@ type Response struct {
 	ID string
 	// Model is the name to report to the client. §7.2: the body always carries
 	// the name the client asked for, never the upstream id.
-	Model             string
+	Model string
+	// ServedModel is the name the UPSTREAM put in its own response body, kept
+	// exactly as it arrived and before Model above replaced it.
+	//
+	// It is the only witness to a substitution (see [CompareModel]): the status
+	// is 200, the body is well formed, the tokens are real, and the one thing
+	// that disagrees with dorang's configuration is this string. §7.2 requires
+	// the client-facing name to win on the way out, which is precisely what
+	// destroys the evidence — so it is retained here, at the one point where
+	// both names exist, and compared by the caller who also holds
+	// `upstream_model`.
+	//
+	// Empty means the upstream named nothing, which is not a disagreement.
+	ServedModel       string
 	Created           int64
 	Choices           []Choice
 	Usage             *Usage

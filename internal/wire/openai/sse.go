@@ -15,10 +15,11 @@ const DefaultMaxFrameBytes = 4 << 20
 
 // ScannerOptions configures a [Scanner].
 type ScannerOptions struct {
-	// From is the model name the upstream reports. It is used ONLY to decide
-	// whether the scan can be skipped entirely; the rewrite itself is
-	// unconditional, because COMPATIBILITY 2.5 requires the client-facing name
-	// on every chunk regardless of what the backend put there.
+	// From is the model name dorang SENT upstream. It decides whether the
+	// rewrite can be skipped entirely — the rewrite itself is unconditional,
+	// because COMPATIBILITY 2.5 requires the client-facing name on every chunk
+	// regardless of what the backend put there — and it is the name the
+	// upstream's own answer is compared against; see [Scanner.ModelAgreement].
 	From string
 	// To is the client-facing name written into every frame's model field.
 	// Empty disables rewriting.
@@ -87,6 +88,20 @@ type Scanner struct {
 	usage    Usage
 	hasUsage bool
 
+	// from is the name dorang sent upstream, and served the first name the
+	// upstream put in a frame. They are the two sides of the §17.1 rule-3
+	// comparison — one read out of dorang's own configuration, one read out of
+	// the provider's body — and agree is the verdict, computed once.
+	//
+	// served is a fixed array rather than a slice so that recording a name
+	// costs no allocation: the scanner is already one heap object per stream
+	// and this makes it 128 bytes larger rather than adding a second.
+	from      string
+	served    [canonical.MaxServedModelBytes]byte
+	servedLen int
+	agree     canonical.ModelAgreement
+	sawModel  bool
+
 	wrote bool
 	// trailNL counts newlines at the end of what has been written, which is how
 	// COMPATIBILITY 1.5's "only a frame missing its delimiter is re-framed" is
@@ -98,7 +113,7 @@ type Scanner struct {
 
 // NewScanner returns a scanner writing to dst.
 func NewScanner(dst io.Writer, opt ScannerOptions) *Scanner {
-	s := &Scanner{dst: dst, collect: opt.CollectUsage, maxFrame: opt.MaxFrameBytes}
+	s := &Scanner{dst: dst, collect: opt.CollectUsage, maxFrame: opt.MaxFrameBytes, from: opt.From}
 	if s.maxFrame <= 0 {
 		s.maxFrame = DefaultMaxFrameBytes
 	}
@@ -181,6 +196,7 @@ func (s *Scanner) Write(p []byte) (int, error) {
 		}
 		if s.rewrite {
 			if vs, ve, ok := modelValue(line); ok {
+				s.noteServed(line[vs:ve])
 				if err := s.write(p[start : ls+vs]); err != nil {
 					return 0, err
 				}
@@ -188,6 +204,10 @@ func (s *Scanner) Write(p []byte) (int, error) {
 					return 0, err
 				}
 				start = ls + ve
+			}
+		} else if !s.sawModel {
+			if vs, ve, ok := modelValue(line); ok {
+				s.noteServed(line[vs:ve])
 			}
 		}
 		pos = le
@@ -244,6 +264,7 @@ func (s *Scanner) emit(line []byte) error {
 	}
 	if s.rewrite {
 		if vs, ve, ok := modelValue(line); ok {
+			s.noteServed(line[vs:ve])
 			if err := s.write(line[:vs]); err != nil {
 				return err
 			}
@@ -252,8 +273,64 @@ func (s *Scanner) emit(line []byte) error {
 			}
 			return s.write(line[ve:])
 		}
+	} else if !s.sawModel {
+		if vs, ve, ok := modelValue(line); ok {
+			s.noteServed(line[vs:ve])
+		}
 	}
 	return s.write(line)
+}
+
+// ModelAgreement reports how the model name the UPSTREAM put in its frames
+// compares with [ScannerOptions.From], the name dorang sent it.
+//
+// This is the streaming half of DESIGN §17.1 rule 3's "A disagrees with B",
+// and a stream is where the disagreement is hardest to see: the field is
+// per-chunk, dorang relays the body without buffering it, and — on the ordinary
+// aliasing path, where To differs from From — the rewrite REPLACES the
+// upstream's answer with the client-facing name on its way out, so the evidence
+// never reaches the client at all. The verdict is taken before the splice.
+//
+// The reading is [canonical.ModelUnobserved] until the first frame carrying a
+// model field, and never changes afterwards: the value is not re-read, so a
+// stream of ten thousand chunks pays for one comparison. A frame whose model
+// value contains a JSON escape is not decoded and reports unobserved rather
+// than a guess — a name needing an escape cannot be compared byte-wise against
+// a configuration string that does not.
+//
+// It is also unobserved for the whole of a stream on which the scanner
+// degraded to a plain copy ([Scanner.Passthrough]), because nothing was read.
+// dorang's own relay always asks for usage collection, so that path is not
+// taken there.
+//
+// ModelAgreement allocates nothing.
+func (s *Scanner) ModelAgreement() canonical.ModelAgreement { return s.agree }
+
+// ServedModel returns the model name the upstream put in its own frames, or ""
+// if none was read.
+//
+// It converts the recorded bytes to a string, so it allocates. Callers read it
+// only when [Scanner.ModelAgreement] says there is something worth naming,
+// which keeps the ordinary stream free of the allocation.
+func (s *Scanner) ServedModel() string {
+	if s.servedLen == 0 {
+		return ""
+	}
+	return string(s.served[:s.servedLen])
+}
+
+// noteServed records the first model name a frame carried and settles the
+// comparison. Subsequent frames are not consulted.
+func (s *Scanner) noteServed(v []byte) {
+	if s.sawModel {
+		return
+	}
+	s.sawModel = true
+	if len(v) == 0 || len(v) > len(s.served) || bytes.IndexByte(v, '\\') >= 0 {
+		return
+	}
+	s.servedLen = copy(s.served[:], v)
+	s.agree = canonical.CompareModelBytes(s.from, s.served[:s.servedLen])
 }
 
 func (s *Scanner) write(b []byte) error {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -453,6 +454,88 @@ func TestInBandErrorDoesNotEchoTheCredential(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInBandErrorScrubTracksInternalRedact is the half the inline copy of the
+// scrubber did not have.
+//
+// [scrub] used to be an inline reimplementation of internal/redact that agreed
+// with it on nothing except the placeholder. Two implementations of one security
+// control is bad on its own; these two had DRIFTED, which is worse, because the
+// audit that reads one concludes about the other. Both cases below are things
+// the copy got wrong and internal/redact gets right, and both are asserted the
+// way the scrubbing work has always been asserted — on what reaches the client,
+// not on which function ran.
+func TestInBandErrorScrubTracksInternalRedact(t *testing.T) {
+	// A credential with characters a URL escapes. Real OAuth access tokens are
+	// base64 and carry exactly these.
+	t.Run("percent-encoded spelling", func(t *testing.T) {
+		const leaked = "sk-CANARY-a/b+c=d-9f3b21" // pragma: allowlist secret — test fixture
+		escaped := url.QueryEscape(leaked)
+		if escaped == leaked {
+			t.Fatal("the fixture does not exercise escaping")
+		}
+		// An upstream that quotes the request URL back — which is how a
+		// *url.Error and most proxy diagnostics report a failure — delivers the
+		// credential in this spelling and no other. A plain-text search misses
+		// it entirely.
+		body := oaFrames(oaChunkAlpha,
+			`{"error":{"message":"rejected: GET /v1/chat?probe=`+escaped+`","type":"api_error"}}`,
+			"[DONE]")
+
+		rec := runStreamRelay(t, body, leaked)
+		if strings.Contains(rec.Body.String(), escaped) {
+			t.Errorf("the credential reached the client percent-encoded:\n%s", rec.Body.String())
+		}
+	})
+
+	// The other direction, and the one that made the copy actively harmful.
+	//
+	// `vllm serve --api-key test` is an ordinary way to bring a self-hosted
+	// deployment up. The inline scrubber had no minimum secret length, so it
+	// replaced every occurrence of that string inside ordinary words: an
+	// upstream message reading "the latest test run … contest the quota" left
+	// as "the la[redacted] [redacted] run … con[redacted] the quota". On this
+	// path the damage is not cosmetic — [relayWatch] treats a REWRITTEN frame as
+	// proof the upstream echoed the credential, so dorang corrupted a frame the
+	// client reads and simultaneously believed it had stopped a leak.
+	//
+	// internal/redact declines to match below [redact.MinLen], which is the
+	// documented trade and it is worth stating plainly: a credential of four
+	// characters is not scrubbed at all. It is also not secret material, and
+	// mangling every message in the deployment does not make it one.
+	t.Run("a short credential does not mangle the frame", func(t *testing.T) {
+		const short = "test" // pragma: allowlist secret — test fixture
+		const msg = "the latest test run of this model is unavailable; contest the quota"
+		body := oaFrames(oaChunkAlpha,
+			`{"error":{"message":"`+msg+`","type":"api_error"}}`, "[DONE]")
+
+		rec := runStreamRelay(t, body, short)
+		if !strings.Contains(rec.Body.String(), msg) {
+			t.Errorf("a four-character api key mangled the relayed frame:\n%s", rec.Body.String())
+		}
+		if strings.Contains(rec.Body.String(), redacted) {
+			t.Errorf("a sub-MinLen secret was treated as one:\n%s", rec.Body.String())
+		}
+	})
+}
+
+// runStreamRelay relays one streamed upstream body through a chat deployment
+// holding secret, and returns what the client was written.
+func runStreamRelay(t *testing.T, body, secret string) *httptest.ResponseRecorder {
+	t.Helper()
+	f := streamUpstream(t, body)
+	p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+	c := chatCall(catalog.APIOpenAIChat)
+	c.Stream = true
+	rec := httptest.NewRecorder()
+	b := New(Options{
+		Credentials: staticCredentials{secrets: map[string]string{"c1": secret}},
+		Client:      NewClient(),
+		Now:         time.Now,
+	})
+	b.Do(context.Background(), target(p), c, rec)
+	return rec
 }
 
 // TestByteRelayStaysByteFaithful is the other side of the scrubber's bargain.

@@ -3,8 +3,9 @@
 //
 // # Why the separation is the whole problem
 //
-// DESIGN §15.1 publishes a warm-local p50 of 200 µs and fixes the measurement
-// boundary in the same paragraph:
+// DESIGN §15.1 publishes a warm-local p50 — 200 µs when this package was
+// written, 249 µs now that this package has measured it three times — and fixes
+// the measurement boundary in the same paragraph:
 //
 //	Gateway overhead = from the last byte of the request line+headers being
 //	read, to the first byte written upstream, plus from the last upstream byte

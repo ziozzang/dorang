@@ -204,7 +204,7 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 	creds := collectCredentials(cfg)
 
 	groups := make([]router.Group, 0, len(cfg.Models))
-	seen := make(map[string]int)
+	ids := deploymentIDs(cfg)
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		g := router.Group{Name: m.Name, Class: m.Class}
@@ -221,14 +221,8 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 			if !ok {
 				return nil, fmt.Errorf("app: model %s: no provider named %q", m.Name, d.Provider)
 			}
-			id := deploymentID(m.Name, d.Provider, d.UpstreamModel)
-			if n := seen[id]; n > 0 {
-				id = fmt.Sprintf("%s#%d", id, n)
-			}
-			seen[deploymentID(m.Name, d.Provider, d.UpstreamModel)]++
-
 			rd := router.Deployment{
-				ID:            id,
+				ID:            ids[i][j],
 				Provider:      d.Provider,
 				ProviderGroup: p.CapacityGroup,
 				Kind:          p.Kind,
@@ -239,6 +233,21 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 				Capabilities:  capabilitiesFor(cat, p.Kind),
 				Suppressed:    suppressedFor(p.Kind),
 				PrefixTTL:     cfg.PrefixTTLFor(d.Provider, d).TableTTL(),
+				// models[].deployments[].max_output_tokens. Passing it is what
+				// makes it an operator's DECISION rather than the catalog's
+				// DESCRIPTION: [router.Router.compile] records that the value
+				// arrived set, and only then does the ceiling refuse instead of
+				// merely reserving output for the context-fit check. Left
+				// unpassed the field is filled from pkg/catalog on every
+				// deployment and no configured ceiling can ever refuse
+				// anything (DESIGN §17.1).
+				MaxOutputTokens: d.MaxOutputTokens,
+				// COMPATIBILITY §5.5, resolved deployment-then-provider by the
+				// schema so the precedence is stated once.
+				MaxTokensField: cfg.MaxTokensFieldFor(d.Provider, d),
+			}
+			if err := checkMaxTokensField(cat, m.Name, d.Provider, p.Kind, rd.MaxTokensField); err != nil {
+				return nil, err
 			}
 			if rd.Timeout == 0 {
 				rd.Timeout = p.Timeout.Duration()
@@ -304,6 +313,37 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 // version of this function was found.
 func deploymentID(group, provider, upstream string) string {
 	return group + "|" + provider + "|" + upstream
+}
+
+// deploymentIDs assigns every configured deployment the id the router compiles
+// for it, indexed as ids[model][deployment].
+//
+// It is one function rather than a rule spelled out twice, because a second
+// caller now needs the same answer: the operator UI's models screen shows these
+// ids, and the ledger records them on every request. An id derived one way for
+// routing and another way for display would put an operator's join between two
+// tables that do not agree — and the disagreement would appear only where the
+// SAME (group, provider, upstream) triple is configured more than once, which
+// is exactly the case the "#n" suffix exists for and the last one anybody would
+// think to test.
+func deploymentIDs(cfg *config.Config) [][]string {
+	seen := make(map[string]int)
+	out := make([][]string, len(cfg.Models))
+	for i := range cfg.Models {
+		m := &cfg.Models[i]
+		out[i] = make([]string, len(m.Deployments))
+		for j := range m.Deployments {
+			d := &m.Deployments[j]
+			base := deploymentID(m.Name, d.Provider, d.UpstreamModel)
+			id := base
+			if n := seen[base]; n > 0 {
+				id = fmt.Sprintf("%s#%d", base, n)
+			}
+			seen[base]++
+			out[i][j] = id
+		}
+	}
+	return out
 }
 
 // capabilitiesFor is what a deployment of this kind can express (DESIGN §10.1).
@@ -384,6 +424,31 @@ func suppressedFor(kind string) canonical.Capability {
 // catalog has never heard of is treated as OpenAI-compatible, which is what an
 // unlisted OpenAI-compatible server almost always is, and which is visible in
 // `dorangctl catalog explain` rather than guessed silently at request time.
+// checkMaxTokensField refuses `max_tokens_field` on a deployment whose wire
+// shape has no such field.
+//
+// The schema can only check that the value is one of the two spellings; which
+// shapes HAVE an output-ceiling field is a fact about internal/wire, and this is
+// the first layer that knows both. Refusing at start-up is the same disposition
+// `providers[].params.drop` takes for `max_tokens` on an anthropic provider, and
+// for the same reason: a key that loads and does nothing is worse than a key
+// that is refused, because the operator who wrote it believes it took effect
+// (CONFIG §23.2). Anthropic's messages API spells the ceiling `max_tokens`,
+// requires it, and offers no alternative — so there is nothing here to select.
+func checkMaxTokensField(cat *catalog.Catalog, model, provider, kind, field string) error {
+	if field == "" {
+		return nil
+	}
+	if api := apiFor(cat, kind); api != catalog.APIOpenAIChat && api != catalog.APIOpenAIResponses {
+		return fmt.Errorf("app: model %s deployment on provider %q: max_tokens_field is set to %q, "+
+			"but this provider's kind %q speaks %s, whose request has no such choice — "+
+			"the setting would load and change nothing. Remove it, or move the deployment "+
+			"to an OpenAI-shaped provider",
+			model, provider, field, kind, api)
+	}
+	return nil
+}
+
 func apiFor(cat *catalog.Catalog, kind string) catalog.API {
 	if kd, ok := cat.Kind(kind); ok && kd.API != "" {
 		return kd.API
@@ -864,17 +929,37 @@ func newModelList(cfg *config.Config) *modelList {
 }
 
 func (m *modelList) swap(cfg *config.Config) {
+	names := clientFacingModelNames(cfg)
+	out := make([]server.Model, 0, len(names))
+	for _, n := range names {
+		out = append(out, server.Model{ID: n})
+	}
+	m.models.Store(&out)
+}
+
+// clientFacingModelNames is every name a client may put in a request body's
+// `model` field or in a deployment path segment, sorted: the model groups and
+// the aliases.
+//
+// Class names are not in it. A class is the scope fail-back delegates within
+// (§3, §7.6) and the unit priority is expressed in; router.New resolves an alias
+// and then a group, and never a class, so a class name is not routable and a
+// client that sent one would be refused.
+//
+// It is one function because two callers need the same answer and the answer is
+// a rule rather than a list. GET /v1/models publishes it, and
+// [metrics.Requests.SetAdmittedModels] admits `model` label values from it — so
+// a second spelling would let a name a client read out of /v1/models fold to
+// __unknown__ on the operator's dashboard, which is a disagreement that would
+// only show up for whichever of aliases or groups the second copy forgot.
+func clientFacingModelNames(cfg *config.Config) []string {
 	names := make([]string, 0, len(cfg.Models)+len(cfg.Aliases))
 	names = append(names, cfg.ModelNames()...)
 	for alias := range cfg.Aliases {
 		names = append(names, alias)
 	}
 	sort.Strings(names)
-	out := make([]server.Model, 0, len(names))
-	for _, n := range names {
-		out = append(out, server.Model{ID: n})
-	}
-	m.models.Store(&out)
+	return names
 }
 
 // Models implements server.ModelLister.

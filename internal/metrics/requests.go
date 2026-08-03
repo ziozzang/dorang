@@ -21,6 +21,18 @@ type Tokens struct {
 // internal/server's Observation contract needs.
 type Sample struct {
 	// Model is the client-facing model name, "" for a route with none.
+	//
+	// It is the caller's own bytes. internal/server reads it out of the request
+	// body — or out of the deployment path segment — and meters it whether or
+	// not it named anything dorang serves, so a refused request hands this field
+	// a string the caller chose.
+	//
+	// It does not reach a label in that state. [Requests.Observe] admits it only
+	// if it is in the configured model set and substitutes
+	// [UnknownModelSentinel] otherwise, so the bytes below are an INPUT to the
+	// label and not the label. The full-resolution record of what was asked for
+	// is the ledger's, which is keyed rows in a store rather than series in a
+	// registry — see [Requests.SetAdmittedModels].
 	Model string
 	// Provider, Credential and Endpoint are ids and fixed-cardinality route
 	// names. Endpoint is the route's name, never the raw path: a path is
@@ -61,6 +73,20 @@ type Sample struct {
 	FallbackFrom   string
 	FallbackTo     string
 	FallbackReason string
+
+	// Deployment is the deployment id this request was served by, "" when it
+	// never reached one. It is a configuration id and needs no admission.
+	Deployment string
+	// ServedModel is the model the upstream said actually answered, set ONLY
+	// when it was a different model from the one dorang asked for and one this
+	// build's catalog also knows (DESIGN §17.1 rule 3, [server.Result]).
+	//
+	// Empty is every ordinary request, and empty emits nothing: the family this
+	// feeds does not exist until an upstream substitutes. Unlike [Sample.Model]
+	// this needs no admission set, because the admission already happened —
+	// internal/app resolved the name against pkg/catalog before setting it, and
+	// a name that is not an entry never arrives here. See [substKey].
+	ServedModel string
 }
 
 // reqKey is the label tuple of `dorang_requests_total`.
@@ -101,11 +127,34 @@ type fallbackKey struct{ from, to, reason string }
 
 type fallbackEntry struct{ n atomic.Uint64 }
 
+// substKey identifies one model substitution: a deployment that was sent one
+// model id and answered as another.
+//
+// # Why `served` is admissible as a label and `model` was not
+//
+// [Sample.Model] is the caller's own bytes, which is why it needs
+// [Requests.SetAdmittedModels] and a 128-entry cap to keep a key holder from
+// minting series at will. `served` looks like the same hazard — it is read out
+// of a response body — and it is not, for a reason that is structural rather
+// than a judgement call: internal/app sets [Sample.ServedModel] only after
+// establishing that the name resolves to an entry in pkg/catalog under the
+// deployment's kind. A name that is not in the catalog never reaches here at
+// all. So the domain of this label is the catalog's model set, which is a file
+// this build ships, and its size does not depend on what any upstream chooses
+// to say.
+//
+// The cap is still here, and still counts what it folds. A bound that rests on
+// an argument is a bound that is one refactor away from resting on nothing.
+type substKey struct{ provider, deployment, served string }
+
+type substEntry struct{ n atomic.Uint64 }
+
 // RequestsOptions tunes the caps.
 type RequestsOptions struct {
 	MaxSeries         int
 	MaxModels         int
 	MaxFallbackSeries int
+	MaxSubstSeries    int
 }
 
 // Requests owns the per-request families of DESIGN §12.3.
@@ -123,6 +172,7 @@ type Requests struct {
 	series    *table[reqKey, reqEntry]
 	models    *table[modelKey, modelEntry]
 	fallbacks *table[fallbackKey, fallbackEntry]
+	substs    *table[substKey, substEntry]
 
 	tokens [5]atomic.Uint64
 
@@ -142,6 +192,14 @@ type Requests struct {
 	// cache" — rule 3 of the package comment, and the exact shape of vLLM's
 	// `/load` trap in VLLM.md §3.3.
 	prefixEnabled atomic.Bool
+
+	// admitted is the set of model names that may appear verbatim in a label.
+	//
+	// A pointer to an immutable map, swapped whole, because a reload replaces it
+	// while requests are being observed and [Requests.Observe] must not take a
+	// lock to read it. nil means "admit everything", which is what a bare
+	// [NewRequests] does — see [Requests.SetAdmittedModels].
+	admitted atomic.Pointer[map[string]struct{}]
 }
 
 // NewRequests builds the recorder.
@@ -155,6 +213,9 @@ func NewRequests(o RequestsOptions) *Requests {
 	if o.MaxFallbackSeries <= 0 {
 		o.MaxFallbackSeries = DefaultMaxFallbackSeries
 	}
+	if o.MaxSubstSeries <= 0 {
+		o.MaxSubstSeries = DefaultMaxSubstitutionSeries
+	}
 	return &Requests{
 		series: newTable[reqKey, reqEntry]("dorang_requests_total", o.MaxSeries, nil),
 		models: newTable[modelKey, modelEntry]("dorang_request_duration_seconds", o.MaxModels,
@@ -162,7 +223,9 @@ func NewRequests(o RequestsOptions) *Requests {
 				m.duration = NewHist(DurationBounds)
 				m.ttft = NewHist(TTFTBounds)
 			}),
-		fallbacks:    newTable[fallbackKey, fallbackEntry]("dorang_fallback_total", o.MaxFallbackSeries, nil),
+		fallbacks: newTable[fallbackKey, fallbackEntry]("dorang_fallback_total", o.MaxFallbackSeries, nil),
+		substs: newTable[substKey, substEntry]("dorang_model_substitutions_total",
+			o.MaxSubstSeries, nil),
 		capacityWait: NewHist(WaitBounds),
 	}
 }
@@ -171,14 +234,112 @@ func NewRequests(o RequestsOptions) *Requests {
 // per-model hit ratio is omitted entirely when it is not.
 func (q *Requests) SetPrefixEnabled(on bool) { q.prefixEnabled.Store(on) }
 
+// SetAdmittedModels declares the model names that may appear verbatim in a
+// `model` label. Every other name becomes [UnknownModelSentinel].
+//
+// # The rule this enforces
+//
+// A LABEL VALUE IS DRAWN FROM CONFIGURATION, NEVER FROM A MESSAGE. Not from a
+// request body, not from a response body, not from a URL path segment, not from
+// an upstream error string. A label whose value a message can choose is a memory
+// leak with an HTTP interface, and the leak is reachable by anyone holding one
+// valid key. Anything added to this package later — a substitution counter, a
+// per-model anything — resolves its label against a set like this one first, or
+// carries the full-resolution fact somewhere that is not a series. There is no
+// third option, and "the cap will hold it" is not one: see below for what the
+// cap actually cost when it was the only bound.
+//
+// # Why this instead of a cap or an eviction
+//
+// The cap alone bounded memory and nothing else. Entries are never evicted, so
+// 128 fabricated names spent the table for the life of the process and every
+// model first seen afterwards — including a real one a config reload had just
+// added — folded into [OverflowSentinel] with no duration, TTFT or prefix-hit
+// series of its own. That is a permanent, remotely triggerable denial of
+// resolution on the operator's dashboard, and it does not heal.
+//
+// Eviction would let the table recover and is the wrong instrument here. The
+// per-model families include counters, and a series that is evicted and later
+// recreated restarts at zero: to a Prometheus consumer that is a counter reset,
+// which `rate()` reads as a process restart. Worse, the churn would be driven by
+// the attacker rather than by the operator — a caller minting names continuously
+// would evict the real models continuously, turning a one-shot loss of
+// resolution into a permanent corruption of every legitimate model's counters.
+// An LRU makes the failure worse and harder to see, so there is none.
+//
+// # What it costs, and where the lost signal went
+//
+// The names callers ask for and dorang does not serve collapse into one bucket,
+// so the metric can no longer say WHICH unserved model was asked for. That is a
+// real signal and it is not lost, only moved: internal/meter records the name
+// the caller asked for on every request including refused ones, and `/spend/logs`
+// serves those rows at full resolution. Unbounded detail belongs in keyed rows
+// in a store; a Prometheus series is the wrong container for it, which is the
+// whole reason this defect existed. The VOLUME of unserved-model traffic stays
+// on the metric as `dorang_requests_total{model="__unknown__"}`, which is the
+// part an alert wants.
+//
+// # Calling it
+//
+// Never calling it admits everything, which is what [NewRequests] alone does and
+// what this package did before admission existed. Calling it with an empty slice
+// admits nothing, which is the right answer for a gateway that serves no model
+// groups. internal/app calls it at assembly AND on every reload; the reload half
+// is the one that matters, because a bound fixed at start-up is a bound a
+// legitimately grown configuration finds already spent.
+//
+// A name REMOVED by a reload keeps the series it already has. The series stops
+// advancing and goes flat, which is what any model that stops receiving traffic
+// does; it is not withdrawn, because withdrawing it would be the counter reset
+// this design refuses to introduce.
+func (q *Requests) SetAdmittedModels(names []string) {
+	set := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		set[n] = struct{}{}
+	}
+	q.admitted.Store(&set)
+	// The table has to be able to hold every configured name plus the two
+	// values [Requests.admitModel] can substitute, or a legitimate config would
+	// fold — which is the defect, arriving by the other door. It is a raise and
+	// never a drop: see [table.raiseCap].
+	q.models.raiseCap(len(set) + 2)
+}
+
+// admitModel is the label value for a client-facing model name.
+//
+// One map lookup against an immutable map behind an atomic pointer: no lock, no
+// allocation, no string construction (DESIGN §15.5). It is on the hot path and
+// BenchmarkObserve is what says it stayed there.
+func (q *Requests) admitModel(name string) string {
+	// "" is a route with no model — /v1/models, a health probe, a passthrough
+	// relay. It is one value and it is not a name anyone asked to be served, so
+	// folding it into the unknown bucket would report those routes as unserved
+	// model requests and would change what an existing dashboard shows for them.
+	if name == "" {
+		return name
+	}
+	set := q.admitted.Load()
+	if set == nil {
+		return name
+	}
+	if _, ok := (*set)[name]; ok {
+		return name
+	}
+	return UnknownModelSentinel
+}
+
 // Observe records one finished request.
 //
 // In the steady state this is: one read-lock, one map lookup and a handful of
 // atomic adds per table it touches. No allocation, no formatting, no string
 // construction.
 func (q *Requests) Observe(s Sample) {
+	// Once, and used for both tables. Two resolutions of the same name is two
+	// chances for `dorang_requests_total{model=…}` and the per-model histograms
+	// to disagree about what a request was.
+	model := q.admitModel(s.Model)
 	k := reqKey{
-		model:      s.Model,
+		model:      model,
 		provider:   s.Provider,
 		credential: s.Credential,
 		endpoint:   s.Endpoint,
@@ -211,7 +372,7 @@ func (q *Requests) Observe(s Sample) {
 		q.notionalMissing.Add(1)
 	}
 
-	m, _ := q.models.get(modelKey{s.Model})
+	m, _ := q.models.get(modelKey{model})
 	m.duration.Observe(s.Duration)
 	if s.TTFT > 0 {
 		// A zero TTFT means "not measured", not "instant". §7.5a(a) makes the
@@ -230,6 +391,14 @@ func (q *Requests) Observe(s Sample) {
 		f, _ := q.fallbacks.get(fallbackKey{s.FallbackFrom, s.FallbackTo, s.FallbackReason})
 		f.n.Add(1)
 	}
+
+	// The §17.1 rule-3 model-identity check. Empty is every ordinary request,
+	// so the whole family costs one string comparison on the hot path and
+	// nothing else; see [substKey].
+	if s.ServedModel != "" {
+		e, _ := q.substs.get(substKey{s.Provider, s.Deployment, s.ServedModel})
+		e.n.Add(1)
+	}
 }
 
 func nonNeg(v int64) int64 {
@@ -243,15 +412,17 @@ func nonNeg(v int64) int64 {
 func (q *Requests) CollectorName() string { return "requests" }
 
 func (q *Requests) folders() []*folder {
-	return []*folder{&q.series.f, &q.models.f, &q.fallbacks.f}
+	return []*folder{&q.series.f, &q.models.f, &q.fallbacks.f, &q.substs.f}
 }
 
 // Collect implements [Collector].
 func (q *Requests) Collect(w *Writer) {
 	w.Metric("dorang_requests_total", Counter,
 		"Requests served, by model, provider, credential, status and route. "+
-			"Every label is bounded by configuration; the tuple is bounded by a cap "+
-			"whose folds are counted in dorang_metrics_cardinality_folds_total.")
+			"Every label is bounded by configuration: model is the name asked for "+
+			"only when the configuration serves it, and __unknown__ otherwise — "+
+			"/spend/logs has the names. Folds into __overflow__ are counted in "+
+			"dorang_metrics_cardinality_folds_total.")
 	q.series.each(lessReqKey, func(k reqKey, e *reqEntry, over bool) {
 		if over {
 			k = reqKey{OverflowSentinel, OverflowSentinel, OverflowSentinel,
@@ -267,7 +438,7 @@ func (q *Requests) Collect(w *Writer) {
 
 	w.Metric("dorang_request_duration_seconds", Histogram,
 		"Gateway request duration. Buckets resolve microseconds because DESIGN §15.1 "+
-			"states the warm-local target as p50 200 µs and p99 2 ms.")
+			"states the warm-local target as p50 249 µs and p99 2 ms.")
 	q.models.each(lessModelKey, func(k modelKey, m *modelEntry, over bool) {
 		if m.duration == nil {
 			return
@@ -345,6 +516,24 @@ func (q *Requests) Collect(w *Writer) {
 		w.Uint(e.n.Load())
 	})
 
+	w.Metric("dorang_model_substitutions_total", Counter,
+		"Requests an upstream answered as a DIFFERENT model from the upstream_model "+
+			"dorang sent it, where both names are models this build's catalog knows "+
+			"(DESIGN §17.1 rule 3). A 200 with a well-formed body: the request was "+
+			"priced at the asked model's rate and windowed against its declared "+
+			"context, and the caller was told nothing. dorang does not reroute or "+
+			"re-price on this — it is a fact for an operator to act on. A healthy "+
+			"deployment emits no series here at all.")
+	q.substs.each(lessSubstKey, func(k substKey, e *substEntry, over bool) {
+		if over {
+			k = substKey{OverflowSentinel, OverflowSentinel, OverflowSentinel}
+		}
+		w.Label("provider", k.provider)
+		w.Label("deployment", k.deployment)
+		w.Label("served", k.served)
+		w.Uint(e.n.Load())
+	})
+
 	w.Metric("dorang_prefix_routed_total", Counter,
 		"Routed requests eligible for cache-affinity routing, per model. The "+
 			"denominator of dorang_prefix_hit_ratio.")
@@ -414,6 +603,16 @@ func lessReqKey(a, b reqKey) bool {
 }
 
 func lessModelKey(a, b modelKey) bool { return a.model < b.model }
+
+func lessSubstKey(a, b substKey) bool {
+	if a.provider != b.provider {
+		return a.provider < b.provider
+	}
+	if a.deployment != b.deployment {
+		return a.deployment < b.deployment
+	}
+	return a.served < b.served
+}
 
 func lessFallbackKey(a, b fallbackKey) bool {
 	if a.from != b.from {

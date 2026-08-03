@@ -146,6 +146,12 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 		if err := watch.flush(); err != nil {
 			return canonical.Usage{}, fw.n, err
 		}
+		// The scanner located the model field on the first frame that carried
+		// one and compared it with From — the name dorang sent — before the
+		// rewrite three lines above replaced it with the client-facing name. On
+		// this path that rewrite is the ONLY record of what the upstream said,
+		// and it overwrites it, so the reading has to be taken here.
+		x.noteServedAgreement(sc.ModelAgreement(), sc.ServedModel)
 		u, _ := sc.Usage()
 		return u, fw.n, watch.failure(x.secrets)
 	}

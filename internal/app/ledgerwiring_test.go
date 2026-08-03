@@ -197,9 +197,13 @@ func TestGlobalSpendReportReadsTheRollups(t *testing.T) {
 	if want := int64(905); rep.Total.TotalTokens != want {
 		t.Errorf("total tokens = %d, want %d", rep.Total.TotalTokens, want)
 	}
+	// These buckets carry no list rate — nothing contributed one — so the
+	// notional total is reported as unavailable rather than as zero. A rollup
+	// row written before the notional counts existed lands in exactly this
+	// case, which is why "known" needs a request to have contributed rather
+	// than merely nothing having gone missing (§8.5 rule 5).
 	if rep.Total.NotionalKnown {
-		t.Error("the rollups carry no notional column, so a notional total must be " +
-			"reported as unavailable rather than as zero (§8.5 rule 5)")
+		t.Error("a report over buckets with no list rate claims a notional total")
 	}
 
 	// Grouping by day collapses the two chat buckets of the 20th into one row

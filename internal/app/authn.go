@@ -251,26 +251,24 @@ func (p *principal) AllowsModel(model string) bool {
 		if l == nil {
 			continue
 		}
-		if !modelAllowed(l.Models, model) {
+		// The SAME function the gate applies ([auth.Limits.authorize]), not a
+		// second implementation of the same paragraph.
+		//
+		// This package had one: an identical `modelAllowed`, which agreed with
+		// internal/auth's for as long as both existed. Agreement was the reason
+		// it survived and is not a reason to keep it — internal/redact's two
+		// copies of one rule agreed too, until they drifted in both directions
+		// at once, one leaking a credential and the other corrupting ordinary
+		// text. What made the duplication invisible here is that the two are
+		// consumed by different surfaces: this one filters GET /v1/models and
+		// the other decides POST /v1/chat/completions, so a divergence would
+		// have surfaced as a 403 on a model the client had just been listed
+		// rather than as any test failing.
+		if !auth.ModelAllowed(l.Models, model) {
 			return false
 		}
 	}
 	return true
-}
-
-// modelAllowed applies one subject's allow-list. An empty list allows
-// everything, and "*" does too. Names are compared WHOLE: a model name is
-// opaque and nothing splits it (DESIGN §2.1).
-func modelAllowed(list []string, model string) bool {
-	if len(list) == 0 {
-		return true
-	}
-	for _, m := range list {
-		if m == "*" || m == model {
-			return true
-		}
-	}
-	return false
 }
 
 // authError renders an authentication or authorization failure as the server's

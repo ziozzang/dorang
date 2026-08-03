@@ -297,7 +297,7 @@ func (l *Limits) authorize(subject, id string, a Access, now time.Time) error {
 	if l.Expired(now) {
 		return refuse(ReasonExpired, subject, "")
 	}
-	if a.Model != "" && !allowedIn(l.Models, a.Model, false) {
+	if a.Model != "" && !ModelAllowed(l.Models, a.Model) {
 		return refuse(ReasonModelNotAllowed, subject, a.Model)
 	}
 	if a.Route != "" && !allowedIn(l.AllowedRoutes, a.Route, true) {
@@ -338,6 +338,25 @@ func (l *Limits) BudgetExceeded(now time.Time) bool {
 		return false
 	}
 	return l.SpentNanoUSD >= *l.MaxBudgetNanoUSD
+}
+
+// ModelAllowed reports whether one subject's allow-list admits a model name.
+//
+// It is exported because it is the SAME rule the gate applies — [Limits.authorize]
+// calls it below — and internal/app needs it to filter GET /v1/models. Those two
+// answers must agree: a model the listing shows and the gate refuses is a 403 on
+// a name the client was just told it could use, and a model the listing hides
+// and the gate serves is a capability the operator cannot see.
+//
+// It existed twice until now, once here and once as internal/app's own
+// `modelAllowed`. The two agreed, which is the only reason the duplication was
+// survivable and is not a reason to keep it: the copies in internal/redact
+// agreed too, until one of them leaked a credential and the other corrupted
+// ordinary text. Names are compared WHOLE — a model name is opaque and nothing
+// splits it (DESIGN §2.1) — so no "/*" prefix rule applies here even though the
+// route allow-list beside it has one.
+func ModelAllowed(list []string, model string) bool {
+	return allowedIn(list, model, false)
 }
 
 // allowedIn reports whether v is admitted by an allow-list. An empty list

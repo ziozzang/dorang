@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -8,6 +9,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ziozzang/dorang/internal/canonical"
 )
 
 // Warning is something an import could not represent. Import never drops
@@ -385,6 +388,10 @@ func (im *importer) importModelList(list *yaml.Node) {
 			case "model_info":
 				if mi, ok := asMap(em.vals[k]); ok {
 					for _, ik := range mi.keys {
+						if advice, known := modelInfoAdvice[ik]; known {
+							im.warn(path+".model_info."+ik, "%s", advice)
+							continue
+						}
 						im.warn(path+".model_info."+ik,
 							"model_info is not part of dorang's schema and was not imported")
 					}
@@ -467,6 +474,27 @@ func (im *importer) importParams(path string, params *yamlMap, provider string, 
 			im.applyDropParams(p+".drop_params", n, provider)
 		case "additional_drop_params":
 			im.applyDropList(p+".additional_drop_params", n, provider)
+
+		case "max_tokens", "max_completion_tokens":
+			// REFUSED, and this is the whole point of refusing rather than
+			// moving the number: the two settings are not the same setting.
+			//
+			// The incumbent merges litellm_params into the call and the
+			// CALLER's own value wins, so `max_tokens: 65536` there is a
+			// DEFAULT — it decides what a caller who named nothing gets, and
+			// constrains nobody. dorang's max_output_tokens is a CEILING — it
+			// constrains callers who name a number and does nothing for those
+			// who do not. Copying the literal across would swap which half of
+			// the traffic the setting applies to, and every request over 65536
+			// that succeeds today would begin failing, on an import that
+			// reported success.
+			im.warn(p+"."+k, "the source applies %s as a DEFAULT for a caller who names none, and "+
+				"dorang's models[].deployments[].max_output_tokens is a CEILING that refuses a "+
+				"caller who names more — they constrain opposite halves of the traffic, so the "+
+				"value was NOT imported. dorang takes the default from the model catalog "+
+				"(pkg/catalog max_output_tokens for this kind and model); if you meant to CAP "+
+				"what callers may ask this deployment for, write max_output_tokens: %s yourself",
+				k, scalarValue(n))
 
 		case "input_cost_per_second", "output_cost_per_second":
 			// The incumbent's own semantic for these keys is the request's ELAPSED
@@ -610,6 +638,31 @@ var priceFieldByKey = map[string]priceField{
 	"output_cost_per_second":          {"compute_seconds", 0},
 	"input_cost_per_audio_per_second": {"audio_seconds", 0},
 	"input_cost_per_request":          {"request", 0},
+}
+
+// modelInfoAdvice covers the model_info keys that are not decoration.
+//
+// The generic "model_info is not part of dorang's schema" is true and useless
+// for a key that RESTRICTS ACCESS: an operator reads it as "cosmetic metadata
+// was skipped" and migrates a gated model as an open one. Three of the four
+// mechanisms in dorang's own §23.1 ledger got there by being described that
+// accurately and that unhelpfully.
+var modelInfoAdvice = map[string]string{
+	"access_via_team_ids": "this model is restricted to named TEAMS, and the restriction was NOT " +
+		"imported — but the capability exists. dorang's model allow-list is a per-subject list " +
+		"consulted for the key, its user AND its team (auth.Limits.Models; every subject must " +
+		"allow, so a key-level list narrows its team's and can never widen it), and a team is a " +
+		"DIRECTORY ROW rather than a line in this file, so no configuration file can express it. " +
+		"Set it with POST /team/update {\"team_id\": …, \"models\": [\"<this model_name>\", …]} for " +
+		"each team named here. Note the relation inverts: the source says \"only these teams may " +
+		"reach this model\" and dorang says \"this team may reach only these models\", and an " +
+		"EMPTY dorang list allows everything — so a team you never give a list to still reaches " +
+		"this model, and the restriction is only true once every other team has one",
+	"access_groups": "model access groups have no equivalent: dorang's allow-list names models " +
+		"directly, per key, user and team. The group was NOT imported; expand it into the " +
+		"models list of each team or key that held it",
+	"team_id": "a model owned by one team is expressed from the other end in dorang, as that " +
+		"team's own models allow-list (POST /team/update). It was NOT imported",
 }
 
 // unpricedFieldAdvice covers the incumbent's remaining rate keys: the ones
@@ -770,6 +823,18 @@ func (im *importer) setProviderRetry(provider string, attempts int) {
 
 func (im *importer) applyDropParams(path string, n *yaml.Node, provider string) {
 	if b, ok := boolOf(n); ok {
+		if !b {
+			// Writing `false` would produce a file that refuses to load, which
+			// is worse than not writing it: the operator's next step is
+			// `config lint`, and a refusal there reads as a bug in the import.
+			im.warn(path, "false has no equivalent and was NOT imported. The source relays the "+
+				"caller's own JSON, so \"do not filter\" means \"let the provider answer 400\"; "+
+				"dorang CONVERTS, and a parameter the target's wire shape has no field for cannot "+
+				"be forwarded into anything. Every such removal is reported in "+
+				"x-dorang-dropped-params, and a construct whose loss would change the answer is "+
+				"refused rather than dropped")
+			return
+		}
 		for i := range im.cfg.Providers {
 			if provider == "" || im.cfg.Providers[i].Name == provider {
 				im.cfg.Providers[i].Params.DropUnsupported = boolPtr(b)
@@ -784,6 +849,14 @@ func (im *importer) applyDropParams(path string, n *yaml.Node, provider string) 
 	im.warn(path, "value %q is neither a boolean nor a list and was not imported", scalarValue(n))
 }
 
+// applyDropList imports the incumbent's drop_params/additional_drop_params onto
+// providers[].params.drop.
+//
+// The list is load-bearing — an upstream that answers 400 to max_tokens is why
+// an operator wrote it — and the field it lands in is applied to the request
+// before the encoder runs. What this function must not do is import a name that
+// will take effect on nothing, because the whole reason `params.drop` was worth
+// wiring is that it had been accepting exactly such names in silence.
 func (im *importer) applyDropList(path string, n *yaml.Node, provider string) {
 	if n.Kind != yaml.SequenceNode {
 		im.warn(path, "value is not a list and was not imported")
@@ -791,9 +864,26 @@ func (im *importer) applyDropList(path string, n *yaml.Node, provider string) {
 	}
 	var names []string
 	for _, item := range n.Content {
-		if v := scalarValue(item); v != "" {
-			names = append(names, v)
+		v := scalarValue(item)
+		if v == "" {
+			continue
 		}
+		if err := canonical.CheckDropParam(v); err != nil {
+			var de *canonical.DropParamError
+			if errors.As(err, &de) {
+				im.warn(path, "%q was NOT imported: %s", de.Name, de.Reason)
+			} else {
+				im.warn(path, "%q was NOT imported: %v", v, err)
+			}
+			continue
+		}
+		if !canonical.ModelledDropParam(v) {
+			im.warn(path, "%q is not a parameter dorang models. It was imported, and it removes "+
+				"the field from the pass-through map that carries unrecognised fields to an upstream "+
+				"of the caller's OWN protocol family. On a crossing between families dorang never "+
+				"sends it in the first place, so there the drop is already the effect", v)
+		}
+		names = append(names, v)
 	}
 	for i := range im.cfg.Providers {
 		if provider == "" || im.cfg.Providers[i].Name == provider {

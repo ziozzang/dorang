@@ -145,6 +145,18 @@ const (
 	// publishes — so the code follows the document rather than the config key.
 	CodeContextWindow  = "context_length_exceeded"
 	CodeQuotaExhausted = "insufficient_quota"
+	// CodeOutputCeiling is a request whose max_tokens is above the ceiling the
+	// OPERATOR set on every deployment behind this model
+	// (models[].deployments[].max_output_tokens).
+	//
+	// It is its own code and not CodeContextWindow because the two are
+	// different facts and a client acts on them differently: a context refusal
+	// says the conversation is too long and the fix is to shorten it, this one
+	// says the answer asked for is too long and the fix is to ask for less. It
+	// carries CauseContextWindow all the same, because the operator who wrote a
+	// fallback chain for "this model is too small for this request" wrote one
+	// chain, not two.
+	CodeOutputCeiling = "max_tokens_exceeded"
 	// CodeNoCapacity and CodeNoCandidate follow §11.2 for the same reason
 	// CodeContextWindow and CodeQuotaExhausted do. They used to read
 	// `no_capacity` and `no_candidate`, which are dorang's internal words for

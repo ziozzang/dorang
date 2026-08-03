@@ -136,6 +136,16 @@ type Deployment struct {
 	// same_class_larger chain. Left zero, it is filled from pkg/catalog.
 	ContextWindow int
 	// MaxOutputTokens is the declared output ceiling. Zero means undeclared.
+	//
+	// It has two sources and they are not equivalent. Set from configuration
+	// (`models[].deployments[].max_output_tokens`) it is an operator's DECISION
+	// and is ENFORCED: a request naming a larger ceiling cannot use this
+	// deployment. Left zero and filled from pkg/catalog at compile it is a
+	// DESCRIPTION of the model, used only to reserve output for the context-fit
+	// check, and it never refuses anything — the catalog drifts, and a stale
+	// entry that refused traffic would turn a documentation lag into an outage.
+	//
+	// [Router.compile] records which of the two it was; see enforceOut.
 	MaxOutputTokens int
 	// PriorityVerified records that the operator has declared the engine flag
 	// that makes priority actually take effect (VLLM.md §1.2, SGLANG.md §3.4).
@@ -157,11 +167,34 @@ type Deployment struct {
 	// while a self-hosted engine holds blocks until memory pressure evicts them,
 	// and one number cannot be right for both.
 	PrefixTTL time.Duration
+	// MaxTokensField is the output-ceiling spelling this deployment's requests
+	// carry (`max_tokens` or `max_completion_tokens`). Empty means the
+	// encoder's default, which is `max_tokens`.
+	//
+	// The router does not route on it and never reads it. It rides here for the
+	// same reason [Deployment.Capabilities] does: it is a property of the
+	// DEPLOYMENT, a fail-back hop lands on a different one, and the encoder is
+	// two layers away. Carrying it on the decision is what stops internal/app
+	// from keeping a second per-deployment table beside the routing table and
+	// looking the wrong row up on hop two.
+	MaxTokensField string
 
 	// compiled at New.
 	caps      []capacity.Candidate
 	credIndex map[string]int
 	interned  uint32
+	// enforceOut records that MaxOutputTokens was set by the operator rather
+	// than filled from the catalog, which is what makes it a ceiling that
+	// refuses instead of a figure that reserves. See [Deployment.MaxOutputTokens].
+	enforceOut bool
+	// modelKnown records that pkg/catalog holds an entry for (Kind,
+	// UpstreamModel) — that this deployment's model is one dorang has figures
+	// for. See [Decision.ModelKnown] for the one thing it is used for.
+	//
+	// It is computed here, once per compile, because the alternative is a
+	// catalog lookup per request: Catalog.Model composes three layers and walks
+	// the prefix rules, which is not per-request work (§15.5).
+	modelKnown bool
 	// ridx is a router-wide deployment index. Round-robin state is keyed on it
 	// rather than on a position within one group, because a same_class hop
 	// produces a candidate set drawn from several groups at once.

@@ -11,6 +11,7 @@ import (
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
+	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
 // clock is an injectable clock that is safe under -race.
@@ -59,7 +60,20 @@ type harnessOpts struct {
 	pricing  string
 }
 
+// newHarnessWithCatalog wires a router that has a model catalog, which is the
+// only way to reach the branch of [Router.compile] that FILLS a window or an
+// output ceiling rather than reading one from configuration.
+func newHarnessWithCatalog(t *testing.T, cfg Config, cat *catalog.Catalog) *harness {
+	t.Helper()
+	return newHarnessWith(t, cfg, harnessOpts{}, func(d *Deps) { d.Catalog = cat })
+}
+
 func newHarness(t *testing.T, cfg Config, o harnessOpts) *harness {
+	t.Helper()
+	return newHarnessWith(t, cfg, o, nil)
+}
+
+func newHarnessWith(t *testing.T, cfg Config, o harnessOpts, extra func(*Deps)) *harness {
 	t.Helper()
 	h := &harness{t: t, clock: newClock(), quota: stubQuota{}}
 
@@ -89,6 +103,9 @@ func newHarness(t *testing.T, cfg Config, o harnessOpts) *harness {
 			t.Fatalf("pricing catalog: %v", err)
 		}
 		deps.Pricing = c
+	}
+	if extra != nil {
+		extra(&deps)
 	}
 
 	cfg.Now = h.clock.now

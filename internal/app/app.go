@@ -765,6 +765,11 @@ func (a *App) Reload(cfg *config.Config) error {
 		anthropicTotalTokens: anthropicTotalTokens(cfg),
 	})
 	a.models.swap(cfg)
+	// The same set, into the metrics surface. The registry is built once and
+	// this reload does not rebuild it, so without this line the `model` label's
+	// bound and the prefix-ratio gate would both keep describing the
+	// configuration the process started with — see [App.applyMetricsConfig].
+	a.applyMetricsConfig(cfg)
 	a.targets.swap(buildTargets(cfg, cat))
 	a.quota = qs
 	a.Catalog = cat

@@ -48,6 +48,21 @@ type RequestLog struct {
 	CostNano             int64
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
+	// NotionalNano is what this request would have cost at list rate (DESIGN
+	// §8.5) and NotionalKnown says whether that figure exists.
+	//
+	// The flag is the column, not a nicety. §8.5 rule 5: a missing list rate is
+	// reported as missing and never as zero, because a subscription with no
+	// notional_rate rule would otherwise read as infinitely efficient. The two
+	// columns have had a schema since migration 0002 and no writer until the
+	// meter carried the pair — which is why /spend/logs and the usage screen
+	// both reported `unavailable` on every deployment while the pricing engine
+	// computed the figure for every request and put it in a response header.
+	//
+	// It is never a term in CostNano. §8.5 requires that exclusion to be
+	// structural, and separate columns are what makes it so.
+	NotionalNano  int64
+	NotionalKnown bool
 
 	// UtilMultiplierPPM is the factor a utilization-priced rule applied to this
 	// request's rate, in parts per million (1_000_000 is 1.0x), and UtilPPM the
@@ -165,7 +180,7 @@ const requestLogCols = `l.ts, l.id, l.api_key_id, l.user_id, l.team_id, l.creden
 	l.subscription_cost_nano, l.latency_ms, l.ttft_ms, l.queue_ms, l.capacity_wait_ms,
 	l.upstream_ms, l.fallback_count, l.streamed, l.trace_id, l.session_id, l.node_id,
 	l.batch_id, l.metadata, l.secret_id, l.util_multiplier_ppm, l.util_ppm,
-	l.util_source`
+	l.util_source, l.notional_nano, l.notional_known`
 
 const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_id,
 	provider_id, deployment_id, model_group, upstream_model, endpoint,
@@ -173,9 +188,14 @@ const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_i
 	reasoning_tokens, total_tokens, cost_nano, marginal_cost_nano,
 	subscription_cost_nano, latency_ms, ttft_ms, queue_ms, capacity_wait_ms,
 	upstream_ms, fallback_count, streamed, trace_id, session_id, node_id,
-	batch_id, metadata, secret_id, util_multiplier_ppm, util_ppm, util_source`
+	batch_id, metadata, secret_id, util_multiplier_ppm, util_ppm, util_source,
+	notional_nano, notional_known`
 
-const requestLogInsertArity = 37
+// requestLogInsertArity is COUNTED from the column list rather than written
+// beside it: a literal that has to be edited whenever a column is added is a
+// bind-variable mismatch waiting for the next column, reported by the driver at
+// run time on the ledger write path.
+var requestLogInsertArity = strings.Count(requestLogInsertCols, ",") + 1
 
 // ---------------------------------------------------------------------------
 // Writing
@@ -257,7 +277,8 @@ func (s *Store) insertLogChunk(ctx context.Context, tx *sql.Tx, rows []RequestLo
 			r.LatencyMS, r.TTFTMS, r.QueueMS, r.CapacityWaitMS, r.UpstreamMS,
 			r.FallbackCount, r.Streamed, nullStr(r.TraceID), nullStr(r.SessionID),
 			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata, nullStr(r.SecretID),
-			nullZeroInt(r.UtilMultiplierPPM), nullZeroInt(r.UtilPPM), nullStr(r.UtilSource))
+			nullZeroInt(r.UtilMultiplierPPM), nullZeroInt(r.UtilPPM), nullStr(r.UtilSource),
+			r.NotionalNano, r.NotionalKnown)
 	}
 	_, err := s.txExec(ctx, tx, b.String(), args...)
 	return err
@@ -607,7 +628,7 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		&r.TotalTokens, &r.CostNano, &r.MarginalCostNano, &r.SubscriptionCostNano,
 		&r.LatencyMS, &r.TTFTMS, &r.QueueMS, &r.CapacityWaitMS, &r.UpstreamMS,
 		&r.FallbackCount, &r.Streamed, &traceID, &sessionID, &nodeID, &batchID, &r.Metadata,
-		&secretID, &utilMul, &utilPPM, &utilSource)
+		&secretID, &utilMul, &utilPPM, &utilSource, &r.NotionalNano, &r.NotionalKnown)
 	if err != nil {
 		return RequestLog{}, err
 	}

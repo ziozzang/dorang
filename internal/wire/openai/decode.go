@@ -420,9 +420,13 @@ func ResponseToCanonical(w *Response, opt *DecodeOptions) (*canonical.Response, 
 		return nil, errorString("openai: nil response")
 	}
 	out := &canonical.Response{
-		ID:      w.ID,
-		Model:   w.Model,
-		Created: w.Created,
+		ID: w.ID,
+		// Model is what the client is told; ServedModel is what the upstream
+		// said, kept because opt.Model below is about to overwrite the only
+		// copy of it. See [canonical.Response.ServedModel].
+		Model:       w.Model,
+		ServedModel: w.Model,
+		Created:     w.Created,
 		// Everything unmodelled that follows is tagged with the shape it came
 		// from, so only an encoder for that shape forwards it (DESIGN §10.7).
 		Extra:       w.Extra,

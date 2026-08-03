@@ -390,9 +390,13 @@ func ResponseToCanonical(w *Response, opt *DecodeOptions) (*canonical.Response, 
 		return nil, errNilResponse
 	}
 	out := &canonical.Response{
-		ID:    w.ID,
-		Model: w.Model,
-		Extra: w.Extra,
+		ID: w.ID,
+		// Model is what the client is told; ServedModel is what the upstream
+		// said, kept because opt.Model below is about to overwrite the only
+		// copy of it. See [canonical.Response.ServedModel].
+		Model:       w.Model,
+		ServedModel: w.Model,
+		Extra:       w.Extra,
 		// Tagging the shape is what keeps these members OUT of a chat
 		// completion. Before the tag existed only this family produced them and
 		// only this family read them; now that every adapter does, an untagged

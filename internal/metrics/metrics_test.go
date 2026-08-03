@@ -3,6 +3,8 @@ package metrics
 import (
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -379,12 +381,19 @@ func TestTTFTZeroIsNotASample(t *testing.T) {
 
 // TestBucketsResolveMicroseconds keeps the duration histogram able to answer
 // the only question it exists for. DESIGN §15.1 states the warm-local p50 as
-// 200 µs and the p99 as 2 ms; a histogram whose first bucket is 5 ms reports
+// 249 µs and the p99 as 2 ms; a histogram whose first bucket is 5 ms reports
 // "everything is under 5 ms" through a twentyfold regression.
+//
+// The bound checked here is 100 µs rather than the p50 itself, on purpose. The
+// p50 has moved four times (200 µs published, 480 µs measured, then 375 µs and
+// 249 µs) and a test that tracked it would have to be edited every time the
+// codec got faster, which is a test that asserts the changelog. What must hold
+// across all four is that the bounds resolve well BELOW the figure, so the
+// median lands with buckets on both sides of it rather than in the floor.
 func TestBucketsResolveMicroseconds(t *testing.T) {
 	if DurationBounds[0] > 0.0001 {
-		t.Errorf("lowest duration bucket is %v s; it must resolve below the 200 µs p50",
-			DurationBounds[0])
+		t.Errorf("lowest duration bucket is %v s; it must resolve well below the "+
+			"249 µs warm-local p50", DurationBounds[0])
 	}
 	var below2ms int
 	for _, b := range DurationBounds {
@@ -427,6 +436,321 @@ func TestBucketsResolveMicroseconds(t *testing.T) {
 	if counts[i180] != 1 || counts[i1900] != 1 {
 		t.Errorf("bucket occupancy %d / %d, want 1 / 1", counts[i180], counts[i1900])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// What the scrape actually publishes
+// ---------------------------------------------------------------------------
+
+// The three tests below exist so OPERATIONS.md §6 can be checked against a
+// value rather than against a reading. Both of the claims they pin had been
+// wrong in the document for as long as this package has existed, and both were
+// wrong in the same way: the document describes internal/server's
+// zero-configuration fallback, which no assembled gateway serves.
+
+// TestScrapedDurationBucketsAreTheRangeOperationsPublishes reads the bucket
+// bounds off a real registry's output.
+//
+// OPERATIONS.md §6.1 said "buckets from 100 µs to 60 s". That is
+// internal/server's fallback block — [server.durationBuckets] — and
+// [Server.handleMetrics] serves it only when no registry is configured. Every
+// assembled gateway wires one, which replaces the family wholesale. Asserting
+// the endpoints here means the document is checkable: if someone widens or
+// narrows [DurationBounds], this fails and names the two numbers the prose has
+// to be edited to.
+func TestScrapedDurationBucketsAreTheRangeOperationsPublishes(t *testing.T) {
+	fams, err := Parse(fullRegistry(t).Metrics(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var les []float64
+	for _, f := range fams {
+		if f.Name != "dorang_request_duration_seconds" {
+			continue
+		}
+		for _, s := range f.Samples {
+			if !strings.HasSuffix(s.Name, "_bucket") {
+				continue
+			}
+			le := s.Label("le")
+			if le == "" {
+				t.Fatalf("a histogram bucket with no le label: %+v", s)
+			}
+			if le == "+Inf" {
+				continue
+			}
+			v, err := strconv.ParseFloat(le, 64)
+			if err != nil {
+				t.Fatalf("le=%q does not parse: %v", le, err)
+			}
+			les = append(les, v)
+		}
+	}
+	if len(les) == 0 {
+		t.Fatal("the scrape has no dorang_request_duration_seconds buckets at all")
+	}
+	sort.Float64s(les)
+	lo, hi := les[0], les[len(les)-1]
+
+	// The published range, as two numbers. 50 µs and 300 s.
+	if lo != 0.00005 {
+		t.Errorf("lowest bucket is %v s, want 5e-05; OPERATIONS.md §6.1 has to say so", lo)
+	}
+	if hi != 300 {
+		t.Errorf("highest finite bucket is %v s, want 300; OPERATIONS.md §6.1 has to say so", hi)
+	}
+	// And the range the document used to claim is provably not this one, so a
+	// future edit cannot quietly reinstate the fallback's numbers.
+	if lo == 0.0001 && hi == 60 {
+		t.Error("the scraped histogram is internal/server's fallback block, not this package's")
+	}
+}
+
+// TestScrapedRequestFamiliesCarryCallerFacingLabels pins the labels that are on
+// the wire.
+//
+// OPERATIONS.md §6's preamble said there are "no per-path, per-model or per-key
+// labels anywhere". Four of them are here, and one — `credential` — is a per-key
+// label under a different name. The sentence was not a description but an
+// argument, so the fix is not to soften it: it is to state what bounds each
+// label, which is what [DefaultMaxRequestSeries] now spells out and what the
+// next test proves is true of only four of the five.
+func TestScrapedRequestFamiliesCarryCallerFacingLabels(t *testing.T) {
+	fams, err := Parse(fullRegistry(t).Metrics(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"dorang_requests_total":           {"model", "provider", "credential", "status", "endpoint"},
+		"dorang_request_duration_seconds": {"model"},
+		"dorang_ttft_seconds":             {"model"},
+	}
+	for _, f := range fams {
+		names, ok := want[f.Name]
+		if !ok {
+			continue
+		}
+		delete(want, f.Name)
+		if len(f.Samples) == 0 {
+			t.Fatalf("%s rendered no samples", f.Name)
+		}
+		s := f.Samples[0]
+		for _, n := range names {
+			if s.Label(n) == "" {
+				t.Errorf("%s carries no %q label; §6.1's label inventory is wrong", f.Name, n)
+			}
+		}
+	}
+	for name := range want {
+		t.Errorf("%s is not in the scrape at all", name)
+	}
+}
+
+// TestTheConfiguredSetBoundsTheModelLabel is what replaced the series cap as the
+// bound on `model`.
+//
+// The finding it comes from: a gateway that lets a client mint label values has
+// handed out a denial of service on its own registry. `provider`, `credential`,
+// `endpoint` and `status` do not let it — they are ids from configuration, a
+// route name and an HTTP status. `model` did. internal/server reads it from the
+// request body and meters it verbatim on every request including the ones it
+// refuses (TestMeteredModelIsTheCallersOwnBytes), so a key allowed exactly one
+// model could mint label values by asking for models it may not have, and the
+// series cap was the only thing in the way.
+//
+// The cap bounded memory and nothing else. What it could not bound is stated in
+// TestAModelAddedAfterAFloodStillGetsItsOwnSeries, which is the recovery half of
+// this pair. This half is the admission rule: a name the configuration does not
+// serve never becomes a label value and therefore never occupies an entry, so
+// the bound is structural (DESIGN §17.1) rather than a number a caller races to.
+func TestTheConfiguredSetBoundsTheModelLabel(t *testing.T) {
+	const maxModels = 4
+	q := NewRequests(RequestsOptions{MaxModels: maxModels})
+	q.SetAdmittedModels([]string{"a-real-model"})
+
+	// A caller-chosen string does not reach the label. The bytes still arrive
+	// here — nothing upstream validates them, and nothing should, because the
+	// model ASKED FOR is what the ledger records — but they are an input to the
+	// label rather than the label.
+	minted := `gpt-4o"; DROP` // and the renderer would have had to escape it
+	q.Observe(Sample{Model: minted, Provider: "p", Credential: "c",
+		Endpoint: "chat_completions", Status: 404, Duration: time.Millisecond})
+
+	fams, err := Parse(renderRequests(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := labelValues(fams, "dorang_request_duration_seconds", "model")
+	if got[minted] {
+		t.Errorf("the caller's own string is the label value: %v", keysOf(got))
+	}
+	if !got[UnknownModelSentinel] {
+		t.Errorf("an unserved model is not in the unknown bucket; got %v", keysOf(got))
+	}
+	// The same value on the headline family, from the same resolution. Two
+	// answers here would be two dashboards that disagree about one request.
+	if rt := labelValues(fams, "dorang_requests_total", "model"); rt[minted] || !rt[UnknownModelSentinel] {
+		t.Errorf("dorang_requests_total disagrees with the histogram: %v", keysOf(rt))
+	}
+
+	// Flooding is now free of consequence: four times the cap in fabrications
+	// occupies nothing, so nothing folds and the fold counter stays still.
+	for i := 0; i < maxModels*8; i++ {
+		q.Observe(Sample{Model: "fabricated-" + strconv.Itoa(i), Provider: "p",
+			Credential: "c", Endpoint: "chat_completions", Status: 404,
+			Duration: time.Millisecond})
+	}
+	q.Observe(Sample{Model: "a-real-model", Provider: "p", Credential: "c",
+		Endpoint: "chat_completions", Status: 200, Duration: time.Millisecond})
+
+	fams, err = Parse(renderRequests(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = labelValues(fams, "dorang_request_duration_seconds", "model")
+	if !got["a-real-model"] {
+		t.Errorf("the configured model has no series of its own: %v", keysOf(got))
+	}
+	if got[OverflowSentinel] {
+		t.Errorf("the flood folded something; it should not have reached the table: %v", keysOf(got))
+	}
+	if n := q.models.f.Folds(); n != 0 {
+		t.Errorf("dorang_metrics_cardinality_folds_total moved by %d on caller traffic alone", n)
+	}
+	// Two: the configured model and the one unknown bucket. 32 fabrications
+	// bought the caller nothing.
+	if len(got) != 2 {
+		t.Errorf("%d model series, want 2 (the configured one and %s): %v",
+			len(got), UnknownModelSentinel, keysOf(got))
+	}
+}
+
+// TestAModelAddedAfterAFloodStillGetsItsOwnSeries is the recovery property, and
+// it is the half a cap can never have.
+//
+// Entries are never evicted — deliberately, because evicting one and recreating
+// it later restarts its counters, and a counter that restarts is a process
+// restart to `rate()`. So a table that a caller can spend stays spent for the
+// life of the process, and the operator's first symptom is not the flood: it is
+// the config reload afterwards that adds a real model and finds no room for it,
+// with no duration, TTFT or prefix-hit series of its own until a restart.
+//
+// The fix has to make the flood unable to spend the table, which is the previous
+// test, and it has to let the reload raise the bound, which is this one. Both,
+// or the second model in a two-model configuration is one flood away from being
+// invisible.
+func TestAModelAddedAfterAFloodStillGetsItsOwnSeries(t *testing.T) {
+	// A cap of exactly one entry, so there is no headroom to hide behind: the
+	// only way "added-by-reload" gets a series is if admission kept the flood
+	// out AND the reload raised the cap for it.
+	q := NewRequests(RequestsOptions{MaxModels: 1})
+	q.SetAdmittedModels([]string{"first-model"})
+
+	q.Observe(Sample{Model: "first-model", Provider: "p", Credential: "c",
+		Endpoint: "chat_completions", Status: 200, Duration: time.Millisecond})
+	for i := 0; i < 500; i++ {
+		q.Observe(Sample{Model: "fabricated-" + strconv.Itoa(i), Provider: "p",
+			Credential: "c", Endpoint: "chat_completions", Status: 404,
+			Duration: time.Millisecond})
+	}
+
+	// The reload. A model is added to the configuration and traffic arrives for
+	// it.
+	q.SetAdmittedModels([]string{"first-model", "added-by-reload"})
+	q.Observe(Sample{Model: "added-by-reload", Provider: "p", Credential: "c",
+		Endpoint: "chat_completions", Status: 200, Duration: 2 * time.Millisecond,
+		TTFT: 30 * time.Millisecond, Routed: true})
+
+	fams, err := Parse(renderRequests(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range []string{
+		"dorang_requests_total",
+		"dorang_request_duration_seconds",
+		"dorang_ttft_seconds",
+		"dorang_prefix_routed_total",
+	} {
+		got := labelValues(fams, family, "model")
+		if !got["added-by-reload"] {
+			t.Errorf("%s has no series for the model the reload added: %v",
+				family, keysOf(got))
+		}
+	}
+	// And the model that was already there kept its own series rather than
+	// being displaced to make room.
+	if got := labelValues(fams, "dorang_request_duration_seconds", "model"); !got["first-model"] {
+		t.Errorf("the model observed before the flood lost its series: %v", keysOf(got))
+	}
+
+	// A name the reload REMOVES keeps the series it has. Withdrawing it would
+	// be the counter reset this design refuses; it simply stops advancing.
+	q.SetAdmittedModels([]string{"added-by-reload"})
+	q.Observe(Sample{Model: "first-model", Provider: "p", Credential: "c",
+		Endpoint: "chat_completions", Status: 200, Duration: time.Millisecond})
+	if fams, err = Parse(renderRequests(q)); err != nil {
+		t.Fatal(err)
+	}
+	if got := labelValues(fams, "dorang_request_duration_seconds", "model"); !got["first-model"] {
+		t.Errorf("a de-configured model's series vanished from the scrape, which reads "+
+			"as a counter reset: %v", keysOf(got))
+	}
+}
+
+// TestARouteWithNoModelIsNotAnUnknownModel keeps /v1/models, the health probes
+// and the passthrough relays out of the unknown bucket.
+//
+// They carry no model at all, which is not the same claim as "a model dorang
+// does not serve", and folding them together would both misreport those routes
+// and change what an existing dashboard shows for them.
+func TestARouteWithNoModelIsNotAnUnknownModel(t *testing.T) {
+	q := NewRequests(RequestsOptions{})
+	q.SetAdmittedModels([]string{"m1"})
+	q.Observe(Sample{Provider: "p", Credential: "c", Endpoint: "health", Status: 200,
+		Duration: time.Millisecond})
+
+	fams, err := Parse(renderRequests(q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := labelValues(fams, "dorang_requests_total", "model")
+	if got[UnknownModelSentinel] {
+		t.Errorf("a route with no model was reported as an unserved model: %v", keysOf(got))
+	}
+	if !got[""] {
+		t.Errorf("the empty model label is gone: %v", keysOf(got))
+	}
+}
+
+// renderRequests collects one [Requests] on its own so a test can read the
+// families it owns without the rest of the registry's output.
+func renderRequests(q *Requests) []byte {
+	r := New(nil)
+	r.Register(q)
+	return r.Metrics(nil)
+}
+
+// labelValues is the set of values a family carries for one label name.
+func labelValues(fams []Family, family, label string) map[string]bool {
+	out := map[string]bool{}
+	for _, f := range fams {
+		if f.Name != family {
+			continue
+		}
+		for _, s := range f.Samples {
+			out[s.Label(label)] = true
+		}
+	}
+	return out
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -890,18 +1214,59 @@ func BenchmarkGather(b *testing.B) {
 	}
 }
 
+// BenchmarkObserve measures the observation path in the three states the model
+// label's admission rule puts it in.
+//
+// `no admitted set` is what this package did before [Requests.SetAdmittedModels]
+// existed and is the baseline the other two are read against; it is also what a
+// bare [NewRequests] still does. `configured model` is what an assembled gateway
+// serves — one lookup in an immutable map behind an atomic pointer, on every
+// request. `unserved model` is the same lookup missing, which is the path a
+// caller minting names drives, and it must not be the cheaper one to reach or
+// the flood would be an amplification.
+//
+// All three must report zero allocations. DESIGN §15.5 forbids formatted string
+// construction here, and a map lookup that allocated would be exactly that
+// wearing a different shape.
 func BenchmarkObserve(b *testing.B) {
-	q := NewRequests(RequestsOptions{})
 	s := Sample{Model: "m", Provider: "p", Credential: "c", Endpoint: "chat",
 		Status: 200, Duration: time.Millisecond, TTFT: time.Millisecond, Routed: true}
-	q.Observe(s)
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			q.Observe(s)
-		}
-	})
+
+	// A realistic set rather than a set of one: the lookup's cost is a hash of
+	// the name plus a bucket probe, and a map with a single entry would measure
+	// a case no deployment runs.
+	names := make([]string, 0, 64)
+	for i := 0; i < 64; i++ {
+		names = append(names, "configured-model-"+strconv.Itoa(i))
+	}
+	names = append(names, "m")
+
+	for _, c := range []struct {
+		name  string
+		admit []string
+		model string
+	}{
+		{"no admitted set", nil, "m"},
+		{"configured model", names, "m"},
+		{"unserved model", names, "not-a-configured-model"},
+	} {
+		b.Run(c.name, func(b *testing.B) {
+			q := NewRequests(RequestsOptions{})
+			if c.admit != nil {
+				q.SetAdmittedModels(c.admit)
+			}
+			sample := s
+			sample.Model = c.model
+			q.Observe(sample)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					q.Observe(sample)
+				}
+			})
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

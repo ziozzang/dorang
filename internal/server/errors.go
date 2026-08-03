@@ -52,7 +52,8 @@ type Error struct {
 
 	// Status is the HTTP status dorang answers with. Not on the wire.
 	Status int
-	// RetryAfterSeconds populates Retry-After on a 429. Not in the envelope.
+	// RetryAfterSeconds populates Retry-After on the three retry-signalling
+	// statuses ([retryAfterStatus]). Not in the envelope.
 	RetryAfterSeconds int
 	// NativeType is the upstream's own type string when it was outside the
 	// canonical vocabulary. It is surfaced as x-dorang-native-error-type,
@@ -71,9 +72,10 @@ type Error struct {
 	// not have to wait for that: it can answer any request with the x-api-key
 	// header it was just given.
 	//
-	// Callers that record this must scrub it first; internal/redact is the
-	// scrubber, and internal/app applies it with the exact secret that request
-	// carried.
+	// Callers that record this must scrub it first. internal/backend is the
+	// caller on the dispatch path, and it scrubs with the exact secret that
+	// request carried, read back off the outbound headers. internal/redact
+	// states the rule; internal/app does not apply it and never did.
 	NativeMessage string
 	// NativeCode is the upstream's own code when it could not become the
 	// envelope's code — a number where §7.1 requires a string, or a JSON object
@@ -576,7 +578,8 @@ func opaqueError(status int, body []byte) *Error {
 // It is a ledger column and a log line, not a response body, so the bound is
 // about storage and about not letting a backend write a megabyte into every
 // row — the confidentiality question is answered by the text not being relayed
-// at all, and by internal/redact scrubbing what is kept.
+// at all, and by internal/backend scrubbing what is kept against the credential
+// that request carried (internal/redact states that rule).
 const nativeMessageLimit = 512
 
 // nativeCodeHeaderLimit bounds the x-dorang-native-error-code header value, and
@@ -799,13 +802,41 @@ func EncodeError(e *Error) []byte {
 	return appendEnvelope(make([]byte, 0, 128), e)
 }
 
+// retryAfterStatus reports whether Retry-After means anything on this status.
+//
+// COMPATIBILITY §11.4. The three admitted statuses are the ones whose whole
+// content is "come back later": 429, 503, and the Anthropic family's 529, which
+// [TypeForStatus] and [canonicalMessage] already treat as 503's other spelling.
+//
+// This used to be `status == 429` alone, and the gap was not theoretical. A
+// provider's own `Retry-After` on an overloaded 503 or 529 is parsed by
+// internal/backend, carried on [Error.RetryAfterSeconds] the whole way here, and
+// was then dropped on the floor — a value read, stored, documented, and never
+// emitted, which is DESIGN §17.1's dominant class. §11.4's own argument is
+// STRONGER for a 503 than for a 429: a client that is rate limited can at least
+// infer a window from its own request rate, and a client told the far side is
+// overloaded has nothing at all to guess with.
+//
+// The other 5xx are deliberately excluded rather than forgotten. A 500 or a 502
+// is the upstream reporting that something went wrong, not that it will be ready
+// at a stated time, and dorang never computes a delay for one; forwarding a
+// header a broken backend happened to emit would publish a number under a status
+// that makes no claim about recovery.
+func retryAfterStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable, 529:
+		return true
+	}
+	return false
+}
+
 // WriteError writes the envelope as a complete HTTP response.
 //
 // It is safe to call with headers already stamped; it does not stamp them.
-// Retry-After is attached on a 429 whether or not detail headers were asked
-// for — it is a standard header a client acts on, not a dorang extension whose
-// absence is merely inconvenient (§10.4's bounding rule is about the x-dorang-*
-// set).
+// Retry-After is attached on every status [retryAfterStatus] admits, whether or
+// not detail headers were asked for — it is a standard header a client acts on,
+// not a dorang extension whose absence is merely inconvenient (§10.4's bounding
+// rule is about the x-dorang-* set).
 func WriteError(w http.ResponseWriter, e *Error) {
 	if e == nil {
 		e = NewError(http.StatusInternalServerError, TypeAPIError, "unknown error")
@@ -818,7 +849,7 @@ func WriteError(w http.ResponseWriter, e *Error) {
 	h.Set("Content-Type", "application/json")
 	var lb [20]byte
 	h.Set("Content-Length", string(strconv.AppendInt(lb[:0], int64(len(*buf)), 10)))
-	if e.Status == http.StatusTooManyRequests && e.RetryAfterSeconds > 0 {
+	if retryAfterStatus(e.Status) && e.RetryAfterSeconds > 0 {
 		h.Set("Retry-After", string(strconv.AppendInt(lb[:0], int64(e.RetryAfterSeconds), 10)))
 	}
 	// An UPSTREAM-controlled string about to become a response header value.

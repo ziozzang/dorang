@@ -37,7 +37,14 @@ import (
 //     scrapes a backend at all — the whole block is inert, not just the poll
 //     interval), `providers[].params.drop`, `providers[].usage_probe.interval`
 //     and `models[].deployments[].stream_timeout`. They are tracked in
-//     docs/CONFIG.md §23.1 instead. The check does hold for the distinctive
+//     docs/CONFIG.md §23.1 instead.
+//
+//     `models[].deployments[].max_output_tokens` is the newest instance and was
+//     born into it: `MaxOutputTokens` occurs in internal/router, internal/app
+//     and pkg/catalog, so this check reported it consumed on the day it was
+//     added — while internal/app/build.go did not yet copy it onto the routing
+//     table. What holds it is TestAnOperatorsOutputCeilingRefusesRatherThanClamping
+//     in internal/router, which asserts the refusal rather than the field. The check does hold for the distinctive
 //     names, which is where new settings land: `MaxQueueWait`,
 //     `ClientPriority`, `PrefixTTL`, `AffinityGroup`.
 //
@@ -199,6 +206,11 @@ var readExempt = map[string]bool{
 	// Refused here as well: numeric metering cannot be turned off, so the flag
 	// exists to carry the refusal rather than to be consulted downstream.
 	"Config.Metering.Numeric": true,
+	// Refused here as well: dorang converts rather than relaying, so there is
+	// nothing to forward a parameter the target's wire shape has no field for
+	// into. `false` is a load error naming providers[].params.drop; `true` is
+	// the only behaviour, so nothing downstream has a decision to make.
+	"Config.Providers.Params.DropUnsupported": true,
 	// Config.Compat.UsageChunkChoices and Config.Compat.AnthropicTotalTokens
 	// were here, refused at their non-default value because the value had no
 	// path from configuration into internal/wire. Both are wired now — they
@@ -237,10 +249,16 @@ var knownUnwired = map[string]bool{
 	// that itself without importing a sibling package (§1), which is why the
 	// entries had to leave this list rather than become a validation rule.
 	//
-	// §10.3 parameter conversion. The knob that says whether unsupported
-	// parameters are dropped never reaches the conversion path; only the kind's
-	// own capability set decides.
-	"Config.Providers.Params.DropUnsupported": true,
+	// Config.Providers.Params.DropUnsupported was here — "the knob that says
+	// whether unsupported parameters are dropped never reaches the conversion
+	// path". It still does not, and the disposition changed rather than the
+	// wiring: `false` is a load error now, so the field carries a refusal
+	// instead of a silence, and it has moved to readExempt where the other
+	// refusals live. Its neighbour params.drop, named in this file's own list of
+	// settings the check cannot see, IS wired now — through backend.Spec into
+	// canonical.Request.DropParams — and the check would have reported it as
+	// consumed either way, which is the vacuity the doc comment above opens with.
+	//
 	// §7.4b. The prefix chain is cut logarithmically; `checkpoints: fixed`
 	// validates and selects nothing.
 	"Config.Routing.Prefix.Checkpoints": true,

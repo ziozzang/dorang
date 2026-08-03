@@ -33,7 +33,7 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 	reg.Register(metrics.NewBuildCollector(Version, Commit, a.now))
 
 	a.requests = metrics.NewRequests(metrics.RequestsOptions{})
-	a.requests.SetPrefixEnabled(cfg.Routing.Prefix.IsEnabled())
+	a.applyMetricsConfig(cfg)
 	reg.Register(a.requests)
 
 	if a.Broker != nil {
@@ -93,6 +93,33 @@ func (a *App) buildMetrics(cfg *config.Config) *metrics.Registry {
 		reg.Register(metrics.NewShadowCollector(a.Shadow))
 	}
 	return reg
+}
+
+// applyMetricsConfig hands [metrics.Requests] the two facts about the running
+// configuration it cannot pull for itself.
+//
+// It is called from [App.buildMetrics] AND from [App.Reload], and the second
+// call is the one that matters. The registry is built once, at assembly, and a
+// reload does not rebuild it — so a fact copied into it only at start-up is a
+// fact that stops being true the first time an operator edits the file:
+//
+//   - The admitted model set is what bounds the `model` label. A bound fixed at
+//     start-up is a bound that a config reload adding a model finds already
+//     spent, and the resulting fold does not heal without a restart. That is the
+//     exact symptom this wiring exists to prevent, and
+//     TestModelLabelAdmissionFollowsAReload is what says the call is here.
+//   - `routing.prefix.enabled` gates dorang_prefix_hit_ratio. It hot-reloads
+//     like every other section (§4.1) — the dispatcher's prefixOn is swapped on
+//     every reload — and this gate did not follow it, so turning cache-affinity
+//     routing OFF left the ratio published against a table that had stopped
+//     being consulted, and turning it ON left the ratio absent on a gateway that
+//     was using it.
+func (a *App) applyMetricsConfig(cfg *config.Config) {
+	if a.requests == nil {
+		return
+	}
+	a.requests.SetAdmittedModels(clientFacingModelNames(cfg))
+	a.requests.SetPrefixEnabled(cfg.Routing.Prefix.IsEnabled())
 }
 
 // metricsAccess renders observability.prometheus and observability.metrics.public
@@ -385,6 +412,11 @@ func (a *App) recordMetrics(ev *server.Event) {
 		FallbackFrom:   r.FallbackFromDeployment,
 		FallbackTo:     r.Deployment,
 		FallbackReason: r.FallbackFrom,
+		Deployment:     r.Deployment,
+		// Empty on every request an upstream answered honestly, which is what
+		// keeps dorang_model_substitutions_total absent rather than zero on a
+		// healthy gateway (DESIGN §17.1 rule 3).
+		ServedModel: r.ServedModel,
 	})
 }
 

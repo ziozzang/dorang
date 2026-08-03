@@ -112,6 +112,17 @@ type Target struct {
 	// UpstreamModel is the REAL model id. It goes upstream; the client's
 	// requested name goes back in the response body (§7.2).
 	UpstreamModel string
+	// ModelKnown reports that pkg/catalog holds an entry for UpstreamModel
+	// under this provider's kind, mirroring [router.Decision.ModelKnown].
+	//
+	// It arms the substitution reading: unset, this package still classifies
+	// what the upstream answered — that costs nothing — but does not COPY the
+	// name out, because a deployment whose model dorang has no figures for
+	// cannot prove a substitution and would otherwise pay one string allocation
+	// per request for an answer nobody can act on. An operator alias like
+	// `local`, answered by whatever gguf the server loaded, is exactly that
+	// case.
+	ModelKnown bool
 	// PriorityField is the wire field the number goes in, empty when this
 	// engine takes none. Priority is the value for THIS engine's direction.
 	PriorityField string
@@ -132,6 +143,18 @@ type Target struct {
 	// silently downgraded, and so that the set the router filtered on is the
 	// set the encoder converts against.
 	Capabilities canonical.Capability
+	// MaxTokensField is the spelling this deployment's upstream takes for the
+	// output ceiling: `max_tokens` or `max_completion_tokens`. Empty is
+	// `max_tokens`, which is [openai.EncodeOptions]'s own default, so an
+	// unconfigured deployment keeps today's bytes exactly.
+	//
+	// It is on the Target rather than the Call because it is a property of the
+	// deployment and a fail-back hop lands on a different one — the same
+	// argument Capabilities carries. It is only meaningful for the OpenAI wire
+	// shapes; internal/app refuses to build a deployment that sets it on a
+	// provider whose shape has no such field, rather than accepting it and
+	// encoding something else.
+	MaxTokensField string
 }
 
 // Call is one client request, decoded once and reusable across fail-back hops.
@@ -321,6 +344,20 @@ type Result struct {
 	FirstByteSent bool
 	// Attempts counts the in-provider attempts made.
 	Attempts int
+	// ServedModel is the model name the upstream put in its own response body,
+	// and ModelAgreement is how it compares with the `upstream_model` dorang
+	// sent. ServedModel is filled only when the comparison found something
+	// worth naming, because materializing it otherwise would put an allocation
+	// on every stream for a string nobody reads.
+	//
+	// [canonical.ModelSubstituted] is a 200 that answered as a DIFFERENT model:
+	// the request is priced at the asked model's rate for another model's work,
+	// the router's context-window fallback used the asked model's declared
+	// window, and the client was told nothing. This is reported and never acted
+	// on here — see [exchange.agree].
+	ServedModel    string
+	ModelAgreement canonical.ModelAgreement
+
 	// LoadMetrics is the engine's own `endpoint-load-metrics` report, verbatim,
 	// or empty when the response carried none (VLLM.md §3.2). It is the input to
 	// utilization pricing and is deliberately unparsed here: an empty string
@@ -603,6 +640,7 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		// then wrote nothing at all committed a response that had no content,
 		// could never be retried, and reported success.
 		res.FirstByteSent = sent > 0
+		res.ServedModel, res.ModelAgreement = x.served, x.agree
 		if err != nil {
 			res.Err = streamError(err)
 			// Another DEPLOYMENT may be tried precisely while nothing has been
@@ -664,6 +702,7 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	res.Usage = usage
 	res.Body = out
 	res.ContentType = ctype
+	res.ServedModel, res.ModelAgreement = x.served, x.agree
 	return res
 }
 
@@ -771,6 +810,12 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 			server.TypeAPIError, "the upstream answer produced nothing to send").
 			WithCode(CodeUpstreamShape)
 	}
+
+	// The one point at which both names exist: dec.resp.ServedModel is what the
+	// upstream called itself, and it is about to stop mattering to everything
+	// downstream because §7.2 has already put the client's name in Model. Read
+	// here, reported by [Backend.Do], acted on nowhere.
+	x.noteServedModel(dec.resp.ServedModel)
 
 	adoptEngineReasoning(dec.resp, x.prov.engine)
 

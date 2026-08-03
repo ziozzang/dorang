@@ -11,6 +11,7 @@ import (
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/cluster"
+	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/server"
@@ -63,7 +64,7 @@ import (
 //
 // Not wired, and named rather than implied:
 //
-//   - ModelRegistry (deployments, aliases). This one is NOT waiting on a store
+//   - ModelRegistry (the `/model/*` WRITES). This one is NOT waiting on a store
 //     layer; it is waiting on a reader. The routing table is compiled from
 //     configuration by [buildRouter] — `models[]`, aliases and classes out of
 //     internal/config — and the `deployments` and `model_aliases` tables have no
@@ -72,6 +73,12 @@ import (
 //     traffic differently, which is precisely the "stores a value nobody reads"
 //     failure the Directory work above exists to remove. It stays a 501 that
 //     names the gap until routing reads the table or the table is dropped.
+//
+//     The READ half is wired, and the distinction is the point: see
+//     [adminRouting]. `/model/*` still refuses, and the operator UI's models
+//     screen — which only ever reads — is served from the routing table this
+//     process compiled, because the alternative was a navigation item that
+//     answered 501 on every click in every deployment.
 //   - The daily-activity endpoints. They ask for a second, per-day per-subject
 //     per-MODEL breakdown, and no materialization is keyed on two dimensions at
 //     once. /global/spend/report answers the single-dimension question and
@@ -212,6 +219,11 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		// published for the five controls it owns; this is the same publication
 		// for the lifecycle internal/admin owns.
 		Invalidator: adminInvalidatorOrNil(a.KeyControl),
+
+		// The read-only half of the models screen. `Models` — the editable
+		// registry `/model/*` writes through — stays unset for the reason above;
+		// this is what the gateway actually routes on. See [adminRouting].
+		Routing: &adminRouting{cfg: a.Config},
 
 		Capacity: &adminCapacityReporter{b: a.Broker},
 		Catalog:  &adminCatalog{c: a.Catalog},
@@ -526,6 +538,20 @@ func adminSecretFrom(s *store.KeySecret) admin.KeySecret {
 	}
 }
 
+// adminKeyFrom renders a stored key for the administration surface.
+//
+// Tier and the pend pair are copied across for the reason every other field is:
+// both types have the column, and a field that exists on both sides and is
+// dropped in the middle reports a fixed answer — `"tier": ""`, `"pended":
+// false` — for every key on every deployment, which is the shape of defect this
+// package keeps finding. §11.6's pend is the one that shows: an operator
+// reading `/ui/keys` saw "active" beside a credential the gateway was refusing.
+//
+// The reverse direction ([storeKeyFrom]) deliberately does NOT carry them.
+// `UpdateAPIKey` writes neither column — a pend is applied and released by its
+// own store methods, which is what makes "released in ONE action" true — so
+// carrying them into the update path would be a write nothing performs, wearing
+// the appearance of one.
 func adminKeyFrom(k *store.APIKey) *admin.Key {
 	return &admin.Key{
 		ID: k.ID, KeyLabel: k.KeyLabel, KeyAlias: k.KeyAlias,
@@ -537,6 +563,7 @@ func adminKeyFrom(k *store.APIKey) *admin.Key {
 		RPMLimit: k.RPMLimit, TPMLimit: k.TPMLimit, MaxParallel: k.MaxParallel,
 		PriorityClass: k.PriorityClass, Tags: k.Tags,
 		Blocked: k.Blocked, ExpiresAt: k.ExpiresAt,
+		Tier: k.Tier, PendedAt: k.PendedAt, PendReason: k.PendReason,
 		HashScheme: string(k.HashScheme), Source: k.Source,
 		CreatedAt: k.CreatedAt, UpdatedAt: k.UpdatedAt,
 	}
@@ -830,9 +857,14 @@ func rollupPlan(groups []admin.GroupBy) (dim store.RollupDim, byDay, byDim bool,
 
 // rollupUsage converts a rollup counter set into the administration surface's.
 //
-// NotionalKnown stays false and NotionalNano stays zero: the rollup tables have
-// no notional column, and DESIGN §8.5 rule 5 requires a missing list rate to be
-// reported as missing rather than as a flattering zero.
+// The notional figure (§8.5) is carried across with the flag that says whether
+// it means anything. It used to be hard-wired to `NotionalKnown: false`, with a
+// comment that the rollups had no notional column — they have had one since
+// migration 0002, and what was actually missing was a writer and a way to say
+// "this sum is whole". Both exist now (see [store.UsageDelta.NotionalKnown]),
+// and the consequence was not abstract: the usage screen's notional and
+// leverage tiles read `unavailable` in every window of every deployment, which
+// is honest and is furniture — a tile that can never be anything else.
 //
 // The cost DECOMPOSITION is read from its own columns. It used to be
 // `MarginalCostNano: d.CostNano` — the whole total reported as marginal usage —
@@ -851,6 +883,8 @@ func rollupUsage(d store.UsageDelta) admin.Usage {
 		TotalTokens: d.TotalTokens,
 		CostNano:    d.CostNano, MarginalCostNano: d.MarginalNano,
 		SubscriptionCostNano: d.SubscriptionNano,
+		NotionalNano:         d.NotionalNano,
+		NotionalKnown:        d.NotionalKnown(),
 		LatencyMSSum:         d.LatencyMSSum,
 	}
 }
@@ -882,13 +916,14 @@ func adminLogRow(r store.RequestLog) admin.LogRow {
 		TotalTokens: r.TotalTokens,
 		CostNano:    r.CostNano, MarginalCostNano: r.MarginalCostNano,
 		SubscriptionCostNano: r.SubscriptionCostNano,
-		// NotionalKnown stays false: the ledger has no notional column in this
-		// build, and reporting a missing list rate as zero is the one thing
-		// DESIGN §8.5 says not to do.
-		// The §8.6 disclosure. It has a producer in this build, unlike the
-		// notional pair above it: the columns, the writer and this reader
-		// arrived together, because a variable price whose factor the ledger
-		// does not carry is an invoice nobody can dispute.
+		// The list-rate equivalent and whether the row has one. The flag is not
+		// decoration: reporting a missing notional as zero is the one thing
+		// DESIGN §8.5 says not to do, because it makes a subscription look
+		// infinitely efficient.
+		NotionalNano:  r.NotionalNano,
+		NotionalKnown: r.NotionalKnown,
+		// The §8.6 disclosure: a variable price whose factor the ledger does
+		// not carry is an invoice nobody can dispute.
 		UtilMultiplierPPM: r.UtilMultiplierPPM,
 		UtilPPM:           r.UtilPPM,
 		UtilSource:        r.UtilSource,
@@ -898,6 +933,130 @@ func adminLogRow(r store.RequestLog) admin.LogRow {
 		TraceID: r.TraceID, SessionID: r.SessionID, NodeID: r.NodeID,
 		BatchID: r.BatchID, Tags: r.Tags,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The routing table, read-only
+// ---------------------------------------------------------------------------
+
+// adminRouting answers "what does this gateway route" from the configuration it
+// compiled, for the operator UI's models screen.
+//
+// # Why this exists when /model/* is still a 501
+//
+// The reasoning above stands and is unchanged: `deployments` and
+// `model_aliases` have a schema and no reader, so an adapter over them would
+// let an operator POST /model/new, get a 200, see the row, and route nothing
+// differently. That argument is about WRITES.
+//
+// A read-only screen is a different question, and it had a worse answer: the
+// navigation advertised "Models & deployments" on all three pages and every
+// click answered 501, in every deployment, because [admin.Config.Models] was
+// never set. dorang knows its model set perfectly well — it serves it on
+// `/v1/models`, routes on it, and stamps these very deployment ids into
+// `x-dorang-deployment` and the ledger. Refusing to show it was not caution; it
+// was a link that could not work.
+//
+// So the screen is served from here, `/model/*` keeps answering 501 with the
+// message that names the gap, and the page says which of the two it is looking
+// at. See [admin.Config.Routing].
+//
+// # Why the configuration and not the router
+//
+// The same reason [adminPricer] reads the catalog off the dispatcher's state:
+// the configuration is swapped by pointer on SIGHUP, and a captured copy would
+// keep describing the process's start-up state — while "did my reload take
+// effect" is the main reason an operator opens this screen at all. The ids come
+// from [deploymentIDs], the function the router itself compiles with.
+type adminRouting struct{ cfg func() *config.Config }
+
+// ListDeployments implements admin.ModelCatalog.
+func (r *adminRouting) ListDeployments(context.Context) ([]*admin.Deployment, error) {
+	cfg := r.cfg()
+	if cfg == nil {
+		return nil, nil
+	}
+	ids := deploymentIDs(cfg)
+	out := make([]*admin.Deployment, 0, len(cfg.Models))
+	for i := range cfg.Models {
+		m := &cfg.Models[i]
+		for j := range m.Deployments {
+			d := &m.Deployments[j]
+			dep := &admin.Deployment{
+				ID:            ids[i][j],
+				ModelGroup:    m.Name,
+				ProviderID:    d.Provider,
+				UpstreamModel: d.UpstreamModel,
+				CredentialIDs: append([]string(nil), d.Credentials...),
+				// Zero weight is one to the router, so it is one here. A column
+				// reading 0 beside a deployment that takes its full share of
+				// round-robin traffic describes the file, not the behaviour.
+				Weight:   max(d.Weight, 1),
+				Priority: d.Priority,
+				Params:   "{}",
+				// Every deployment in the compiled table can serve. There is no
+				// disabled state in `models:` — a deployment one does not want
+				// is removed — so the column is honest rather than decorative.
+				Enabled: true,
+			}
+			timeout := d.Timeout.Duration()
+			if p, ok := cfg.Provider(d.Provider); ok && timeout == 0 {
+				// The effective timeout, resolved exactly as buildRouter
+				// resolves it. Showing the deployment's own empty value would
+				// report "no timeout" for a deployment that has its provider's.
+				timeout = p.Timeout.Duration()
+			}
+			dep.TimeoutMS = msPtr(timeout)
+			dep.StreamTimeoutMS = msPtr(d.StreamTimeout.Duration())
+			for _, lim := range d.Limits {
+				switch lim.Metric {
+				case config.MetricRPM:
+					dep.RPMLimit = limitPtr(lim.Value)
+				case config.MetricTPM:
+					dep.TPMLimit = limitPtr(lim.Value)
+				}
+			}
+			// MaxParallel is deliberately left unset. A deployment-level
+			// `max_concurrent` is not read by anything — concurrency ceilings
+			// come from `capacity:` and are keyed on the credential, the
+			// provider group and the route — and rendering one would put a
+			// limit on the screen that nothing enforces, which is the defect
+			// this screen was opened to remove rather than to relocate.
+			out = append(out, dep)
+		}
+	}
+	return out, nil
+}
+
+// ListAliases implements admin.ModelCatalog.
+func (r *adminRouting) ListAliases(context.Context) ([]admin.Alias, error) {
+	cfg := r.cfg()
+	if cfg == nil {
+		return nil, nil
+	}
+	out := make([]admin.Alias, 0, len(cfg.Aliases))
+	for alias, group := range cfg.Aliases {
+		out = append(out, admin.Alias{Alias: alias, ModelGroup: group})
+	}
+	return out, nil
+}
+
+func msPtr(d time.Duration) *int64 {
+	if d <= 0 {
+		return nil
+	}
+	v := d.Milliseconds()
+	return &v
+}
+
+// limitPtr renders a declared ceiling, and an undeclared one as "no limit"
+// rather than as a limit of zero — the two are different answers and flattening
+// them is how a configured ceiling quietly stops existing.
+func limitPtr(v int64) *int64 {
+	if v <= 0 {
+		return nil
+	}
+	return &v
 }
 
 // ---------------------------------------------------------------------------

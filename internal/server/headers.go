@@ -81,6 +81,23 @@ const (
 	// HeaderRealModel is the legacy spelling of the same value, mirrored only
 	// when legacy headers are on (COMPATIBILITY §7.7).
 	HeaderRealModel = "X-Dorang-Real-Model"
+	// HeaderServedModel names the model that ACTUALLY answered, and is present
+	// only when that is a different model from HeaderUpstreamModel — see
+	// [Result.ServedModel]. Its absence is the ordinary case and asserts
+	// nothing.
+	//
+	// It is here because the third thing a silent substitution costs, after the
+	// price and the window, is the caller's own contract: a client that asked
+	// for one model got another and was told nothing. §7.2 makes that worse
+	// rather than better on the way out — the body is REQUIRED to carry the
+	// client's name, so dorang overwrites the one field that disagreed. This
+	// header is the only place the disagreement survives.
+	//
+	// A streamed answer does not carry it, for the reason
+	// [Result.Downgraded] does not either: the header block closes on the first
+	// write, and on a stream the first write is the frame the reading is taken
+	// from.
+	HeaderServedModel = "X-Dorang-Served-Model"
 	// HeaderProvider, HeaderCredential and HeaderDeployment identify the
 	// selected target by id. Never a secret.
 	HeaderProvider   = "X-Dorang-Provider"
@@ -363,6 +380,9 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	if r.UpstreamModel != "" {
 		h.Set(HeaderUpstreamModel, r.UpstreamModel)
 	}
+	if r.ServedModel != "" {
+		h.Set(HeaderServedModel, r.ServedModel)
+	}
 	if r.Deployment != "" {
 		h.Set(HeaderDeployment, r.Deployment)
 	}
@@ -386,7 +406,7 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 		stampLegacyHeaders(h, rq, r, costDeferred)
 	}
 
-	if status == http.StatusTooManyRequests && r.RetryAfterSeconds > 0 {
+	if retryAfterStatus(status) && r.RetryAfterSeconds > 0 {
 		h.Set(HeaderRetryAfter, strconv.Itoa(r.RetryAfterSeconds))
 	}
 	if r.RateLimit.Set {

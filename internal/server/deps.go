@@ -435,6 +435,18 @@ type Result struct {
 	Credential    string
 	Deployment    string
 	UpstreamModel string
+	// ServedModel is the model the upstream said actually answered, set ONLY
+	// when it is a different model from UpstreamModel and one this build's
+	// catalog also knows (DESIGN §17.1 rule 3). Empty is the ordinary case and
+	// carries no claim.
+	//
+	// It is the only witness to a 200 that was served by something other than
+	// what the configuration asked for, which is the failure mode a status
+	// code, a body shape, a token count and a `/models` listing are all blind
+	// to. The request was still priced at UpstreamModel's rate and still
+	// windowed against UpstreamModel's declared context; recording that is what
+	// this field is for, and dorang does not act on it.
+	ServedModel string
 
 	Attempt int
 	// FallbackFrom is the cause that sent this request down a fallback chain,
@@ -492,6 +504,18 @@ type Result struct {
 	// subscription look infinitely efficient", and without this flag zero is
 	// exactly what a reader of NotionalNanoUSD sees.
 	NotionalPriced bool
+	// NotionalMissing marks the case NotionalPriced's absence cannot express on
+	// its own: the pricing engine RAN for this request and had no notional_rate
+	// rule to answer with.
+	//
+	// Both flags clear means the request never reached pricing at all — refused
+	// before dispatch, or a gateway with no price catalog — which is not a
+	// missing list rate but an absent price for absent usage. The ledger needs
+	// the difference: aggregating "no figure" and "no rule" together would make
+	// every window containing one refused request report its whole notional
+	// total as unavailable, which is §8.5's honest answer given for a dishonest
+	// reason.
+	NotionalMissing bool
 
 	// QuotaUsedPct is the credential's quota-window consumption, keyed by
 	// window name ("minute", "day", …). Nil when no probe reported.

@@ -52,7 +52,7 @@ func (c *AuthCollector) Collect(w *Writer) {
 	w.Metric("dorang_auth_cache_misses_total", Counter,
 		"Credential lookups that fell through to the overlay or the store. This is the "+
 			"`cold-auth` profile of DESIGN §15.1, whose budget is 15 ms against a "+
-			"warm-local 200 µs.")
+			"warm-local 249 µs.")
 	w.Uint(st.Misses)
 
 	// Absent until something has been looked up. A hit ratio of 0.0 on an idle

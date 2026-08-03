@@ -41,6 +41,20 @@ type exchange struct {
 	// attempt is the in-provider attempt number, used only to keep a retried
 	// multipart body's boundary distinct from the first one's.
 	attempt int
+	// served is the model name the UPSTREAM put in its own answer and agree is
+	// how it compares with target.UpstreamModel — the name dorang sent.
+	//
+	// They live on the exchange for the same reason respType does: they are read
+	// from the answer, deep inside a conversion whose signature has nothing to
+	// carry them, and needed by [Backend.Do], which holds neither the body nor
+	// the decoded response. See [canonical.CompareModel] for what the comparison
+	// means and why a naive inequality is not it.
+	//
+	// Nothing in this package acts on them. A substitution is a fact to report;
+	// recording that an endpoint substitutes is not permission to substitute,
+	// and it is not permission to reroute or to fail the request either.
+	served string
+	agree  canonical.ModelAgreement
 	// names is the request's tool-name registry, shared by the encoder that
 	// shortens an over-long name and by every decoder that has to restore it
 	// (COMPATIBILITY 5.3). It lives on the exchange because that is the only
@@ -86,6 +100,36 @@ func (x *exchange) accept() {
 	}
 	x.accepted = true
 	x.call.Accepted(x.loss)
+}
+
+// noteServedModel records how the upstream's own answer compares with the name
+// dorang sent it.
+//
+// The classification is unconditional and free — it reads two strings and
+// allocates nothing. The NAME is copied out only when the comparison found a
+// substitution AND the target's model is one the catalog knows, because that is
+// the only combination in which a caller can prove anything, and copying it
+// otherwise would put an allocation on every request to a deployment whose
+// upstream answers under an alias it resolved for itself.
+func (x *exchange) noteServedModel(served string) {
+	if served == "" {
+		return
+	}
+	x.agree = canonical.CompareModel(x.target.UpstreamModel, served)
+	if x.agree.Substituted() && x.target.ModelKnown {
+		x.served = served
+	}
+}
+
+// noteServedAgreement is [exchange.noteServedModel] for the byte relay, whose
+// scanner has already classified the name against the same comparand without
+// ever turning it into a string. name materializes it, and is called only when
+// the verdict makes the string worth having.
+func (x *exchange) noteServedAgreement(agree canonical.ModelAgreement, name func() string) {
+	x.agree = agree
+	if agree.Substituted() && x.target.ModelKnown {
+		x.served = name()
+	}
 }
 
 // clientCapabilities is what the CALLER's protocol can carry, which is the set a

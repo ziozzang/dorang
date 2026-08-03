@@ -27,12 +27,17 @@ import (
 // warmLocalP50 is the headline gateway-overhead budget of DESIGN §15.1, as it
 // was published when this gate was written.
 //
-// testing/perf has since MEASURED it end to end at 480 µs — the 200 µs was
-// never measured and does not hold at the profile's 4 KiB body. This constant
-// stays where it was on purpose: it is the denominator of a bound, and 5% of
-// the corrected figure would be 24 µs. A gate that loosens itself because the
-// thing it is a fraction of got slower is a ratchet pointing the wrong way, so
-// the percentages reported below are the pessimistic reading.
+// testing/perf has since MEASURED it end to end, and the figure has moved three
+// times: up to 480 µs when it was first measured — the 200 µs was never measured
+// and does not hold at the profile's 4 KiB body — then down to 375 µs and to
+// §15.1's current 249 µs as the codec got faster twice. This constant stays
+// where it was through all three on purpose: it is the denominator of a bound,
+// and 5% of the corrected figure would have been 24 µs at 480 and would be
+// 12.45 µs now. A gate that loosens itself because the thing it is a fraction of
+// got slower is a ratchet pointing the wrong way, and one that re-tightens when
+// it gets faster again is a bound that tracks the changelog rather than the
+// requirement. 10 µs is under every one of those, so the percentages reported
+// below are the pessimistic reading against the loosest of them.
 const warmLocalP50 = 200 * time.Microsecond
 
 // meteringBudget is 5% of it — the bound the added cost of metering must stay

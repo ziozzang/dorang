@@ -323,6 +323,11 @@ func (m *Meter) recordTrace(ev *Event, ts time.Time) {
 		// no producer.
 		MarginalCostNano:     ev.MarginalCostNano,
 		SubscriptionCostNano: ev.SubscriptionCostNano,
+		// The list-rate equivalent, and whether there was one. §8.5's whole
+		// purpose is that a subscription's value is visible, and a row that
+		// carries the billed figure alone reports a flat plan as free.
+		NotionalCostNano: ev.NotionalCostNano,
+		NotionalKnown:    ev.NotionalKnown,
 		// And the disclosure of a price that moved, for the same reason: a
 		// variable charge whose factor the row does not carry cannot be
 		// reconciled against anything.

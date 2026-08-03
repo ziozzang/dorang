@@ -408,23 +408,13 @@ observability: {prometheus: false}
 	if c.Observability.PrometheusEnabled() {
 		t.Error("prometheus = true, want false")
 	}
-	// drop_unsupported false must survive too.
-	c2 := mustLoad(t, `
-`)
-	_ = c2
-	c3, err := LoadBytes([]byte(`
-version: 1
-providers:
-  - {name: p1, kind: openai, params: {drop_unsupported: false}}
-credentials: [{id: c1, provider: p1, key_env: DORANG_TEST_FIXTURE_KEY}]
-models: [{name: m1, deployments: [{provider: p1, upstream_model: u1}]}]
-`))
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if c3.Providers[0].Params.DropsUnsupported() {
-		t.Error("drop_unsupported = true, want false")
-	}
+	// drop_unsupported: false used to be listed here, on the grounds that an
+	// explicit false has to survive defaulting. It does survive — decoding and
+	// defaulting are unchanged — and it is now REFUSED one phase later, because
+	// nothing can act on it: dorang converts, so a parameter the target's wire
+	// shape has no field for cannot be forwarded into anything. See
+	// TestDropUnsupportedFalseIsRefused. Its neighbour params.drop is live now,
+	// and one live key beside one dead one is the state that refusal removes.
 }
 
 // --- opaque model names ------------------------------------------------------

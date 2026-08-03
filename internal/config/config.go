@@ -439,10 +439,63 @@ type Provider struct {
 
 // Params controls parameter conversion for a provider (§10.3).
 type Params struct {
-	DropUnsupported *bool          `yaml:"drop_unsupported,omitempty"`
-	Drop            []string       `yaml:"drop,omitempty"`
-	Set             map[string]any `yaml:"set,omitempty"`
-	Default         map[string]any `yaml:"default,omitempty"`
+	DropUnsupported *bool `yaml:"drop_unsupported,omitempty"`
+	// Drop names the parameters this upstream rejects. It reaches
+	// [canonical.Request.DropParams] through backend.Spec, is applied before the
+	// encoder runs, and every removal is reported in x-dorang-dropped-params.
+	//
+	// It is NOT the capability set and does not overlap it. A capability says
+	// what a KIND can express and dorang decides it beside the encoder; this
+	// says what ONE endpoint rejects, which only the operator can know — the
+	// same `kind: openai` reaches OpenAI, a vLLM build from March and a vendor
+	// shim, and they do not accept the same fields. `max_tokens` is the case
+	// that separates them: every encoder writes it, no capability bit will ever
+	// describe it, and an upstream that 400s on it is a real deployment.
+	Drop []string `yaml:"drop,omitempty"`
+	// MaxTokensField is the DEFAULT output-ceiling spelling for every
+	// deployment on this provider; a deployment may override it. See
+	// [Deployment.MaxTokensField], which documents why the choice exists and
+	// why the deployment is the level that finally decides.
+	//
+	// It is here because a whole endpoint usually agrees: a token-plan or
+	// compatibility gateway that wants max_completion_tokens wants it for
+	// everything it fronts, and repeating the key on fifty-six deployments is
+	// how one of them ends up missing it.
+	MaxTokensField string         `yaml:"max_tokens_field,omitempty"`
+	Set            map[string]any `yaml:"set,omitempty"`
+	Default        map[string]any `yaml:"default,omitempty"`
+}
+
+// Output-ceiling spellings for `max_tokens_field`.
+//
+// They are string literals rather than an import of internal/wire/openai's own
+// constants because this package is the schema and deliberately depends on
+// internal/canonical alone — a config file has to be loadable by a tool that
+// builds no wire stack. That makes them a second spelling of one fact, which is
+// this repository's most-documented defect, so the two are pinned against each
+// other by a test in internal/app, the layer that imports both.
+const (
+	MaxTokensFieldMaxTokens           = "max_tokens"
+	MaxTokensFieldMaxCompletionTokens = "max_completion_tokens"
+)
+
+// MaxTokensFields is the accepted set, in the order a refusal lists them.
+var MaxTokensFields = []string{MaxTokensFieldMaxTokens, MaxTokensFieldMaxCompletionTokens}
+
+// MaxTokensFieldFor resolves the output-ceiling spelling of one deployment: the
+// deployment's own value, else its provider's, else empty.
+//
+// Empty is not a third value. It is "unset", and it means `max_tokens` —
+// [openai.EncodeOptions] carries that default already, so this returns the
+// operator's answer or nothing rather than inventing a second copy of it.
+func (c *Config) MaxTokensFieldFor(provider string, d *Deployment) string {
+	if d != nil && d.MaxTokensField != "" {
+		return d.MaxTokensField
+	}
+	if p, ok := c.Provider(provider); ok {
+		return p.Params.MaxTokensField
+	}
+	return ""
 }
 
 // DropsUnsupported reports whether parameters the kind does not support are
@@ -869,6 +922,46 @@ type Deployment struct {
 	Timeout       Duration `yaml:"timeout,omitempty"`
 	StreamTimeout Duration `yaml:"stream_timeout,omitempty"`
 	Limits        []Limit  `yaml:"limits,omitempty"`
+	// MaxOutputTokens is an operator's CEILING on what this deployment may be
+	// asked to generate. Zero leaves the model catalog's own figure in place.
+	//
+	// It REFUSES rather than clamps, and the two are different products:
+	//
+	//   - A clamp answers 200 with a truncated completion. The only signal is
+	//     finish_reason, which most clients do not branch on, so the caller
+	//     reads a cut-off answer as a complete one — the §10.5a objection to
+	//     compaction, in a smaller form.
+	//   - A refusal is ROUTABLE. A ceiling is per deployment, so a request over
+	//     one deployment's ceiling can still be served by a sibling with a
+	//     higher one; a clamp succeeds locally and can never fail back.
+	//
+	// It is enforced only where an operator WROTE it. The same number arriving
+	// from pkg/catalog is a description of the model rather than a decision
+	// about it, and the catalog drifts — turning a stale entry into a refusal
+	// would convert a documentation lag into an outage.
+	MaxOutputTokens int `yaml:"max_output_tokens,omitempty"`
+	// MaxTokensField selects which spelling of the output ceiling this
+	// deployment's requests carry: `max_tokens` or `max_completion_tokens`.
+	// Empty inherits `providers[].params.max_tokens_field`, and if that is
+	// empty too the value is `max_tokens`.
+	//
+	// The two are not interchangeable in either direction and there is no value
+	// that works everywhere (COMPATIBILITY §5.5). The OpenAI-compatible
+	// ecosystem — vLLM, SGLang, llama.cpp, ollama and most gateways — accepts
+	// only `max_tokens`; current reasoning models on the vendor surface reject
+	// it and require `max_completion_tokens`. Both cases live behind
+	// `kind: openai`, and the second one lives behind the SAME base URL as the
+	// first, which is why this is per deployment and cannot be a property of
+	// the kind or even of the provider: api.openai.com takes `max_tokens` for a
+	// chat model and refuses it for a reasoning model.
+	//
+	// Getting it wrong is not always a 400. A measured token-plan endpoint
+	// accepted `max_tokens: 16`, ignored it, and substituted a much larger
+	// ceiling — 116 completion tokens billed for a request that asked for 16,
+	// with `finish_reason: length` making the answer look as though the
+	// caller's own limit had been honoured. That is the failure this key
+	// exists for: the loud one is cheap, and the silent one is billed.
+	MaxTokensField string `yaml:"max_tokens_field,omitempty"`
 	// PrefixTTL overrides the provider's affinity lifetime for this deployment.
 	// It is the most specific of the three levels and wins over both.
 	//

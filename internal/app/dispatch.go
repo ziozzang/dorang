@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -66,6 +67,49 @@ type dispatcher struct {
 	// reset them: a counter that restarts on SIGHUP is a counter nobody can
 	// alert on.
 	filter filterCounters
+	// subs remembers which (deployment, served model) pairs have already been
+	// logged, for the same reason and with the same lifetime.
+	subs substitutionLog
+}
+
+// substitutionLog keeps a model substitution from becoming a log flood.
+//
+// The measured case substitutes on EVERY request — z.ai's `glm-5.1` answered as
+// `glm-5.2` three runs out of three — so a line per occurrence would be a line
+// per request for the life of the deployment, which is how a real signal gets
+// filtered out of an operator's log pipeline and then out of their attention.
+// The COUNT is the metric's job. The line's job is to say, once, what is
+// happening and to which deployment.
+//
+// The set is capped rather than unbounded. Its key is (deployment, served
+// model) and both halves are bounded by configuration — the deployment list and
+// the catalog — but a cap costs nothing and the failure mode of not having one
+// is a map that grows with whatever an upstream chooses to say.
+type substitutionLog struct {
+	mu   sync.Mutex
+	seen map[[2]string]struct{}
+}
+
+// maxLoggedSubstitutions bounds [substitutionLog]. Past it the metric still
+// counts every occurrence; only the once-per-pair line stops.
+const maxLoggedSubstitutions = 256
+
+// first reports whether this pair has not been logged before.
+func (s *substitutionLog) first(deployment, served string) bool {
+	k := [2]string{deployment, served}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[k]; ok {
+		return false
+	}
+	if len(s.seen) >= maxLoggedSubstitutions {
+		return false
+	}
+	if s.seen == nil {
+		s.seen = make(map[[2]string]struct{}, 8)
+	}
+	s.seen[k] = struct{}{}
+	return true
 }
 
 type dispatchState struct {
@@ -563,6 +607,11 @@ type result struct {
 	// and mislabelling either gives the client something it cannot play or
 	// parse.
 	contentType string
+	// servedModel is the name the upstream put in its own body when that name
+	// disagreed with the `upstream_model` dorang sent, and modelAgreement is the
+	// verdict. Empty and [canonical.ModelUnobserved] are the ordinary case.
+	servedModel    string
+	modelAgreement canonical.ModelAgreement
 }
 
 // attempt makes one upstream call and relays its answer.
@@ -597,6 +646,10 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		Provider:      up,
 		Credential:    dec.Credential,
 		UpstreamModel: dec.UpstreamModel,
+		// Arms the substitution reading (§17.1 rule 3): the catalog has figures
+		// for this model, so a different model answering is something the
+		// operator can be shown rather than a name dorang cannot place.
+		ModelKnown: dec.ModelKnown,
 		// Direction-normalized for THIS engine by internal/router (§7.5).
 		// Nothing on this side negates, offsets or clamps it: two
 		// implementations of one negation is how vLLM and SGLang end up agreeing
@@ -610,6 +663,11 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		// this package had already answered when it built the routing table, and
 		// the day the two stop agreeing routing admits what encoding then drops.
 		Capabilities: dec.Capabilities,
+		// COMPATIBILITY §5.5's output-ceiling spelling, resolved per deployment
+		// at assembly and carried on the decision — so a fail-back hop encodes
+		// with the spelling of the deployment it landed on rather than the one
+		// it left.
+		MaxTokensField: dec.MaxTokensField,
 	}
 	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
 }
@@ -711,6 +769,9 @@ func backendResult(br backend.Result) result {
 		body:        br.Body,
 		contentType: br.ContentType,
 		loadMetrics: br.LoadMetrics,
+
+		servedModel:    br.ServedModel,
+		modelAgreement: br.ModelAgreement,
 	}
 	if br.Err == nil {
 		res.outcome = router.Outcome{
@@ -779,6 +840,97 @@ func writeBody(w http.ResponseWriter, body []byte, contentType string) error {
 
 // settle prices a completed request, feeds the quota meters and fills the parts
 // of the result the meter reads.
+// noteSubstitution finishes the model-identity check of DESIGN §17.1 rule 3.
+//
+// # Where A and B were observed
+//
+// A is `models[].deployments[].upstream_model`, read out of dorang's own
+// configuration and put on the wire by internal/backend. B is the `model`
+// member of the body the provider sent back, read by internal/wire and carried
+// out on [backend.Result]. Two genuinely different origins, one of them outside
+// dorang's control — so this is a check that can fire, and not documentation.
+//
+// It fires on the operator's own subscriptions today: the z.ai coding plan
+// answers `glm-5.1` and `glm-5` with `glm-5.2`, and `glm-4.5-air` with
+// `glm-4.7`, at HTTP 200 with a well-formed body and real tokens. Nothing else
+// dorang checks can see that. The status is 200, the body parses, the usage is
+// present, and a `/models` listing shows all eight ids as if all eight served.
+//
+// # Two gates, and both are load-bearing
+//
+// A substitution is claimed only when BOTH hold:
+//
+//  1. The names disagree in a way that is not a refinement
+//     ([canonical.CompareModel]). Without this, ordinary version pinning fires:
+//     the catalog carries `claude-haiku-4-5` AND `claude-haiku-4-5-20251001` as
+//     separate anthropic entries with identical figures, and Anthropic answers
+//     the first with the second on every request.
+//
+//  2. BOTH names resolve to catalog entries under this deployment's kind, and
+//     to DIFFERENT entries. Without this, an alias the upstream resolved for
+//     itself fires: an operator's `local` deployment answered by
+//     `…-Q6_K.gguf`, or an OpenRouter id answered as
+//     `private/openrouter/…` with its `:free` suffix dropped. Both are in the
+//     operator's live configuration, both are correct behaviour, and neither
+//     name is a model dorang has ever had figures for.
+//
+// Gate 2 is also what makes the claim MEAN something. The harm of a
+// substitution is that a figure was wrong — the request was priced at the asked
+// model's rate for another model's work, and §10.5a's context-window fallback
+// used the asked model's declared window — and that harm is only provable when
+// dorang holds a second set of figures it should have used instead. Where the
+// returned name is not an entry, nothing was mispriced against anything,
+// because there was no other figure.
+//
+// Gate 2's cheap half — is the ASKED name an entry — was decided at compile and
+// rides on [router.Decision.ModelKnown], which is what keeps a deployment like
+// `local` from paying for this check at all.
+//
+// # Detection is not policy
+//
+// Nothing here rewrites the request, reroutes it, refuses it, re-prices it or
+// marks the deployment unhealthy. It records. What an operator does about a
+// substituting deployment is their decision, and the two things they need to
+// make it — that it is happening, and which model actually answered — are what
+// the counter and the line carry.
+func (d *dispatcher) noteSubstitution(st *dispatchState, dec *router.Decision,
+	rq *server.Request, res result) {
+
+	// Empty is the ordinary case by construction: internal/backend copies the
+	// name out only when its own comparison found a substitution against a
+	// model the catalog knows.
+	if res.servedModel == "" || !res.modelAgreement.Substituted() || st.catalog == nil {
+		return
+	}
+	if !st.catalog.Model(dec.Kind, res.servedModel).ModelKnown {
+		// A name dorang has no entry for. Not a substitution — a decoration, or
+		// an alias the upstream resolved for itself. Silence is correct.
+		return
+	}
+	rq.Result.ServedModel = res.servedModel
+
+	if !d.subs.first(dec.Deployment, res.servedModel) {
+		return
+	}
+	// Ids and model names only. Nothing here is a secret, and nothing here is
+	// caller-supplied.
+	if dec.PinnedTo != "" {
+		// The case where a substitution destroys the whole point of the
+		// configuration: a pin promises this deployment and no other, so there
+		// is no fallback that could have caught it.
+		d.logf("app: deployment %s (pinned by %s) was sent upstream_model %q and answered as "+
+			"%q, a different model this catalog also knows; the request was priced and "+
+			"windowed as %q. dorang did not reroute or re-price it (DESIGN §17.1)",
+			dec.Deployment, dec.PinnedTo, dec.UpstreamModel, res.servedModel, dec.UpstreamModel)
+		return
+	}
+	d.logf("app: deployment %s was sent upstream_model %q and answered as %q, a different "+
+		"model this catalog also knows; the request was priced and windowed as %q. dorang "+
+		"did not reroute or re-price it (DESIGN §17.1). Further occurrences on this pair "+
+		"are counted in dorang_model_substitutions_total and not logged",
+		dec.Deployment, dec.UpstreamModel, res.servedModel, dec.UpstreamModel)
+}
+
 func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	rq *server.Request, res result) {
 
@@ -792,6 +944,10 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	}
 	rq.Result.TTFTNS = res.ttft.Nanoseconds()
 	rq.Result.LatencyNS = res.total.Nanoseconds()
+
+	// Before the pricing gate below, and deliberately: a substitution is a fact
+	// about the ANSWER, and it is true whether or not this deployment is priced.
+	d.noteSubstitution(st, dec, rq, res)
 
 	// The tokens-per-minute ceiling is fed from App.recordMetrics, at the
 	// meter, because that is the one point every finished request passes and it
@@ -936,6 +1092,14 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		// whose list-rate equivalent genuinely came to nothing, and the first
 		// of those makes the plan look infinitely efficient.
 		rq.Result.NotionalPriced = true
+	} else {
+		// The other half of the same rule, and it is recorded rather than
+		// inferred. Reaching pricing and finding no notional rule is a fact
+		// about the CATALOG; never reaching pricing is a fact about the
+		// request. Only the first makes an aggregate's notional sum an
+		// understatement, and only a flag set here can tell the two apart by
+		// the time the rollup is a row in a table.
+		rq.Result.NotionalMissing = true
 	}
 
 	// The same figure the ledger row took, never a second reading of the Cost.

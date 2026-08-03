@@ -8,12 +8,34 @@ import (
 // DurationBounds are the gateway-overhead histogram's cumulative bounds, in
 // seconds.
 //
-// DESIGN §15.1 states the warm-local profile as p50 200 µs and p99 2 ms. A
+// DESIGN §15.1 states the warm-local profile as p50 249 µs and p99 2 ms. A
 // histogram whose first bucket is 5 ms reports "everything is under 5 ms",
 // which is true, useless, and indistinguishable from a twenty-fold regression.
 // So the low end resolves microseconds and the bounds thin out only once past
 // the point where the number stops being about dorang and starts being about
 // the upstream.
+//
+// These bounds were chosen when §15.1 published a 200 µs p50, and they are left
+// alone now that it is measured at 249 µs. Resolving BELOW the figure is the
+// requirement, and four bounds still sit below it. The move is if anything an
+// improvement: 200 µs used to be the target and is now the bound just under the
+// median, so the p50 falls INSIDE (200 µs, 300 µs] instead of on its edge.
+// Against a lognormal fitted to §15.1's measured 4 KiB quantiles — p50 249 µs,
+// p90 324 µs, p99 429 µs — those two bounds hold 16% and 80% of the mass, and
+// Prometheus' histogram_quantile recovers the median as 253 µs, 1.6% high. It
+// recovers the p50 within 2% at every body size §15.1 measures.
+//
+// What these bounds do NOT resolve well is the upper tail of that same profile,
+// and it is worth writing down because it is not what it looks like: the
+// measured p90 and p99 both land in (300 µs, 500 µs], so histogram_quantile
+// reports the p90 as ~399 µs against a true 324 and the p99 as ~491 against a
+// true 429. That is not damage done by the p50 moving. It is the profile
+// getting FASTER than the shape these bounds were drawn for — they were spread
+// to carry a distribution running from 200 µs out to a 2 ms p99, and the real
+// one now ends at 429 µs, so the six bounds from 750 µs to 3 ms that were meant
+// to carry the tail are empty and the tail is squeezed into two. The 2 ms p99
+// TARGET is still an exact bound, so whether the profile passes is still
+// answered exactly; only the reported value of the tail is biased high.
 var DurationBounds = []float64{
 	0.00005, 0.0001, 0.00015, 0.0002, 0.0003, 0.0005, 0.00075,
 	0.001, 0.0015, 0.002, 0.003, 0.005, 0.0075,

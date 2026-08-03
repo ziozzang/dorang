@@ -81,6 +81,16 @@ func (a *meterAdapter) Record(ev server.Event) {
 		CostNano:             r.CostNanoUSD,
 		MarginalCostNano:     r.MarginalNanoUSD,
 		SubscriptionCostNano: r.SubscriptionNanoUSD,
+		// The list-rate equivalent and which of §8.5's three states this request
+		// is in. It was computed for every priced request and published in
+		// x-dorang-notional-usd, and it stopped here — so `notional_nano`, which
+		// has had a column on the ledger row and on all three rollups since
+		// migration 0002, was written by nothing, and every window of
+		// /global/spend/report and of the operator's usage screen reported it as
+		// unavailable.
+		NotionalCostNano: r.NotionalNanoUSD,
+		NotionalKnown:    r.NotionalPriced,
+		NotionalMissing:  r.NotionalMissing,
 		// The utilization disclosure, carried on every priced request whose rule
 		// declares a factor — the fallbacks included. A row that records the
 		// factor only when the price moved cannot answer "was this request
@@ -141,6 +151,12 @@ func (s *storeSink) WriteRollups(ctx context.Context, buckets []meter.Bucket) er
 			CostNano:         bk.CostNano,
 			MarginalNano:     bk.MarginalCostNano,
 			SubscriptionNano: bk.SubscriptionCostNano,
+			// The list-rate sum and the two counts that say whether it is whole.
+			// See [store.UsageDelta.NotionalKnown]: a sum with holes in it is
+			// reported as unavailable, never as a total.
+			NotionalNano:     bk.NotionalCostNano,
+			NotionalRequests: bk.NotionalRequests,
+			NotionalMissing:  bk.NotionalMissingCount,
 			LatencyMSSum:     bk.LatencySum.Milliseconds(),
 		}
 		// The bucket's hour is already the accumulator key, so it is used as
@@ -213,16 +229,21 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			// marginal figure and a sunk plan cost must not enter it.
 			MarginalCostNano:     t.MarginalCostNano,
 			SubscriptionCostNano: t.SubscriptionCostNano,
-			UtilMultiplierPPM:    t.UtilMultiplierPPM,
-			UtilPPM:              t.UtilPPM,
-			UtilSource:           t.UtilSource,
-			LatencyMS:            t.Latency.Milliseconds(),
-			TTFTMS:               t.TTFT.Milliseconds(),
-			QueueMS:              t.QueueWait.Milliseconds(),
-			CapacityWaitMS:       t.CapacityWait.Milliseconds(),
-			UpstreamMS:           t.UpstreamConnect.Milliseconds(),
-			FallbackCount:        t.Retries,
-			TraceID:              t.TraceID,
+			// Per row the answer is a boolean: this request had a list rate or
+			// it did not. §8.5 rule 5 forbids reporting the second as a zero,
+			// which is what the column pair exists for.
+			NotionalNano:      t.NotionalCostNano,
+			NotionalKnown:     t.NotionalKnown,
+			UtilMultiplierPPM: t.UtilMultiplierPPM,
+			UtilPPM:           t.UtilPPM,
+			UtilSource:        t.UtilSource,
+			LatencyMS:         t.Latency.Milliseconds(),
+			TTFTMS:            t.TTFT.Milliseconds(),
+			QueueMS:           t.QueueWait.Milliseconds(),
+			CapacityWaitMS:    t.CapacityWait.Milliseconds(),
+			UpstreamMS:        t.UpstreamConnect.Milliseconds(),
+			FallbackCount:     t.Retries,
+			TraceID:           t.TraceID,
 		})
 		if t.Excerpt != "" {
 			rows = append(rows, store.RequestTrace{

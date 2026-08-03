@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -149,4 +150,64 @@ func (r stubReporter) Health(dst []byte) []byte {
 		return dst
 	}
 	return append(dst, r.body...)
+}
+
+// TestMeteredModelIsTheCallersOwnBytes is the other half of a claim that lives
+// in OPERATIONS.md §6: that no metric carries a per-model label, "deliberately",
+// because letting a client mint label values hands out a denial of service on
+// the metrics registry.
+//
+// internal/metrics does carry one, and this is where its value comes from.
+// [Event.Model] is [Request.Model], which is whatever the request body said —
+// this package never checks it against the configured model set, and it must
+// not, because the model that was ASKED for is the fact the ledger and the
+// meter are recording. The consequence is the one the §6 argument describes:
+// the label value is chosen by the caller.
+//
+// The refused case is the one worth pinning. `finish` is deferred from
+// ServeHTTP, so a request the model allow-list turns away is still metered, and
+// still metered with the name it asked for. A key permitted exactly one model
+// can therefore mint unbounded label values by asking for models it may not
+// have — which means the bound cannot come from authorization, and has to come
+// from internal/metrics' series cap. That cap is now the documented one.
+func TestMeteredModelIsTheCallersOwnBytes(t *testing.T) {
+	cases := []struct {
+		name       string
+		allowed    []string // the key's model allow-list; nil allows everything
+		model      string
+		wantStatus int
+	}{
+		{"served", nil, "no-such-model-\"a\"", http.StatusOK},
+		{"refused by the allow-list", []string{"model-x"}, "not-allowed-µ-42", http.StatusForbidden},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := &recordingMeter{}
+			s := newTestServer(t, func(o *Options) {
+				o.Meter = m
+				o.Auth = &fakeAuth{keys: map[string]*fakePrincipal{
+					"good": {id: "key-good", models: c.allowed},
+				}}
+			})
+
+			w := do(s, post("/v1/chat/completions", `{"model":`+quoteJSON(c.model)+`}`))
+			if w.Code != c.wantStatus {
+				t.Fatalf("status %d, want %d: %s", w.Code, c.wantStatus, w.Body.String())
+			}
+
+			ev := m.last(t)
+			if ev.Model != c.model {
+				t.Errorf("metered model %q, want the caller's own %q", ev.Model, c.model)
+			}
+		})
+	}
+}
+
+// quoteJSON is enough of a JSON string encoder for the fixtures above.
+func quoteJSON(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

@@ -305,6 +305,11 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		Credential:    cred,
 		UpstreamModel: req.UpstreamModel,
 		Capabilities:  dec.Capabilities,
+		// The batch path encodes with the same adapter the interactive one
+		// does, so it needs the same spelling. Leaving it off here is how a
+		// setting ends up true of /v1/chat/completions and false of the batch
+		// that replays the identical request.
+		MaxTokensField: dec.MaxTokensField,
 	}, &backend.Call{
 		Op:               backend.OpChat,
 		ClientAPI:        catalog.APIOpenAIChat,

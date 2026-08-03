@@ -889,7 +889,9 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 	if w == nil {
 		return nil, errorString("openai: nil responses response")
 	}
-	out := &canonical.Response{ID: w.ID, Model: w.Model, Created: w.CreatedAt}
+	// ServedModel keeps the upstream's own name, which opt.Model below
+	// overwrites; see [canonical.Response.ServedModel].
+	out := &canonical.Response{ID: w.ID, Model: w.Model, ServedModel: w.Model, Created: w.CreatedAt}
 	if opt != nil && opt.Model != "" {
 		out.Model = opt.Model
 	}

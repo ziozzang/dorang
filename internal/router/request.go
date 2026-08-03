@@ -161,6 +161,22 @@ type Decision struct {
 	Provider      string
 	Credential    string
 	UpstreamModel string
+	// ModelKnown reports that pkg/catalog holds an entry for (Kind,
+	// UpstreamModel).
+	//
+	// It exists for exactly one consumer: the substitution check of
+	// [canonical.CompareModel]. A provider that answers with a name dorang has
+	// no entry for has not proved a substitution — it has decorated or resolved
+	// an alias, which is ordinary and must stay silent. An operator's own
+	// `local` alias answered by the gguf a llama.cpp server loaded, and an
+	// OpenRouter id answered as `private/openrouter/…`, are both that case, and
+	// both are in the operator's live configuration today.
+	//
+	// So the check is only armed where a substitution can be PROVED: both names
+	// resolve to catalog entries, and the entries differ. This field is the
+	// cheap half of that test, computed once at compile, and it is what keeps
+	// the other half — which materializes a string — off the ordinary path.
+	ModelKnown bool
 
 	// Reservation holds the capacity axes this attempt occupies. [Router.Report]
 	// releases it; releasing it twice is safe.
@@ -223,6 +239,12 @@ type Decision struct {
 	// [backend.CapabilitiesForAPI], and this field is how its answer reaches the
 	// encoder.
 	Capabilities canonical.Capability
+	// MaxTokensField is the output-ceiling spelling THIS deployment takes,
+	// carried out to the encoder for the same reason Capabilities is: it is a
+	// per-deployment fact the layer that encodes cannot see, and a fail-back
+	// hop lands on a deployment that may answer differently. Empty means
+	// `max_tokens`. See [Deployment.MaxTokensField].
+	MaxTokensField string
 	// Dropped names what this deployment will not apply: the droppable
 	// parameters it cannot express, and the constructs dorang declines to send
 	// it (see [Deployment.Suppressed]). They are reported, not fatal: the request

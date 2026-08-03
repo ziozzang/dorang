@@ -28,7 +28,31 @@ type UsageDelta struct {
 	// exists.
 	MarginalNano     int64
 	SubscriptionNano int64
+	// NotionalNano is the list-rate equivalent of this bucket's traffic (DESIGN
+	// §8.5). NotionalRequests counts the requests that contributed to it and
+	// NotionalMissing the ones that reached pricing with no notional rule.
+	//
+	// Counts rather than a flag, because a bucket is many requests and "known"
+	// is not a property that survives being ORed. They are sums, which is what
+	// keeps [UsageDelta.NotionalKnown] associative across merges, across nodes
+	// and across a GROUP BY.
+	NotionalNano     int64
+	NotionalRequests int64
+	NotionalMissing  int64
 	LatencyMSSum     int64
+}
+
+// NotionalKnown reports whether NotionalNano is the whole list-rate figure for
+// this delta rather than a sum with holes in it (DESIGN §8.5 rule 5: a missing
+// list rate is reported as missing, never as a flattering zero).
+//
+// Both clauses are load-bearing. A missing count above zero means the sum is
+// short by an unknown amount. A notional count of zero means nothing
+// contributed to it at all — an empty window, a window of refusals, or a bucket
+// written before the counts existed — and "0" would be a claim about a list
+// rate nobody computed.
+func (d UsageDelta) NotionalKnown() bool {
+	return d.NotionalRequests > 0 && d.NotionalMissing == 0
 }
 
 // Add folds o into d.
@@ -43,6 +67,9 @@ func (d *UsageDelta) Add(o UsageDelta) {
 	d.CostNano += o.CostNano
 	d.MarginalNano += o.MarginalNano
 	d.SubscriptionNano += o.SubscriptionNano
+	d.NotionalNano += o.NotionalNano
+	d.NotionalRequests += o.NotionalRequests
+	d.NotionalMissing += o.NotionalMissing
 	d.LatencyMSSum += o.LatencyMSSum
 }
 
@@ -109,7 +136,21 @@ func (b RollupBatch) Observe(r RequestLog) {
 		// built from ledger rows would disagree with the rows it was built from.
 		MarginalNano:     r.MarginalCostNano,
 		SubscriptionNano: r.SubscriptionCostNano,
+		NotionalNano:     r.NotionalNano,
 		LatencyMSSum:     r.LatencyMS,
+	}
+	if r.NotionalKnown {
+		d.NotionalRequests = 1
+	} else {
+		// One row with no list rate makes the bucket's notional sum an
+		// understatement, and the count is how the reader finds out.
+		//
+		// A ledger row carries one flag and therefore cannot distinguish "no
+		// notional rule matched" from "this request never reached pricing at
+		// all", which the metering path can. Folding both into missing is the
+		// conservative direction: it reports unavailable where the truth might
+		// have been a complete total, and never a total that is quietly short.
+		d.NotionalMissing = 1
 	}
 	if r.Status >= 400 {
 		d.Errors = 1
@@ -230,7 +271,17 @@ func sortRollupRows(rows []rollupRow) {
 }
 
 const rollupCounters = `requests, errors, prompt_tokens, completion_tokens, cached_tokens,
-	reasoning_tokens, total_tokens, cost_nano, marginal_nano, subscription_nano, latency_ms_sum`
+	reasoning_tokens, total_tokens, cost_nano, marginal_nano, subscription_nano,
+	notional_nano, notional_requests, notional_missing, latency_ms_sum`
+
+// rollupArity is the number of bind variables one merged row takes: the bucket
+// key, the dimension value, every counter rollupCounters names, and updated_at.
+//
+// It is COUNTED from that list rather than written beside it. The number was a
+// literal 14 in two places, and a literal that must be edited whenever a column
+// is added is a bind-variable mismatch waiting for the next column — reported
+// by the driver, at run time, on the flush path.
+var rollupArity = strings.Count(rollupCounters, ",") + 1 + 3
 
 func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol string, rows []rollupRow, now int64) error {
 	if len(rows) == 0 {
@@ -243,22 +294,23 @@ func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol 
 	}
 	sortRollupRows(rows)
 
-	// 14 bound parameters per row; chunked well under SQLite's per-statement
-	// parameter ceiling.
+	// rollupArity bound parameters per row; chunked well under SQLite's
+	// per-statement parameter ceiling.
 	for chunk := range chunks(rows, 500) {
 		var b strings.Builder
 		b.WriteString("INSERT INTO " + table + " (bucket_start, " + dimCol + ", " + rollupCounters + ", updated_at) VALUES ")
-		args := make([]any, 0, len(chunk)*14)
+		args := make([]any, 0, len(chunk)*rollupArity)
 		for i := range chunk {
 			if i > 0 {
 				b.WriteString(", ")
 			}
-			b.WriteString(valuesTuple(14))
+			b.WriteString(valuesTuple(rollupArity))
 			r := &chunk[i]
 			args = append(args, r.bucket, r.dim,
 				r.d.Requests, r.d.Errors, r.d.PromptTokens, r.d.CompletionTokens,
 				r.d.CachedTokens, r.d.ReasoningTokens, r.d.TotalTokens,
 				r.d.CostNano, r.d.MarginalNano, r.d.SubscriptionNano,
+				r.d.NotionalNano, r.d.NotionalRequests, r.d.NotionalMissing,
 				r.d.LatencyMSSum, now)
 		}
 		b.WriteString(`
@@ -273,6 +325,9 @@ func (s *Store) mergeRollupTable(ctx context.Context, tx *sql.Tx, table, dimCol 
 			  cost_nano         = ` + table + `.cost_nano         + excluded.cost_nano,
 			  marginal_nano     = ` + table + `.marginal_nano     + excluded.marginal_nano,
 			  subscription_nano = ` + table + `.subscription_nano + excluded.subscription_nano,
+			  notional_nano     = ` + table + `.notional_nano     + excluded.notional_nano,
+			  notional_requests = ` + table + `.notional_requests + excluded.notional_requests,
+			  notional_missing  = ` + table + `.notional_missing  + excluded.notional_missing,
 			  latency_ms_sum    = ` + table + `.latency_ms_sum    + excluded.latency_ms_sum,
 			  updated_at        = excluded.updated_at`)
 		if _, err := s.txExec(ctx, tx, b.String(), args...); err != nil {
@@ -495,6 +550,7 @@ func (s *Store) ReadRollupRange(ctx context.Context, q RollupQuery) ([]RollupRow
 			&r.Usage.PromptTokens, &r.Usage.CompletionTokens, &r.Usage.CachedTokens,
 			&r.Usage.ReasoningTokens, &r.Usage.TotalTokens, &r.Usage.CostNano,
 			&r.Usage.MarginalNano, &r.Usage.SubscriptionNano,
+			&r.Usage.NotionalNano, &r.Usage.NotionalRequests, &r.Usage.NotionalMissing,
 			&r.Usage.LatencyMSSum); err != nil {
 			return nil, UsageDelta{}, err
 		}
@@ -525,6 +581,8 @@ var sumCols = []string{
 	"COALESCE(SUM(cached_tokens),0)", "COALESCE(SUM(reasoning_tokens),0)",
 	"COALESCE(SUM(total_tokens),0)", "COALESCE(SUM(cost_nano),0)",
 	"COALESCE(SUM(marginal_nano),0)", "COALESCE(SUM(subscription_nano),0)",
+	"COALESCE(SUM(notional_nano),0)", "COALESCE(SUM(notional_requests),0)",
+	"COALESCE(SUM(notional_missing),0)",
 	"COALESCE(SUM(latency_ms_sum),0)",
 }
 
@@ -535,7 +593,8 @@ func (s *Store) rollupTotal(ctx context.Context, table string, start, end int64)
 			" WHERE bucket_start >= ? AND bucket_start < ?", start, end).
 		Scan(&d.Requests, &d.Errors, &d.PromptTokens, &d.CompletionTokens, &d.CachedTokens,
 			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano,
-			&d.MarginalNano, &d.SubscriptionNano, &d.LatencyMSSum)
+			&d.MarginalNano, &d.SubscriptionNano,
+			&d.NotionalNano, &d.NotionalRequests, &d.NotionalMissing, &d.LatencyMSSum)
 	if err != nil && err != sql.ErrNoRows {
 		return UsageDelta{}, err
 	}
@@ -549,7 +608,8 @@ func (s *Store) readRollup(ctx context.Context, table, dimCol string, bucket int
 		bucket, dim).
 		Scan(&d.Requests, &d.Errors, &d.PromptTokens, &d.CompletionTokens, &d.CachedTokens,
 			&d.ReasoningTokens, &d.TotalTokens, &d.CostNano,
-			&d.MarginalNano, &d.SubscriptionNano, &d.LatencyMSSum)
+			&d.MarginalNano, &d.SubscriptionNano,
+			&d.NotionalNano, &d.NotionalRequests, &d.NotionalMissing, &d.LatencyMSSum)
 	if err == sql.ErrNoRows {
 		return UsageDelta{}, ErrNotFound
 	}

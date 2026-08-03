@@ -54,8 +54,13 @@
 //
 // # Buckets
 //
-// DESIGN §15.1 puts the warm-local p50 at 200 µs and the p99 at 2 ms. A histogram
+// DESIGN §15.1 puts the warm-local p50 at 249 µs and the p99 at 2 ms. A histogram
 // whose lowest bucket is 5 ms cannot answer whether that target is met, which is
 // the only question it exists to answer, so [DurationBounds] resolves
 // microseconds.
+//
+// The p50 in that sentence has moved three times — 200 µs published and never
+// measured, 480 µs when it first was, then 375 µs and 249 µs as the codec got
+// faster twice — and the bounds have not moved with it, deliberately. See
+// [DurationBounds] for why they still bracket the figure.
 package metrics

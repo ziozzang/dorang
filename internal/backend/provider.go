@@ -2,10 +2,12 @@ package backend
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -77,6 +79,17 @@ type Spec struct {
 	// Retry is the in-provider retry policy (§7.6 owns the cross-deployment
 	// one). The zero value means one attempt.
 	Retry Policy
+	// DropParams are the parameters this upstream rejects, named by the
+	// operator: `providers[].params.drop` (DESIGN §10.3).
+	//
+	// It is per PROVIDER rather than per deployment because the fact it records
+	// is a fact about the endpoint — an old vLLM build, a vendor shim, a proxy
+	// that validates strictly — and every model behind one base URL shares it.
+	//
+	// The list is applied to the neutral request before the encoder runs and
+	// every removal is reported in x-dorang-dropped-params, which is the whole
+	// difference between this and the operator editing their clients.
+	DropParams []string
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -93,6 +106,7 @@ type Provider struct {
 	retry   Policy
 	engine  Engine
 	ad      adapter
+	drop    []string
 }
 
 // NewProvider resolves a spec.
@@ -116,6 +130,10 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	drop, err := resolveDropParams(api, s.DropParams)
+	if err != nil {
+		return nil, err
+	}
 	return &Provider{
 		name:    s.Name,
 		kind:    s.Kind,
@@ -125,7 +143,50 @@ func NewProvider(s Spec) (*Provider, error) {
 		retry:   s.Retry.withDefaults(),
 		engine:  EngineForKind(s.Kind),
 		ad:      ad,
+		drop:    drop,
 	}, nil
+}
+
+// requiredOutputCeiling names the wire shapes whose request is INVALID without
+// an output ceiling.
+//
+// Anthropic's messages API is the one dorang speaks: max_tokens is required,
+// and internal/wire/anthropic fills it from the model catalog when the caller
+// named none (DESIGN §10.7's first trap). So a provider of that shape whose
+// operator asked to drop max_tokens gets it back from the catalog on the very
+// next line — the setting would load, look applied, and change nothing, which
+// is the disposition this whole mechanism exists to stop being.
+func requiredOutputCeiling(api catalog.API) bool {
+	return api == catalog.APIAnthropicMessages
+}
+
+// outputCeilingNames are the two spellings of the one field.
+var outputCeilingNames = map[string]bool{"max_tokens": true, "max_completion_tokens": true}
+
+// resolveDropParams validates an operator's drop list against the wire shape
+// this provider actually speaks.
+//
+// It refuses at construction rather than per request, for the reason
+// [NewProvider] refuses a missing base URL: a start-up failure an operator reads
+// is better than a behaviour they never see.
+func resolveDropParams(api catalog.API, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if err := canonical.CheckDropParam(n); err != nil {
+			return nil, fmt.Errorf("backend: params.drop: %w", err)
+		}
+		if outputCeilingNames[n] && requiredOutputCeiling(api) {
+			return nil, fmt.Errorf("backend: params.drop: %q cannot be dropped for a %s provider: "+
+				"the field is REQUIRED by that wire shape and is refilled from the model catalog, "+
+				"so the drop would take effect on nothing. Cap the ceiling with "+
+				"models[].deployments[].max_output_tokens instead", n, api)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 // Name is the provider's configured id.

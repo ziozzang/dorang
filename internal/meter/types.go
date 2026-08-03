@@ -267,6 +267,28 @@ type Event struct {
 	// adjustments in order), so the difference is the net adjustment.
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
+	// NotionalCostNano is what this request would have cost at list rate
+	// (DESIGN §8.5). NotionalKnown says the pricing engine produced that
+	// figure; NotionalMissing says it ran and had no notional_rate rule to
+	// produce one.
+	//
+	// Three states in two flags, and the third is the reason there are two:
+	//
+	//   known    — the figure is real, zero included.
+	//   missing  — there is no figure. §8.5 rule 5: reported as missing, never
+	//              as zero, because a subscription with no notional rule would
+	//              otherwise look infinitely efficient — the most flattering
+	//              possible reading and the one least likely to be questioned.
+	//   neither  — the request never reached pricing: refused before dispatch,
+	//              or a gateway with no price catalog at all. It has no list
+	//              rate because it has no usage, and counting that as missing
+	//              would make every window containing a single 4xx report its
+	//              whole notional total unavailable.
+	//
+	// They are never both true.
+	NotionalCostNano int64
+	NotionalKnown    bool
+	NotionalMissing  bool
 	// UtilMultiplierPPM, UtilPPM and UtilSource are the disclosure of a price
 	// that MOVED (DESIGN §8.6): the factor a utilization-priced rule applied to
 	// this request's rate, in parts per million, the backend occupancy it was
@@ -328,6 +350,20 @@ type Bucket struct {
 	// class. See [Event].
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
+	// NotionalCostNano is the list-rate sum over this bucket's requests,
+	// NotionalRequests how many contributed to it, and NotionalMissingCount how
+	// many reached pricing with no notional rule (see [Event]).
+	//
+	// Counts rather than flags, because a bucket is many requests and "known"
+	// is not a property that survives being ORed. A sum over a bucket where one
+	// request had no list rate is an UNDERSTATEMENT, and §8.5 rule 5 forbids
+	// presenting one as a total — so the reader compares the counts and reports
+	// unavailable rather than a number that is too small by an unknown amount.
+	// Summing keeps that answer associative across merges and across nodes,
+	// which a boolean would not.
+	NotionalCostNano     int64
+	NotionalRequests     int64
+	NotionalMissingCount int64
 
 	// LatencySum and TTFTSum are sums, not averages; the store divides by
 	// Requests and TTFTCount respectively. Summing keeps merges associative.
@@ -345,6 +381,9 @@ func (b *Bucket) addCounters(c *counters) {
 	b.CostNano += c.costNano
 	b.MarginalCostNano += c.marginalNano
 	b.SubscriptionCostNano += c.subscriptionNano
+	b.NotionalCostNano += c.notionalNano
+	b.NotionalRequests += c.notionalRequests
+	b.NotionalMissingCount += c.notionalMissing
 	b.LatencySum += time.Duration(c.latencySum)
 	b.TTFTSum += time.Duration(c.ttftSum)
 	b.TTFTCount += c.ttftCount
@@ -357,6 +396,9 @@ func (b *Bucket) addBucket(o *Bucket) {
 	b.CostNano += o.CostNano
 	b.MarginalCostNano += o.MarginalCostNano
 	b.SubscriptionCostNano += o.SubscriptionCostNano
+	b.NotionalCostNano += o.NotionalCostNano
+	b.NotionalRequests += o.NotionalRequests
+	b.NotionalMissingCount += o.NotionalMissingCount
 	b.LatencySum += o.LatencySum
 	b.TTFTSum += o.TTFTSum
 	b.TTFTCount += o.TTFTCount
@@ -411,6 +453,11 @@ type Trace struct {
 	// decomposition. See [Event] for why they travel beside the total.
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
+	// NotionalCostNano is the row's list-rate equivalent and NotionalKnown says
+	// whether it means anything (DESIGN §8.5). Per row the answer IS a boolean,
+	// which is why the ledger keeps a flag where the rollups keep a count.
+	NotionalCostNano int64
+	NotionalKnown    bool
 	// The utilization disclosure. See [Event] for what each one is.
 	UtilMultiplierPPM int64
 	UtilPPM           int64

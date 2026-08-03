@@ -96,6 +96,12 @@ func (openaiAdapter) encode(x *exchange) ([]byte, error) {
 			// nobody keeps is what turns COMPATIBILITY 5.3 into a one-way
 			// destruction of any tool name over 64 bytes.
 			ToolNames: x.toolNames(),
+			// COMPATIBILITY §5.5. The two spellings are not interchangeable and
+			// no default is right everywhere, so the OPERATOR selects it per
+			// deployment; empty keeps max_tokens, which is what every request
+			// has always carried. This field had both constants and a working
+			// consumer in the encoder, and nothing that could reach either.
+			MaxTokensField: x.target.MaxTokensField,
 		})
 	}
 	return encodeT1(x)
