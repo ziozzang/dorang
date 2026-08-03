@@ -68,6 +68,44 @@ type exchange struct {
 	// condition [Call.Request] is nil under. Every LossReport method tolerates a
 	// nil receiver, so the encoders need no branch for it.
 	loss *canonical.LossReport
+	// accepted records that [Call.Accepted] has been handed the report, so that
+	// "exactly once" is a property of this struct rather than of the reader of
+	// two call sites in [Backend.finish].
+	accepted bool
+}
+
+// accept hands the loss report to [Call.Accepted], once.
+//
+// The two call sites are the two moments a header block closes — before a
+// stream's first write, and when a buffered answer's rendering is done — and
+// which one runs is decided by whether the answer streams. See [Call.Accepted]
+// for why that is one callback at two instants rather than two callbacks.
+func (x *exchange) accept() {
+	if x.accepted || x.call.Accepted == nil {
+		return
+	}
+	x.accepted = true
+	x.call.Accepted(x.loss)
+}
+
+// clientCapabilities is what the CALLER's protocol can carry, which is the set a
+// response is encoded against.
+//
+// It is the mirror of [exchange.capabilities] and it is a different question:
+// that one is what the DEPLOYMENT can express, and it decides the request half.
+// Answering the response half with the request's set would report the upstream's
+// limitations to a client that never had them.
+//
+// It exists as an accessor because the alternative was leaving it unset and
+// letting each encoder's `opt.caps()` fall back to its own DefaultCapabilities.
+// That fallback happens to produce this same value today — anthropic's default
+// IS CapabilitiesForAPI(APIAnthropicMessages) — so the response direction was
+// converted against the right set BY COINCIDENCE, through a nil check whose
+// comment says "none supplied" rather than "the caller's". A coincidence is not
+// a decision, and the first per-request client capability set would have ended
+// it silently.
+func (x *exchange) clientCapabilities() canonical.Capability {
+	return CapabilitiesForAPI(x.call.ClientAPI)
 }
 
 // toolNames returns the shared tool-name registry, allocating it on first use.

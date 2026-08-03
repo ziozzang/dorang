@@ -56,12 +56,42 @@ import (
 // so is that this file REFUSES anything it is not certain of.
 //
 // [Append] plans a type by walking it with reflect. Where the plan covers every
-// field, the fast path runs. Where it meets anything the plan does not model —
-// an embedded field, a `,string` tag, a [json.Number], an interface, a
-// [encoding.TextMarshaler], a type that is only a Marshaler through its pointer,
-// a recursive type — it returns no plan at all and the value goes to [Marshal],
-// which is encoding/json, unchanged. An unhandled shape is therefore SLOW and
-// never wrong.
+// field, the fast path runs. Where it meets anything the plan does not model it
+// returns no plan at all and the value goes to [Marshal], which is
+// encoding/json, unchanged. An unhandled shape is therefore SLOW and never
+// wrong.
+//
+// The refused set is a list rather than a principle, because a promise stated as
+// a principle is one nobody can check. In full, and in the order [plan] and
+// [planStruct] test them:
+//
+//   - a recursive type;
+//   - [json.Number];
+//   - an INTERFACE-typed value, including one whose interface is [Appender] or
+//     [json.Marshaler];
+//   - a type that is a Marshaler, an Appender or a [encoding.TextMarshaler]
+//     only through its pointer;
+//   - an [encoding.TextMarshaler];
+//   - `[]byte` and its named forms;
+//   - a map whose key is not a plain string kind;
+//   - a channel, a function, a complex number, an unsafe pointer;
+//   - a container any of whose elements is refused;
+//   - an embedded (anonymous) field;
+//   - a tag option other than `omitempty` — `,string`, `,omitzero`, anything
+//     added later;
+//   - a field name that would need JSON escaping;
+//   - TWO fields resolving to the same JSON name;
+//   - a struct any of whose fields is refused.
+//
+// Two of those entries were added after the list was found to be aspirational
+// rather than descriptive. The interface entry existed in this comment and not
+// in the code — an interface type implements itself, so `Appender` and
+// `json.Marshaler` fields were planned and then PANICKED on a nil dynamic value
+// where encoding/json writes `null`. The duplicate-name entry existed nowhere:
+// encoding/json drops both colliding fields and this planner wrote both, which
+// is a different document. Neither was reachable from any wire type, which is
+// exactly the point of a refusal list — it is what makes the type nobody has
+// written yet slow instead of wrong.
 //
 // Being slow is still a regression, so it is also a test: [Delegations] counts
 // the values an append run handed back, each adapter's TestRequestSubtreeIsPlanned
@@ -295,6 +325,26 @@ func plan(t reflect.Type, open map[reflect.Type]bool) appendFn {
 	if t == numberType {
 		// json.Number is a string kind that encodes as a bare number, and it
 		// validates its contents while doing so. Not modelled.
+		return nil
+	}
+	if t.Kind() == reflect.Interface {
+		// An INTERFACE-typed value, refused here rather than by the `default`
+		// arm below, which is where the file's promise used to claim it landed.
+		//
+		// It did not. An interface type implements itself, so `Appender` and
+		// `json.Marshaler` fields reached `t.Implements(appenderType)` two lines
+		// down and were PLANNED — and then [appendViaAppender] asserts on the
+		// dynamic value, which panics twice over where encoding/json writes
+		// `null`: once on a nil interface, whose `v.Interface()` is a nil `any`
+		// that no single-value assertion accepts; and once on any ADDRESSABLE
+		// interface field, nil or not, because `v.Addr()` has type *Appender and
+		// a pointer to an interface implements nothing. Every element of a
+		// slice is addressable, so `[]Appender` panicked on its first entry.
+		//
+		// No wire type has such a field today, which is why nothing was
+		// observed. That is the argument for closing it rather than against: a
+		// refusal list exists so the next type nobody has written yet is slow
+		// rather than a panic on the response path.
 		return nil
 	}
 	// A Marshaler reachable only through the pointer is encoded or not depending
@@ -536,9 +586,24 @@ type plannedField struct {
 
 // planStruct mirrors encoding/json's typeFields for the shapes the wire types
 // use, and refuses the ones they do not: an embedded field (whose members are
-// promoted, with a conflict rule), and any tag option other than omitempty.
+// promoted, with a conflict rule), any tag option other than omitempty, and two
+// fields that resolve to the same JSON name.
 func planStruct(t reflect.Type, open map[reflect.Type]bool) appendFn {
 	var fields []plannedField
+	// seen is the duplicate-name guard. encoding/json resolves a collision with
+	// dominantField: at equal depth and equal tagged-ness it drops EVERY field
+	// with that name, and where exactly one is tagged the tagged one wins. This
+	// planner has no such rule and never did — it wrote each field in
+	// declaration order, so `struct{A int "json:\"x\""; B int "json:\"x\""}`
+	// produced `{"x":0,"x":0}` where encoding/json produces `{}`. That is a
+	// different document, not a slower one, which is the one thing this file
+	// promises cannot happen.
+	//
+	// Implementing dominantField instead of refusing was the alternative and is
+	// the wrong trade: the rule is subtle, its inputs (depth, tagged-ness)
+	// mostly matter for promoted fields this planner already refuses, and being
+	// exact by construction is what the rest of the refusal list is worth.
+	seen := make(map[string]bool, t.NumField())
 	for i := range t.NumField() {
 		sf := t.Field(i)
 		if sf.Anonymous {
@@ -567,6 +632,10 @@ func planStruct(t reflect.Type, open map[reflect.Type]bool) appendFn {
 		if !plainName(name) {
 			return nil
 		}
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
 		fn := plan(sf.Type, open)
 		if fn == nil {
 			return nil

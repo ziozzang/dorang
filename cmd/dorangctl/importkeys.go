@@ -51,6 +51,14 @@ func (e env) importKeys(args []string) int {
 			"source table holding the credentials")
 		onMissingTeam = fs.String("on-missing-team", string(store.MissingTeamSkip),
 			"skip: refuse a key whose team is absent; orphan: import it with the team dropped")
+		onUntranslatable = fs.String("on-untranslatable", string(store.UntranslatableSkip),
+			"skip: refuse a key whose allow-list holds an idiom dorang cannot express, such as "+
+				"a route group or a model sentinel; clear: import it with that allow-list dropped, "+
+				"which is a widening and is named per key in the report")
+		objectPermTable = fs.String("object-permission-table", store.DefaultObjectPermissionTable,
+			"source table an object_permission_id points into. It is READ: a key whose model "+
+				"restriction lives there and is not resolved imports with an empty allow-list, "+
+				"and empty allows every model")
 		limit  = fs.Int("limit", 0, "read at most N source rows (0: all)")
 		source = fs.String("source", "", `value recorded in api_keys.source (default "litellm")`)
 		commit = fs.Bool("commit", false,
@@ -70,6 +78,11 @@ func (e env) importKeys(args []string) int {
 	if policy != store.MissingTeamSkip && policy != store.MissingTeamOrphan {
 		return e.fail("--on-missing-team: want %q or %q, got %q",
 			store.MissingTeamSkip, store.MissingTeamOrphan, *onMissingTeam)
+	}
+	untranslatable := store.UntranslatablePolicy(*onUntranslatable)
+	if untranslatable != store.UntranslatableSkip && untranslatable != store.UntranslatableClear {
+		return e.fail("--on-untranslatable: want %q or %q, got %q",
+			store.UntranslatableSkip, store.UntranslatableClear, *onUntranslatable)
 	}
 	d, err := sourceDriver(*driver, *from)
 	if err != nil {
@@ -98,12 +111,14 @@ func (e env) importKeys(args []string) int {
 	defer src.Close()
 
 	rep, err := dst.ImportKeys(ctx, src, store.ImportOptions{
-		Table:          *table,
-		OnMissingTeam:  policy,
-		ExpectAdminKey: *expectAdminKey,
-		DryRun:         !*commit,
-		Limit:          *limit,
-		Source:         *source,
+		Table:                 *table,
+		OnMissingTeam:         policy,
+		OnUntranslatable:      untranslatable,
+		ObjectPermissionTable: *objectPermTable,
+		ExpectAdminKey:        *expectAdminKey,
+		DryRun:                !*commit,
+		Limit:                 *limit,
+		Source:                *source,
 	})
 	if err != nil {
 		return e.fail("%v", err)

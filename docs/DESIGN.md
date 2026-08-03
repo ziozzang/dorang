@@ -855,8 +855,21 @@ Two corrections from review:
   >
   > The two could not both be kept, and not merely on tidiness grounds: charging a block to
   > `spent_nano` **and** reserving against `reserved_nano` counts the same money twice, which
-  > is why `Ledger.readCounter` summed both columns. The reservation code, its columns
-  > (migration `0006`), its sweep job and this paragraph's earlier text are gone.
+  > is why `Ledger.readCounter` summed both columns. The reservation code, its sweep job and
+  > this paragraph's earlier text are gone.
+  >
+  > **The two columns are not, and that is deliberate.** Migration `0006` dropped them in the
+  > same release that stopped using them, and that combination cannot stand beside
+  > OPERATIONS.md §9's `migrate once, from one node, before rolling`: the previous release
+  > names both columns in a `SELECT` and an `INSERT`, both fail with `no such column:
+  > reserved_nano` against the new schema, and the budget path fails **closed** — `503
+  > budget_unavailable` on every budgeted request, on every node not yet rolled. Reproduced
+  > against a populated database. The drop was withdrawn; `0006` retains the columns, inert,
+  > and a later release removes them.
+  >
+  > The general rule it settles is in §9.5a: **a migration may add and it may widen, and it
+  > may never remove what the previous release reads.** One release of separation, because the
+  > documented upgrade order depends on it.
 - **Unexecuted requests are refunded in full [R1-20].** A request may reserve budget at the
   gate and then be rejected while waiting for capacity, never reaching an upstream. Revision
   1 defined settlement only for completion. Revision 2 makes budget a **soft hold** at the
@@ -1686,6 +1699,41 @@ Clustering later restricts the job to the leader; it does not introduce it.
 
 ---
 
+### 9.5a Schema changes are one release wider than the code that needs them
+
+Migrations are forward-only, embedded, checksummed, and applied **once, from one node, before
+the fleet is rolled** (OPERATIONS.md §9). That order is the only one that works — a new binary
+generally needs schema the fleet does not have yet — and it has a consequence that is easy to
+state and easy to forget:
+
+> **A migration may add and it may widen. It may never remove or narrow anything the previous
+> release reads or writes.**
+
+Between step 2 and the end of step 3, every unrolled node is the previous release running
+against the new schema. So retiring a column takes two releases: one that stops using it and
+leaves it in place, and a later one that drops it.
+
+This is a correction, not a principle stated in advance. Migration `0006` was the first
+destructive migration in the tree and dropped `budget_state.reserved_nano` and
+`reserved_until` in the same release that stopped reading them. Followed exactly as documented
+it took the fleet down — `no such column: reserved_nano` in both the old release's budget
+`SELECT` and its `INSERT`, and the budget path fails closed with `503 budget_unavailable`. The
+drop was withdrawn and deferred.
+
+Two tests hold the rule rather than the instance. `TestMigrateOntoADatabaseWithData` runs the
+**previous release's own statements**, copied verbatim, against every migrated schema — a
+migration test that starts from an empty database cannot fail the way an upgrade does, and
+this one could not have caught `0006` before it did.
+`TestTheIntermediateReleaseNeverNamesTheRetiredColumns` is the other half: it fails if any SQL
+in the tree names a retired column, so the deferral is a fact about this release rather than a
+comment about it.
+
+The guarantee runs one release deep and in one direction. Skipping a release can cross both
+halves of a two-step at once, and there is no downgrade path in either case — the rollback plan
+is a database restore.
+
+---
+
 ### 9.6 The write path — what may be deferred, and what may not
 
 Metering is not the only thing that writes. Latency comes from whichever write is *not*
@@ -1748,8 +1796,10 @@ Three rules that follow, and are testable:
 > second budget write. `budget_state` used to carry `reserved_nano` and `reserved_until` with
 > a synchronous `ReserveBudget` over them — a write to the store per request per subject,
 > which is precisely the arrangement this section exists to avoid — and it had no caller
-> anywhere outside its own tests. It is deleted, columns included (migration `0006`). The row
-> is a spend counter; the hold is the block lease.
+> anywhere outside its own tests. The code is deleted. The two columns survive one release
+> longer, inert, because the previous release still reads them and migrations are applied
+> before a fleet is rolled (§9.5a, migration `0006`). The row is a spend counter; the hold is
+> the block lease.
 >
 > A consequence for anything reading `budget_state.spent_nano` directly: it runs up to one
 > block **ahead** of what has been spent, because the block is charged before it is handed

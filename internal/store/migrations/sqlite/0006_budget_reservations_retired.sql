@@ -1,0 +1,84 @@
+-- The budget reservation columns, RETIRED but not dropped (DESIGN §6.4, §9.6).
+--
+--   budget_state.reserved_nano
+--   budget_state.reserved_until
+--
+-- This migration deliberately executes nothing. It occupies version 6 so the
+-- number is never reused, and it records why the drop that used to be here is
+-- not here.
+--
+-- # What the columns were
+--
+-- They were the storage of a SECOND budget reservation mechanism.
+-- internal/store shipped ReserveBudget / SettleBudget / ReleaseReservation /
+-- SweepExpiredReservations over them, internal/cluster ran a leader job that
+-- swept them every tick, and DESIGN §6.4 R1-19 described them as the safety net
+-- for a process killed between reserve and settle. All of it was tested and
+-- none of it had a caller: `ReserveBudget` had zero non-test call sites in the
+-- tree, so `reserved_nano` was zero in every row of every deployment and the
+-- sweep's `WHERE reserved_nano > 0` was a query per tick against a predicate
+-- that could not match.
+--
+-- The mechanism that runs is the lease block of §9.6. `cluster.Ledger` draws a
+-- block, charges it to `spent_nano` in FULL before a unit of it is handed out,
+-- and holds the units in memory behind an atomic; the store sees a write per
+-- block rather than per request, which is the whole reason a synchronous budget
+-- reservation is affordable. Reserving through this table would have been the
+-- write-per-request arrangement §9.6 exists to avoid, and it is why the two
+-- could never be merged: charging a block AND reserving against it would count
+-- the same money twice.
+--
+-- The capability the columns claimed is not lost with them. "A process killed
+-- between reserve and settle must not lock that amount forever" is served by
+-- `quota_leases.expires_at` plus the leader's lease-reclaim pass, which returns
+-- `amount - used` of every lease whose TTL has passed. That net is strictly
+-- wider than the one removed: it also covers a node that dies holding a block
+-- already charged to `spent_nano`, which no reservation sweep could ever have
+-- reclaimed.
+--
+-- # Why the DROP was withdrawn
+--
+-- This file was `0006_drop_budget_reservations.sql` and it ended:
+--
+--     ALTER TABLE budget_state DROP COLUMN reserved_nano;
+--     ALTER TABLE budget_state DROP COLUMN reserved_until;
+--
+-- OPERATIONS.md §9 tells an operator to apply migrations ONCE, from one node,
+-- BEFORE rolling the fleet. That is the correct order and very nearly the only
+-- workable one, because a new binary generally needs schema a rolling fleet
+-- does not have yet. It has a price, and the price is that every migration must
+-- leave the PREVIOUS release still able to run: the old binary keeps serving
+-- for the whole of the roll, against the new schema.
+--
+-- These two statements broke that. The previous release's durable budget path
+-- named both columns, in a SELECT (`spent_nano + reserved_nano`) and in an
+-- INSERT. Reproduced against a populated database: both fail with `no such
+-- column: reserved_nano`, and the old node then fails CLOSED -- `503
+-- budget_unavailable` on every budgeted request until it is replaced. Applying
+-- migrations before rolling, exactly as documented, took the fleet down.
+--
+-- So the drop is deferred, which is the standard two-step and the only one of
+-- the three available answers that keeps `migrate before rolling` true:
+--
+--   this release  stops reading and writing the columns -- already done, and
+--                 there is a test that fails if any statement names them again
+--                 -- and leaves them in place, inert, holding 0 and NULL.
+--   a later one   drops them, once no deployment still runs a binary that
+--                 reads them.
+--
+-- The alternatives were considered and rejected. Changing the documented order
+-- to `roll first, migrate last` fixes this one migration and breaks every
+-- additive one, which is most of them. Making the drop conditional does not
+-- help at all: the column is either there for the old binary or it is not, and
+-- a condition on the schema cannot know whether a node still running is about
+-- to read it.
+--
+-- # The rule this establishes
+--
+-- A migration may add and it may widen. It may NOT remove anything the previous
+-- release reads or writes, in the same release that stops using it. There is
+-- one release of separation, and an operator is owed that guarantee because the
+-- documented upgrade order depends on it.
+--
+-- No data is at stake either way: the columns are `0` and `NULL` in every row
+-- that exists, because nothing ever wrote anything else into them.

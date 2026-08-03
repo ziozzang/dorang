@@ -523,6 +523,21 @@ func compareSets(t *testing.T, what string, sqlite, postgres []string) {
 // So this seeds after every step and reads the seed back after every later
 // step. A migration that broke existing data would fail at the step that broke
 // it, naming it.
+//
+// # And the fleet, which is what it missed
+//
+// This test used to plant rows in `teams` and `api_keys` only, and to read them
+// back with SQL it wrote itself. That verified that migrations APPLY. It could
+// not verify what an operator actually depends on, and migration 0006 walked
+// straight past it: the first destructive migration in the tree dropped two
+// columns of `budget_state`, a table this test never touched, and the statements
+// that broke were the PREVIOUS RELEASE'S, which this test never ran.
+//
+// OPERATIONS.md §9 has migrations applied once, from one node, before the fleet
+// is rolled. For the whole of that roll the old binary is serving against the
+// new schema. So the shape that has to be exercised is a populated table plus
+// the statements of the release being upgraded FROM -- both of which are now
+// below, and neither of which any amount of migrating-from-empty can produce.
 func TestMigrateOntoADatabaseWithData(t *testing.T) {
 	eachEnv(t, func(t *testing.T, b backend, dsn string) {
 		ctx := context.Background()
@@ -561,6 +576,10 @@ func TestMigrateOntoADatabaseWithData(t *testing.T) {
 				                      spend_nano, created_at, updated_at)
 				VALUES (?, ?, ?, 'dorang_v1', ?, ?, ?, ?)`,
 				id, "lookup-"+id, "hash-"+id, "label-"+id, int64(i+1)*1_000, now, now)
+			// The durable budget counter, which is the table 0006 came for.
+			// It is planted through the PREVIOUS release's own INSERT, so a
+			// migration that makes that statement unrunnable fails here.
+			previousReleaseBudgetWrite(t, ctx, s, b, "key", id, int64(i+1)*100, m)
 			planted = append(planted, id)
 
 			// Everything planted so far, including by earlier steps, survives.
@@ -576,6 +595,10 @@ func TestMigrateOntoADatabaseWithData(t *testing.T) {
 				if name != "team "+p {
 					t.Fatalf("after migration %d (%s), team %s reads %q", m.Version, m.Name, p, name)
 				}
+				// And the old binary can still READ every budget row it
+				// wrote. A rolling fleet has nodes doing exactly this for
+				// the whole of the roll.
+				previousReleaseBudgetRead(t, ctx, s, "key", p, m)
 			}
 		}
 
@@ -593,6 +616,74 @@ func TestMigrateOntoADatabaseWithData(t *testing.T) {
 			t.Fatalf("Migrate saw %d applied steps, want %d", rep.AlreadyApplied, len(steps))
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The previous release's statements
+//
+// These two are `cluster.Ledger`'s durable budget path as of a8a0ca1, copied
+// verbatim rather than called, because calling the current code would assert
+// nothing: the point is that the binary an operator is upgrading FROM keeps
+// working against the schema the upgrade installs, and that binary is not in
+// this build. A literal is the only form of that claim that cannot drift with
+// the code it is a claim about.
+//
+// If a future release legitimately removes these columns, this pair is what has
+// to be retired with them -- one release later, and deliberately.
+// ---------------------------------------------------------------------------
+
+// previousReleaseBudgetPeriod is the fixed period the fleet statements use.
+const previousReleaseBudgetPeriod = "monthly"
+
+// previousReleaseBudgetWrite is `Ledger.addCounter`'s CounterBudget branch.
+func previousReleaseBudgetWrite(t *testing.T, ctx context.Context, s *Store, b backend,
+	kind, id string, delta int64, m migration) {
+
+	t.Helper()
+	g := "max"
+	if b.dialect == DialectPostgres {
+		g = "GREATEST"
+	}
+	now := Micros(s.now())
+	_, err := s.exec(ctx, `
+		INSERT INTO budget_state
+		    (subject_kind, subject_id, period, period_start, spent_nano, reserved_nano, reserved_until, updated_at)
+		VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
+		ON CONFLICT (subject_kind, subject_id, period, period_start) DO UPDATE SET
+		    spent_nano = `+g+`(budget_state.spent_nano + ?, 0),
+		    updated_at = ?`,
+		kind, id, previousReleaseBudgetPeriod, int64(0), delta, now, delta, now)
+	if err != nil {
+		t.Fatalf("after migration %d (%s), the PREVIOUS release can no longer write a "+
+			"budget row: %v\n\n"+
+			"OPERATIONS.md §9 has migrations applied from one node BEFORE the fleet is "+
+			"rolled, so every node still on the old binary runs this statement against "+
+			"this schema for the whole of the roll. It now fails, and the budget path "+
+			"fails CLOSED: 503 budget_unavailable on every budgeted request until that "+
+			"node is replaced. A migration may add and it may widen; it may not remove "+
+			"what the previous release still names.", m.Version, m.Name, err)
+	}
+}
+
+// previousReleaseBudgetRead is `Ledger.readCounter`'s CounterBudget branch,
+// including the `spent_nano + reserved_nano` sum.
+func previousReleaseBudgetRead(t *testing.T, ctx context.Context, s *Store,
+	kind, id string, m migration) {
+
+	t.Helper()
+	var v int64
+	err := s.queryRow(ctx, `
+		SELECT spent_nano + reserved_nano FROM budget_state
+		 WHERE subject_kind = ? AND subject_id = ? AND period = ? AND period_start = ?`,
+		kind, id, previousReleaseBudgetPeriod, int64(0)).Scan(&v)
+	if err != nil {
+		t.Fatalf("after migration %d (%s), the PREVIOUS release can no longer read a "+
+			"budget row: %v\n\n"+
+			"The old binary keeps serving through the roll and reads its budget counter "+
+			"on every budgeted request. This is the read that returned "+
+			"`no such column: reserved_nano` and put the node into 503 "+
+			"budget_unavailable.", m.Version, m.Name, err)
+	}
 }
 
 // applyOne runs one migration and records it exactly as Migrate does.

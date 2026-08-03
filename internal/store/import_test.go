@@ -48,6 +48,17 @@ CREATE TABLE "LiteLLM_VerificationToken" (
     updated_at            TEXT
 )`
 
+// The out-of-line permission table. A key's model restriction may live here
+// instead of in its own `models` column, which is the shape that fails OPEN if
+// the id is carried and never resolved.
+const objectPermDDL = `
+CREATE TABLE "LiteLLM_ObjectPermissionTable" (
+    object_permission_id TEXT PRIMARY KEY,
+    models               TEXT,
+    mcp_servers          TEXT,
+    vector_stores        TEXT
+)`
+
 type sourceRow struct {
 	token         string
 	keyName       string
@@ -66,7 +77,15 @@ type sourceRow struct {
 	objectPerm    string
 }
 
-func newSourceDB(t *testing.T, rows []sourceRow) *sql.DB {
+// permRow is one row of the incumbent's permission table.
+type permRow struct {
+	id           string
+	models       string
+	mcpServers   string
+	vectorStores string
+}
+
+func newSourceDB(t *testing.T, rows []sourceRow, perms ...permRow) *sql.DB {
 	t.Helper()
 	dsn := sqliteDSN(filepath.Join(t.TempDir(), "source.db"))
 	db, err := sql.Open("sqlite", dsn)
@@ -76,6 +95,16 @@ func newSourceDB(t *testing.T, rows []sourceRow) *sql.DB {
 	t.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(sourceDDL); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := db.Exec(objectPermDDL); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range perms {
+		if _, err := db.Exec(`INSERT INTO "LiteLLM_ObjectPermissionTable"
+			(object_permission_id, models, mcp_servers, vector_stores) VALUES (?, ?, ?, ?)`,
+			p.id, p.models, p.mcpServers, p.vectorStores); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for _, r := range rows {
 		_, err := db.Exec(`INSERT INTO "LiteLLM_VerificationToken"
@@ -227,7 +256,11 @@ func TestImportCarriesEveryAuthorizationField(t *testing.T) {
 		maxBudget:     12.5,
 		budgetPeriod:  "monthly",
 		objectPerm:    "objperm-9",
-	}})
+	}},
+		// The permission row exists and restricts nothing, so the key keeps
+		// its own model allow-list. An id that resolves to nothing is the
+		// only shape in which a carried object_permission_id still imports.
+		permRow{id: "objperm-9"})
 
 	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
 		func(t *testing.T, s *Store) {
@@ -414,6 +447,261 @@ func TestImportAccountsForEveryRowAndColumn(t *testing.T) {
 				if !reported[col] {
 					t.Errorf("source column %s vanished without a report line", col)
 				}
+			}
+		})
+}
+
+// ---------------------------------------------------------------------------
+// Meaning, not data
+//
+// Measured against a live incumbent with 54 keys: the import's arithmetic was
+// exactly right -- 54 scanned, 4 imported, 50 skipped for a missing team, every
+// lookup matching sha256(token)[:32] of the source digest -- and three of the
+// incumbent's authorization idioms crossed as data with their meaning gone. The
+// report said nothing about any of them. These tests assert the REPORT, because
+// the report is the artifact that failed.
+// ---------------------------------------------------------------------------
+
+// TestAnObjectPermissionRestrictionArrivesOnTheKey is the fail-open, closed.
+//
+// The incumbent may keep a key's model restriction in a row of
+// LiteLLM_ObjectPermissionTable rather than in the key's own `models` column.
+// Carrying the id and never resolving it leaves dorang's `models` EMPTY, and an
+// empty allow-list allows every model — so a key that could reach one model
+// arrives able to reach all of them, with no line anywhere saying so.
+//
+// It did not fire on the live database only by luck: the one key carrying an id
+// pointed at a row whose `models` was empty. The other row in that same table
+// restricted to a single model.
+func TestAnObjectPermissionRestrictionArrivesOnTheKey(t *testing.T) {
+	const token = "sk-fenced" // pragma: allowlist secret — test fixture
+	src := newSourceDB(t, []sourceRow{{
+		token: HashLegacySHA256(token), keyName: "sk-...FN",
+		// The key's own models column is empty. That is the whole hazard:
+		// empty is dorang's spelling for "unrestricted".
+		models: "",
+		// The restriction lives over here.
+		objectPerm: "objperm-fenced",
+	}}, permRow{id: "objperm-fenced", models: `{qwen3.5:397b}`})
+
+	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
+		func(t *testing.T, s *Store) {
+			ctx := context.Background()
+			rep, err := s.ImportKeys(ctx, src, ImportOptions{Now: importNow})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Imported != 1 {
+				t.Fatalf("imported %d, want 1\n%s", rep.Imported, rep.Summary())
+			}
+			if rep.ObjectPermissions != 1 {
+				t.Errorf("ObjectPermissions = %d, want 1: the report has to say that a "+
+					"restriction was resolved, or an operator cannot tell a key that was "+
+					"fenced from one that never was", rep.ObjectPermissions)
+			}
+			k, err := s.GetAPIKeyByLookup(ctx, KeyLookup(token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(k.Models) == 0 {
+				t.Fatalf("model allow-list is empty, and empty allows EVERY model: the "+
+					"restriction in %s did not cross", DefaultObjectPermissionTable)
+			}
+			if strings.Join(k.Models, ",") != "qwen3.5:397b" {
+				t.Fatalf("model allow-list = %v, want the permission row's [qwen3.5:397b]", k.Models)
+			}
+		})
+}
+
+// TestAnUnresolvableObjectPermissionIsRefusedAndNamed covers every way the
+// resolution can fail. Each one is refused rather than imported, because each
+// one imports as an empty allow-list and empty allows everything — the failure
+// is silent in exactly the cases where the operator most needs to hear it.
+func TestAnUnresolvableObjectPermissionIsRefusedAndNamed(t *testing.T) {
+	cases := []struct {
+		name  string
+		perms []permRow
+		want  string // a fragment the report must carry
+	}{
+		{
+			name:  "no such row",
+			perms: []permRow{{id: "objperm-other", models: `{model-a}`}},
+			want:  "no such row",
+		},
+		{
+			name:  "a restriction dorang has no allow-list for",
+			perms: []permRow{{id: "objperm-x", models: `{model-a}`, vectorStores: `{store-1}`}},
+			want:  "vector_stores",
+		},
+		{
+			name:  "the permission row holds a sentinel of its own",
+			perms: []permRow{{id: "objperm-x", models: `{all-team-models}`}},
+			want:  "all-team-models",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			const token = "sk-unresolvable" // pragma: allowlist secret — test fixture
+			src := newSourceDB(t, []sourceRow{{
+				token: HashLegacySHA256(token), keyName: "sk-...UN", objectPerm: "objperm-x",
+			}}, c.perms...)
+
+			eachBackendCfg(t, func(cfg *Config) { cfg.Now = func() time.Time { return importNow } },
+				func(t *testing.T, s *Store) {
+					ctx := context.Background()
+					rep, err := s.ImportKeys(ctx, src, ImportOptions{Now: importNow})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if rep.Imported != 0 {
+						t.Fatalf("imported %d: an unresolved object permission imports as an "+
+							"EMPTY model allow-list, which allows every model\n%s",
+							rep.Imported, rep.Summary())
+					}
+					// Refusal is not enough on its own: the operator has to be
+					// told which key and which id.
+					if len(rep.Untranslated) != 1 {
+						t.Fatalf("Untranslated = %+v, want one entry naming the id", rep.Untranslated)
+					}
+					u := rep.Untranslated[0]
+					if u.Column != "object_permission_id" || u.Value != "objperm-x" ||
+						u.Action != "refused" {
+						t.Errorf("report entry = %+v, want object_permission_id/objperm-x refused", u)
+					}
+					if !strings.Contains(u.Detail, c.want) {
+						t.Errorf("the report does not say %q:\n%s", c.want, rep.Summary())
+					}
+					// The counters stay reconciled.
+					if len(rep.NotMigrated) != rep.Skipped || rep.Skipped != 1 {
+						t.Errorf("skipped %d with %d reasons, want 1 and 1",
+							rep.Skipped, len(rep.NotMigrated))
+					}
+					// And clearing is NOT available for this one, whatever the
+					// operator asks for: a widening is not a flag.
+					rep2, err := s.ImportKeys(ctx, src, ImportOptions{
+						Now: importNow, OnUntranslatable: UntranslatableClear,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if rep2.Imported != 0 {
+						t.Fatalf("--on-untranslatable=clear imported an unresolved object "+
+							"permission: clearing this one drops a restriction rather than "+
+							"an unmatchable literal\n%s", rep2.Summary())
+					}
+				})
+		})
+	}
+}
+
+// TestARouteGroupOrAModelSentinelIsRefusedByName is the other two idioms. Both
+// fail CLOSED — the entry matches nothing, so the key is refused every route or
+// every model — which is why they are second priority and not third: three of
+// the four importable keys on the live database carried the route group, two
+// carried the model sentinel, and every one of them authenticated fine and
+// could do nothing.
+func TestARouteGroupOrAModelSentinelIsRefusedByName(t *testing.T) {
+	const (
+		routeToken = "sk-route-group"    // pragma: allowlist secret — test fixture
+		modelToken = "sk-model-sentinel" // pragma: allowlist secret — test fixture
+	)
+	src := newSourceDB(t, []sourceRow{
+		{token: HashLegacySHA256(routeToken), keyName: "sk-...RG",
+			allowedRoutes: `{llm_api_routes}`},
+		{token: HashLegacySHA256(modelToken), keyName: "sk-...MS",
+			models: `{all-team-models}`},
+	})
+
+	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
+		func(t *testing.T, s *Store) {
+			ctx := context.Background()
+			rep, err := s.ImportKeys(ctx, src, ImportOptions{Now: importNow})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Imported != 0 || rep.Skipped != 2 {
+				t.Fatalf("imported %d, skipped %d, want 0 and 2\n%s",
+					rep.Imported, rep.Skipped, rep.Summary())
+			}
+			named := map[string]Untranslated{}
+			for _, u := range rep.Untranslated {
+				named[u.Value] = u
+			}
+			for _, want := range []struct{ value, column string }{
+				{"llm_api_routes", "allowed_routes"},
+				{"all-team-models", "models"},
+			} {
+				u, ok := named[want.value]
+				if !ok {
+					t.Fatalf("the report never names %q; an operator finds out when a "+
+						"consumer gets 403 instead\n%s", want.value, rep.Summary())
+				}
+				if u.Column != want.column || u.Action != "refused" {
+					t.Errorf("%q reported as %+v, want %s refused", want.value, u, want.column)
+				}
+			}
+			// The summary is what the operator actually reads.
+			sum := rep.Summary()
+			for _, want := range []string{"llm_api_routes", "all-team-models", "--on-untranslatable"} {
+				if !strings.Contains(sum, want) {
+					t.Errorf("the printed summary does not mention %q:\n%s", want, sum)
+				}
+			}
+		})
+}
+
+// TestClearingAnUntranslatableAllowListIsOptInAndNamed pins the escape hatch.
+//
+// Refusing every key with a route group would leave an operator with no way
+// forward but hand-editing the incumbent's database, so `clear` exists. It is
+// opt-in because it WIDENS — an empty dorang allow-list is unrestricted — and
+// every key it touches is named, because a widening nobody is told about is the
+// defect this whole file is about.
+func TestClearingAnUntranslatableAllowListIsOptInAndNamed(t *testing.T) {
+	const token = "sk-cleared" // pragma: allowlist secret — test fixture
+	src := newSourceDB(t, []sourceRow{{
+		token: HashLegacySHA256(token), keyName: "sk-...CL",
+		allowedRoutes: `{llm_api_routes}`,
+		// A widening sentinel beside a literal: the union the incumbent
+		// read is "every team model", so keeping model-a and dropping the
+		// sentinel would leave the key NARROWER than it was.
+		models: `["all-team-models","model-a"]`,
+	}})
+
+	eachBackendCfg(t, func(c *Config) { c.Now = func() time.Time { return importNow } },
+		func(t *testing.T, s *Store) {
+			ctx := context.Background()
+			rep, err := s.ImportKeys(ctx, src, ImportOptions{
+				Now: importNow, OnUntranslatable: UntranslatableClear,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rep.Imported != 1 {
+				t.Fatalf("imported %d, want 1\n%s", rep.Imported, rep.Summary())
+			}
+			if len(rep.Untranslated) != 2 {
+				t.Fatalf("Untranslated = %+v, want both idioms named", rep.Untranslated)
+			}
+			for _, u := range rep.Untranslated {
+				if u.Action != "cleared" {
+					t.Errorf("%+v: want action cleared", u)
+				}
+			}
+			k, err := s.GetAPIKeyByLookup(ctx, KeyLookup(token))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(k.AllowedRoutes) != 0 {
+				t.Errorf("route allow-list = %v, want cleared", k.AllowedRoutes)
+			}
+			if len(k.Models) != 0 {
+				t.Errorf("model allow-list = %v: a union containing \"every team model\" is "+
+					"every team model, so the literal beside it cannot be kept as the whole "+
+					"of the restriction", k.Models)
+			}
+			if !strings.Contains(rep.Summary(), "cleared") {
+				t.Errorf("the summary does not report the widening:\n%s", rep.Summary())
 			}
 		})
 }

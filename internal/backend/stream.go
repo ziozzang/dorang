@@ -69,6 +69,31 @@ type eventSink interface {
 // its terminator. The client-facing half of both is unchanged: bytes already
 // sent stay sent, and the failure is delivered in band because the status is
 // spent. What changes is that the attempt is now reported as one.
+// # Why a streamed answer's response-side loss reaches no header
+//
+// It was worth establishing rather than assuming, because the buffered half of
+// the same question has an answer and this one does not.
+//
+// These three lines are the last mutation of the header block. Every path below
+// them writes through fw, and the first write is what stamps the extension
+// headers (internal/server's responseWriter calls WriteHeader on the first
+// Write). So the header block closes at the FIRST EVENT.
+//
+// Every response-side loss a stream can produce is discovered after that. The
+// sinks convert event by event and write each one as they go — there is no
+// point at which a frame is held — so a collapsed stop reason is known when the
+// terminating event arrives, a thinking block that cannot cross is known when
+// that block arrives, and neither is knowable before the first event without
+// predicting the answer. The alternative, computing the crossing's capability
+// delta up front and reporting it pre-flight, would report "downgraded" on every
+// crossing stream whether or not anything was lost, which is a header that means
+// nothing.
+//
+// So: no common stamp point exists, and this is not a carrier problem. The
+// asymmetry [Call.Accepted] documents is in the answer. What a stream can still
+// carry, and what nothing here writes today, is an in-band frame — and that is a
+// wire-shape change rather than a report, which is why it is named here rather
+// than done.
 func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter) (canonical.Usage, int64, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

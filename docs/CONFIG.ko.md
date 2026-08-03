@@ -46,7 +46,7 @@
 |---|---|---|
 | Duration | `250ms`, `30s`, `1h`, `2h45m` | **맨 숫자는 초** — `timeout: 180`은 180s. 음수 거부 |
 | Size | `4096`, `64MiB`, `8GiB`, `512KB` | `KiB/MiB/GiB/TiB/PiB`는 1024의 거듭제곱; `KB/MB/GB/TB/PB`는 1000의 거듭제곱. 대소문자 무관 |
-| Decimal | `"0.0000025"`, `"20.00"`, `"5"` | **텍스트로 보관**되어 정확히 파싱된다. 가격은 절대 이진 부동소수를 거치지 않는다(§8.3). 따옴표로 감쌀 것 — 아니면 YAML이 float를 준다 |
+| Decimal | `"2.50"`, `"20.00"`, `"5"` | **텍스트로 보관**되어 정확히 파싱된다. 가격은 절대 이진 부동소수를 거치지 않는다(§8.3). 따옴표로 감쌀 것 — 아니면 YAML이 float를 준다 |
 | Path | `~/.dorang/dorang.db` | 선행 `~`는 프로세스 사용자 홈으로 확장된다 |
 
 ### 0.3 비밀값
@@ -1006,7 +1006,8 @@ pricing:
     - id: plan-a-tokens
       class: marginal_usage
       match: {provider: plan-a, model: model-x}
-      rates: {input: "0.0000025", output: "0.00001", cached_read: "0.00000025"}
+      # 100만 토큰당 $2.50 / $10.00 / $0.25 — §13.1c.
+      rates: {input: "2.50", output: "10.00", cached_read: "0.25"}
     - id: plan-a-subscription
       class: fixed_subscription
       match: {credential: plan-a-1}
@@ -1016,6 +1017,9 @@ pricing:
       class: adjustment
       percent: "5"
 ```
+
+**토큰 요율은 100만 토큰당이다.** 요율표를 옮겨 적기 전에 [§13.1c](#131c-요율은-무엇-하나당인가)를
+먼저 읽을 것. 토큰당 값은 거부되지 않는다 — 모든 요청이 0원으로 가격 매겨질 뿐이다.
 
 ### 13.1 키
 
@@ -1027,7 +1031,7 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | 어떤 종류의 비용인가 | `notional_rate` 규칙은 `source`와 `as_of`를 실어야 하고, 다른 어떤 클래스도 그 둘을 실을 수 없다 (§8.5) |
 | `rules[].priority` | int | `0` | id보다 먼저 specificity 동률을 가른다 | 음수 거부 |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | specificity 사다리 | 선언되지 않은 `provider`나 `credential`은 거부. `model`과 `model_prefix`는 선언된 모델과 대조되지 **않는다** — 현재 어떤 배포도 서빙하지 않는 모델을 정당하게 가격 매길 수 있다 |
-| `rules[].rates.<component>` | decimal | — | 단위당 요율. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다 |
+| `rules[].rates.<component>` | decimal | — | 각 컴포넌트의 수량 **한 단위당** 요율이며, 토큰 5종의 그 한 단위는 **100만 토큰이다 — §13.1c**. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다. **토큰당 값은 거부되지 않는다** — 모든 요청이 0원이 되는데도 `/spend/calculate`는 규칙이 매치됐다며 여전히 `"missing": false`를 답한다(§13.1c) |
 | `rules[].period` + `rules[].amount` | string + decimal | — | `fixed_subscription`의 주기와 비용 | 그 클래스에 둘 다 필수; 금액 0 거부 |
 | `rules[].percent` | decimal | — | `adjustment`의 퍼센트 | 그 클래스에 필수; 0 거부 |
 
@@ -1107,6 +1111,64 @@ DESIGN §10.7의 규칙 — *청구 단위는 절대 변환되지 않는다* —
 > 마이그레이션: 기존 게이트웨이의 `input_cost_per_second`에서 가져온 요율은 `compute_seconds`가 된다.
 > 그것이 기존 게이트웨이가 곱하는 값 — 응답 시간 — 이기 때문이다. **그 모델이 오디오 길이로 청구한다면
 > `audio_seconds`로 바꿀 것**. 임포터는 그런 키마다 경고를 내지 대신 골라 주지 않는다.
+
+### 13.1c 요율은 무엇 하나당인가
+
+**토큰 요율은 100만 토큰당이다.** `input: "2.50"`은 입력 100만 토큰당 2달러 50센트라는 뜻이고,
+그것이 모든 벤더가 요율표를 인쇄하는 방식이다. 토큰 하나당 $2.50이 아니며, 같은 가격의 토큰당
+표기인 `"0.0000025"`는 그 가격이 아니라 그 가격을 100만으로 나눈 값이다.
+
+엔진은 요율에 수량을 곱하고 컴포넌트의 제수로 나눈다. 제수 표는 하나뿐이고 설정 불가다:
+
+| 컴포넌트 | 단위 | 요율 하나가 덮는 양 | 제수 |
+|---|---|---|---|
+| `input`, `output`, `cached_read`, `cache_write`, `reasoning` | `per_1m_tokens` | **1,000,000 토큰** | 10⁶ |
+| `request` | `per_request` | 요청 하나 | 1 |
+| `characters` | `per_1k_characters` | 1,000자 | 10³ |
+| `compute_seconds` | `per_compute_second` | 요청 자체의 벽시계 1초 (§13.1b) | 1 |
+| `audio_seconds` | `per_audio_second` | 녹음된 오디오 1초 (§13.1b) | 1 |
+
+이 절 맨 위의 규칙으로 계산해 보면 — 프롬프트 12,000 토큰 중 2,000이 캐시에서, 완성 800 토큰.
+§13.1a의 잘라내기로 `input`에는 10,000이 청구된다:
+
+```
+10,000 / 1,000,000 × 2.50  = 0.025
+ 2,000 / 1,000,000 × 0.25  = 0.0005
+   800 / 1,000,000 × 10.00 = 0.008
+                             ------
+                             0.0335 USD   (33,500,000 nanoUSD)
+```
+
+같은 요율표의 토큰당 표기로 같은 요청을 계산하면 **34 nanoUSD**, 곧 0.000000034 USD로 참값의 백만분의
+일이다. 200 토큰쯤 아래로는 **정확히 0으로** 반올림되며, 대부분의 요청이 거기에 해당하고 원장 전체가
+그렇게 보인다.
+
+> ⚠️ **단위는 어디에도 적혀 있지 않았고, 배포되는 예제는 틀린 단위로 실려 나갔다.** 이 문서의 §13
+> 예제와 `deploy/config.example.yaml`이 모두 토큰당 값인 `input: "0.0000025"`를 엔진이 100만당으로
+> 읽는 필드에 넣고 있었다. 운영자가 확인할 수 있는 모든 것이 설정이 옳다고 말한다: 파싱되고,
+> `dorangctl config lint`는 `ok`, `dorang --check`도 `ok`, 규칙은 선택되며,
+> `POST /spend/calculate`는 **`"missing": false`**를 답한다 — `missing`은 매치된 규칙이 없다는
+> 뜻인데 규칙은 매치됐기 때문이다. 유일한 증상은 0으로 가득 찬 원장이고, 그것은 요율이 틀렸다기보다
+> 게이트웨이가 미터링을 안 하는 것처럼 읽힌다.
+>
+> `docs/DESIGN.md` §8.5의 카탈로그 예제는 처음부터 옳았으므로(`unit: per_1m_tokens` 아래 `"0.85"`),
+> 배포되는 두 문서가 서로 어긋나 있었고 운영자가 복사하는 쪽이 틀린 쪽이었다. 예제는 이제 100만당이며,
+> 테스트가 배포 파일로 알려진 요청을 가격 매겨 손으로 계산한 값과 대조한다 — 파일이 파싱되는지만
+> 확인하는 테스트는 그 내내 통과했다.
+
+**`pricing.rules`에는 `unit:` 키가 없다.** 인라인 형식은 사용한 컴포넌트 이름에서 단위를 유도하며,
+그래서 한 규칙이 두 단위의 컴포넌트를 섞을 수 없다. 외부 카탈로그 파일에는 `unit:`이 *있고*,
+**거기서 `unit:`이 없으면 `per_1m_tokens`이다** — 토큰당 숫자를 쓰고 `unit:`을 생략한 카탈로그 규칙은
+똑같이 실패한다.
+
+**incumbent에서 import해도 배율은 조정되지 않는다.** LiteLLM importer는 `input_cost_per_token`을
+`rates.input`에 그대로 옮긴다. 즉 import된 가격표는 100만당 필드에 든 토큰당 값이며, 경고 없이 10⁶배
+싸다. **import한 토큰 요율은 모두 1,000,000을 곱한 뒤에 믿을 것**, 그리고 한 요청을
+`POST /spend/calculate`로 벤더 요율표와 대조할 것.
+
+**확인 방법.** 알려진 토큰 수로 `POST /spend/calculate`를 부르거나 `dorangctl price`를 써서 요율표와
+손으로 대조한다. `"missing": false`는 그 확인이 아니다 — 규칙이 매치됐다는 뜻이지 그 규칙이 옳다는
+뜻이 아니다.
 
 ### 13.2 클래스는 경쟁하지 않고 합성한다
 
@@ -1692,6 +1754,21 @@ key pepper, batch 블롭, shadow 리포트. 컨테이너 이미지는 그것을 
 설정한다. 그것이 없으면 `~`는 서빙 사용자의 홈이고, 이미지의 `nonroot` 사용자에서 그것은 `/home/nonroot`
 — 볼륨 밖, 컨테이너의 쓰기 가능 레이어이며 재시작에 사라진다. 생성된 pepper를 잃으면 그 아래에서 발급된
 모든 api 키가 검증 불가능해진다.
+
+**그 디렉터리를 누가 소유하느냐가 게이트웨이의 기동 여부를 결정한다.** 이미지는 uid `65532`로 돌고,
+자기가 소유하지 않은 디렉터리 안에는 데이터베이스도 spool도 pepper도 만들 수 없다. 증상은 기동 시
+`mkdir /var/lib/dorang/…: permission denied`이고, `restart: unless-stopped` 아래에서는 크래시 루프이며,
+이미지에는 셸이 없어 안에서 고칠 방법이 없다. 세 가지 마운트 중 무엇을 쓰느냐가 이 일이 일어날 수
+있는지를 가른다:
+
+| 마운트 | 소유권 | 해야 할 일 |
+|---|---|---|
+| **네임드 볼륨** (`-v dorang-state:/var/lib/dorang`) | Docker가 이미지에서 소유권까지 함께 시드하고, 이미지는 그 디렉터리를 `65532` 소유로 싣고 있다 | 없음 |
+| **바인드 마운트** (`-v /srv/dorang:/var/lib/dorang`) | 항상 호스트 디렉터리의 것. Docker는 바인드 마운트에 아무것도 복사하지 않는다 | 첫 기동 **전에** 호스트에서 `chown 65532:65532 /srv/dorang` |
+| **Kubernetes 볼륨** | `emptyDir`은 world-writable이라 그대로 되고, **PersistentVolumeClaim**은 안 된다 | 파드 `securityContext`에 `fsGroup: 65532` — `deploy/kubernetes.yaml`이 그렇게 한다 |
+
+실패하던 것은 네임드 볼륨 경우였고, 진단하기 가장 어려운 방식으로 실패했다: Docker는 볼륨을 **생성할
+때만** 시드하므로, 한 번 밖에서 chown해 둔 운영자는 그 뒤로 다시는 보지 못하고 재현할 수도 없다.
 
 ---
 

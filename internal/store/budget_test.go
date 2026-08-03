@@ -3,8 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 )
@@ -64,38 +62,64 @@ func TestBudgetStateIsSpendOnly(t *testing.T) {
 	})
 }
 
-// TestBudgetStateHasNoReservationColumns is the schema half of the same
-// deletion, and it is the assertion migration 0006 exists to make true.
+// TestTheReservationColumnsSurviveInertForOneRelease is the schema half of the
+// same deletion, and it says the opposite of what it used to.
 //
-// A column nothing writes is the same defect as a function nothing calls, in a
-// medium with no compiler to notice it. This fails if either column comes back.
+// It used to assert that migration 0006 had DROPPED both columns, because a
+// column nothing writes is the same defect as a function nothing calls. That is
+// still true of the code, and the code is gone — `ReserveBudget` and its three
+// siblings, the leader's sweep, the `spent_nano + reserved_nano` read. What was
+// wrong was dropping the STORAGE in the same release.
 //
-// The ErrNoRows case is the whole difficulty and is why it is spelled out. A
-// SELECT of a column that does not exist fails to PREPARE, with the column
-// named; a SELECT of a column that does exist against an empty table succeeds
-// and returns no rows. Both are non-nil errors, so "err != nil" passes either
-// way — which is what the first version of this test asserted, and reverting
-// migration 0006 left it green. Distinguishing them is the test.
-func TestBudgetStateHasNoReservationColumns(t *testing.T) {
+// OPERATIONS.md §9 has an operator apply migrations from one node before rolling
+// the fleet, so the previous release keeps serving against the new schema for the
+// whole of the roll — and the previous release names both columns, in a SELECT
+// and in an INSERT. Reproduced: both fail with `no such column: reserved_nano`,
+// and the budget path then fails closed with `503 budget_unavailable` on every
+// budgeted request. So the drop is deferred one release, and until then the
+// invariant is this pair:
+//
+//   - the columns are STILL THERE, so the old binary survives the roll; and
+//   - nothing in this release names them, which is
+//     [TestTheIntermediateReleaseNeverNamesTheRetiredColumns], a source-level
+//     assertion because "no statement runs" is not a thing a query can observe.
+//
+// When the drop finally ships, this test is what has to be inverted with it —
+// deliberately, and one release after the code stopped reading them.
+func TestTheReservationColumnsSurviveInertForOneRelease(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
-		// A row, so that a surviving column answers with a value rather than
-		// with ErrNoRows and the two cases cannot be confused at all.
+		// Written the way THIS release writes a budget row: it names neither
+		// column, so both must take their declared defaults.
 		mustExec(t, s, `INSERT INTO budget_state
 		    (subject_kind, subject_id, period, period_start, spent_nano, updated_at)
 		  VALUES ('key', 'k', 'monthly', 0, 1, 0)`)
 
-		for _, col := range []string{"reserved_nano", "reserved_until"} {
-			var v any
-			err := s.queryRow(context.Background(),
-				`SELECT `+col+` FROM budget_state`).Scan(&v)
-			if err == nil || errors.Is(err, sql.ErrNoRows) {
-				t.Fatalf("budget_state still has %s (err %v): the reservation mechanism "+
-					"was deleted and its storage must go with it", col, err)
-			}
-			if !strings.Contains(strings.ToLower(err.Error()), col) {
-				t.Fatalf("selecting %s failed for some reason other than the column "+
-					"being absent: %v", col, err)
-			}
+		// The previous release's own read, verbatim. It is the statement that
+		// broke, and running it is the only assertion that settles whether the
+		// old binary survives this schema.
+		var counter int64
+		if err := s.queryRow(context.Background(),
+			`SELECT spent_nano + reserved_nano FROM budget_state`).Scan(&counter); err != nil {
+			t.Fatalf("the PREVIOUS release can no longer read its budget counter: %v\n\n"+
+				"Migrations are applied before the fleet is rolled (OPERATIONS.md §9), so "+
+				"every node still on the old binary runs this on every budgeted request "+
+				"until it is replaced. It fails CLOSED: 503 budget_unavailable.", err)
+		}
+		if counter != 1 {
+			t.Fatalf("the previous release reads its counter as %d, want 1: the retired "+
+				"columns must be INERT, not merely present — a non-zero reserved_nano "+
+				"would make the old binary refuse budget this release has not spent",
+				counter)
+		}
+
+		var reservedUntil sql.NullInt64
+		if err := s.queryRow(context.Background(),
+			`SELECT reserved_until FROM budget_state`).Scan(&reservedUntil); err != nil {
+			t.Fatalf("reserved_until: %v", err)
+		}
+		if reservedUntil.Valid {
+			t.Fatalf("reserved_until = %d, want NULL: nothing in this release writes it",
+				reservedUntil.Int64)
 		}
 	})
 }

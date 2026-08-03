@@ -173,6 +173,16 @@ func (c *call) userNew() error {
 	if err := spec.apply(u); err != nil {
 		return err
 	}
+	// Unlike `/key/generate`, this route accepts a caller-chosen id, so a key may
+	// ALREADY name it — an imported credential whose owner had not been created
+	// yet is the ordinary way to arrive here. Those keys were serving with no
+	// owner's envelope and are about to serve with one, including its block flag
+	// and its ceiling, so they are announced. On a freshly minted id this finds
+	// nothing and publishes nothing, which is the normal case.
+	owned, err := c.ownedKeys(KeyFilter{UserID: u.ID})
+	if err != nil {
+		return err
+	}
 	if err := d.CreateUser(c.ctx(), u); err != nil {
 		if errors.Is(err, ErrConflict) {
 			return newFault(http.StatusConflict, CodeConflict, typeInvalidRequest,
@@ -181,7 +191,7 @@ func (c *call) userNew() error {
 		return err
 	}
 	view := viewUser(u)
-	if err := c.recordAudit("user.new", "user", u.ID, nil, view); err != nil {
+	if err := c.appliedTo(owned, CauseUpdated, "user.new", "user", u.ID, nil, view); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"user": view})
@@ -266,12 +276,29 @@ func (c *call) userUpdate() error {
 			return err
 		}
 	}
+	// Every field this handler writes except the role and the metadata is an
+	// authorization field the hot path reads off its cached snapshot, through
+	// [auth.Principal.User]: the block flag, the model allow-list, the rate
+	// ceilings, the budget and its period. An update that is not announced is
+	// therefore an update the fleet honours a credential-cache TTL later —
+	// sixty seconds — which is what `{"blocked": true}` through this route used
+	// to mean. `blocked` is singled out only in the CAUSE, because blocking the
+	// person is what an operator does when someone leaves and a node's log
+	// should spell it that way.
+	owned, err := c.ownedKeys(KeyFilter{UserID: id})
+	if err != nil {
+		return err
+	}
+	cause := CauseUpdated
+	if updated.Blocked && !u.Blocked {
+		cause = CauseRevoked
+	}
 	updated.UpdatedAt = c.a.now().UTC()
 	if err := d.UpdateUser(c.ctx(), &updated); err != nil {
 		return err
 	}
 	after := viewUser(&updated)
-	if err := c.recordAudit("user.update", "user", id, before, after); err != nil {
+	if err := c.appliedTo(owned, cause, "user.update", "user", id, before, after); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"user": after})
@@ -304,6 +331,7 @@ func (c *call) userDelete() error {
 		return badRequest("user_ids must name at least one user").withParam("user_ids")
 	}
 	before := make([]userView, 0, len(ids))
+	var owned []string
 	for _, id := range ids {
 		u, err := d.GetUser(c.ctx(), id)
 		if err != nil {
@@ -313,12 +341,25 @@ func (c *call) userDelete() error {
 			return err
 		}
 		before = append(before, viewUser(u))
+		// Enumerated before the delete, because afterwards there is nothing left
+		// to enumerate. Whether the store cascades the keys away or leaves them
+		// orphaned, every one of them is serving from a cached entry that names
+		// an owner who is about to stop existing.
+		ks, err := c.ownedKeys(KeyFilter{UserID: id})
+		if err != nil {
+			return err
+		}
+		owned = append(owned, ks...)
 	}
 	n, err := d.DeleteUsers(c.ctx(), ids)
 	if err != nil {
 		return err
 	}
-	if err := c.recordAudit("user.delete", "user", strings.Join(ids, ","),
+	// CauseRevoked rather than CauseUpdated: removing a person from the directory
+	// is the incident spelling of this route — it is what an operator runs when
+	// someone leaves — and a node's log should say the credentials were revoked
+	// rather than that something about them changed.
+	if err := c.appliedTo(owned, CauseRevoked, "user.delete", "user", strings.Join(ids, ","),
 		map[string]any{"users": before}, map[string]any{"deleted": n}); err != nil {
 		return err
 	}

@@ -224,8 +224,36 @@ type Call struct {
 	// already on the wire by the time Do returns, so a loss delivered there would
 	// reach x-dorang-downgraded on buffered answers and nowhere on streamed ones —
 	// which is a report that is present or absent depending on a property of the
-	// response the caller did not ask about. This callback is the last moment both
-	// kinds of answer still have a header block.
+	// response the caller did not ask about.
+	//
+	// # WHEN it fires, and why that is not one line
+	//
+	// At the LAST MOMENT THIS KIND OF ANSWER still has a header block, which is
+	// not the same instant for both kinds:
+	//
+	//   - a STREAM: immediately before [Backend.relay], whose third statement
+	//     sets the SSE content type and whose first event write stamps the
+	//     headers. There is nothing after it.
+	//   - a BUFFERED answer: when [Backend.finish] returns, after the upstream
+	//     body has been read, decoded and rendered into the caller's protocol.
+	//     The bytes go out on [Result.Body] and are written by the caller, long
+	//     after Do has returned, so the block is still open.
+	//
+	// It used to fire at the stream's moment for both, and that was the whole of
+	// the response direction's silence. Every loss the RESPONSE encoders produce
+	// — a rich stop reason collapsed onto this family's enumeration, a thinking
+	// block that cannot cross, `n > 1` folded into one message — is produced
+	// while rendering the answer, which happens strictly AFTER the upstream body
+	// is read. At the stream's moment not one byte of that body has arrived, so
+	// a buffered answer's report was handed over complete in one direction and
+	// empty in the other, and the encoders wrote their half into a report nobody
+	// held.
+	//
+	// The asymmetry that remains is in the ANSWER, not in the carrier, and it is
+	// irreducible: a streamed answer's response-side losses are discovered event
+	// by event, and its headers left with the first one. There is no later point
+	// for a stream, so the report a stream delivers carries the request direction
+	// only. See the note on [Backend.relay].
 	//
 	// The report is nil for an operation with no neutral request, and empty for a
 	// conversion that lost nothing; both are ordinary, and every LossReport method
@@ -533,14 +561,12 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 
-	// The last moment anything can still be put on the response headers: they
-	// are stamped on the first write, and for a stream the first write is three
-	// lines below (DESIGN §10.4).
-	if x.call.Accepted != nil {
-		x.call.Accepted(x.loss)
-	}
-
 	if x.call.Stream {
+		// The last moment a STREAM has a header block: they are stamped on the
+		// first write, and the first write is inside relay, three lines below
+		// (DESIGN §10.4). Nothing of the answer has been read yet, so the report
+		// carries the request direction only — see [Call.Accepted].
+		x.accept()
 		usage, sent, err := b.relay(x, resp, w)
 		res.Total = b.now().Sub(start)
 		res.Usage = usage
@@ -561,6 +587,14 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		}
 		return res
 	}
+
+	// A BUFFERED answer's header block is still open when this function returns —
+	// the bytes leave on [Result.Body] and the caller writes them — so the
+	// handover happens here, at the end, where the response encoders have already
+	// written their half of the report. Deferred rather than called on the
+	// success path, so that the failure returns below hand over the same report
+	// they always did rather than acquiring a new way to skip it.
+	defer x.accept()
 
 	body, err := readUpstreamBody(resp.Body, b.maxBody)
 	if err != nil {
@@ -738,14 +772,14 @@ func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.U
 	}
 	// The T1 chat-shaped surfaces render differently from chat completions even
 	// though their caller speaks the same family, so they are asked first.
-	if out, done, eerr := encodeT1Client(dec.resp, x.call, b.now().Unix()); done {
+	if out, done, eerr := encodeT1Client(dec.resp, x, b.now().Unix()); done {
 		if eerr != nil {
 			return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 				"could not render the response: "+eerr.Error()).WithCode(CodeResponseEncode)
 		}
 		return out, jsonType, usage, nil
 	}
-	out, eerr := encodeClient(dec.resp, x.call, b.now().Unix())
+	out, eerr := encodeClient(dec.resp, x, b.now().Unix())
 	if eerr != nil {
 		return nil, "", usage, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"could not render the response: "+eerr.Error()).WithCode(CodeResponseEncode)
@@ -808,19 +842,43 @@ func malformedToolCall(r *canonical.Response) (string, bool) {
 //     argument for crossing the id, and it is a good one; it just has to be the
 //     same argument on both paths, and it does not extend to handing a client an
 //     identifier its own SDK's shape does not describe.
-func encodeClient(r *canonical.Response, c *Call, now int64) ([]byte, error) {
+//
+// # The loss report, and the capability set it is computed against
+//
+// Both travel now, and neither did. The response encoders have recorded what a
+// crossing costs since they were written — a rich stop reason collapsed onto
+// this family's enumeration, a thinking block with no shape here, a redacted
+// payload that cannot be reconstructed, `n > 1` folded into one message — and
+// every one of those calls landed on a nil report, discarded at the point it was
+// produced. The capability set was worse than absent: it was zero, so each
+// encoder's `opt.caps()` fell back to its own DefaultCapabilities, which is the
+// same value [exchange.clientCapabilities] computes. The response direction was
+// therefore converted against the correct set BY COINCIDENCE, and reported
+// against nothing at all.
+func encodeClient(r *canonical.Response, x *exchange, now int64) ([]byte, error) {
+	c := x.call
 	switch c.ClientAPI {
 	case catalog.APIAnthropicMessages:
 		// TotalTokens is COMPATIBILITY §6.8. The zero value is the compat shape
 		// the reference implementation emits, so an unset call is unchanged; the
 		// strict vendor shape is reachable only because the value now travels.
-		opt := &anthropic.ResponseOptions{Model: c.Model, TotalTokens: c.AnthropicTotalTokens}
+		opt := &anthropic.ResponseOptions{
+			Model:        c.Model,
+			TotalTokens:  c.AnthropicTotalTokens,
+			Capabilities: x.clientCapabilities(),
+			Loss:         x.loss,
+		}
 		if !r.SameFamily(canonical.FamilyAnthropicMessages) {
 			opt.ID = anthropic.NewMessageID()
 		}
 		return anthropic.MarshalResponse(r, opt)
 	default:
-		opt := &openai.ResponseOptions{Model: c.Model, Created: createdOr(r, now)}
+		opt := &openai.ResponseOptions{
+			Model:        c.Model,
+			Created:      createdOr(r, now),
+			Capabilities: x.clientCapabilities(),
+			Loss:         x.loss,
+		}
 		if !r.SameFamily(canonical.FamilyOpenAIChat) {
 			opt.ID = openai.NewStreamID()
 		}

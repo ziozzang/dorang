@@ -29,12 +29,54 @@ import (
 // `/key/regenerate`, `/key/rotate`, `/key/rotate/cut`, `/key/pend` and
 // `/key/release`.
 //
+// # The second half: the subjects a key hangs off
+//
+// The sweep that closed the eight routes above enumerated KEY mutations, and
+// that was the wrong noun. §11.2's envelope is three subjects — the key, its
+// user, its team — and [auth.Principal] caches all three in one entry, which is
+// why the hot path refuses on `p.User.Blocked` and `p.Team.Blocked` from the
+// CACHED copy. Blocking a user therefore had exactly the defect blocking a key
+// had, at exactly the same cost: sixty seconds on every node that did not serve
+// the call, against a published bound of 270 ms. So did `/user/delete`,
+// `/team/update`, `/team/delete` — and `/budget/*`, whose ceiling is
+// [auth.Limits.MaxBudgetNanoUSD] on the same cached entry, which is the third
+// class and the one two sweeps had now each walked past.
+//
+// [Invalidator] names a KEY, deliberately (see its documentation). The subject
+// routes therefore resolve the subject to the keys underneath it — see
+// [call.ownedKeys] — and announce one message per key. That keeps the message a
+// key id, which is what the receiving node can act on without a join, and it
+// keeps this package's dependency on the cluster at one method.
+//
 // # What is deliberately NOT published
 //
-// Creation. A key that has never been seen has nothing cached to drop, and the
-// bound for "used before it existed, then created" is the negative-entry TTL
-// (`auth.DefaultNegativeTTL`, 5 s) rather than a mistake. `/key/generate`
-// therefore announces nothing, and that is a decision rather than an omission.
+// Creation, of a key. A key that has never been seen has nothing cached to
+// drop, and the bound for "used before it existed, then created" is the
+// negative-entry TTL (`auth.DefaultNegativeTTL`, 5 s) rather than a mistake.
+// `/key/generate` therefore announces nothing, and that is a decision rather
+// than an omission.
+//
+// Creating a USER or a TEAM is NOT the same case and does publish, for keys that
+// already name the id. The asymmetry is real rather than an oversight: a key's
+// id is minted by the route that creates it, so nothing can reference it first,
+// whereas `/user/new` and `/team/new` both accept a caller-chosen id and a key
+// may already carry it — those keys were serving with no owner's envelope and
+// are now serving with one. In the normal case the enumeration finds nothing and
+// nothing is published.
+//
+// Team MEMBERSHIP. `/team/member_add` and `/team/member_delete` write
+// `team_members`, and no cached authorization decision is derived from that
+// table: a key's team is `api_keys.team_id` (§9.2), the administrative scope a
+// key carries is derived from the same column, and the administrative role join
+// is re-read from the store on every administrative request rather than cached.
+// A membership change therefore does not change whether any request is served,
+// and publishing one would be a message no node could act on.
+//
+// Models and deployments. `/model/*` changes whether a MODEL is servable, which
+// is a routing fact rather than a credential one: it reaches no entry in the
+// credential cache, and [Invalidator] — one key id and a cause — has no shape
+// that could carry it. The routing table is reloaded by `/admin/config/reload`,
+// per node, which is what OPERATIONS tells an operator to run against the fleet.
 
 // InvalidationCause says why a key's cached copy has to be dropped. It travels
 // with the message so that an operator reading a node's log learns which control
@@ -155,6 +197,105 @@ func (c *call) invalidate(keyID, cause string) error {
 func (c *call) applied(keyID, cause, action string, before, after any) error {
 	invErr := c.invalidate(keyID, cause)
 	if err := c.recordAudit(action, "key", keyID, before, after); err != nil {
+		return err
+	}
+	return invErr
+}
+
+// maxAnnouncedKeys bounds one subject mutation's announcement.
+//
+// It exists so that "block this user" cannot become an unbounded scan of the key
+// table inside an HTTP handler. It is deliberately far above any real fan-out —
+// a user or a team with ten thousand credentials is a deployment doing something
+// this surface was not designed for — and reaching it is REPORTED rather than
+// silently truncated, because an announcement that covered a prefix of the keys
+// and said nothing would be the same defect this file exists to remove, wearing
+// a limit.
+const maxAnnouncedKeys = 10_000
+
+// ownedKeys resolves a subject — a user, or a team — to the keys whose cached
+// authorization envelope is derived from it.
+//
+// It is the whole of what the subject routes need that the key routes did not.
+// [Invalidator] names a key id, and a node applying an invalidation drops that
+// key's entries; a user's block reaches the hot path through
+// [auth.Principal.User], which lives in those same entries, so dropping them is
+// what makes the block take effect.
+//
+// It is called BEFORE the durable write, always, including on the routes where
+// the ownership set cannot change. A delete has to be enumerated first — after
+// it, the rows that named the subject are gone and there is nothing left to
+// resolve — and having one order for every route is what stops the next handler
+// from picking the wrong one. The consequence is the good one: a store that
+// cannot answer refuses the mutation BEFORE it happens, rather than leaving a
+// durable change nobody can announce.
+//
+// It returns nothing at all when no invalidator is wired: the deployment has
+// accepted the entry TTL as its bound (see [Invalidator]), and a listing whose
+// only consumer is an announcement that will not be sent is a query for nothing.
+func (c *call) ownedKeys(f KeyFilter) ([]string, error) {
+	if c.a.cfg.Invalidator == nil || c.a.cfg.Keys == nil {
+		return nil, nil
+	}
+	if f.UserID == "" && f.TeamID == "" {
+		return nil, nil
+	}
+	f.Limit = c.a.cfg.MaxListLimit
+	f.Offset = 0
+	var ids []string
+	for {
+		page, err := c.a.cfg.Keys.ListKeys(c.ctx(), f)
+		if err != nil {
+			return nil, err
+		}
+		for _, k := range page {
+			ids = append(ids, k.ID)
+		}
+		if len(page) < f.Limit {
+			return ids, nil
+		}
+		if len(ids) >= maxAnnouncedKeys {
+			flt := newFault(http.StatusInternalServerError, CodeInvalidationFailed, typeAPI,
+				"this subject owns more than %d keys, which is more than one change can announce; "+
+					"the change has NOT been applied. Block or delete the keys directly, in batches, "+
+					"so that each one is announced", maxAnnouncedKeys)
+			flt.Detail = map[string]any{
+				"user_id": f.UserID, "team_id": f.TeamID, "limit": maxAnnouncedKeys,
+			}
+			return nil, flt
+		}
+		f.Offset += len(page)
+	}
+}
+
+// invalidateKeys announces one applied change for every key of a subject.
+//
+// The FIRST failure is remembered and the loop continues, for the reason
+// `/key/delete`'s does: stopping half way through would leave the rest of a
+// blocked user's credentials serving on the TTL because an earlier one could not
+// be published, which is the worst available outcome and the one an early return
+// produces by default.
+func (c *call) invalidateKeys(keyIDs []string, cause string) error {
+	var first error
+	for _, id := range keyIDs {
+		if err := c.invalidate(id, cause); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// appliedTo is [call.applied] for a mutation on a subject rather than on a key:
+// announce every key underneath it, then write the one trail row that records
+// what the operator actually did.
+//
+// Same order and the same reason. The announcement is what makes the change take
+// effect so it goes first; the audit row is written even when the announcement
+// failed, and its fault wins, because a mutation that took effect and left no
+// record is the worse of the two outcomes.
+func (c *call) appliedTo(keyIDs []string, cause, action, kind, id string, before, after any) error {
+	invErr := c.invalidateKeys(keyIDs, cause)
+	if err := c.recordAudit(action, kind, id, before, after); err != nil {
 		return err
 	}
 	return invErr

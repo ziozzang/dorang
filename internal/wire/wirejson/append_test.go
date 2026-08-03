@@ -153,6 +153,144 @@ func TestAppendRejectsWhatItDoesNotModel(t *testing.T) {
 	}
 }
 
+// --- the two shapes the refusal list claimed and did not have -----------------
+
+// dupTaggedType is the collision encoding/json resolves by dropping BOTH
+// fields: two fields, same depth, both tagged with the same name.
+//
+// It is built with reflect rather than written as a literal because `go vet`
+// refuses the literal — "struct field B repeats json tag" — which is itself the
+// finding in miniature. vet catches the shape a developer WRITES; the planner
+// has to be right about the shape it is HANDED, including one composed at run
+// time or arriving from a package vet was not run over.
+var dupTaggedType = reflect.StructOf([]reflect.StructField{
+	{Name: "A", Type: reflect.TypeFor[int](), Tag: `json:"x"`},
+	{Name: "B", Type: reflect.TypeFor[int](), Tag: `json:"x"`},
+})
+
+// dupValue is a value of dupTaggedType with both fields set, so that "both are
+// dropped" is distinguishable from "both happened to be zero".
+func dupValue() any {
+	v := reflect.New(dupTaggedType).Elem()
+	v.Field(0).SetInt(1)
+	v.Field(1).SetInt(2)
+	return v.Interface()
+}
+
+// dupTaggedOverUntagged is the collision encoding/json resolves by letting the
+// tagged field win. It needs no embedding, so it is reachable in a flat struct
+// of the kind every wire type is, and vet does not object to it.
+type dupTaggedOverUntagged struct {
+	X int
+	Y int `json:"X"`
+}
+
+// TestAppendRefusesDuplicateJSONNames closes the first hole.
+//
+// The planner had no duplicate-name rule at all and wrote every field in
+// declaration order, so a struct with two `x` fields produced `{"x":0,"x":0}`
+// where encoding/json produces `{}`. Not a slower answer — a different
+// document, and the one thing the file's promise says cannot happen.
+//
+// No wire type has such a field, which is why nothing was ever observed. It is
+// asserted here as a property of the PLANNER rather than of the wire types,
+// because the next wire type is what turns an accident into a defect.
+func TestAppendRefusesDuplicateJSONNames(t *testing.T) {
+	for _, v := range []any{dupValue(), dupTaggedOverUntagged{X: 1, Y: 2}} {
+		if fn := planOf(reflect.TypeOf(v)); fn != nil {
+			t.Errorf("%T was planned; two fields resolve to one JSON name and "+
+				"encoding/json's conflict rule is not modelled here", v)
+		}
+		agree(t, v)
+	}
+
+	// And the bytes, spelled out, so that a future "improvement" that plans this
+	// type has to look at what it would emit. encoding/json drops both; the
+	// planner used to write `{"x":1,"x":2}`, which is a different document and
+	// not a slower one.
+	b, err := Append(nil, dupValue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "{}" {
+		t.Errorf("Append(two fields tagged x) = %s, want {}", b)
+	}
+	if got, err := Append(nil, dupTaggedOverUntagged{X: 1, Y: 2}); err != nil {
+		t.Fatal(err)
+	} else if string(got) != `{"X":2}` {
+		t.Errorf("Append(tagged over untagged) = %s, want {\"X\":2}: encoding/json lets "+
+			"the tagged field win", got)
+	}
+}
+
+// nilAppender and nilMarshaler are interface-typed fields. An interface type
+// implements itself, so both reached the planner's `t.Implements(...)` tests and
+// were PLANNED, despite this file's promise naming "an interface" as refused.
+type nilAppender struct {
+	V Appender `json:"v"`
+}
+
+type nilMarshaler struct {
+	V json.Marshaler `json:"v"`
+}
+
+// sliceOfAppenders is the worse half: every element of a slice is addressable,
+// so appendViaAppender took the `v.Addr()` branch, and *Appender implements
+// nothing — it panicked on a NON-nil entry too.
+type sliceOfAppenders struct {
+	V []Appender `json:"v"`
+}
+
+// realAppender is a non-nil dynamic value for the slice case.
+type realAppender struct{}
+
+func (realAppender) AppendJSON(dst []byte) ([]byte, error) { return append(dst, `"a"`...), nil }
+
+func (realAppender) MarshalJSON() ([]byte, error) { return []byte(`"a"`), nil }
+
+// TestAppendRefusesInterfaceTypedFields closes the second hole, and asserts the
+// nil case AS A VALUE rather than as a panic.
+//
+// This is the one that matters. `encoding/json` writes `null` for a nil
+// interface; the planner asserted on the dynamic value and panicked —
+// `interface conversion: interface {} is nil` — and would have done so on the
+// response path, inside a handler, for a wire type nobody has written yet.
+func TestAppendRefusesInterfaceTypedFields(t *testing.T) {
+	for _, v := range []any{
+		nilAppender{}, nilMarshaler{},
+		nilAppender{V: realAppender{}},
+		sliceOfAppenders{V: []Appender{realAppender{}}},
+		sliceOfAppenders{V: []Appender{nil}},
+	} {
+		if fn := planOf(reflect.TypeOf(v)); fn != nil {
+			t.Errorf("%T was planned; an interface-typed field is refused, and the "+
+				"planned path asserts on the dynamic value", v)
+		}
+		agree(t, v)
+	}
+
+	// The nil case as a VALUE. A test that only asserted "no plan" would pass
+	// against a planner that panicked one refactor later.
+	for _, tc := range []struct {
+		name string
+		v    any
+	}{
+		{"a nil Appender", nilAppender{}},
+		{"a nil Marshaler", nilMarshaler{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := Append([]byte("PRE"), tc.v)
+			if err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+			if got := string(b[len("PRE"):]); got != `{"v":null}` {
+				t.Errorf("Append(%T) = %s, want {\"v\":null} — encoding/json writes null "+
+					"for a nil interface, and this used to panic", tc.v, got)
+			}
+		})
+	}
+}
+
 type textMarshaler struct{}
 
 func (textMarshaler) MarshalText() ([]byte, error) { return []byte("t"), nil }

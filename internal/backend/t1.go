@@ -166,14 +166,23 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 // It is separate from [encodeClient] because the caller's family is not enough
 // to decide the shape here: a /v1/completions client and a /v1/chat/completions
 // client both speak openai-chat and must get different objects.
-func encodeT1Client(r *canonical.Response, c *Call, now int64) ([]byte, bool, error) {
+func encodeT1Client(r *canonical.Response, x *exchange, now int64) ([]byte, bool, error) {
+	c := x.call
 	switch c.Op {
 	case OpCompletions:
 		// `created` for the same reason as in [encodeClient]: this shape has the
 		// member, the family the answer may have come from does not, and a
 		// timestamp of 0 is a timestamp in 1970.
+		//
+		// The loss report travels for the reason it does in [encodeClient]. This
+		// shape is the one with the loudest response-side downgrade of all —
+		// `choices.text` can hold one string, so every block of a multi-block
+		// answer beyond the first is gone (openai.EncodeCompletionResponse) — and
+		// it was raised into a nil report on every /v1/completions crossing.
 		out, err := openai.MarshalCompletionResponse(r, &openai.ResponseOptions{
 			Model: c.Model, Created: createdOr(r, now),
+			Capabilities: x.clientCapabilities(),
+			Loss:         x.loss,
 		})
 		return out, true, err
 	case OpResponses:

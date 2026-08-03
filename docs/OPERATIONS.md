@@ -961,6 +961,39 @@ Two ordering rules:
 - **A configuration change and a binary change should not be the same step.** If the new binary
   refuses the old configuration, you want to know which of the two caused it.
 
+### What "migrate first" costs, and who pays it
+
+Step 2 applies the new schema while every node in the fleet is still running the **old** binary,
+and those nodes keep serving until step 3 reaches them. So the order above is only safe if a
+migration leaves the previous release able to run. That is a promise dorang makes, and it is
+worth stating as one:
+
+> **A migration may add and it may widen. It may never remove or narrow anything the previous
+> release reads or writes.** A column being retired stays in place for one release after the
+> code stops using it, and is dropped in the release after that.
+
+This is not a style preference. Migration `0006` originally dropped `budget_state.reserved_nano`
+and `budget_state.reserved_until` in the same release that stopped using them. Followed exactly
+as written above, that took the fleet down: the old binary's budget path names both columns in a
+`SELECT` and in an `INSERT`, both fail with `no such column: reserved_nano`, and the budget path
+fails **closed** — `503 budget_unavailable` on every budgeted request, on every node not yet
+rolled. The drop was withdrawn and deferred; `internal/store/migrations/*/0006_budget_reservations_retired.sql`
+carries the reasoning, and `TestMigrateOntoADatabaseWithData` now runs the previous release's own
+statements against each migrated schema so the next one cannot ship the same way.
+
+Two consequences for you:
+
+- **Do not skip a release when a retirement is in flight.** The guarantee is one release deep. An
+  N → N+2 jump can cross both halves of a two-step at once, and then the binary you are upgrading
+  *from* is not the one the intermediate migration was written to protect. Roll through the
+  intermediate release, or take the deployment down for the jump.
+- **The old binary is expected to keep writing during step 2 and 3.** That is not a race you need
+  to avoid; it is the case the guarantee covers. What you must not do is run step 2 from a node
+  that is *newer* than the rest by more than one release.
+
+There is still no downgrade path (the rollback plan is a database restore), so the guarantee runs
+in one direction only: the previous release survives the new schema, not the other way round.
+
 `--check` with the new binary against the old configuration is the cheapest pre-flight there is,
 and it catches the case that actually happens: a key the new schema no longer accepts, or one it
 now requires.

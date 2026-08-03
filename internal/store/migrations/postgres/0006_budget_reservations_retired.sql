@@ -1,0 +1,12 @@
+-- The budget reservation columns, RETIRED but not dropped (DESIGN §6.4, §9.6).
+--
+-- The SQLite file of the same version carries the full rationale. In short: the
+-- columns are inert and nothing in this release reads or writes them, but the
+-- PREVIOUS release does, and OPERATIONS.md §9 has an operator apply migrations
+-- before rolling the fleet. Dropping them here would have broken every node
+-- still running the old binary -- reproduced: `no such column: reserved_nano`,
+-- then `503 budget_unavailable` on every budgeted request. The drop is deferred
+-- one release.
+--
+-- This file executes nothing. It occupies version 6 so the number is never
+-- reused.

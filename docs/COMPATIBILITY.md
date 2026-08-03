@@ -310,6 +310,40 @@ Two things the table is deliberate about:
   wire. Modelling either as a missing capability would produce a `400` for a reason that is
   not true of the deployment.
 
+#### 7.9a Loss in the response direction, and the one case it cannot be reported
+
+Everything above is about the request. A conversion loses things in the other direction too,
+and those losses are **not** derivable from the request: the caller did not ask for four
+choices, the upstream volunteered them; the caller did not ask for `pause_turn`, the model
+stopped that way. The capability subtraction that produces the request-side report cannot see
+any of it, because it subtracts against what the *request* uses.
+
+**A buffered answer reports them exactly like a request-side loss.** The construct names reach
+`x-dorang-downgraded` and `x-dorang-dropped-params` on the same response, under the same rules,
+because the answer's bytes are rendered while its header block is still open. The response-side
+constructs are the same vocabulary as above — `rich_stop_reason` and `thinking_block` are the
+common ones on a crossing, and `n` is raised as a **downgrade** rather than as a dropped
+parameter, because collapsing four choices into one message hands the caller a different answer
+rather than the same answer with a knob unapplied. It is the same classification the request
+half gives `n`, and the two disagreeing was a defect rather than a distinction.
+
+**A streamed answer does not report them, and cannot.** The headers of an SSE response go out
+with its first event, and a stream's response-side losses are discovered as later events arrive
+— a collapsed stop reason is known at the terminating frame. There is no header block left by
+then, and there is no earlier point at which the loss is known: predicting it from the family
+pairing alone would mark every crossing stream as downgraded whether or not anything was.
+
+So the guarantee is stated as it is rather than as a rule with an unmentioned exception:
+
+> **`x-dorang-downgraded` and `x-dorang-dropped-params` report the request direction on every
+> answer, and the response direction on buffered answers only.**
+
+Nothing carries a stream's response-direction loss today, and that is recorded as a gap rather
+than closed by a mechanism that would not be true. The two channels a stream still has are an
+in-band frame — a wire-shape change, not a report — and the ledger, which is written after the
+exchange and off the response's critical path. Either would be a decision to take on its own
+terms; neither is a header.
+
 ## 8. Routing behavior is part of compatibility
 
 Reliability regressions are indistinguishable from protocol breakage to a user. The defaults

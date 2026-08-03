@@ -132,11 +132,18 @@ func TestATranscriptIsChargedForTheRecordingThroughTheWholeStack(t *testing.T) {
 // A GPU-second rate is a real thing and the request's own duration is its correct input,
 // so the two rules must not be two spellings of one behaviour once they are assembled.
 //
+// The upstream states NO billing unit here, and that is the whole of the case a
+// per_compute_second rate is for: a self-hosted deployment billed by occupancy reports
+// how long the work took and does not claim to have metered anything else. When the
+// vendor DOES state an axis, the pairing is refused —
+// [TestAWallTimeRateAgainstAVendorBilledRecordingRecordsUnpriced] is that half, and this
+// test used to be it, asserting the defect.
+//
 // It asserts a BAND rather than a figure: the quantity is a real elapsed time and the
 // only thing that can be pinned about it is that it is the request's and not the
 // recording's. The band is wide enough for a loaded machine and nowhere near 600 s.
 func TestAWallTimeRateStillChargesWallTimeThroughTheWholeStack(t *testing.T) {
-	up := transcriptionUpstream(t, "duration", 600, 40*time.Millisecond)
+	up := transcriptionUpstream(t, "", 600, 40*time.Millisecond)
 	a := newWiringApp(t, audioYAML(up.URL, `compute_seconds: "0.0001"`), nil,
 		func(o *Options) { o.Upstream = up.Client() })
 	secret := issueKey(t, a, nil)
@@ -163,6 +170,43 @@ func TestAWallTimeRateStillChargesWallTimeThroughTheWholeStack(t *testing.T) {
 	if usd >= 0.001 {
 		t.Fatalf("charged %s USD for a request that took tens of milliseconds at "+
 			"$0.0001/s: a per_compute_second rate reached for the recording's length", got)
+	}
+}
+
+// TestAWallTimeRateAgainstAVendorBilledRecordingRecordsUnpriced is the direction the
+// two-axis split left open, joined.
+//
+// It is the headline defect of ef94f58 — a ten-minute recording billed as eight seconds
+// — reached through the other axis. Splitting `seconds` into `compute_seconds` and
+// `audio_seconds` stopped an audio rate from reaching for wall time; it did not stop a
+// COMPUTE rate from being the rule that matched a request the vendor billed by the
+// recording. The unit guard was written as a list of the token components, and
+// compute_seconds is not one, so neither half of the check refused it: the rate applied,
+// the arithmetic succeeded, and 40 ms of dorang's own latency was charged against a
+// 600-second invoice with NoPrice reporting nothing wrong.
+//
+// The two durations are four orders of magnitude apart on purpose, exactly as in
+// [TestATranscriptIsChargedForTheRecordingThroughTheWholeStack]: what a wrong axis
+// produces here is a plausible small number, not an error.
+func TestAWallTimeRateAgainstAVendorBilledRecordingRecordsUnpriced(t *testing.T) {
+	// The vendor billed the RECORDING and said so. The catalog prices dorang's
+	// own wall clock.
+	up := transcriptionUpstream(t, "duration", 600, 40*time.Millisecond)
+	a := newWiringApp(t, audioYAML(up.URL, `compute_seconds: "0.0001"`), nil,
+		func(o *Options) { o.Upstream = up.Client() })
+	secret := issueKey(t, a, nil)
+
+	w := transcriptionPost(t, a, secret, "transcribe")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(server.HeaderCostUSD); got != "" {
+		t.Fatalf("charged %s USD. The vendor billed 600 s of recording; this rate is "+
+			"quoted per second of COMPUTE and was applied to the tens of milliseconds "+
+			"the request took. The invoice at $0.0001/s is $0.06 — the charge is three "+
+			"orders of magnitude under it, and it is not an error, it is a plausible "+
+			"number. A rate on an axis the vendor did not bill must record the request "+
+			"unpriced", got)
 	}
 }
 

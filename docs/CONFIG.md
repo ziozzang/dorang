@@ -785,7 +785,7 @@ capacity:
 |---|---|---|
 | `route` | `providers[].max_concurrency` | one provider |
 | `provider_group` | `capacity.provider_groups` | several providers sharing an upstream pool |
-| `model` | `capacity.models[]` | **one (key, model) pair** |
+| `model` | `capacity.models[]` | **one (provider, upstream model) pair** — every credential of that provider shares it |
 | `credential_group` | `capacity.credential_groups` | **one account, every model** |
 | `key` | `key_rotation.providers[].keys[].max_concurrency` | one key |
 | `principal` | `capacity.principals` | one caller, keyed by **API key id** |
@@ -827,9 +827,9 @@ it — listed here rather than in §23.1 because the key does not exist to be in
 |---|---|---|---|---|
 | `provider_groups.<name>.max_concurrency` | int | `0` | The provider-group ceiling | Negative is refused. **`0` is not a ceiling of zero — it means this axis does not constrain.** A group referenced by a provider but not declared here is refused |
 | `credential_groups.<name>.max_concurrency` | int | `0` | The per-account ceiling, across every model | Same. This is the axis that models "3 in flight, any model" |
-| `models[].provider` | string | — | Which provider the (key, model) ceiling belongs to | Must be declared |
+| `models[].provider` | string | — | Which provider the ceiling belongs to. It is half the axis key, and the credential is **not** the other half | Must be declared |
 | `models[].model` | string | — | The **upstream** model name the ceiling counts over | Empty is refused |
-| `models[].max_concurrency` | int | `0` | The per-(key, model) ceiling | This is the axis that models "7 per model, so two models is 14" |
+| `models[].max_concurrency` | int | `0` | The per-(provider, upstream model) ceiling | It is **per provider, not per key**: a second credential on the same provider draws from the same bucket. It also stacks with `credential_groups`, and the narrower wins — a plan capped at 7 per account will not run 7 of each of two models however this is set |
 | `principals.<id>.max_concurrent` | int | `32` for `default` | The per-caller ceiling. `<id>` is an **API key id**; the entry named `default` applies to every caller with no entry of its own | Negative is refused. A `default` entry is always present — if you do not write one, `{max_concurrent: 32}` is inserted |
 | `global.max_concurrency` | int | unset | The process- or cluster-wide ceiling | Absent means no global ceiling. Omitting the whole `global:` block is different from writing `{max_concurrency: 0}` only in intent; both leave the axis unconstrained |
 | `interactive_reserve` | float | `0.3` | The fraction of **every** axis batch work may not occupy | Must be in `[0,1)`. `1.0` or higher is refused — it would make every axis unusable by batch entirely, which is expressible as `0.999…` and is more likely a typo |
@@ -1101,7 +1101,8 @@ pricing:
     - id: plan-a-tokens
       class: marginal_usage
       match: {provider: plan-a, model: model-x}
-      rates: {input: "0.0000025", output: "0.00001", cached_read: "0.00000025"}
+      # $2.50 / $10.00 / $0.25 PER MILLION TOKENS — §13.1c.
+      rates: {input: "2.50", output: "10.00", cached_read: "0.25"}
     - id: plan-a-subscription
       class: fixed_subscription
       match: {credential: plan-a-1}
@@ -1111,6 +1112,9 @@ pricing:
       class: adjustment
       percent: "5"
 ```
+
+**Token rates are per million tokens.** Read [§13.1c](#131c-which-quantity-a-rate-is-per) before
+transcribing a card. A per-token rate is not refused, it prices every request to zero.
 
 ### 13.1 Keys
 
@@ -1122,7 +1126,7 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
-| `rules[].rates.<component>` | decimal | — | Per-unit rates. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
+| `rules[].rates.<component>` | decimal | — | Rates, each **per one unit of its component's quantity, and that quantity is a MILLION tokens for the five token components — §13.1c**. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. **A per-TOKEN rate is not refused** — it prices every request to zero while `/spend/calculate` still answers `"missing": false`, because the rule did match (§13.1c). `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
 | `rules[].period` + `rules[].amount` | string + decimal | — | A `fixed_subscription` rule's period and cost | Both required for that class; a zero amount is refused |
 | `rules[].percent` | decimal | — | An `adjustment` rule's percentage | Required for that class; zero is refused |
 
@@ -1215,6 +1219,68 @@ no-prices, because in each case the arithmetic would succeed and produce a plaus
 > `compute_seconds`, because that is what the incumbent multiplies by — the response time.
 > **If the model bills by the length of the audio, change it to `audio_seconds`**; the
 > importer warns on every such key rather than choosing for you.
+
+### 13.1c Which quantity a rate is per
+
+**A token rate is per MILLION tokens.** `input: "2.50"` means two dollars fifty per million
+input tokens, which is how every vendor prints a card. It does **not** mean $2.50 per token, and
+`"0.0000025"` — the per-token spelling of the same price — is not that price, it is that price
+divided by a million.
+
+The engine multiplies the rate by the quantity and divides by the component's divisor. There is
+one divisor table and it is not configurable:
+
+| Component | Unit | One rate covers | Divisor |
+|---|---|---|---|
+| `input`, `output`, `cached_read`, `cache_write`, `reasoning` | `per_1m_tokens` | **1,000,000 tokens** | 10⁶ |
+| `request` | `per_request` | one request | 1 |
+| `characters` | `per_1k_characters` | 1,000 characters | 10³ |
+| `compute_seconds` | `per_compute_second` | one second of request wall time (§13.1b) | 1 |
+| `audio_seconds` | `per_audio_second` | one second of recorded audio (§13.1b) | 1 |
+
+Worked, against the rule at the top of this section — 12,000 prompt tokens of which 2,000 were
+served from cache, and 800 completion tokens. The carve-out of §13.1a charges 10,000 at `input`:
+
+```
+10,000 / 1,000,000 × 2.50  = 0.025
+ 2,000 / 1,000,000 × 0.25  = 0.0005
+   800 / 1,000,000 × 10.00 = 0.008
+                             ------
+                             0.0335 USD   (33,500,000 nanoUSD)
+```
+
+The same request against the per-token spelling of the same card is **34 nanoUSD** — 0.000000034
+USD, a millionth of the true figure. Below about two hundred tokens it rounds to **exactly zero**,
+which is what most requests do, and what the whole ledger looks like.
+
+> ⚠️ **The unit was never written down, and the example shipped in the wrong one.** This file's
+> §13 example and `deploy/config.example.yaml` both carried `input: "0.0000025"` — the per-token
+> figure — into a field the engine reads per million. Everything an operator can check says the
+> configuration is correct: it parses, `dorangctl config lint` says `ok`, `dorang --check` says
+> `ok`, the rule is selected, and `POST /spend/calculate` answers **`"missing": false`** — because
+> `missing` reports that no rule matched, and one did. The only symptom is a ledger of zeroes,
+> which reads as a gateway that is not metering rather than as a rate that is wrong.
+>
+> `docs/DESIGN.md` §8.5's catalog example had it right the whole time (`"0.85"` under
+> `unit: per_1m_tokens`), so the two shipped documents disagreed and the one an operator copies
+> was the wrong one. The example is now per-million and a test prices a known request against the
+> shipped file and asserts the hand-computed figure — a test that only checked the file parses
+> passed throughout.
+
+**There is no `unit:` key in `pricing.rules`.** The inline form derives the unit from the
+component names you used, which is why a rule may not mix components from two units. The
+external catalog file *does* have `unit:`, and **an absent `unit:` there means `per_1m_tokens`**
+— so a catalog rule that writes per-token numbers and omits `unit:` fails exactly the same way.
+
+**Importing from an incumbent does not rescale.** The LiteLLM importer maps
+`input_cost_per_token` onto `rates.input` and copies the literal through unchanged, so an
+imported price list is per-token values in a per-million field: a factor of 10⁶ too cheap, with
+no warning. **Multiply every imported token rate by 1,000,000 before trusting it**, and check one
+request through `POST /spend/calculate` against the vendor's card.
+
+**How to check.** `POST /spend/calculate` with a known token count, or `dorangctl price`, and
+compare against the card by hand. `"missing": false` is not that check — it says a rule matched,
+not that the rule is right.
 
 ### 13.2 Classes compose; they do not compete
 
@@ -1841,6 +1907,22 @@ directory, which under the image's `nonroot` user is `/home/nonroot`: outside th
 the container's writable layer, and gone on restart. Losing the generated pepper makes every
 api key issued under it unverifiable.
 
+**Whoever owns that directory decides whether the gateway starts.** The image runs as uid
+`65532` and cannot create its database, spool or pepper inside a directory it does not own; the
+failure is `mkdir /var/lib/dorang/…: permission denied` at start-up, and under
+`restart: unless-stopped` it is a crash loop with no shell in the image to fix it from. Which of
+the three mount kinds you use decides whether that can happen:
+
+| Mount | Ownership | What you have to do |
+|---|---|---|
+| **Named volume** (`-v dorang-state:/var/lib/dorang`) | Docker seeds it from the image, ownership included, and the image ships the directory owned by `65532` | Nothing |
+| **Bind mount** (`-v /srv/dorang:/var/lib/dorang`) | The host directory's, always. Docker copies nothing into a bind mount | `chown 65532:65532 /srv/dorang` on the host, **before** the first start |
+| **Kubernetes volume** | `emptyDir` is world-writable and works as-is; a **PersistentVolumeClaim** is not | Set `fsGroup: 65532` in the pod's `securityContext` — `deploy/kubernetes.yaml` does |
+
+The named-volume case is the one that used to fail, and it failed in the way that is hardest to
+diagnose: Docker seeds a volume only when it CREATES it, so an operator who chowned the volume
+once out of band never saw it again and could not reproduce it.
+
 ---
 
 ## 24. Keys the schema accepts that this build does not act on
@@ -2111,8 +2193,10 @@ capacity:
     acct-2: {max_concurrency: 3}
     plan-a-account: {max_concurrency: 7}
   models:
-    - {provider: plan-a, model: model-x, max_concurrency: 7}   # per (key, MODEL)
-    - {provider: plan-a, model: model-y, max_concurrency: 7}   # so both together = 14
+    # Per (PROVIDER, upstream model). Both rules stack with plan-a-account
+    # above, and the narrower wins — see the note below.
+    - {provider: plan-a, model: model-x, max_concurrency: 7}
+    - {provider: plan-a, model: model-y, max_concurrency: 7}
   principals:
     default: {max_concurrent: 16}
   global: {max_concurrency: 64}
@@ -2160,8 +2244,12 @@ Notes that matter at this tier:
   generates its own and the keys one issues are unverifiable by the other.
 - `sample_rate: 0.2` at ~50 req/s keeps ~440 MB/day of excerpts instead of ~2.2 GB.
 - The `plan-a` numbers are the shape the axes exist for: 7 per model *and* 7 per account means
-  two models can reach 14 concurrent on one key while the account ceiling still holds at the
-  provider-group level.
+  each model has its own 7 — but `plan-a-account` above caps that key at 7 across ALL models, and
+  the narrower axis wins, so the reachable figure here is **7 in total, not 14**. Two models
+  really reaching 14 means dropping the credential group, which is what
+  `testing/providers/dual-key.yaml.tmpl` does and says. The per-model axis is keyed on
+  `(provider, upstream model)` and not on the credential, so a second key on `plan-a` would draw
+  from the same two buckets rather than opening its own.
 - `usage_probe` is what makes quota reflect traffic that did not go through dorang, and it is
   absent here because neither provider in this file has a prober. The three that do are `zai`,
   `anthropic` (an OAuth subscription, §11.2b) and `deepseek`; see §6.1a for the `allowances`

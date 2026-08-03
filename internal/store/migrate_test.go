@@ -3,6 +3,12 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -285,4 +291,90 @@ func TestMigrationsDeclareSameTables(t *testing.T) {
 			t.Errorf("table %s exists in postgres but not sqlite", tbl)
 		}
 	}
+}
+
+// TestTheIntermediateReleaseNeverNamesTheRetiredColumns is the other half of the
+// two-step deferral, and the half that decides whether the drop is safe NEXT
+// time.
+//
+// The deferral only buys anything if this release genuinely stopped using the
+// columns. If some statement still names them, the drop is not one release away
+// -- it is as far away as it ever was, and the next person to write it will be
+// working from a comment rather than from a fact.
+//
+// It looks at SQL string literals rather than at the whole file, because the
+// columns are legitimately named all over this tree in prose: the migration that
+// retires them, the DESIGN sections that explain why, this test's own fixtures.
+// What must not exist is a statement.
+func TestTheIntermediateReleaseNeverNamesTheRetiredColumns(t *testing.T) {
+	retired := []string{"reserved_nano", "reserved_until"}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var offences []string
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "vendor", "node_modules":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Tests are exempt: this file plants the previous release's own
+		// statements on purpose, and that is the point of them.
+		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, p, nil, 0)
+		if perr != nil {
+			return nil // not our business to police a file that does not parse
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			v := strings.ToLower(lit.Value)
+			if !looksLikeSQL(v) {
+				return true
+			}
+			for _, col := range retired {
+				if strings.Contains(v, col) {
+					rel, _ := filepath.Rel(root, p)
+					offences = append(offences, fmt.Sprintf("%s:%d names %s",
+						rel, fset.Position(lit.Pos()).Line, col))
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offences) > 0 {
+		t.Fatalf("this release still runs SQL against the retired budget reservation "+
+			"columns:\n  %s\n\nThe two-step deferral in migration 0006 rests on this "+
+			"release not using them: it leaves the columns in place so the PREVIOUS "+
+			"release survives the roll, and a later release drops them. A statement "+
+			"here means the drop cannot happen in the next release either.",
+			strings.Join(offences, "\n  "))
+	}
+}
+
+// looksLikeSQL keeps the scan above off struct tags, JSON names and log lines,
+// which may name a column without running one.
+func looksLikeSQL(lower string) bool {
+	for _, kw := range []string{"select ", "insert ", "update ", "delete ", "alter table"} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }

@@ -119,6 +119,40 @@ type httpQuery struct{ c *call }
 
 func (q *httpQuery) get(name string) string { return queryString(q.c.r, name) }
 
+// budgetKeys resolves a budget's subject to the keys whose cached authorization
+// envelope carries its ceiling.
+//
+// This is the third class of mutation that changes whether a request is served,
+// and the one two enumerations had each walked past — the first swept keys, the
+// second swept users and teams. A ceiling is not bookkeeping: it is
+// [auth.Limits.MaxBudgetNanoUSD] on the cached entry, and the hot path refuses a
+// subject whose recorded spend has already reached it. So lowering a team's
+// ceiling below what it has already spent is a REFUSAL, and raising one back
+// above is the operator ending an outage — and both used to land on the fleet a
+// credential-cache TTL later, exactly like a block.
+//
+// `credential` and `global` resolve to nothing: neither is a subject of the
+// credential cache. A provider credential's ceiling is enforced by
+// internal/quota against the credential's own row, and the deployment-wide
+// ceiling belongs to no key at all.
+func (c *call) budgetKeys(sub BudgetSubject) ([]string, error) {
+	switch sub.Kind {
+	case "key":
+		// Already a key id. Announcing it costs one message and needs no
+		// listing, and an id with no row behind it publishes a message that
+		// drops nothing, which is the harmless direction.
+		if c.a.cfg.Invalidator == nil || sub.ID == "" {
+			return nil, nil
+		}
+		return []string{sub.ID}, nil
+	case "user":
+		return c.ownedKeys(KeyFilter{UserID: sub.ID})
+	case "team":
+		return c.ownedKeys(KeyFilter{TeamID: sub.ID})
+	}
+	return nil, nil
+}
+
 // POST /budget/new and POST /budget/update
 //
 // They differ in one check: new refuses to overwrite an existing ceiling, and
@@ -183,6 +217,11 @@ func budgetSet(mustExist bool) handler {
 			*next.SoftBudgetNano > *next.MaxBudgetNano {
 			return badRequest("soft_budget must not exceed max_budget").withParam("soft_budget")
 		}
+		// Enumerated before the write, like every other subject mutation.
+		owned, err := c.budgetKeys(sub)
+		if err != nil {
+			return err
+		}
 		if err := bs.SetBudget(c.ctx(), next); err != nil {
 			return err
 		}
@@ -200,7 +239,12 @@ func budgetSet(mustExist bool) handler {
 		if configured {
 			beforeState = before
 		}
-		if err := c.recordAudit(action, "budget", budgetID(sub), beforeState, after); err != nil {
+		// CauseUpdated, never CauseRevoked, even when the new ceiling is below
+		// what the subject has already spent. A ceiling is a limit rather than a
+		// decision about the credential, and an operator reading a node's log
+		// should be able to tell "the budget moved" from "somebody revoked this".
+		if err := c.appliedTo(owned, CauseUpdated, action, "budget", budgetID(sub),
+			beforeState, after); err != nil {
 			return err
 		}
 		writeJSON(c.w, c.r, http.StatusOK, map[string]any{"budget": after})
@@ -264,13 +308,23 @@ func (c *call) budgetDelete() error {
 		return err
 	}
 	before := viewBudget(b)
+	owned, err := c.budgetKeys(sub)
+	if err != nil {
+		return err
+	}
 	if err := bs.ClearBudget(c.ctx(), sub); err != nil {
 		return err
 	}
 	// Recorded state matters here: clearing a budget removes the ceiling, it
 	// does not remove the spend, and an operator reading the trail later needs
 	// to see which of the two happened.
-	if err := c.recordAudit("budget.delete", "budget", budgetID(sub), before,
+	//
+	// It is announced for the same reason setting one is, and this is the
+	// direction that costs an outage rather than an overspend: clearing the
+	// ceiling is how an operator lets a subject that has hit its budget serve
+	// again, and until this published, the fleet went on refusing for a
+	// credential-cache TTL after the operator had already lifted the limit.
+	if err := c.appliedTo(owned, CauseUpdated, "budget.delete", "budget", budgetID(sub), before,
 		map[string]any{"max_budget": nil, "soft_budget": nil, "spend_preserved": true}); err != nil {
 		return err
 	}

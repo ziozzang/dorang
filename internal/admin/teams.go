@@ -174,6 +174,13 @@ func (c *call) teamNew() error {
 	if t.Name == "" {
 		return badRequest("team_name is required").withParam("team_name")
 	}
+	// The same case as `/user/new`, for the same reason: the id is the caller's,
+	// so a key may already carry it and be about to acquire an envelope it did
+	// not have. On a freshly minted id this finds nothing.
+	owned, err := c.ownedKeys(KeyFilter{TeamID: t.ID})
+	if err != nil {
+		return err
+	}
 	if err := d.CreateTeam(c.ctx(), t); err != nil {
 		if errors.Is(err, ErrConflict) {
 			return newFault(http.StatusConflict, CodeConflict, typeInvalidRequest,
@@ -182,7 +189,7 @@ func (c *call) teamNew() error {
 		return err
 	}
 	view := viewTeam(t, nil)
-	if err := c.recordAudit("team.new", "team", t.ID, nil, view); err != nil {
+	if err := c.appliedTo(owned, CauseUpdated, "team.new", "team", t.ID, nil, view); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"team": view})
@@ -254,12 +261,24 @@ func (c *call) teamUpdate() error {
 	if err := spec.apply(&updated); err != nil {
 		return err
 	}
+	// The team half of `/user/update`'s reasoning, and the wider blast radius of
+	// the two: `{"blocked": true}` here is how an operator stops a whole team's
+	// access at once, and every key on the team was honouring it a credential
+	// cache TTL later on every node that did not serve this call.
+	owned, err := c.ownedKeys(KeyFilter{TeamID: id})
+	if err != nil {
+		return err
+	}
+	cause := CauseUpdated
+	if updated.Blocked && !t.Blocked {
+		cause = CauseRevoked
+	}
 	updated.UpdatedAt = c.a.now().UTC()
 	if err := d.UpdateTeam(c.ctx(), &updated); err != nil {
 		return err
 	}
 	after := viewTeam(&updated, members)
-	if err := c.recordAudit("team.update", "team", id, before, after); err != nil {
+	if err := c.appliedTo(owned, cause, "team.update", "team", id, before, after); err != nil {
 		return err
 	}
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"team": after})
@@ -292,6 +311,7 @@ func (c *call) teamDelete() error {
 		return badRequest("team_ids must name at least one team").withParam("team_ids")
 	}
 	before := make([]teamView, 0, len(ids))
+	var owned []string
 	for _, id := range ids {
 		t, err := d.GetTeam(c.ctx(), id)
 		if err != nil {
@@ -305,12 +325,18 @@ func (c *call) teamDelete() error {
 			return err
 		}
 		before = append(before, viewTeam(t, members))
+		// Before the delete, for the reason `/user/delete` does it first.
+		ks, err := c.ownedKeys(KeyFilter{TeamID: id})
+		if err != nil {
+			return err
+		}
+		owned = append(owned, ks...)
 	}
 	n, err := d.DeleteTeams(c.ctx(), ids)
 	if err != nil {
 		return err
 	}
-	if err := c.recordAudit("team.delete", "team", strings.Join(ids, ","),
+	if err := c.appliedTo(owned, CauseRevoked, "team.delete", "team", strings.Join(ids, ","),
 		map[string]any{"teams": before}, map[string]any{"deleted": n}); err != nil {
 		return err
 	}
@@ -385,6 +411,12 @@ func (s *memberSpec) resolve() (userID, role string) {
 }
 
 // POST /team/member_add
+//
+// Nothing is announced here, and it is the one subject route where that is a
+// decision rather than an omission: a `team_members` row feeds no cached
+// authorization decision. A key's team is `api_keys.team_id` and its
+// administrative scope is derived from that same column, so adding a user to a
+// team changes neither. See the note in invalidation.go.
 func (c *call) teamMemberAdd() error {
 	d, err := c.a.directory()
 	if err != nil {
@@ -441,6 +473,10 @@ func (c *call) teamMemberAdd() error {
 }
 
 // POST /team/member_delete
+//
+// Announces nothing, for the reason [call.teamMemberAdd] does. Removing a person
+// from a team does not stop their key serving; `/user/update` with
+// `{"blocked": true}` is the control that does, and it announces.
 func (c *call) teamMemberDelete() error {
 	d, err := c.a.directory()
 	if err != nil {

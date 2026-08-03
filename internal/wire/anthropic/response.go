@@ -167,7 +167,19 @@ func EncodeResponse(r *canonical.Response, opt *ResponseOptions) (*EncodedRespon
 	if len(r.Choices) > 1 {
 		// One message, one turn. n > 1 has no shape here and COMPATIBILITY 10
 		// marks multi-choice as unspecified, so it is reported and not guessed.
-		loss.DropParam("n")
+		//
+		// A DOWNGRADE, not a dropped param, and the distinction is the whole
+		// difference between the two channels. [canonical.CapMultipleChoices] is
+		// Material — the caller is handed a different answer, not the same answer
+		// with a knob unapplied — and the REQUEST half already says so at
+		// [canonical.Request.MaterialLoss], which raises exactly this construct
+		// with exactly this detail. Reporting it here as droppable was one
+		// construct with two classifications: `n: 4` refused with a 400 on the
+		// way out, and the same fact whispered into x-dorang-dropped-params on
+		// the way back, where a client that consented to the loss reads the
+		// header that means "a knob was not applied".
+		loss.Downgrade(canonical.ConstructMultipleChoices,
+			"n: "+strconv.Itoa(len(r.Choices))+" choice(s) collapsed to one message")
 	}
 	out.Content = []ContentBlock{}
 	if len(r.Choices) > 0 {

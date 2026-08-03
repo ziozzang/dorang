@@ -51,10 +51,53 @@ var componentInfo = [numComponents]struct {
 	cAudioSeconds:   {"audio_seconds", "audio_seconds", UnitPerAudioSecond, microsPerSecond, 6},
 }
 
-// tokenComponents is the set of components that price a token count. It is what
-// [noPriceReason] asks about when the vendor said it billed by duration.
+// tokenComponents is the set of components that price a token count.
 var tokenComponents = [numComponents]bool{
 	cInput: true, cOutput: true, cCacheRead: true, cCacheWrite: true, cReasoning: true,
+}
+
+// meteredComponents are the components that price a QUANTITY OF THE REQUEST —
+// something the vendor measured and put on the invoice. [noPriceReason] refuses
+// a rate on any of them that is not the quantity the vendor said it billed.
+//
+// cRequest is deliberately absent, and it is the only one. A per-request fee
+// prices the EXISTENCE of the call rather than a quantity of it, so it makes no
+// claim about which axis the vendor metered and cannot be applied to the wrong
+// one. Including it would refuse the ordinary catalog — a default rule carrying
+// `request: "0.001"` beside everything else — for a request whose vendor simply
+// stated its billing unit.
+var meteredComponents = [numComponents]bool{
+	cInput: true, cOutput: true, cCacheRead: true, cCacheWrite: true, cReasoning: true,
+	cCharacters: true, cComputeSeconds: true, cAudioSeconds: true,
+}
+
+// billedQuantities is, for each STATED billing unit, the set of metered
+// quantities that unit puts on the invoice.
+//
+// # Why this is a whitelist
+//
+// It used to be a blacklist: "if the vendor billed a duration, refuse the token
+// rates", spelled with [tokenComponents]. That shape can only refuse what
+// somebody remembered to enumerate, and it left two directions open — a
+// `per_compute_second` rate was refused by neither. Reproduced: a rule quoting
+// compute seconds against a 600-second recording the vendor billed BY DURATION
+// charged 8 seconds of dorang's own wall time, `NoPrice=0`. That is the headline
+// defect of ef94f58, a ten-minute recording billed as eight seconds, reachable
+// again through the axis the split was supposed to have separated. The mirror
+// case — the same rate against a token-billed request — was open too.
+//
+// Stated as a whitelist, a component that nobody thought about is refused rather
+// than billed, and a NEW component added to this file is refused by default
+// until it is listed here. That is the direction the mistake has to fall in: an
+// unpriced request is reported and disputed, a wrongly-priced one is invoiced.
+var billedQuantities = map[BilledUnit][numComponents]bool{
+	BilledTokens: {
+		cInput: true, cOutput: true, cCacheRead: true, cCacheWrite: true, cReasoning: true,
+	},
+	// A stated duration is the RECORDING the vendor metered, never how long
+	// dorang's own request took. cComputeSeconds is absent for exactly that
+	// reason, and its absence is the fix.
+	BilledDuration: {cAudioSeconds: true},
 }
 
 // rateSet holds the rates a rule (or one of its tiers) declares.

@@ -836,11 +836,36 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 			"was clamped to zero (a credit may zero a request out, not pay the caller)",
 			dec.Provider, dec.UpstreamModel)
 	}
+	// charged is the ONE figure this request costs, and every counter below
+	// takes it from here.
+	//
+	// It used to be read twice: the ledger row read it inside the switch and the
+	// quota counter read cost.TotalNano from a line outside it. Two arms of that
+	// switch record nothing, and the line outside them charged the plan share
+	// anyway — quota +32.26 USD against a ledger row of 0.00, on one request
+	// that produced no billable line, with the plan accumulator advanced past it
+	// for good. A single variable is the fix, and it is the shape rather than the
+	// value: there is no longer a path through this function on which the two can
+	// differ, because there is no second read.
+	var charged int64
 	switch {
 	case cost.Missing:
 		// §8.3: an unpriced model warns rather than costing zero in silence.
-		d.logf("app: no marginal price rule matched %s/%s; the request is unpriced",
+		d.logf("app: no marginal price rule matched %s/%s; the request has no marginal price",
 			dec.Provider, dec.UpstreamModel)
+		// It is not necessarily free, and this is the arm where that matters
+		// most. A flat plan is a catalog with NO marginal_usage rule at all
+		// (§8.1), so every one of its requests arrives here, and the plan
+		// share pricing attributed is the whole of what this row costs.
+		// Recording nothing would have left `subscription_spend` without a
+		// producer for exactly the plans it exists for, while the period's
+		// accumulator advanced on every request — the plan cost apportioned
+		// to rows that all report zero.
+		charged = cost.TotalNano
+		rq.Result.CostNanoUSD = charged
+		rq.Result.MarginalNanoUSD = cost.MarginalNano
+		rq.Result.SubscriptionNanoUSD = cost.SubscriptionNano
+		rq.Result.Priced = charged != 0 || cost.SubscriptionNano != 0
 	case cost.NoPrice != pricing.NoPriceNone:
 		// A rule matched and could not be applied, which is a DIFFERENT catalog
 		// error from having no rule and has a different fix: the catalog says the
@@ -850,10 +875,16 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		// forbid is charging one billing unit's rate against another unit's
 		// number, which produces a plausible figure and no error at all.
 		d.logf("app: price rule %s matched %s/%s and could not price it on %s: %s; "+
-			"the request is unpriced", cost.NoPriceRule, dec.Provider, dec.UpstreamModel,
+			"the request is unpriced and charges nothing — no marginal cost, no plan "+
+			"share, no quota", cost.NoPriceRule, dec.Provider, dec.UpstreamModel,
 			cost.NoPriceQuantity, cost.NoPrice.Why())
+		// charged stays zero, and internal/pricing has already made every
+		// class of the returned Cost zero as well: an unpriceable request
+		// does not advance the plan accumulator, so the share it would have
+		// taken is still there for the next row of the period.
 	default:
-		rq.Result.CostNanoUSD = cost.TotalNano
+		charged = cost.TotalNano
+		rq.Result.CostNanoUSD = charged
 		// The decomposition of the number on the line above, by pricing class —
 		// and it travels WITH that number rather than beside it, so a row can
 		// never report a plan share larger than the total it is part of.
@@ -865,11 +896,6 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		// separate fields, never conflated", conflated. The column, its reader
 		// in /spend/logs and its JSON name all existed; nothing wrote it.
 		//
-		// An unpriced model records no cost at all, plan share included. That is
-		// §8.3's existing rule — the log line above is how it is reported — and
-		// it stays here rather than being quietly widened, because a row whose
-		// `spend` is zero and whose `subscription_spend` is not would be a
-		// second wrong answer rather than a fix.
 		rq.Result.MarginalNanoUSD = cost.MarginalNano
 		rq.Result.SubscriptionNanoUSD = cost.SubscriptionNano
 		rq.Result.Priced = true
@@ -883,8 +909,11 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		rq.Result.NotionalPriced = true
 	}
 
+	// The same figure the ledger row took, never a second reading of the Cost.
+	// The token and request counters are measurements and are recorded whatever
+	// the catalog could or could not say about the price.
 	st.quota.record(dec.Credential, now, quota.Usage{
-		CostNanoUSD:  cost.TotalNano,
+		CostNanoUSD:  charged,
 		TokensInput:  int64(res.usage.InputTokens),
 		TokensOutput: int64(res.usage.OutputTokens),
 		Requests:     1,

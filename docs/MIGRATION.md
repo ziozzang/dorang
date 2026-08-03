@@ -331,11 +331,71 @@ to "is this worth importing at all".
 | `--commit` | write. Without it nothing is written and the report is identical |
 | `--table` | source table, default `LiteLLM_VerificationToken` |
 | `--on-missing-team` | `skip` (default) refuses a key whose team is absent — see §3.3 for why that failure is the safe one — or `orphan` to import it with the team dropped |
+| `--on-untranslatable` | `skip` (default) refuses a key whose allow-list holds an idiom dorang cannot express, or `clear` to import it with that allow-list dropped. See §3.6 |
+| `--object-permission-table` | source table an `object_permission_id` points into, default `LiteLLM_ObjectPermissionTable`. It is **read**: see §3.6 |
 | `--limit` | read at most N source rows, for a first look at a large table |
 | `--expect-admin-key` | say so if you believe the administrative credential is among the rows. It never is, and the report will explain why |
 
 Re-running is safe: a key already present is left untouched and counted, so a re-import cannot
 undo a revocation you made in between.
+
+### 3.6 The three idioms that do not mean the same thing on the other side
+
+The import carries the incumbent's authorization columns verbatim. Three of them are not
+statements dorang can read as written, and the first of the three is the reason this section
+exists at all.
+
+Measured against a live incumbent with 54 keys: the arithmetic was exact — 54 scanned, 4
+imported, 50 skipped for a missing team, every `lookup` matching `sha256(token)[:32]` of the
+source digest — and all three idioms crossed as data with their meaning gone. The report said
+nothing about any of them. It does now: every one of them appears in the report with the key,
+the column and the value.
+
+**1. `object_permission_id` — the one that failed OPEN, and is now resolved.**
+A key's model restriction may live in the key's own `models` column *or* in a row of
+`LiteLLM_ObjectPermissionTable` that the key points at. Carrying the id without reading that
+table left dorang's `models` **empty**, and an empty allow-list allows **every** model — a key
+silently gaining access it did not have.
+
+The import now **reads that table** and folds the row's `models` into the key's own allow-list,
+taking the intersection where both restrict. The report counts each one under *object
+permissions resolved*. When the id **cannot** be resolved — the table is unreadable, the row is
+absent, the row restricts something dorang has no allow-list for (`vector_stores`,
+`mcp_servers`), or the key and the row have no model in common — **the key is refused and
+named.** `--on-untranslatable=clear` does not apply to it, in either direction: clearing this
+one drops a restriction rather than an unmatchable literal, and a widening is not something a
+flag should decide.
+
+**2. `allowed_routes: {llm_api_routes}` — a route group, not a path.**
+The incumbent expands group names into sets of paths. dorang matches literal paths, `*`, or a
+prefix ending `/*`, so a group name matches no request and the key is refused **every** route
+with `403 route_not_allowed` — including `/v1/models`. Three of the four importable keys on the
+live database carried this.
+
+**3. `models: {all-team-models}` — a sentinel, not a model.**
+Same shape, same direction: `all-team-models`, `all-proxy-models`, `all-model-access` and
+`no-default-models` are instructions about the set of model names, and dorang reads them as one
+literal model nobody serves. Two live keys carried this.
+
+Both of the last two fail **closed**, which is why they are second priority and not third: the
+key authenticates and can do nothing. Both are refused by default and named in the report. To
+import them anyway:
+
+```
+dorangctl import keys --from <dsn> --on-untranslatable=clear --commit
+```
+
+`clear` drops the allow-list dorang could not express, which at key level means **unrestricted**
+— a widening. It is opt-in for that reason, and every key it touches is named in the report as
+`cleared`. For the model sentinels it clears the *whole* key-level list rather than the sentinel
+entry, because a union containing "every team model" *is* every team model: dropping the
+sentinel and keeping the literal beside it would leave the key narrower than the incumbent had
+it, which is a different wrong answer and a quieter one. A key left unrestricted at key level is
+still bounded by its team's and its user's limits.
+
+Route groups are detected by shape, not by a list of names: anything that is not a path and is
+not `*` is a name for a set dorang cannot enumerate. A group this code has never heard of is
+refused too, which is the only direction that cannot fail open.
 
 > **This section used to say the opposite, and it was right at the time.** It read *"There is
 > no CLI entry point for credential import … no `dorangctl` subcommand and no administrative

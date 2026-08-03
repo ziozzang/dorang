@@ -182,13 +182,47 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		marginal = m
 	}
 
+	// An UNPRICEABLE request charges nothing, in every billing class.
+	//
+	// # The distinction this turns on, and why it is not cost.Missing
+	//
+	// The marginal class refuses in two different ways and they are not the same
+	// fact. `Missing` means the catalog says NOTHING about this model's marginal
+	// cost — which is the ordinary shape of a flat plan, whose whole price is the
+	// subscription and which has no marginal_usage rule at all
+	// ([TestSubscriptionAttributionIsUnchangedWithoutAMarginalRule] pins it). The
+	// plan share is the right answer there and it accrues as it always has.
+	//
+	// `NoPrice` is the other one: a rule MATCHED and could not be applied. The
+	// catalog says the wrong thing about this model rather than nothing, the
+	// request produces no billable row anywhere, and there is nothing for a plan
+	// share to be a share OF.
+	//
+	// # What the NoPrice arm used to do
+	//
+	// The `break` above leaves the switch, not compute, so this ran with
+	// settle=true and ADVANCED the period's accumulator — and the accumulator
+	// only ever moves forward, so what it took could not be given back. Measured:
+	// 32.26 USD of a 100.00 USD plan, ten days into the period, on one unpriceable
+	// request; quota +32.26, ledger 0.00.
+	//
+	// # Withholding costs the plan nothing
+	//
+	// The share is a function of ELAPSED TIME, not of requests: `accrue` returns
+	// plan_cost x elapsed/period and the accumulator holds what has been
+	// attributed so far, so the next priceable row in the same period takes
+	// everything that accrued while the unpriceable ones passed through. The
+	// share is DEFERRED, never lost. The previous behaviour is the one that lost
+	// it, by attributing it to a row that reported nothing.
+	unpriced := cost.NoPrice != NoPriceNone
+
 	// fixed_subscription: the most specific rule wins, then this request takes the share
 	// of the plan cost that has accrued since the previous settlement.
 	if ex != nil {
 		trace = &ex.Classes[ClassSubscription]
 	}
 	var subscription amt
-	if sub := c.idx[ClassSubscription].selectWinner(req, at, &ev.examined, trace); sub != nil {
+	if sub := c.idx[ClassSubscription].selectWinner(req, at, &ev.examined, trace); sub != nil && !unpriced {
 		s, err := c.subscriptionShare(sub, at, settle)
 		if err != nil {
 			return Cost{}, err
@@ -201,12 +235,22 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 	}
 
 	// adjustment: every matching rule applies, in order.
+	//
+	// Withheld on an unpriced request for the same reason and by the same rule.
+	// An `add` adjustment is the one that makes this more than tidiness: it does
+	// not scale the base, so it would produce a non-zero TotalNano on a request
+	// with no marginal cost and no plan share, and the disagreement between the
+	// quota counter and the ledger row would be back with a different sign.
 	if ex != nil {
 		trace = &ex.Classes[ClassAdjustment]
 	}
-	adjustment, err := c.applyAdjustments(req, at, ev, marginal, subscription, &cost, trace)
-	if err != nil {
-		return Cost{}, err
+	var adjustment amt
+	if !unpriced {
+		a, err := c.applyAdjustments(req, at, ev, marginal, subscription, &cost, trace)
+		if err != nil {
+			return Cost{}, err
+		}
+		adjustment = a
 	}
 
 	// notional_rate: what this traffic would have cost at list rates. Never billed.
@@ -246,7 +290,7 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 	}
 
 	// Round once, at the end, half-to-even, carrying the sub-nano remainder.
-	mNano, sNano, aNano, nNano, err := c.roundOut(req, settle, marginal, subscription, adjustment, notional)
+	mNano, sNano, aNano, nNano, err := c.roundOut(req, settle, !unpriced, marginal, subscription, adjustment, notional)
 	if err != nil {
 		return Cost{}, err
 	}
@@ -301,7 +345,7 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 // sum of the three reported fields and reconciliation cannot drift by a stray nano. When
 // settling, each class keeps its own carried remainder, so a stream of sub-nano requests
 // accumulates to the exact amount instead of rounding to zero forever.
-func (c *Catalog) roundOut(req *Request, settle bool, m, s, a, n amt) (int64, int64, int64, int64, error) {
+func (c *Catalog) roundOut(req *Request, settle, priced bool, m, s, a, n amt) (int64, int64, int64, int64, error) {
 	var carry carrySet
 	var slot *carrySet
 	if settle {
@@ -317,6 +361,29 @@ func (c *Catalog) roundOut(req *Request, settle bool, m, s, a, n amt) (int64, in
 			c.carries[bucket] = slot
 		}
 		carry = *slot
+	}
+	if !priced {
+		// The three billing classes are zero on an unpriced request, and they
+		// neither read nor advance their carried remainders. A remainder is the
+		// unpaid fraction of a PREVIOUS charge; adding it to a request that is
+		// not being charged would round a zero up to one nano and put a
+		// marginal cost on a row the ledger records as unpriced — which is the
+		// same disagreement this whole branch exists to remove, one nano wide.
+		//
+		// The notional estimate still settles. It is excluded from TotalNano by
+		// construction (§8.5), internal/app records it on an unpriced row —
+		// it is the one figure that still means something there, "what this
+		// would have cost at list rates" — and its remainder is what stops a
+		// sub-nano list rate from rounding to zero forever.
+		nNano, nCarry, err := roundToNano(n, carry.notional)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+		if slot != nil {
+			carry.notional = nCarry
+			*slot = carry
+		}
+		return 0, 0, 0, nNano, nil
 	}
 	mNano, mCarry, err := roundToNano(m, carry.marginal)
 	if err != nil {
@@ -496,23 +563,32 @@ func effectiveRates(r *rule, req *Request) rateSet {
 // being visibly wrong.
 func noPriceReason(r *rule, req *Request) (NoPriceReason, string) {
 	rates := effectiveRates(r, req)
-	if rates.set[cAudioSeconds] {
-		if req.Billed == BilledTokens {
-			return NoPriceVendorBilledTokens, componentInfo[cAudioSeconds].name
+
+	// The axis the vendor billed on, when it said. Asked as a whitelist —
+	// see [billedQuantities] — because the blacklist this replaces refused
+	// only the directions somebody had enumerated, and it left the
+	// `per_compute_second` rate unguarded in BOTH directions: eight seconds
+	// of dorang's wall time charged for a ten-minute recording the vendor
+	// billed by duration, with NoPrice reporting nothing wrong.
+	if allowed, stated := billedQuantities[req.Billed]; stated {
+		for i := 0; i < numComponents; i++ {
+			if !rates.set[i] || !meteredComponents[i] || allowed[i] {
+				continue
+			}
+			if req.Billed == BilledTokens {
+				return NoPriceVendorBilledTokens, componentInfo[i].name
+			}
+			return NoPriceVendorBilledDuration, componentInfo[i].name
 		}
-		if req.AudioSeconds == 0 {
-			return NoPriceAudioNotMeasured, componentInfo[cAudioSeconds].name
-		}
+	}
+
+	// A duration of zero is an absence rather than a measurement, whether or
+	// not the vendor stated an axis.
+	if rates.set[cAudioSeconds] && req.AudioSeconds == 0 {
+		return NoPriceAudioNotMeasured, componentInfo[cAudioSeconds].name
 	}
 	if rates.set[cComputeSeconds] && req.Seconds == 0 {
 		return NoPriceComputeNotMeasured, componentInfo[cComputeSeconds].name
-	}
-	if req.Billed == BilledDuration && !rates.set[cAudioSeconds] {
-		for i := 0; i < numComponents; i++ {
-			if rates.set[i] && tokenComponents[i] {
-				return NoPriceVendorBilledDuration, componentInfo[i].name
-			}
-		}
 	}
 	return NoPriceNone, ""
 }
