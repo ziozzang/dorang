@@ -148,7 +148,10 @@ general_settings:
 		t.Errorf("max_conns = %d, want 20", c.Storage.Postgres.MaxConns)
 	}
 
-	// Per-token costs become pricing rules with the literal decimals intact.
+	// Per-TOKEN costs become per-MILLION-token rates. The source file quotes
+	// $2.50 and $10.00 per million the only way it can — as a figure per token —
+	// and dorang's rates.input is per million (§13.1c), so the literal cannot
+	// come through unchanged. This assertion used to demand that it did.
 	if len(c.Pricing.Rules) != 1 {
 		t.Fatalf("pricing rules = %+v", c.Pricing.Rules)
 	}
@@ -156,8 +159,14 @@ general_settings:
 	if r.Class != PricingMarginalUsage || r.Match.Provider != "openai" || r.Match.Model != "gpt-4o" {
 		t.Errorf("pricing rule = %+v", r)
 	}
-	if r.Rates["input"] != "0.0000025" || r.Rates["output"] != "0.00001" {
-		t.Errorf("rates = %+v, want the literals from the file", r.Rates)
+	if r.Rates["input"] != "2.5" || r.Rates["output"] != "10" {
+		t.Errorf("rates = %+v, want input 2.5 and output 10 per MILLION tokens. "+
+			"The literals from the file (0.0000025, 0.00001) are the same prices per ONE "+
+			"token, and in this field they price every request to a millionth (§13.1c)",
+			r.Rates)
+	}
+	if !warningsContain(warnings, "model_list", "were CONVERTED to dorang's quantities") {
+		t.Errorf("the rescaling was not reported:\n%s", warningStrings(warnings))
 	}
 
 	// The result is a configuration that validates.
@@ -394,6 +403,193 @@ unknown_section:
 	// A literal master key is not carried over.
 	if c.Server.MasterKeyEnv != "DORANG_MASTER_KEY" {
 		t.Errorf("a literal master key leaked into the configuration: %q", c.Server.MasterKeyEnv)
+	}
+}
+
+// TestImportConvertsEveryRateItCarries walks the conversion table of
+// priceFieldByKey: every rate key the source format can express, against the
+// component and the quantity dorang prices in.
+//
+// One field copied verbatim across a unit boundary meant the table had never
+// been written down, so the test is the table: a key that is added without a
+// scale fails here rather than in an operator's ledger.
+func TestImportConvertsEveryRateItCarries(t *testing.T) {
+	c, warnings, err := ImportProxyConfig([]byte(`
+model_list:
+  - model_name: chat
+    litellm_params:
+      model: gpt-4o
+      custom_llm_provider: openai
+      api_key: os.environ/K
+      input_cost_per_token: 0.0000025
+      output_cost_per_token: 0.00001
+      cache_read_input_token_cost: 0.00000025
+      cache_creation_input_token_cost: 0.000003125
+      output_cost_per_reasoning_token: 0.00002
+  - model_name: chars
+    litellm_params:
+      model: gemini-1.5-pro
+      custom_llm_provider: gemini
+      api_key: os.environ/G
+      input_cost_per_character: 0.000000125
+  - model_name: gpu
+    litellm_params:
+      model: whisper-1
+      custom_llm_provider: vllm
+      api_base: https://gpu.invalid
+      api_key: os.environ/V
+      input_cost_per_second: "0.0001"
+      input_cost_per_request: "0.002"
+`))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	// Per token → per MILLION tokens: $2.50, $10.00, $0.25, $3.125, $20.00.
+	want := map[string]map[string]string{
+		"openai/gpt-4o": {
+			"input":       "2.5",
+			"output":      "10",
+			"cached_read": "0.25",
+			"cache_write": "3.125",
+			"reasoning":   "20",
+		},
+		// Per character → per 1,000 characters: $0.125 per million characters
+		// is $0.000125 per thousand.
+		"gemini/gemini-1.5-pro": {"characters": "0.000125"},
+		// Per second and per request are dorang's own quantities: unchanged.
+		"vllm/whisper-1": {"compute_seconds": "0.0001", "request": "0.002"},
+	}
+	got := map[string]map[string]string{}
+	for _, r := range c.Pricing.Rules {
+		key := r.Match.Provider + "/" + r.Match.Model
+		if got[key] == nil {
+			got[key] = map[string]string{}
+		}
+		for comp, rate := range r.Rates {
+			got[key][comp] = string(rate)
+		}
+	}
+	for model, rates := range want {
+		for comp, rate := range rates {
+			if got[model][comp] != rate {
+				t.Errorf("%s rates.%s = %q, want %q\nall: %+v",
+					model, comp, got[model][comp], rate, got[model])
+			}
+		}
+	}
+
+	// A rule carries one unit, so the per-second and per-request rates of one
+	// model are two rules rather than one that cannot be assembled.
+	for _, r := range c.Pricing.Rules {
+		if _, ok := PricingUnit(sortedKeys(r.Rates)); !ok {
+			t.Errorf("rule %s mixes units: %+v", r.ID, r.Rates)
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("the imported configuration does not validate: %v\nwarnings:\n%s",
+			err, warningStrings(warnings))
+	}
+	// And nothing it converted is small enough to look like a per-token figure.
+	if a := c.Advisories(); len(a) != 0 {
+		t.Errorf("the converted rates still look like per-token figures: %+v", a)
+	}
+}
+
+// TestImportReadsAFloatPrintersExponent is the shape a rate actually arrives
+// in. The source file is written by a program that formats floats, so "2.5e-06"
+// is as common as "0.0000025" — and it is a decimal dorang refuses to STORE
+// (§13.1c). The importer is the one place that reads it, and it writes the
+// digits out.
+func TestImportReadsAFloatPrintersExponent(t *testing.T) {
+	c, warnings, err := ImportProxyConfig([]byte(`
+model_list:
+  - model_name: chat
+    litellm_params:
+      model: gpt-4o
+      custom_llm_provider: openai
+      api_key: os.environ/K
+      input_cost_per_token: 2.5e-06
+      output_cost_per_token: 1E-5
+`))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	r := c.Pricing.Rules[0]
+	if r.Rates["input"] != "2.5" || r.Rates["output"] != "10" {
+		t.Errorf("rates = %+v, want input 2.5 and output 10", r.Rates)
+	}
+	for comp, rate := range r.Rates {
+		if err := checkDecimal(string(rate)); err != nil {
+			t.Errorf("rates.%s = %q, which this package will not load: %v", comp, rate, err)
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("does not validate: %v\n%s", err, warningStrings(warnings))
+	}
+}
+
+// TestImportWillNotSilentlyHalveAPerSecondRate covers the one pair of keys the
+// source format adds together: it multiplies input_cost_per_second AND
+// output_cost_per_second by the same elapsed time. dorang prices wall time
+// once, so keeping the first quietly would be a rate that is plausible and too
+// low — this section's own defect, one field over.
+func TestImportWillNotSilentlyHalveAPerSecondRate(t *testing.T) {
+	c, warnings, err := ImportProxyConfig([]byte(`
+model_list:
+  - model_name: gpu
+    litellm_params:
+      model: llama-3
+      custom_llm_provider: vllm
+      api_base: https://gpu.invalid
+      api_key: os.environ/V
+      input_cost_per_second: "0.0001"
+      output_cost_per_second: "0.0002"
+`))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if got := string(c.Pricing.Rules[0].Rates["compute_seconds"]); got != "0.0001" {
+		t.Errorf("compute_seconds = %q, want the first rate kept", got)
+	}
+	if !warningsContain(warnings, "", "write their SUM") {
+		t.Errorf("the second per-second rate was dropped without saying so:\n%s",
+			warningStrings(warnings))
+	}
+}
+
+// TestImportNamesTheRatesItCannotPrice is the other half of the conversion
+// table: a rate with no axis here is reported as a RATE, not as an unknown
+// parameter. "This parameter has no equivalent" about a price reads as "nothing
+// was lost", and something was.
+func TestImportNamesTheRatesItCannotPrice(t *testing.T) {
+	_, warnings, err := ImportProxyConfig([]byte(`
+model_list:
+  - model_name: m
+    litellm_params:
+      model: gpt-4o
+      custom_llm_provider: openai
+      api_key: os.environ/K
+      input_cost_per_image: "0.001"
+      input_cost_per_video_per_second: "0.002"
+      input_cost_per_audio_token: "0.0000001"
+      input_cost_per_token_batches: "0.00000125"
+      input_cost_per_token_above_128k_tokens: "0.000005"
+`))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	for _, want := range []struct{ path, msg string }{
+		{"model_list[0].litellm_params.input_cost_per_image", "no per-image unit"},
+		{"model_list[0].litellm_params.input_cost_per_video_per_second", "second of video"},
+		{"model_list[0].litellm_params.input_cost_per_audio_token", "charged at the input rate"},
+		{"model_list[0].litellm_params.input_cost_per_token_batches", "no batch rate card"},
+		{"model_list[0].litellm_params.input_cost_per_token_above_128k_tokens", "TIER"},
+	} {
+		if !warningsContain(warnings, want.path, want.msg) {
+			t.Errorf("no warning at %s about %q\ngot:\n%s",
+				want.path, want.msg, warningStrings(warnings))
+		}
 	}
 }
 

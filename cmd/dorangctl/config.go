@@ -67,6 +67,13 @@ func (e env) configLint(args []string) int {
 			fmt.Fprintf(e.stdout, "%s: ok (secrets not readable here, see warnings)\n", path)
 			continue
 		}
+		// A configuration can be valid and still say something nobody meant.
+		// These do not fail the lint — pricing must never be what stops a
+		// gateway serving — but an `ok` with nothing else printed is exactly
+		// how a rate a millionth of its true value reaches production.
+		for _, a := range cfg.Advisories() {
+			fmt.Fprintf(e.stderr, "%s: warning: %s\n", path, a)
+		}
 		fmt.Fprintf(e.stdout, "%s: ok — %d provider(s), %d credential(s), %d model group(s)\n",
 			path, len(cfg.Providers), len(cfg.Credentials), len(cfg.Models))
 	}

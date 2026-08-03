@@ -89,6 +89,12 @@ var strategyByName = map[string][]string{
 // providers the source file actually declares. It is never split on a
 // separator, and anything that cannot be resolved is reported and kept whole
 // (§2.1 rule 5).
+//
+// Rates are CONVERTED, not copied. The source format quotes a token price per
+// one token and dorang's `rates.input` is per a million of them, so a literal
+// that came through unchanged was a price a millionth of the vendor's — silently,
+// because the rule still matched. [priceFieldByKey] is the whole conversion
+// table and the conversion itself is exact: a decimal point moves.
 func ImportProxyConfig(data []byte) (*Config, []Warning, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil {
@@ -138,6 +144,7 @@ func ImportProxyConfig(data []byte) (*Config, []Warning, error) {
 		im.importGeneralSettings(n)
 	}
 
+	im.reportRateConversions()
 	im.cfg.ApplyDefaults()
 	im.cfg.buildIndex()
 	return im.cfg, im.warnings, nil
@@ -154,6 +161,14 @@ type importer struct {
 	// priceSeen guards against two entries pricing the same (provider, model)
 	// differently.
 	priceSeen map[string]string
+	// priceKeyByComp records which of the incumbent's keys a component's rate
+	// came from, so a collision between two of them can name both.
+	priceKeyByComp map[string]string
+
+	// convertedRates counts the rates whose quantity was not dorang's, and
+	// firstConversion holds one of them verbatim for the summary line.
+	convertedRates  int
+	firstConversion string
 }
 
 // suggestEnvName invents the environment variable a literal secret should move
@@ -453,29 +468,29 @@ func (im *importer) importParams(path string, params *yamlMap, provider string, 
 		case "additional_drop_params":
 			im.applyDropList(p+".additional_drop_params", n, provider)
 
-		case "input_cost_per_token":
-			im.price(p, provider, upstream, "input", n)
-		case "output_cost_per_token":
-			im.price(p, provider, upstream, "output", n)
-		case "input_cost_per_second":
-			// The incumbent's own semantic for this key is the request's ELAPSED
+		case "input_cost_per_second", "output_cost_per_second":
+			// The incumbent's own semantic for these keys is the request's ELAPSED
 			// TIME — it multiplies the rate by the response time — so that is what
-			// it imports as, faithfully. It is also the key an incumbent
+			// they import as, faithfully. It is also the key an incumbent
 			// configuration uses for a transcription model that bills the length
 			// of the recording, and those two are different quantities (§10.7);
 			// the one key cannot say which, so the import says so rather than
 			// choosing silently.
-			im.warn(p+".input_cost_per_second", "imported as compute_seconds, which prices "+
+			im.warn(p+"."+k, "imported as compute_seconds, which prices "+
 				"the request's own wall time. If this model bills by the length of the "+
 				"AUDIO it was given, change the component to audio_seconds — the two are "+
 				"different quantities and dorang will not substitute one for the other")
-			im.price(p, provider, upstream, "compute_seconds", n)
-		case "output_cost_per_character", "input_cost_per_character":
-			im.price(p, provider, upstream, "characters", n)
-		case "cache_read_input_token_cost":
-			im.price(p, provider, upstream, "cached_read", n)
+			im.price(p, provider, upstream, k, n)
 
 		default:
+			if _, priced := priceFieldByKey[k]; priced {
+				im.price(p, provider, upstream, k, n)
+				continue
+			}
+			if advice, known := unpricedFieldAdvice[k]; known {
+				im.warn(p+"."+k, "%s", advice)
+				continue
+			}
 			im.warn(p+"."+k, "parameter has no equivalent in dorang's schema and was not imported")
 		}
 	}
@@ -553,13 +568,116 @@ func (im *importer) credential(path, provider, raw string) (string, bool) {
 	return id, true
 }
 
-func (im *importer) price(path, provider, model, component string, n *yaml.Node) {
+// priceField is one of the incumbent's cost keys, mapped onto the component
+// dorang prices and the power of ten between the two quantities.
+type priceField struct {
+	component string
+	// pow10 converts a rate quoted per ONE of the incumbent's units into a rate
+	// per one of dorang's. The incumbent quotes tokens per token; dorang's
+	// `rates.input` is per MILLION tokens, so the factor is 10^6.
+	pow10 int
+}
+
+// priceFieldByKey is the conversion table between the incumbent's rate keys and
+// dorang's priced components — the table whose absence was the defect.
+//
+// Every key here crosses a unit boundary or is written down as crossing none,
+// because the failure this table prevents is not a missing mapping, it is a
+// mapping that looks right. `input_cost_per_token: 0.0000025` copied verbatim
+// into `rates.input` parses, validates, matches, and prices a request at a
+// MILLIONTH of the vendor's figure — exactly zero below about two hundred
+// tokens — while `POST /spend/calculate` still answers `"missing": false`,
+// because `missing` reports that no rule matched and one did (CONFIG §13.1c).
+// An operator hits this on the migration path, at the moment they are moving
+// off a gateway whose numbers they trusted.
+//
+// The scale is stated for every key, including the ones where it is 1. A blank
+// would be indistinguishable from a key nobody thought about, which is how the
+// token keys came to be copied through in the first place.
+var priceFieldByKey = map[string]priceField{
+	// Per token → per 1,000,000 tokens.
+	"input_cost_per_token":            {"input", 6},
+	"output_cost_per_token":           {"output", 6},
+	"cache_read_input_token_cost":     {"cached_read", 6},
+	"cache_creation_input_token_cost": {"cache_write", 6},
+	"output_cost_per_reasoning_token": {"reasoning", 6},
+	// Per character → per 1,000 characters.
+	"input_cost_per_character":  {"characters", 3},
+	"output_cost_per_character": {"characters", 3},
+	// Per second → per second, and per request → per request: the incumbent's
+	// quantity and dorang's are the same one, so the factor is 1.
+	"input_cost_per_second":           {"compute_seconds", 0},
+	"output_cost_per_second":          {"compute_seconds", 0},
+	"input_cost_per_audio_per_second": {"audio_seconds", 0},
+	"input_cost_per_request":          {"request", 0},
+}
+
+// unpricedFieldAdvice covers the incumbent's remaining rate keys: the ones
+// dorang cannot express. They are named individually because the generic "this
+// parameter has no equivalent" is not true of a RATE — the money is real, it
+// simply has no axis here — and an operator who reads that line about a price
+// will assume the price was covered by another key.
+var unpricedFieldAdvice = map[string]string{
+	"input_cost_per_image": "dorang has no per-image unit: §8.3 lists images among the priced " +
+		"quantities and internal/pricing implements no rate for them, so the rate was NOT " +
+		"imported. Price the request instead (rates.request) if every request carries the " +
+		"same number of images",
+	"output_cost_per_image": "dorang has no per-image unit and the rate was NOT imported; " +
+		"see rates.request",
+	"input_cost_per_pixel": "dorang has no per-pixel unit and the rate was NOT imported",
+	"input_cost_per_video_per_second": "dorang prices a second of RECORDED AUDIO " +
+		"(audio_seconds) and a second of the request's own wall time (compute_seconds), " +
+		"and neither is a second of video: the rate was NOT imported (§10.7)",
+	"input_cost_per_audio_token": "an audio token is counted as an input token here and is " +
+		"charged at the input rate; the separate audio-token rate was NOT imported and this " +
+		"model will be priced as if its audio tokens were text",
+	"output_cost_per_audio_token": "an audio token is counted as an output token here and is " +
+		"charged at the output rate; the separate audio-token rate was NOT imported",
+	"input_cost_per_query": "dorang prices a request (rates.request), not a query; the rate " +
+		"was NOT imported. Write it as input_cost_per_request if one query is one request",
+	"input_cost_per_token_batches": "dorang has no batch rate card: a batch request is priced " +
+		"at the same rates as an interactive one and this rate was NOT imported (§9.4)",
+	"output_cost_per_token_batches": "dorang has no batch rate card: a batch request is priced " +
+		"at the same rates as an interactive one and this rate was NOT imported (§9.4)",
+	"input_cost_per_token_above_128k_tokens": "a size-dependent rate is a TIER, which the " +
+		"external price catalog expresses (tiers[].up_to_input_tokens) and the inline rules " +
+		"do not: the rate was NOT imported and the model is priced at its base rate for " +
+		"every request size (§13.3)",
+	"output_cost_per_token_above_128k_tokens": "a size-dependent rate is a TIER, which only " +
+		"the external price catalog expresses: the rate was NOT imported (§13.3)",
+	"input_cost_per_character_above_128k_tokens": "a size-dependent rate is a TIER, which only " +
+		"the external price catalog expresses: the rate was NOT imported (§13.3)",
+	"output_cost_per_character_above_128k_tokens": "a size-dependent rate is a TIER, which only " +
+		"the external price catalog expresses: the rate was NOT imported (§13.3)",
+}
+
+// price imports one of the incumbent's rate keys, converting its quantity into
+// dorang's on the way (see [priceFieldByKey]). The conversion is exact — a
+// decimal point moves — because §8.3 forbids a price from passing through a
+// float, and a rate that was rounded on import is a rate nobody can reconcile
+// against the vendor's card.
+func (im *importer) price(path, provider, model, key string, n *yaml.Node) {
+	field, ok := priceFieldByKey[key]
+	if !ok {
+		im.warn(path, "%q is not a priced key and was not imported", key)
+		return
+	}
+	component := field.component
 	lit := strings.TrimSpace(scalarValue(n))
 	if lit == "" {
 		return
 	}
-	if err := checkDecimal(lit); err != nil {
-		im.warn(path, "price %q is not a decimal and was not imported", lit)
+	// The source file is written by a program that prints floats, so a rate can
+	// arrive as "2.5e-06". That is a decimal this package refuses to STORE and a
+	// decimal it can read: the conversion writes the digits out either way.
+	scaled, ok := scaleDecimal(lit, field.pow10)
+	if !ok {
+		im.warn(path+"."+key, "price %q is not a decimal and was not imported", lit)
+		return
+	}
+	if err := checkDecimal(scaled); err != nil {
+		im.warn(path+"."+key, "price %q converts to %s for rates.%s, and %v; it was not imported",
+			lit, scaled, component, err)
 		return
 	}
 	if im.priceSeen == nil {
@@ -575,8 +693,8 @@ func (im *importer) price(path, provider, model, component string, n *yaml.Node)
 		im.warn(path, "%q is not a priced component and was not imported", component)
 		return
 	}
-	key := provider + "\x00" + model + "\x00" + unit
-	id, seen := im.priceSeen[key]
+	ruleKey := provider + "\x00" + model + "\x00" + unit
+	id, seen := im.priceSeen[ruleKey]
 	if !seen {
 		id = fmt.Sprintf("imported-%s-%d", provider, len(im.cfg.Pricing.Rules)+1)
 		im.cfg.Pricing.Rules = append(im.cfg.Pricing.Rules, PricingRule{
@@ -585,20 +703,61 @@ func (im *importer) price(path, provider, model, component string, n *yaml.Node)
 			Match: PricingMatch{Provider: provider, Model: model},
 			Rates: map[string]Decimal{},
 		})
-		im.priceSeen[key] = id
+		im.priceSeen[ruleKey] = id
 	}
+	if im.priceKeyByComp == nil {
+		im.priceKeyByComp = map[string]string{}
+	}
+	compKey := ruleKey + "\x00" + component
 	for i := range im.cfg.Pricing.Rules {
 		r := &im.cfg.Pricing.Rules[i]
 		if r.ID != id {
 			continue
 		}
-		if prev, dup := r.Rates[component]; dup && string(prev) != lit {
-			im.warn(path, "two entries price %s differently for provider %q model %q (%s and %s); "+
-				"the first was kept", component, provider, model, prev, lit)
+		if prev, dup := r.Rates[component]; dup && string(prev) != scaled {
+			// Two keys, one axis. The incumbent multiplies input_cost_per_second
+			// and output_cost_per_second by the SAME elapsed time and adds the
+			// results, so the equivalent single rate is their sum — dorang prices
+			// wall time once. Keeping the first silently would be this section's
+			// own defect a second time: a plausible figure that is too low.
+			im.warn(path+"."+key, "%s and %s both price %s for provider %q model %q, and dorang "+
+				"has one rate for it: %s (from %s) was kept and %s was NOT added to it. If the "+
+				"source charges both, write their SUM into rates.%s by hand",
+				im.priceKeyByComp[compKey], key, component, provider, model,
+				prev, im.priceKeyByComp[compKey], scaled, component)
 			return
 		}
-		r.Rates[component] = Decimal(lit)
+		r.Rates[component] = Decimal(scaled)
+		im.priceKeyByComp[compKey] = key
+		// Counted here rather than at the conversion, so the summary counts the
+		// rates that are IN the generated file and not the ones that were
+		// converted on the way to being dropped.
+		if field.pow10 != 0 {
+			im.convertedRates++
+			if im.firstConversion == "" {
+				im.firstConversion = fmt.Sprintf("%s %s became rates.%s %s",
+					key, lit, component, scaled)
+			}
+		}
 	}
+}
+
+// reportRateConversions says once, at the end, that the rates were rescaled.
+//
+// Once and not per rate: a file with fifty models would bury every other
+// warning, and the conversion is not a decision the operator has to make. What
+// they do have to do is check ONE request against the vendor's card, because
+// this is the number nothing else in the migration can verify for them.
+func (im *importer) reportRateConversions() {
+	if im.convertedRates == 0 {
+		return
+	}
+	im.warn("model_list", "%d rate(s) were CONVERTED to dorang's quantities: a token rate is "+
+		"per MILLION tokens here and a character rate is per 1,000 characters, where the source "+
+		"file quotes both per one (§13.1c). For example %s. The figures in the generated file are "+
+		"therefore not the figures in the source file; check one request through "+
+		"POST /spend/calculate against the vendor's card",
+		im.convertedRates, im.firstConversion)
 }
 
 func (im *importer) setProviderRetry(provider string, attempts int) {

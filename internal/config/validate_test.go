@@ -616,10 +616,15 @@ func TestValidationRules(t *testing.T) {
 			want: "duplicate pricing rule id",
 		},
 		{
+			// A rate card as a vendor prints one: per MILLION tokens (§13.1c).
+			// The fixture used to be the per-token spelling of the same card
+			// with a `1.25e-7` in it — a rate this validator accepted and the
+			// engine refused, which is the disagreement the exponent tests below
+			// close.
 			name: "priced rule with exact decimals",
 			f: fragments{top: "pricing:\n  rules:\n" +
 				"    - {id: r1, class: marginal_usage, match: {provider: p1, model: m1-upstream}, " +
-				"rates: {input: \"0.0000025\", output: \"0.00001\", cached_read: \"1.25e-7\"}}\n" +
+				"rates: {input: \"2.50\", output: \"10.00\", cached_read: \"0.125\"}}\n" +
 				"    - {id: r2, class: fixed_subscription, period: monthly, amount: \"20.00\"}\n" +
 				"    - {id: r3, class: adjustment, percent: \"-10\"}\n"},
 		},
@@ -845,6 +850,111 @@ func filterModel(filter string) string {
 	return "  - name: m2\n" +
 		"    deployments: [{provider: p1, upstream_model: u, credentials: [c1]}]\n" +
 		"    filters: [" + filter + "]\n"
+}
+
+// TestLintRefusesWhatTheEngineRefuses closes a validator/consumer split of the
+// same shape as the `rates.images` defect, with the validator again the more
+// permissive of the two: checkDecimal accepted exponent notation and more than
+// twelve fractional digits, and internal/pricing's parser accepts neither. So
+// `dorangctl config lint` answered `ok` and the gateway then refused to
+// assemble the catalog — a load error delivered one layer too late, after the
+// deploy was signed off.
+//
+// The half of the agreement that lives in this package is that the file does
+// not load. The other half — that the engine really does refuse the same
+// string, and accepts everything this package accepts — is asserted against the
+// assembler itself in cmd/dorangctl.
+func TestLintRefusesWhatTheEngineRefuses(t *testing.T) {
+	cases := []struct {
+		name string
+		rate string
+		want string
+	}{
+		{"exponent", "1.25e-7", "exponent notation is not accepted"},
+		{"capital exponent", "2E9", "exponent notation is not accepted"},
+		{"finer than a pico-unit", "0.0000000000001", "at most 12 fractional digits"},
+		{"more digits than are held exactly", "18446744073709551616", "significant digits"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadFragments(t, fragments{top: "pricing:\n  rules:\n" +
+				"    - {id: r1, class: marginal_usage, rates: {input: \"" + tc.rate + "\"}}\n"})
+			if err == nil {
+				t.Fatalf("the file loaded with rates.input %q, which the engine will not parse", tc.rate)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error does not explain the refusal (%q):\n%v", tc.want, err)
+			}
+		})
+	}
+}
+
+// TestAnImplausibleRateWarnsAndDoesNotRefuse is §13.1c's hand-written arrival:
+// a per-TOKEN figure in a per-million field prices every request to about zero
+// while everything an operator can run says the configuration is fine.
+//
+// Both halves matter. It must WARN, because nothing else does — the rule still
+// matches and /spend/calculate still answers "missing": false. And it must not
+// REFUSE, because a genuinely cheap model exists at $0.02 per million and
+// pricing is never a reason to stop serving.
+func TestAnImplausibleRateWarnsAndDoesNotRefuse(t *testing.T) {
+	perToken := "pricing:\n  rules:\n" +
+		"    - {id: card, class: marginal_usage, match: {provider: p1}, " +
+		"rates: {input: \"0.0000025\", output: \"0.000001\", cached_read: \"0.00000025\"}}\n"
+	c, err := loadFragments(t, fragments{top: perToken})
+	if err != nil {
+		t.Fatalf("a suspicious rate must still LOAD: %v", err)
+	}
+	got := c.Advisories()
+	if len(got) != 3 {
+		t.Fatalf("advisories = %+v, want one for each per-token rate", got)
+	}
+	for _, a := range got {
+		if !strings.Contains(a.Message, "per MILLION tokens") {
+			t.Errorf("the advisory does not name the quantity: %s", a)
+		}
+	}
+	named := false
+	for _, a := range got {
+		if strings.Contains(a.Path, "card") && strings.Contains(a.Path, "input") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("no advisory says which rule and which rate it is about: %+v", got)
+	}
+
+	// A real rate card, including the cheapest model on the market and a
+	// per-second rate that is legitimately tiny because a second is not a
+	// million of anything.
+	cheap := "pricing:\n  rules:\n" +
+		"    - {id: cheap, class: marginal_usage, match: {provider: p1}, " +
+		"rates: {input: \"0.02\", output: \"0.06\", cached_read: \"0.005\"}}\n" +
+		"    - {id: gpu, class: marginal_usage, match: {provider: p1, model: g}, " +
+		"rates: {compute_seconds: \"0.0000004\"}}\n" +
+		"    - {id: free, class: marginal_usage, match: {provider: p1, model: f}, " +
+		"rates: {input: \"0\", output: \"0\"}}\n"
+	c, err = loadFragments(t, fragments{top: cheap})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := c.Advisories(); len(got) != 0 {
+		t.Errorf("a genuinely cheap card was reported as a unit error: %+v", got)
+	}
+
+	// The threshold is 10^-5 exclusive, which is where cmd/dorangctl's shipped
+	// example test puts it too. A rate ON it is not reported: the two sides of
+	// this line have to be the same everywhere, and a boundary that moves
+	// between two tools is a third disagreement.
+	edge := "pricing:\n  rules:\n" +
+		"    - {id: edge, class: marginal_usage, match: {provider: p1}, rates: {input: \"0.00001\"}}\n"
+	c, err = loadFragments(t, fragments{top: edge})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := c.Advisories(); len(got) != 0 {
+		t.Errorf("a rate exactly on the threshold was reported: %+v", got)
+	}
 }
 
 // TestFilterPatternSpellings checks both spellings §10.5b writes, and that a

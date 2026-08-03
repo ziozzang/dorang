@@ -81,6 +81,14 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
   says so", and the thinking-block *signature* dropped crossing into the OpenAI
   family — which no capability mask can see, because the bit is held while the
   encoder drops the signature.
+- **Every imported price list was a millionth of its true value**, and every imported
+  character card a thousandth. `dorangctl import config` copied LiteLLM's per-token literal
+  into a per-million-token field, and its own test asserted the pass-through. The failure is
+  silent: requests round to zero while `/spend/calculate` reports the rule matched with
+  `"missing": false`. Four more rates were not imported at all, including cache *creation*.
+  The shipped `config.example.yaml` and `docs/CONFIG.md` §13 had the same unit confusion by
+  hand, while `docs/DESIGN.md`'s catalog format had it right — so the two shipped examples
+  disagreed, and the one an operator copies was the wrong one.
 - Pricing charged the cached prefix and reasoning tokens twice, 27% over on the
   design's own example card and 5.7× on a 90%-cached workload. Neither
   verification harness could see it, because both priced everything at zero.

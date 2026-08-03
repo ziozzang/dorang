@@ -197,7 +197,7 @@ dorangctl config lint /etc/dorang/config.yaml
 | `.rpm` / `.tpm` / `.max_parallel_requests` | `limits[]` on the deployment |
 | `.weight`, `.timeout`, `.stream_timeout` | deployment fields |
 | drop-unsupported and explicit drop lists | `params.drop_unsupported`, `params.drop[]` |
-| per-token input/output cost | `pricing.rules[]` |
+| per-token input/output cost | `pricing.rules[]` — **rescaled**: per-token rates are multiplied by 10⁶ and per-character rates by 10³, because dorang's fields are per 1M tokens and per 1K characters. The importer used to copy the literal, which made every imported card a millionth of its true price, silently — every request rounded to zero while `/spend/calculate` still reported the rule matched |
 | routing strategy | `models[].strategy` |
 | default / context-window / content-policy fallbacks | `fallbacks.on.*` |
 | `environment_variables` | **not imported** — set them in the process environment and reference with `key_env` |
@@ -237,9 +237,13 @@ Three things the import cannot do for you:
    per deployment. dorang's model — per account across all models, *and* per (key, model) — is
    richer, and the shape that matters is usually not in the source file at all because the
    source file could not express it. Read [CONFIG.md](CONFIG.md) §8 and write the axes by hand.
-2. **Price anything it could not find a rate for.** Run
-   `dorangctl price <model> --input N --output N` on every model group. A warning of
+2. **Price anything it could not find a rate for, and check one price against the vendor's card.**
+   Run `dorangctl price <model> --input N --output N` on every model group. A warning of
    `no marginal_usage rule matched` means that traffic would be recorded UNPRICED.
+   Then `POST /spend/calculate` for one request whose cost you can compute by hand from the
+   vendor's published card, and compare. A rate that is wrong by a factor rather than absent
+   produces no warning at all — the rule matches, `"missing"` is `false`, and the figure is
+   simply wrong. That is what the ×10⁶ defect looked like from the outside.
 3. **Tell you which deployments have an undeclared context window.** Run
    `dorangctl catalog unverified`. An undeclared window is not zero and not unlimited; it neither
    excludes a deployment nor qualifies it as "larger" for the context-window fallback chain. A

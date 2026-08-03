@@ -105,15 +105,91 @@ func TestParseDuration(t *testing.T) {
 	}
 }
 
+// TestDecimalSyntax pins what a decimal is here. The two exponent forms moved
+// from the accepted list to the refused one, which is the defect this test used
+// to hold open: internal/pricing has always refused exponent notation, so
+// `dorangctl config lint` answered `ok` on a rate card the gateway then refused
+// to assemble. See TestLintAndTheEngineAgreeOnADecimal for the other half.
 func TestDecimalSyntax(t *testing.T) {
-	for _, in := range []string{"0", "5", "20.00", "0.0000025", "-10", "+1.5", "1.25e-7", "2E9"} {
+	for _, in := range []string{"0", "5", "20.00", "0.0000025", "-10", "+1.5",
+		"2.50", "0.000000000001", "18446744073709551615"} {
 		if err := checkDecimal(in); err != nil {
 			t.Errorf("checkDecimal(%q): %v", in, err)
 		}
 	}
-	for _, in := range []string{"", ".", "1.2.3", "1,5", "abc", "1e", "0x10", "5%", "1 000"} {
+	for _, in := range []string{
+		"", ".", "1.2.3", "1,5", "abc", "1e", "0x10", "5%", "1 000",
+		// Exponent notation: legal YAML, legal in a float printer's output, and
+		// not a decimal internal/pricing will parse.
+		"1.25e-7", "2E9", "1e-6", "1E+3",
+		// Finer than 10^-12, which internal/pricing refuses rather than truncate.
+		"0.0000000000001",
+		// More significant digits than the engine's significand holds.
+		"18446744073709551616",
+	} {
 		if err := checkDecimal(in); err == nil {
 			t.Errorf("checkDecimal(%q) accepted an invalid decimal", in)
+		}
+	}
+}
+
+// TestScaleDecimalMovesThePointExactly is the arithmetic the importer's unit
+// conversion is made of: a decimal point moves, nothing rounds, and no value
+// passes through a float (§8.3).
+func TestScaleDecimalMovesThePointExactly(t *testing.T) {
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"0.0000025", 6, "2.5"},   // $2.50 per million, written per token
+		{"0.00001", 6, "10"},      // $10 per million
+		{"0.00000025", 6, "0.25"}, // a cached-read rate
+		{"0.000000125", 6, "0.125"},
+		{"2.5e-06", 6, "2.5"},    // the same rate as a float printer writes it
+		{"1.5E-6", 6, "1.5"},     // and with the other spelling of the exponent
+		{"0.000125", 3, "0.125"}, // per character to per 1,000 characters
+		{"0.0001", 0, "0.0001"},  // per second is already per second
+		{"-0.0000025", 6, "-2.5"},
+		{"0", 6, "0"},
+		{"0.000000", 6, "0"},
+		{"3", 3, "3000"},
+		{"0.5", 0, "0.5"},
+	}
+	for _, tc := range cases {
+		got, ok := scaleDecimal(tc.in, tc.n)
+		if !ok {
+			t.Errorf("scaleDecimal(%q, %d) refused a decimal", tc.in, tc.n)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("scaleDecimal(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+		if err := checkDecimal(got); err != nil {
+			t.Errorf("scaleDecimal(%q, %d) = %q, which this package will not store: %v",
+				tc.in, tc.n, got, err)
+		}
+	}
+	for _, in := range []string{"", "abc", "1.2.3", "1e", "1e999999999", "--1"} {
+		if got, ok := scaleDecimal(in, 6); ok {
+			t.Errorf("scaleDecimal(%q, 6) = %q, want a refusal", in, got)
+		}
+	}
+}
+
+// TestDecimalBelowPow10 is the comparison the rate advisory is made of.
+func TestDecimalBelowPow10(t *testing.T) {
+	below := []string{"0.0000025", "0.000001", "0.000009", "-0.0000025", "2.5e-6"}
+	for _, in := range below {
+		if !decimalBelowPow10(in, -5) {
+			t.Errorf("decimalBelowPow10(%q, -5) = false, want true", in)
+		}
+	}
+	// 0.00001 is exactly the threshold and is not below it; 0.02 is the
+	// cheapest real card; 0 is a free model, not a suspicious price.
+	for _, in := range []string{"0.00001", "0.02", "2.50", "0", "0.000", "", "abc"} {
+		if decimalBelowPow10(in, -5) {
+			t.Errorf("decimalBelowPow10(%q, -5) = true, want false", in)
 		}
 	}
 }
