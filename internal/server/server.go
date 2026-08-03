@@ -141,6 +141,17 @@ type Options struct {
 	// Nil adds nothing and the body keeps the shape it always had.
 	HealthReporters []HealthReporter
 
+	// ReadinessGates are the dependencies that can take this node out of
+	// rotation without draining it. Empty leaves the drain as readiness's only
+	// input, which is what it always was.
+	//
+	// A gate is not a health reporter and the two are not interchangeable. A
+	// reporter says a subsystem is unhappy and deliberately does NOT change the
+	// status: degraded metering is not a serving failure and must not take a pod
+	// out of rotation. A gate says this node cannot serve new work, which is the
+	// one thing readiness is for.
+	ReadinessGates []ReadinessGate
+
 	// CaptureHeadBytes and CaptureTailBytes bound what a sampled response
 	// retains for comparison; 0 uses [DefaultCaptureHeadBytes] and
 	// [DefaultCaptureTailBytes]. They are here rather than in the observer
@@ -226,6 +237,7 @@ type snapshot struct {
 	observer   Observer
 	metrics    MetricsSource
 	reporters  []HealthReporter
+	gates      []ReadinessGate
 
 	captureHead int
 	captureTail int
@@ -298,6 +310,7 @@ func (s *Server) Reload(opts Options) error {
 		observer:       opts.Observer,
 		metrics:        opts.Metrics,
 		reporters:      opts.HealthReporters,
+		gates:          opts.ReadinessGates,
 		captureHead:    opts.CaptureHeadBytes,
 		captureTail:    opts.CaptureTailBytes,
 		maxBody:        opts.MaxBodyBytes,
@@ -400,8 +413,26 @@ func (s *Server) Reload(opts Options) error {
 }
 
 // Ready reports whether the server is accepting new work. It goes false the
-// instant a drain starts.
-func (s *Server) Ready() bool { return !s.draining.Load() }
+// instant a drain starts, and false again — reversibly — while any configured
+// [ReadinessGate] says this node cannot serve new work.
+//
+// The two are not the same condition and the health body tells them apart. A
+// drain is terminal and this process is on its way out; a closed gate is a
+// dependency that is expected back, and the node returns to rotation by itself
+// when it is. Neither of them is a liveness signal.
+func (s *Server) Ready() bool {
+	if s.draining.Load() {
+		return false
+	}
+	// The gates are read from the snapshot rather than the Server so that a
+	// reload swaps them by pointer like everything else on this path.
+	for _, g := range s.snap.Load().gates {
+		if ok, _ := g.ReadyForWork(); !ok {
+			return false
+		}
+	}
+	return true
+}
 
 // InFlight is the number of requests currently being served.
 func (s *Server) InFlight() int64 { return s.inflight.Load() }

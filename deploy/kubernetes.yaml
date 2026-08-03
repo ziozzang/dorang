@@ -80,6 +80,18 @@ spec:
       securityContext:
         runAsNonRoot: true
         seccompProfile: {type: RuntimeDefault}
+        # The state volume has to be writable by the image's uid (65532,
+        # distroless `nonroot`). The emptyDir below is world-writable and would
+        # work without this; a PersistentVolumeClaim, which is what anyone
+        # keeping a SQLite ledger substitutes here, would NOT — it arrives
+        # root-owned and the container crash-loops on
+        # `mkdir /var/lib/dorang/…: permission denied`, with no shell in the
+        # image to fix it from. Setting it now means the substitution is a
+        # one-line change rather than a one-line change and an outage.
+        fsGroup: 65532
+        # Only chown when the root of the volume does not already match, so a
+        # large claim is not walked on every pod start.
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: dorang
           image: ghcr.io/ziozzang/dorang:latest # pin a digest for a real deployment

@@ -50,7 +50,7 @@ an error, because that is a typo rather than a choice.
 |---|---|---|
 | Duration | `250ms`, `30s`, `1h`, `2h45m` | A **bare number is seconds** — `timeout: 180` is 180s. Negative is refused |
 | Size | `4096`, `64MiB`, `8GiB`, `512KB` | `KiB/MiB/GiB/TiB/PiB` are powers of 1024; `KB/MB/GB/TB/PB` are powers of 1000. Case-insensitive |
-| Decimal | `"0.0000025"`, `"20.00"`, `"5"` | Held as **text** and parsed exactly. Prices never pass through binary floating point (§8.3). Quote them — YAML would otherwise hand you a float |
+| Decimal | `"2.50"`, `"20.00"`, `"5"` | Held as **text** and parsed exactly. Prices never pass through binary floating point (§8.3). Quote them — YAML would otherwise hand you a float. **Exponent notation (`1.25e-7`) is refused**, as is anything finer than twelve fractional digits: write the digits out (§13.1c) |
 | Path | `~/.dorang/dorang.db` | A leading `~` expands to the process user's home directory |
 
 ### 0.3 Secrets
@@ -1114,7 +1114,8 @@ pricing:
 ```
 
 **Token rates are per million tokens.** Read [§13.1c](#131c-which-quantity-a-rate-is-per) before
-transcribing a card. A per-token rate is not refused, it prices every request to zero.
+transcribing a card. A per-token rate is not refused, it prices every request to zero —
+`dorangctl config lint` and `dorang --check` warn about one, and nothing else will.
 
 ### 13.1 Keys
 
@@ -1126,7 +1127,7 @@ transcribing a card. A per-token rate is not refused, it prices every request to
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
-| `rules[].rates.<component>` | decimal | — | Rates, each **per one unit of its component's quantity, and that quantity is a MILLION tokens for the five token components — §13.1c**. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. **A per-TOKEN rate is not refused** — it prices every request to zero while `/spend/calculate` still answers `"missing": false`, because the rule did match (§13.1c). `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
+| `rules[].rates.<component>` | decimal | — | Rates, each **per one unit of its component's quantity, and that quantity is a MILLION tokens for the five token components — §13.1c**. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. **A per-TOKEN rate is not refused** — it prices every request to zero while `/spend/calculate` still answers `"missing": false`, because the rule did match (§13.1c). It is *warned* about: `config lint` and `--check` report a token rate below `0.00001` per million. Exponent notation (`1.25e-7`) and more than twelve fractional digits **are** refused, by the loader and the engine alike (§13.1c). `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
 | `rules[].period` + `rules[].amount` | string + decimal | — | A `fixed_subscription` rule's period and cost | Both required for that class; a zero amount is refused |
 | `rules[].percent` | decimal | — | An `adjustment` rule's percentage | Required for that class; zero is refused |
 
@@ -1215,10 +1216,14 @@ no-prices, because in each case the arithmetic would succeed and produce a plaus
 > the whole time; it reached the neutral transcript and stopped there, because there was no
 > second axis for it to arrive on.
 >
-> Migrating: a rate imported from an incumbent's `input_cost_per_second` becomes
-> `compute_seconds`, because that is what the incumbent multiplies by — the response time.
-> **If the model bills by the length of the audio, change it to `audio_seconds`**; the
-> importer warns on every such key rather than choosing for you.
+> Migrating: a rate imported from an incumbent's `input_cost_per_second` or
+> `output_cost_per_second` becomes `compute_seconds`, because that is what the incumbent
+> multiplies by — the response time. **If the model bills by the length of the audio, change it
+> to `audio_seconds`**; the importer warns on every such key rather than choosing for you. An
+> `input_cost_per_audio_per_second` needs no such decision and imports straight onto
+> `audio_seconds`. A file that carries **both** per-second keys is the one case the incumbent
+> adds together — it multiplies each by the same elapsed time — and dorang has one wall-clock
+> rate: the import keeps the first, refuses to guess the sum, and says so.
 
 ### 13.1c Which quantity a rate is per
 
@@ -1272,15 +1277,44 @@ component names you used, which is why a rule may not mix components from two un
 external catalog file *does* have `unit:`, and **an absent `unit:` there means `per_1m_tokens`**
 — so a catalog rule that writes per-token numbers and omits `unit:` fails exactly the same way.
 
-**Importing from an incumbent does not rescale.** The LiteLLM importer maps
-`input_cost_per_token` onto `rates.input` and copies the literal through unchanged, so an
-imported price list is per-token values in a per-million field: a factor of 10⁶ too cheap, with
-no warning. **Multiply every imported token rate by 1,000,000 before trusting it**, and check one
-request through `POST /spend/calculate` against the vendor's card.
+**Importing from an incumbent rescales.** `dorangctl import config` converts every rate it
+carries into the quantity dorang prices in, and reports once how many it converted. The
+conversion is exact — a decimal point moves, nothing is rounded, no value passes through a
+float — and it is the whole table, not the two obvious fields:
+
+| The incumbent writes | dorang writes | Factor |
+|---|---|---|
+| `input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`, `cache_creation_input_token_cost`, `output_cost_per_reasoning_token` | `input`, `output`, `cached_read`, `cache_write`, `reasoning` | **× 1,000,000** |
+| `input_cost_per_character`, `output_cost_per_character` | `characters` | **× 1,000** |
+| `input_cost_per_second`, `output_cost_per_second` | `compute_seconds` (§13.1b) | × 1 |
+| `input_cost_per_audio_per_second` | `audio_seconds` (§13.1b) | × 1 |
+| `input_cost_per_request` | `request` | × 1 |
+
+A rate the incumbent can express and dorang cannot — per image, per pixel, per second of
+*video*, a separate audio-token rate, a batch card, an above-128k tier — is **not** imported, and
+each one is reported by name rather than as "this parameter has no equivalent". The money is
+real; it simply has no axis here.
+
+The importer also reads a rate written in exponent notation (`2.5e-06`), which is what a file
+produced by a program that formats floats contains, and writes the digits out. It is the only
+place that notation is accepted: see below.
+
+**A rate is written out in digits.** `0.0000025`, never `2.5e-6`. Exponent notation is a **load
+error** in both the main file and the catalog. It used to be a load error in only one of them —
+`dorangctl config lint` answered `ok` and the gateway then refused to assemble with "exponent
+notation is not accepted", which is a load error delivered after the deploy was signed off. The
+same now goes for more than twelve fractional digits, which the engine will not truncate
+silently.
 
 **How to check.** `POST /spend/calculate` with a known token count, or `dorangctl price`, and
 compare against the card by hand. `"missing": false` is not that check — it says a rule matched,
 not that the rule is right.
+
+`dorangctl config lint` and `dorang --check` do one part of it for you: a token rate below
+`0.00001` per million is three orders of magnitude under the cheapest card on the market, so
+they print a **warning** naming the rule and the rate. It stays a warning and never a refusal —
+a genuinely cheap model exists at $0.02 per million, and a wrong price must never be what stops
+a gateway from serving.
 
 ### 13.2 Classes compose; they do not compete
 
@@ -2360,14 +2394,22 @@ Notes that matter at this tier:
   reported `shared-redis` while using the store would misprice exactly this decision.
 - `min_leasable: 16` is inert under `shared-pg` and becomes load-bearing the moment you
   switch to `leased` — at which point every `max_concurrency` under 16 in this file is refused.
-- `store_messages: hash` with `sample_rate: 0.01` at ~2 k req/s keeps roughly 880 MB/day of the
-  ~88 GB/day that full excerpts would cost.
+- `store_messages: hash` with `sample_rate: 0.01` at ~2 k req/s charges the daily byte budget
+  roughly 880 MB/day of the ~88 GB/day that full excerpts would cost — the sampling is what buys
+  the two orders of magnitude. What is RETAINED is far less again: the budget is charged against
+  the excerpt as read, and the digest that replaces it is a fixed 71 bytes
+  (`sha256:` + 64 hex), so the stored column is about a seventh of the charged figure. Size the
+  budget from the charge and the disk from the retention.
 - `key_ref` is **refused by this build**: a credential declared that way would
   load and have no usable secret until an external resolver exists. Use `key_env` or `key_file`
   today.
-- The vLLM `metrics` scrape is only useful if `--disable-log-stats` is **not** set. Without that,
-  `/metrics` returns 200 with zero series and `least_busy` reads every backend as idle
-  ([VLLM.md](VLLM.md) §3.1).
+- **The vLLM `metrics` scrape is not configured here and cannot be**: `providers[].metrics` is a
+  load error in this build, because nothing fetches the endpoint and enabling it would configure
+  a collector that does not exist. `least_busy` needs no scrape either way — it ranks on this
+  gateway's own live capacity occupancy, and treats a backend it has no samples for as having no
+  opinion rather than as idle (§7.5a). What a scrape would add is the ENGINE's queue depth and
+  KV-cache utilization, which is a better signal only for a self-hosted backend also serving
+  traffic that did not come through dorang ([VLLM.md](VLLM.md) §3.1).
 
 ---
 

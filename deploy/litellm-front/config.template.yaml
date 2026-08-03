@@ -1,0 +1,129 @@
+# dorang — fronting an incumbent LiteLLM as a single provider.
+#
+# The upstream is the incumbent proxy itself. That is deliberate: the model set
+# and every provider credential stay where they are, dorang contributes only its
+# own auth, budgets, metering and routing, and anything that breaks is
+# attributable to dorang. It also sidesteps the blocker that stops a direct
+# cutover — when `STORE_MODEL_IN_DB` is on, the incumbent's `proxy.yaml` holds no
+# `model_list` at all and the upstream credentials are database rows, not a file
+# anyone can translate.
+#
+# The `models:` block is GENERATED from the upstream's own `GET /v1/models` (see
+# gen-models.sh). Regenerate it when the upstream model set changes rather than
+# editing it by hand: the point of this file is that a client sees the same
+# surface through dorang that it saw directly.
+#
+# NO SECRET APPEARS HERE. Every credential is an env reference, resolved from
+# the compose env file.
+
+version: 1
+
+server:
+  listen: ":4100"
+  env: production
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+  # Agent traffic holds connections open for a long time; the incumbent's own
+  # per-provider timeouts are the real ceiling.
+  request_timeout: 1200s
+  shutdown_grace: 30s
+  # Zero on a single node, where nothing is polling readiness and the wait buys
+  # nothing. Raise it to cover a balancer's detection window before putting a
+  # second node behind one.
+  pre_stop_delay: 0s
+
+storage:
+  driver: postgres
+  postgres:
+    url_env: DORANG_DATABASE_URL
+    max_conns: 32
+
+cluster:
+  enabled: false
+
+auth:
+  # REQUIRED if you import the incumbent's keys. They arrive carrying its
+  # unsalted sha256 digest under hash_scheme legacy_sha256; without this every
+  # imported key is a 401 and the import looks like it silently failed.
+  # `rehash_on_use` upgrades each one to dorang_v1 the first time it is
+  # presented, so the window closes by itself as traffic arrives — check
+  # `SELECT hash_scheme, count(*) FROM api_keys GROUP BY 1` to see it close.
+  legacy:
+    enabled: true
+    until: "REPLACE_ME_YYYY-MM-DD"    # required once enabled; pick a real cutoff
+  rehash_on_use: true
+
+providers:
+  - name: litellm
+    kind: openai
+    # Service name on the incumbent's own compose network. Do NOT route back out
+    # through a public hostname: that adds a TLS hop and an ingress to a call
+    # that never needs to leave the host.
+    base_url: http://litellm:4000/v1
+    timeout: 1200s
+    max_concurrency: 32
+    params:
+      drop_unsupported: true
+
+credentials:
+  # One credential, holding a virtual key ISSUED BY THE INCUMBENT. Prefer a key
+  # scoped to the models dorang is meant to serve over the incumbent's master
+  # key: dorang does not need administrative rights on the upstream, and a
+  # gateway that holds them can do more than proxy if it is ever compromised.
+  - id: litellm-1
+    provider: litellm
+    key_env: DORANG_LITELLM_KEY
+
+capacity:
+  global: {max_concurrency: 64}
+  principals:
+    default: {max_concurrent: 16, max_queue_wait: 30s}
+
+routing:
+  sticky:
+    enabled: false
+  prefix:
+    enabled: false          # the upstream owns its own prompt cache
+
+fallbacks:
+  max_hops: 0               # one deployment per model: there is nowhere to fall back to
+
+pricing:
+  currency: USD
+  # RATES ARE PER MILLION TOKENS. The `input`, `output`, `cache_read`,
+  # `cache_write` and `reasoning` components all carry the per_1m_tokens unit,
+  # so a model that costs $2.50 per million input tokens is written "2.50" and
+  # not "0.0000025". A per-token value here is not rejected — it prices every
+  # request to zero, `/spend/calculate` still reports the rule as matched, and
+  # the ledger fills with a spend of 0. Check one request against
+  # `POST /spend/calculate` before trusting the numbers.
+  #
+  # The incumbent's own per-model rates are database rows rather than a file, so
+  # nothing here is inferred from it. These are your assertion. A model with no
+  # rule meters its tokens and reports a spend of zero, which is honest; the
+  # gateway logs "no marginal price rule matched" once per model so you can see
+  # which ones are unpriced.
+  rules:
+    - id: example-model
+      class: marginal_usage
+      match: {model: REPLACE_ME_MODEL_ID}
+      rates: {input: "0.60", output: "2.20"}
+
+metering:
+  numeric:
+    enabled: true
+  trace:
+    store_messages: truncated
+    truncate_chars: 512
+    sample_rate: 1.0
+
+observability:
+  prometheus: true          # /metrics, authenticated — see the runbook
+  log_level: info
+  log_format: json
+
+# --- generated below this line by gen-models.sh -------------------------------
+models:
+  - name: REPLACE_ME_MODEL_ID
+    deployments:
+      - {provider: litellm, upstream_model: REPLACE_ME_MODEL_ID, credentials: [litellm-1]}

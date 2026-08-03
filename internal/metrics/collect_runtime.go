@@ -112,7 +112,10 @@ func (c *ServerCollector) Collect(w *Writer) {
 	}
 
 	w.Metric("dorang_ready", Gauge,
-		"1 when the server accepts new work. It goes to 0 the instant a drain starts.")
+		"1 when the server accepts new work. It goes to 0 the instant a drain starts, and "+
+			"also while a readiness gate is closed — a dependency this node needs is "+
+			"unreachable. The two are told apart in the /health body, not here: this node "+
+			"is out of rotation either way.")
 	w.Bool(st.Ready)
 
 	w.Metric("dorang_uptime_seconds", Gauge, "Seconds since start.")

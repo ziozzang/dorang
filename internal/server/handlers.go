@@ -245,12 +245,33 @@ const (
 	healthOverall
 )
 
+// gateVerdict is one [ReadinessGate]'s answer, taken once so that the status
+// line and the body cannot disagree about it.
+type gateVerdict struct {
+	name   string
+	ok     bool
+	reason string
+}
+
+// inlineGates is how many gate verdicts fit without allocating. A deployment
+// has one or two — the store, and whatever a future release adds beside it.
+const inlineGates = 4
+
 // healthHandler answers a container probe.
 //
 // Liveness is about the process: it is up, so it answers 200 until it is not
 // there to answer at all. Readiness is about whether new work should arrive,
 // and goes 503 the instant a drain starts — which is the entire mechanism by
 // which a rolling deploy does not drop requests.
+//
+// It goes 503 for a second reason too, and the body says which: a closed
+// [ReadinessGate]. The two are reported apart because an operator and an
+// orchestrator both have to act differently on them. `draining` means this
+// process is on its way out and the pod is about to be replaced; `not_ready`
+// means a dependency this node needs is unreachable, the process is fine, and
+// the node will put itself back in rotation without being restarted or
+// redeployed. Liveness is unaffected by a gate for exactly that reason —
+// restarting a node whose database is down does not give it a database.
 //
 // OPTIONS is answered because COMPATIBILITY §0 lists it alongside GET: probes
 // behind a service mesh preflight, and a 501 on the preflight fails the pod.
@@ -263,24 +284,47 @@ func (s *Server) healthHandler(kind healthKind) Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return nil
 		}
-		ready := s.Ready()
+		snap := rq.srv.snap.Load()
+
+		// The gates are asked once. Asking them again to render the body would
+		// let a gate that flipped between the two calls answer 200 with a
+		// closed gate in the body, or the reverse — and the whole value of this
+		// endpoint is that an operator can believe both halves of it.
+		var arr [inlineGates]gateVerdict
+		var gates []gateVerdict
+		if n := len(snap.gates); n > 0 && kind != healthLive {
+			gates = arr[:0]
+			if n > inlineGates {
+				gates = make([]gateVerdict, 0, n)
+			}
+			for _, g := range snap.gates {
+				ok, reason := g.ReadyForWork()
+				gates = append(gates, gateVerdict{name: g.GateName(), ok: ok, reason: reason})
+			}
+		}
+		gatesOpen := true
+		for i := range gates {
+			if !gates[i].ok {
+				gatesOpen = false
+				break
+			}
+		}
+
 		status := http.StatusOK
 		var state string
-		switch kind {
-		case healthReady:
-			if !ready {
-				status, state = http.StatusServiceUnavailable, "draining"
-			} else {
-				state = "ready"
-			}
-		case healthOverall:
-			if !ready {
-				status, state = http.StatusServiceUnavailable, "draining"
-			} else {
-				state = "healthy"
-			}
-		default:
+		switch {
+		case kind == healthLive:
+			// Unconditionally alive. A draining node is alive, and so is a node
+			// whose store went away.
 			state = "alive"
+		case s.draining.Load():
+			status, state = http.StatusServiceUnavailable, "draining"
+		case !gatesOpen:
+			status, state = http.StatusServiceUnavailable, "not_ready"
+		case kind == healthReady:
+			state = "ready"
+		default:
+			state = "healthy"
 		}
 
 		buf := getBuf()
@@ -292,7 +336,28 @@ func (s *Server) healthHandler(kind healthKind) Handler {
 		// not take the pod out of rotation — so the status stays what it was
 		// and the fact appears beside it (DESIGN §14.1).
 		if kind != healthLive {
-			snap := rq.srv.snap.Load()
+			// The readiness gates first, because they are the only thing in this
+			// body that decided the status code. They are rendered whether or
+			// not they are open, for the reason the meter reports when it is
+			// healthy: an operator has to be able to tell "the store is fine"
+			// from "this build does not check".
+			if len(gates) > 0 {
+				b = append(b, `,"gates":{`...)
+				for i := range gates {
+					if i > 0 {
+						b = append(b, ',')
+					}
+					b = appendJSONString(b, gates[i].name)
+					b = append(b, `:{"ready":`...)
+					b = strconv.AppendBool(b, gates[i].ok)
+					if gates[i].reason != "" {
+						b = append(b, `,"reason":`...)
+						b = appendJSONString(b, gates[i].reason)
+					}
+					b = append(b, '}')
+				}
+				b = append(b, '}')
+			}
 			if o := snap.observer; o != nil {
 				b = appendHealthObject(b, "shadow", o.Health)
 			}

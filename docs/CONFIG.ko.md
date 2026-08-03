@@ -46,7 +46,7 @@
 |---|---|---|
 | Duration | `250ms`, `30s`, `1h`, `2h45m` | **맨 숫자는 초** — `timeout: 180`은 180s. 음수 거부 |
 | Size | `4096`, `64MiB`, `8GiB`, `512KB` | `KiB/MiB/GiB/TiB/PiB`는 1024의 거듭제곱; `KB/MB/GB/TB/PB`는 1000의 거듭제곱. 대소문자 무관 |
-| Decimal | `"2.50"`, `"20.00"`, `"5"` | **텍스트로 보관**되어 정확히 파싱된다. 가격은 절대 이진 부동소수를 거치지 않는다(§8.3). 따옴표로 감쌀 것 — 아니면 YAML이 float를 준다 |
+| Decimal | `"2.50"`, `"20.00"`, `"5"` | **텍스트로 보관**되어 정확히 파싱된다. 가격은 절대 이진 부동소수를 거치지 않는다(§8.3). 따옴표로 감쌀 것 — 아니면 YAML이 float를 준다. **지수 표기(`1.25e-7`)는 거부되고**, 소수점 아래 12자리를 넘는 값도 거부된다: 자릿수로 풀어 쓸 것(§13.1c) |
 | Path | `~/.dorang/dorang.db` | 선행 `~`는 프로세스 사용자 홈으로 확장된다 |
 
 ### 0.3 비밀값
@@ -716,7 +716,7 @@ capacity:
 |---|---|---|
 | `route` | `providers[].max_concurrency` | 프로바이더 하나 |
 | `provider_group` | `capacity.provider_groups` | 업스트림 풀을 공유하는 여러 프로바이더 |
-| `model` | `capacity.models[]` | **(키, 모델) 쌍 하나** |
+| `model` | `capacity.models[]` | **(프로바이더, upstream 모델) 쌍 하나** — 그 프로바이더의 모든 credential이 공유한다 |
 | `credential_group` | `capacity.credential_groups` | **계정 하나, 모든 모델** |
 | `key` | `key_rotation.providers[].keys[].max_concurrency` | 키 하나 |
 | `principal` | `capacity.principals` | 호출자 하나, **API 키 id**로 키잉 |
@@ -751,9 +751,9 @@ Go 옵션이지만 `internal/app`은 둘 다 설정하지 않으므로 어떤 YA
 |---|---|---|---|---|
 | `provider_groups.<name>.max_concurrency` | int | `0` | provider-group 상한 | 음수 거부. **`0`은 0짜리 상한이 아니라 이 축이 제약하지 않음을 뜻한다.** 프로바이더가 참조하는데 여기 선언되지 않은 그룹은 거부 |
 | `credential_groups.<name>.max_concurrency` | int | `0` | 모든 모델에 걸친 계정당 상한 | 동일. "모델 무관 동시 3개"를 모델링하는 축 |
-| `models[].provider` | string | — | (키, 모델) 상한이 속한 프로바이더 | 선언돼 있어야 한다 |
+| `models[].provider` | string | — | 상한이 속한 프로바이더. 축 키의 절반이며, 나머지 절반은 credential이 **아니다** | 선언돼 있어야 한다 |
 | `models[].model` | string | — | 상한이 세는 **업스트림** 모델 이름 | 빈 값 거부 |
-| `models[].max_concurrency` | int | `0` | (키, 모델)당 상한 | "모델별 7개, 그래서 모델 둘이면 14"를 모델링하는 축 |
+| `models[].max_concurrency` | int | `0` | (프로바이더, upstream 모델)당 상한 | **키당이 아니라 프로바이더당이다**: 같은 프로바이더의 두 번째 credential은 같은 버킷에서 가져간다. 또한 `credential_groups`와 겹쳐 적용되고 더 좁은 쪽이 이긴다 — 계정당 7로 묶인 플랜은 이 값을 어떻게 두든 모델 둘을 각각 7씩 돌리지 못한다 |
 | `principals.<id>.max_concurrent` | int | `default`에 대해 `32` | 호출자별 상한. `<id>`는 **API 키 id**이고, `default` 항목이 자기 항목 없는 모든 호출자에 적용된다 | 음수 거부. `default` 항목은 항상 존재한다 — 쓰지 않으면 `{max_concurrent: 32}`가 삽입된다 |
 | `global.max_concurrency` | int | 미설정 | 프로세스 또는 클러스터 전역 상한 | 부재는 전역 상한 없음. `global:` 블록 전체를 생략하는 것과 `{max_concurrency: 0}`이라고 쓰는 것은 의도에서만 다르고, 둘 다 축을 제약하지 않는다 |
 | `interactive_reserve` | float | `0.3` | batch가 점유할 수 없는 **모든** 축의 비율 | `[0,1)` 이내여야 한다. `1.0` 이상은 거부 — 모든 축을 batch가 전혀 쓸 수 없게 만드는데, 그것은 `0.999…`로 표현 가능하고 실제로는 오타일 가능성이 더 크다 |
@@ -1020,6 +1020,7 @@ pricing:
 
 **토큰 요율은 100만 토큰당이다.** 요율표를 옮겨 적기 전에 [§13.1c](#131c-요율은-무엇-하나당인가)를
 먼저 읽을 것. 토큰당 값은 거부되지 않는다 — 모든 요청이 0원으로 가격 매겨질 뿐이다.
+`dorangctl config lint`와 `dorang --check`가 그것을 경고하며, 그 외에는 아무것도 말해 주지 않는다.
 
 ### 13.1 키
 
@@ -1031,7 +1032,7 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | 어떤 종류의 비용인가 | `notional_rate` 규칙은 `source`와 `as_of`를 실어야 하고, 다른 어떤 클래스도 그 둘을 실을 수 없다 (§8.5) |
 | `rules[].priority` | int | `0` | id보다 먼저 specificity 동률을 가른다 | 음수 거부 |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | specificity 사다리 | 선언되지 않은 `provider`나 `credential`은 거부. `model`과 `model_prefix`는 선언된 모델과 대조되지 **않는다** — 현재 어떤 배포도 서빙하지 않는 모델을 정당하게 가격 매길 수 있다 |
-| `rules[].rates.<component>` | decimal | — | 각 컴포넌트의 수량 **한 단위당** 요율이며, 토큰 5종의 그 한 단위는 **100만 토큰이다 — §13.1c**. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다. **토큰당 값은 거부되지 않는다** — 모든 요청이 0원이 되는데도 `/spend/calculate`는 규칙이 매치됐다며 여전히 `"missing": false`를 답한다(§13.1c) |
+| `rules[].rates.<component>` | decimal | — | 각 컴포넌트의 수량 **한 단위당** 요율이며, 토큰 5종의 그 한 단위는 **100만 토큰이다 — §13.1c**. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다. **토큰당 값은 거부되지 않는다** — 모든 요청이 0원이 되는데도 `/spend/calculate`는 규칙이 매치됐다며 여전히 `"missing": false`를 답한다(§13.1c). 대신 *경고*된다: `config lint`와 `--check`가 100만당 `0.00001` 미만의 토큰 요율을 보고한다. 지수 표기(`1.25e-7`)와 소수점 아래 12자리 초과는 로더와 엔진 양쪽에서 **거부된다**(§13.1c) |
 | `rules[].period` + `rules[].amount` | string + decimal | — | `fixed_subscription`의 주기와 비용 | 그 클래스에 둘 다 필수; 금액 0 거부 |
 | `rules[].percent` | decimal | — | `adjustment`의 퍼센트 | 그 클래스에 필수; 0 거부 |
 
@@ -1108,9 +1109,13 @@ DESIGN §10.7의 규칙 — *청구 단위는 절대 변환되지 않는다* —
 > 방향으로. 녹음 길이는 내내 옳게 디코드되고 있었다. 그것은 중립 transcript까지 도달해 거기서 멈췄다.
 > 도착할 두 번째 축이 없었기 때문이다.
 >
-> 마이그레이션: 기존 게이트웨이의 `input_cost_per_second`에서 가져온 요율은 `compute_seconds`가 된다.
-> 그것이 기존 게이트웨이가 곱하는 값 — 응답 시간 — 이기 때문이다. **그 모델이 오디오 길이로 청구한다면
-> `audio_seconds`로 바꿀 것**. 임포터는 그런 키마다 경고를 내지 대신 골라 주지 않는다.
+> 마이그레이션: 기존 게이트웨이의 `input_cost_per_second`나 `output_cost_per_second`에서 가져온
+> 요율은 `compute_seconds`가 된다. 그것이 기존 게이트웨이가 곱하는 값 — 응답 시간 — 이기 때문이다.
+> **그 모델이 오디오 길이로 청구한다면 `audio_seconds`로 바꿀 것**. 임포터는 그런 키마다 경고를 내지
+> 대신 골라 주지 않는다. `input_cost_per_audio_per_second`는 그런 결정이 필요 없고 곧바로
+> `audio_seconds`로 들어간다. 초당 키가 **둘 다** 실린 파일은 기존 게이트웨이가 유일하게 더하는
+> 경우이며 — 둘 다 같은 경과 시간에 곱한다 — dorang에는 벽시계 요율이 하나뿐이다: import은 첫 번째를
+> 남기고, 합을 추측하기를 거부하며, 그 사실을 말한다.
 
 ### 13.1c 요율은 무엇 하나당인가
 
@@ -1161,14 +1166,40 @@ DESIGN §10.7의 규칙 — *청구 단위는 절대 변환되지 않는다* —
 **거기서 `unit:`이 없으면 `per_1m_tokens`이다** — 토큰당 숫자를 쓰고 `unit:`을 생략한 카탈로그 규칙은
 똑같이 실패한다.
 
-**incumbent에서 import해도 배율은 조정되지 않는다.** LiteLLM importer는 `input_cost_per_token`을
-`rates.input`에 그대로 옮긴다. 즉 import된 가격표는 100만당 필드에 든 토큰당 값이며, 경고 없이 10⁶배
-싸다. **import한 토큰 요율은 모두 1,000,000을 곱한 뒤에 믿을 것**, 그리고 한 요청을
-`POST /spend/calculate`로 벤더 요율표와 대조할 것.
+**incumbent에서 import하면 배율이 조정된다.** `dorangctl import config`는 실려 있는 모든 요율을
+dorang이 가격 매기는 수량으로 변환하고, 몇 개를 변환했는지 한 번 보고한다. 변환은 정확하다 —
+소수점이 움직일 뿐 반올림도 없고 어떤 값도 부동소수점을 거치지 않는다 — 그리고 명백한 두 필드가
+아니라 표 전체다:
+
+| incumbent가 쓰는 키 | dorang이 쓰는 것 | 배율 |
+|---|---|---|
+| `input_cost_per_token`, `output_cost_per_token`, `cache_read_input_token_cost`, `cache_creation_input_token_cost`, `output_cost_per_reasoning_token` | `input`, `output`, `cached_read`, `cache_write`, `reasoning` | **× 1,000,000** |
+| `input_cost_per_character`, `output_cost_per_character` | `characters` | **× 1,000** |
+| `input_cost_per_second`, `output_cost_per_second` | `compute_seconds` (§13.1b) | × 1 |
+| `input_cost_per_audio_per_second` | `audio_seconds` (§13.1b) | × 1 |
+| `input_cost_per_request` | `request` | × 1 |
+
+incumbent가 표현할 수 있고 dorang이 표현할 수 없는 요율 — 이미지당, 픽셀당, *비디오* 초당, 별도의
+오디오 토큰 요율, 배치 요율표, 128k 초과 티어 — 은 **import되지 않으며**, "이 파라미터는 대응물이
+없다"가 아니라 하나씩 이름으로 보고된다. 돈은 실재하고, 다만 여기에 그 축이 없을 뿐이다.
+
+importer는 지수 표기(`2.5e-06`)로 적힌 요율도 읽는다. 부동소수점을 출력하는 프로그램이 만든 파일에
+들어 있는 것이 그 형태이기 때문이며, 읽어서 자릿수로 풀어 쓴다. 그 표기가 허용되는 곳은 여기뿐이다.
+
+**요율은 자릿수로 적는다.** `2.5e-6`이 아니라 `0.0000025`. 지수 표기는 메인 파일과 카탈로그 파일
+양쪽 모두에서 **로드 오류**다. 예전에는 둘 중 한쪽에서만 로드 오류였다 — `dorangctl config lint`는
+`ok`라 답하고 게이트웨이가 그다음에 "exponent notation is not accepted"로 조립을 거부했으니, 배포
+승인이 끝난 뒤에 도착한 로드 오류다. 소수점 아래 12자리를 넘는 값도 이제 마찬가지다. 엔진은 그것을
+조용히 잘라내지 않는다.
 
 **확인 방법.** 알려진 토큰 수로 `POST /spend/calculate`를 부르거나 `dorangctl price`를 써서 요율표와
 손으로 대조한다. `"missing": false`는 그 확인이 아니다 — 규칙이 매치됐다는 뜻이지 그 규칙이 옳다는
 뜻이 아니다.
+
+`dorangctl config lint`와 `dorang --check`가 그중 한 부분은 대신해 준다: 100만당 `0.00001` 미만의
+토큰 요율은 시장에서 가장 싼 요율표보다도 세 자릿수 아래이므로, 규칙과 요율을 지목하는 **경고**를
+출력한다. 그것은 경고로 남고 결코 거절이 되지 않는다 — 100만 토큰당 $0.02인 정말로 싼 모델이
+존재하고, 틀린 가격이 게이트웨이를 서비스 못 하게 만드는 원인이 되어서는 안 된다.
 
 ### 13.2 클래스는 경쟁하지 않고 합성한다
 
@@ -2046,8 +2077,10 @@ capacity:
     acct-2: {max_concurrency: 3}
     plan-a-account: {max_concurrency: 7}
   models:
-    - {provider: plan-a, model: model-x, max_concurrency: 7}   # (키, 모델)당
-    - {provider: plan-a, model: model-y, max_concurrency: 7}   # 그래서 둘 합치면 14
+    # (프로바이더, upstream 모델)당. 위의 plan-a-account와 겹쳐 적용되고 더 좁은
+    # 쪽이 이긴다 — 아래 주석 참고.
+    - {provider: plan-a, model: model-x, max_concurrency: 7}
+    - {provider: plan-a, model: model-y, max_concurrency: 7}
   principals:
     default: {max_concurrent: 16}
   global: {max_concurrency: 64}
@@ -2094,8 +2127,12 @@ observability: {log_level: info, log_format: json}
 - **`DORANG_KEY_PEPPER`를 명시적으로 설정할 것.** 노드 둘에 생성된 pepper면 각자 자기 것을 만들고 한쪽이
   발급한 키를 다른 쪽이 검증할 수 없다.
 - ~50 req/s에서 `sample_rate: 0.2`는 발췌를 하루 ~2.2 GB 대신 ~440 MB로 유지한다.
-- plan-a 숫자가 축이 존재하는 이유의 형태다: 모델별 7 *그리고* 계정별 7이면 모델 둘이 한 키에서 동시
-  14에 이르는 동안 계정 상한은 provider-group 수준에서 여전히 지켜진다.
+- plan-a 숫자가 축이 존재하는 이유의 형태다: 모델마다 자기 7이 있다 — 하지만 위의 `plan-a-account`가 그
+  키를 모든 모델 통틀어 7로 묶고 더 좁은 축이 이기므로, 여기서 실제로 도달 가능한 값은 **14가 아니라
+  총 7**이다. 모델 둘이 정말 14에 이르려면 credential group을 빼야 하고, 그것이
+  `testing/providers/dual-key.yaml.tmpl`이 하는 일이자 적어 둔 내용이다. 모델별 축의 키는
+  `(프로바이더, upstream 모델)`이고 credential이 아니므로, `plan-a`에 키를 하나 더 붙여도 자기 버킷이
+  새로 열리지 않고 같은 두 버킷에서 가져간다.
 - `usage_probe`가 dorang을 거치지 않은 트래픽까지 쿼터에 반영시킨다(§6.1). 이 파일의 두 프로바이더에는
   prober가 없어서 쓰이지 않았다. prober가 있는 셋은 `zai`, `anthropic`(OAuth 구독, §11.2b), `deepseek`이고,
   보고된 퍼센트를 규칙이 게이트할 수 있는 수치로 바꾸는 `allowances`는 §6.1a에 있다. 만료 임박 쿼터
@@ -2205,7 +2242,10 @@ priority_mapping:
 - `min_leasable: 16`은 `shared-pg`에서 무력하고 `leased`로 바꾸는 순간 하중을 받는다 — 그 시점에
   파일의 16 미만 `max_concurrency`가 전부 거부된다.
 - ~2 k req/s에서 `store_messages: hash` + `sample_rate: 0.01`은 전체 발췌의 하루 ~88 GB 대신 ~880 MB를
-  보관한다.
+  일일 바이트 예산에 **청구한다** — 두 자릿수 차이를 만드는 것은 샘플링이다. 실제로 **보관되는** 양은
+  거기서 또 훨씬 적다: 예산은 읽은 발췌 길이로 청구되고 그것을 대체하는 다이제스트는 고정 71바이트
+  (`sha256:` + hex 64)이므로, 저장 컬럼은 청구된 값의 약 7분의 1이다. 예산은 청구량으로, 디스크는
+  보관량으로 잡을 것.
 - `key_ref`는 **이 빌드에서 거부된다**: 그렇게 선언된 크리덴셜은 외부 resolver가 생기기 전까지 로드되고
   쓸 수 있는 비밀값이 없었을 것이다. 오늘은 `key_env`나 `key_file`을 쓸 것.
 - vLLM `metrics` 스크레이프는 **이 빌드에 없고 `providers[].metrics`는 거부된다**(§6.2). `least_busy`는

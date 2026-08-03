@@ -1,0 +1,78 @@
+# dorang, in front of the incumbent LiteLLM.
+#
+# This project owns nothing the incumbent owns. It joins `litellm_default` as an
+# EXTERNAL network so it can dial `litellm:4000` by service name; it never
+# declares that network, so `docker compose down` cannot remove it.
+#
+#   up:     docker compose -p dorang up -d
+#   down:   docker compose -p dorang down            (leaves the data)
+#   remove: docker compose -p dorang down -v         (removes the data too)
+#
+# Nothing outside this directory and this project's two volumes is touched.
+
+name: dorang
+
+services:
+  dorang-db:
+    image: postgres:17
+    container_name: dorang-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dorang
+      POSTGRES_USER: dorang
+      POSTGRES_PASSWORD: ${DORANG_PG_PASSWORD:?set DORANG_PG_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d dorang -U dorang"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+
+  dorang:
+    build:
+      # DORANG_SOURCE is the checkout to build from; it lives in .env so no
+      # machine-specific path appears in this file.
+      context: ${DORANG_SOURCE:?set DORANG_SOURCE in .env to the dorang checkout}
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${DORANG_VERSION:-dev}
+    image: dorang:local
+    container_name: dorang
+    restart: unless-stopped
+    depends_on:
+      dorang-db:
+        condition: service_healthy
+    env_file: [.env]
+    ports:
+      # Host-published so a consumer outside Docker can reach it. 4100 is
+      # dorang's default and was free on this host.
+      - "4100:4100"
+    volumes:
+      - ./config/dorang.yaml:/etc/dorang/config.yaml:ro
+      # State lives on a volume, never in the container's writable layer: the
+      # trace spool and the batch blobs are here, and losing them loses metering
+      # that has not been flushed.
+      - state:/var/lib/dorang
+    networks:
+      internal:
+      # The incumbent's network, joined read-only in the sense that matters:
+      # declared external, so this project cannot create or destroy it.
+      litellm_default:
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/dorangctl", "health", "--addr", "http://127.0.0.1:4100"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+networks:
+  internal:
+    driver: bridge
+  litellm_default:
+    external: true
+
+volumes:
+  pgdata:
+  state:

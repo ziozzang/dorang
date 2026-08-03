@@ -137,8 +137,15 @@ capacity:
     plan-a-account: {max_concurrency: 7}
     acct-1: {max_concurrency: 3}
     acct-2: {max_concurrency: 3}
-  # Per (key, model): a coding plan may allow 7 in flight *per model*, so
-  # serving two models means 14 concurrent requests on one key (§5).
+  # Per (PROVIDER, upstream model) — not per key. The credential is not part of
+  # the axis key, so this bucket is shared by every credential of `plan-a`:
+  # adding a second key to the provider does not add a second 7.
+  #
+  # It stacks with `credential_groups` rather than replacing it, and the
+  # narrower of the two wins. `plan-a-1` is in `plan-a-account` above at 7
+  # ACROSS all models, so on this file the reachable figure for that key is 7
+  # in total, not 7 per model. Drop the credential group to let a per-model
+  # plan really run 7 of each concurrently (§5).
   models:
     - {provider: plan-a, model: model-x, max_concurrency: 7}
     - {provider: plan-a, model: model-y, max_concurrency: 7}
@@ -186,6 +193,10 @@ models:
         weight: 5
         priority: 1
         timeout: 90s
+        # INERT in this build (§24): nothing forwards it, so this stream is
+        # bounded by `timeout` above and by server.request_timeout. It is
+        # written here because the schema accepts it and a ceiling you believe
+        # you set is worse than none.
         stream_timeout: 60s
         limits:
           - {metric: rpm, value: 600}
@@ -244,11 +255,25 @@ pricing:
   # Rules kept in this file, in addition to the catalog. Prices are exact
   # decimals, never floating point (§8.3); classes compose instead of
   # competing (§8.1).
+  #
+  # TOKEN RATES ARE PER MILLION TOKENS. `input`, `output`, `cached_read`,
+  # `cache_write` and `reasoning` all carry the per_1m_tokens unit, so a card
+  # that reads "$2.50 per million input tokens" is written "2.50" — never
+  # "0.0000025". A per-token value is not refused: it prices every request at a
+  # MILLIONTH of its cost, which rounds to a flat zero for all but the largest,
+  # while `/spend/calculate` still answers `"missing": false` because the rule
+  # DID match. `request` is per request, `characters` per thousand, and the two
+  # per-second components per second (CONFIG §13.1c).
+  #
+  # This block used to carry the per-token spelling and every request it priced
+  # cost nothing. Price one real request through `POST /spend/calculate` and
+  # check the figure against the card before trusting any of it.
   rules:
     - id: plan-a-tokens
       class: marginal_usage
       match: {provider: plan-a, model: model-x}
-      rates: {input: "0.0000025", output: "0.00001", cached_read: "0.00000025"}
+      # $2.50 / $10.00 / $0.25 per million tokens.
+      rates: {input: "2.50", output: "10.00", cached_read: "0.25"}
     - id: plan-a-subscription
       class: fixed_subscription
       match: {credential: plan-a-1}

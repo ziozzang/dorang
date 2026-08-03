@@ -292,6 +292,43 @@ type HealthReporter interface {
 	Health(dst []byte) []byte
 }
 
+// ReadinessGate is a dependency that can decide this node must stop receiving
+// new work, without the node draining and without it dying.
+//
+// It exists because readiness had exactly one input — the drain — and a drain is
+// something this process decides about itself. Everything else a node needs in
+// order to serve is outside it, and the credential store is the sharpest case:
+// with it unreachable, cached principals keep serving, so nothing aggregate
+// looks wrong, while every caller whose key this node has not recently seen gets
+// a 503 from a load balancer that still believes in it. §13 draws readiness as
+// the signal that decides whether new work should arrive, and a node that cannot
+// authenticate anyone new is a node that should not be sent any.
+//
+// It is emphatically NOT a liveness input. The outage this models recovers on
+// its own — reconnection is transparent, the restart count stays zero, and work
+// buffered during the gap is written when the dependency returns — so a probe
+// that killed the process would turn a recoverable blip into a cold start, which
+// is the same mistake as pointing a liveness probe at /health/readiness.
+//
+// Two rules, both because [Server.Ready] is on the path of every container
+// probe and every metrics scrape:
+//
+//   - It must not block and must not perform I/O. It is answering a request.
+//     Whatever consults the dependency does so somewhere else and leaves an
+//     answer here.
+//   - It must not be a hair trigger. "A query failed" is not "cannot serve new
+//     work". [health.Dependency] is the implementation this was written for and
+//     states the threshold it uses and why.
+type ReadinessGate interface {
+	// GateName is a fixed, low-cardinality key for the health body, such as
+	// "store".
+	GateName() string
+	// ReadyForWork reports whether new work may arrive, and a fixed-cardinality
+	// reason when it may not. The reason is rendered into the health body; ""
+	// is legal and renders as an absent field.
+	ReadyForWork() (ok bool, reason string)
+}
+
 // MetricsSource renders the whole Prometheus scrape.
 //
 // It is one method wide for the same reason [Observer] is: internal/metrics
