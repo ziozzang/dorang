@@ -372,11 +372,11 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c 로테이션: 유예 기간을 둔 새 시크릿, 조기 컷, "클라이언트가 갈아탔는가"를 답하기 위한 목록. 키 id는 그대로이므로 예산·지출·허용 목록·원장 이력은 건드리지 않는다 |
 | `/key/pend`, `/key/release` | §11.6의 되돌릴 수 있는 거부. block과 구분된다 — pend는 틀릴 수 있는 통계적 판단이고 운영자가 한 동작으로 해제한다 |
 | `/spend/logs` | 요청별 원장. `key_id`, `team_id`, `trace_id`, `tag`, `errors_only` 중 하나와 유계 날짜 범위가 필요하다 — §9.3은 무계 스캔을 느리게 답하지 않고 거부한다 |
-| `/global/spend/report` | 유계 범위의 집계 지출. DESIGN §9.4의 롤업에서 읽는다. `group_by`는 `day`와 `model`·`key`·`team` 중 **하나**를 받는다 — 세 물질화가 실제로 가진 키다. §9.4는 큐브가 아니라 목적별 롤업을 두므로, 그 밖의 조합(`user`, `tag`, `provider`, 또는 주체 차원 둘 동시)은 테이블 스캔이 되는 대신 없는 것을 명시하며 **501**로 답한다. `notional_spend`는 `0`이 아니라 `null`로 보고된다: 롤업에 리스트 요율 컬럼이 없고 DESIGN §8.5가 유리한 답을 금지한다. `marginal_spend`와 `subscription_spend`는 각자의 컬럼에서 읽으며 `/spend/logs`와 행 단위로 일치한다 — 예전에는 `cost_nano`를 두 번 보고한 것이어서, 운영자가 모델을 비교하는 그 리포트에서 정액제 요금의 몫이 marginal 사용량으로 집계됐다. 그 컬럼들이 생기기 전에 기록된 행은 둘 다 `0`으로 보고한다. 분해가 애초에 기록되지 않았고 그것을 복원할 근거가 없기 때문이다 |
+| `/global/spend/report` | 유계 범위의 집계 지출. DESIGN §9.4의 롤업에서 읽는다. `group_by`는 `day`와 `model`·`key`·`team` 중 **하나**를 받는다 — 세 물질화가 실제로 가진 키다. §9.4는 큐브가 아니라 목적별 롤업을 두므로, 그 밖의 조합(`user`, `tag`, `provider`, 또는 주체 차원 둘 동시)은 테이블 스캔이 되는 대신 없는 것을 명시하며 **501**로 답한다. `notional_spend`는 리스트 요율 환산값(§8.5)이며, 창(window)의 값이 온전하지 않으면 `0`이 아니라 `null`로 보고된다: 롤업은 합계와 함께 두 개의 카운트 — 리스트 요율로 가격이 매겨진 요청 수와, 가격 엔진까지 갔지만 notional 규칙이 없었던 요청 수 — 를 가지며, 후자가 하나라도 있거나 전자가 0이면(카운트가 생기기 전에 기록된 모든 버킷이 여기 해당한다) `notional_available: false`로 답한다. 얼마나 모자란지 알 수 없는 합계를 총계로 제시하는 것이 바로 §8.5가 금지하는 유리한 답이다. 카운트는 마이그레이션 0008에서 추가됐고, `notional_nano` 컬럼 자체는 0002부터 있었으나 기록하는 쪽이 없었다 — 그래서 그 전까지 이 필드는 모든 배포의 모든 창에서 `null`이었다. `marginal_spend`와 `subscription_spend`는 각자의 컬럼에서 읽으며 `/spend/logs`와 행 단위로 일치한다 — 예전에는 `cost_nano`를 두 번 보고한 것이어서, 운영자가 모델을 비교하는 그 리포트에서 정액제 요금의 몫이 marginal 사용량으로 집계됐다. 그 컬럼들이 생기기 전에 기록된 행은 둘 다 `0`으로 보고한다. 분해가 애초에 기록되지 않았고 그것을 복원할 근거가 없기 때문이다 |
 | `/admin/capacity` | 축별 브로커 점유 현황 |
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | 카탈로그 모델 필드의 출처 |
 | `/health/history` | 인프로세스 링. 재시작할 때마다 비어 있는 상태로 시작한다 |
-| `/ui` | 읽기 전용 운영 UI. 관리 크리덴셜로 로그인하며 세션은 1시간이다 — 폐기된 크리덴셜이 UI를 잃기까지의 지연이기도 하다 |
+| `/ui` | 읽기 전용 운영 UI: 키, 모델·배포, 사용량·비용. 관리 크리덴셜로 로그인한다. 세션은 1시간이지만, 그 1시간은 이제 폐기 지연이 아니라 **유휴** 탭의 상한이다: 세션 뒤의 키를 매 요청마다 스토어에 다시 확인하므로 차단·삭제·pend·만료 — 혹은 다른 팀으로 이동 — 는 다음 클릭에서 세션을 끝낸다. 소유 *유저*의 role 회수는 키에 있는 값이 아니므로 여전히 세션 TTL만큼 지연된다. 쿠키의 `Secure`는 브라우저 구간이 TLS일 때 붙으며, TLS를 종단하고 `X-Forwarded-Proto`/`Forwarded`로 알려주는 프록시 뒤에서도 붙는다. 모델 화면은 이 프로세스가 **컴파일한** 라우팅 테이블을 읽는다 — `/model/*`가 501인데도 이 화면이 답하는 이유이며, 아래 주석을 볼 것 |
 | `/user/new`, `/user/info`, `/user/update`, `/user/delete`, `/user/list` | 디렉터리 유저. **`blocked`가 강제된다**: 막힌 유저의 키는 호출을 받은 노드에서 응답 전에 서빙을 멈추고, 다른 모든 노드에서는 `/key/block`이 지키는 것과 같은 공표 상한 안에 멈춘다(§10.1) — `poll: 20ms`에서 두 번째 노드까지 **19.6 ms** 측정, 공표된 270 ms 대비. `max_budget`·`budget_duration`·`rpm_limit`·`tpm_limit`·`models`도 §11.2 세 주체 봉투의 유저 절반으로서 강제된다: 키·유저·팀 중 가장 제한적인 것이 이긴다. 유저를 지워도 그 키는 **지워지지 않는다** — 키는 revoked로 공표되고 그 뒤 *소유자 없이* 서빙되므로, 접근을 끝내려면 유저만이 아니라 키를 막거나 지워야 한다 |
 | `/team/new`, `/team/info`, `/team/update`, `/team/delete`, `/team/list`, `/team/member_add`, `/team/member_delete` | 디렉터리 팀. 유저와 같은 강제에 더해 `max_parallel_requests` — `teams`에는 있고 `users`에는 없는 유일한 상한이다. **멤버십은 의도적으로 무효화를 공표하지 않는다**: 키의 팀은 `team_members`가 아니라 `api_keys.team_id`이므로 멤버십 변경은 어떤 인가 판단도 바꾸지 않고, 그에 대한 메시지는 어느 노드도 행동할 수 없는 메시지다 |
 | `/budget/new`, `/budget/info`, `/budget/update`, `/budget/delete`, `/budget/list` | **키**·**유저**·**팀**의 상한. `budget_id: "team:eng"`처럼 주체로 지정한다. `spend`는 `/key/info`가 쓰는 §9.4 롤업이 아니라 **게이트가 실제로 비교하는 내구 카운터**(`budget_state`)에서 읽는다. 이 경로가 답하는 질문은 "상한을 X로 내리면 거부되는가"이고 게이트가 비교하는 숫자만 그것을 답할 수 있기 때문이다 — 리스 블록이 살아 있는 동안은 원장보다 조금 앞서 달린다(§9.6). **`/budget/delete`는 상한을 지우고 지출은 보존한다**: 과금 판단을 하지 않고 예산 장애를 끝내는 방법이며, 캐시 TTL이 아니라 공표 상한 안에 플릿 전체에 적용된다. 기록된 지출보다 낮게 상한을 내리면 주체를 명시한 **400 `budget_exceeded`**로 거부된다 — 살아 있는 리스 블록을 쥔 노드에서는 최대 한 블록 뒤에(§5.6이 공표하는 overshoot) |
@@ -495,16 +495,30 @@ capacity:
 ```
 dorangctl catalog explain anthropic my-model-name
 dorangctl catalog unverified
+dorangctl catalog unverified --state substituted
 ```
 
 `catalog explain`은 필드별로 해결된 값, 어느 레이어가 이겼는지, 어느 파일이 썼는지를 출력한다. 컨텍스트
 윈도우가 틀린 오퍼레이터는 어느 파일을 고칠지 알아야 하고, 오버레이를 쓴 오퍼레이터는 그것이 적용됐는지
-알아야 한다. 이것 없이는 둘 다 추측이다.
+알아야 한다. 이것 없이는 둘 다 추측이다. ORIGIN 칸의 `undeclared`가 "이 필드가 선언되긴 했는가"의 답이며,
+미선언 `context_window`가 드러나는 자리도 여기다.
 
-`catalog unverified`는 프로브 목록이다: dorang이 검증 날짜 없는 데이터로 능력 질문에 답하게 될 모델들.
+`catalog unverified`는 **검증 상태**를 보고한다: 각 항목을 마지막으로 살아 있는 엔드포인트에 물었을 때 무슨
+일이 있었는가. 상태는 다섯이고 — `verified`, `denied`, `substituted`, `citation_only`, `unchecked` —
+상태마다 오퍼레이터가 할 일이 다르기 때문에 갈라서 보고된다. 발견을 담은 두 상태(`denied`, `substituted`)는
+증거와 함께 나열되고, `--state S`로 한 상태만 따로 볼 수 있다. 라우팅 전에 볼 것은 **`substituted`**다:
+물어본 이름과 다른 모델이 200으로 답했다는 뜻이고, 청구는 요청한 쪽으로 간다. `denied`는 그 반대로 읽어야
+한다 — 자격이 없다는 것은 **모델이 존재한다**는 뜻이고, 항목을 지우면 참인 사실을 잃는다.
+
 **미검증 능력은 부재 능력과 같지 않으며**, 특히 리즈닝 능력은 이름 프리픽스에서 절대 추론되지 않는다 —
 한 모델 버전에서 관측한 effort 스케일을 패밀리 전체로 일반화하는 것이 그 패밀리의 다른 멤버들에서 제어를
-조용히 떨어뜨리는 정확한 경로다.
+조용히 떨어뜨리는 정확한 경로다. 리즈닝 능력은 위의 검증 상태와 **다른 축**이고, 출력 맨 끝에 한 줄로 따로
+선다: 어떤 모델은 존재가 `verified`이면서도 리즈닝 제어가 미지일 수 있다. 예전 출력은 둘을 하나의
+"unverified" 목록으로 뭉갰고, 그래서 읽을 수 없었다.
+
+크리덴셜을 쥐고 있다면 `dorangctl catalog verify --kind <kind> --key-env <VAR>`가 항목마다 진짜 요청을
+하나씩 보내 그 상태를 닫는다. 키는 플래그가 아니라 환경변수 이름으로 지목하고, `--dry-run`은 아무것도 묻지
+않는다. 전체 동작과 이 명령이 내리지 않기로 한 결론 셋은 [MIGRATION.ko.md](MIGRATION.ko.md) §2.4.
 
 **5. 배포 추가** — 새 그룹에 넣거나, 기존 그룹의 두 번째 후보로 넣는다:
 
@@ -606,17 +620,71 @@ scrape_configs:
 `prometheus: false`를 `MetricsOff`로, `metrics.public: true`를 `MetricsPublic`으로 렌더링하고, 기본값은
 `MetricsAdmin`이다.)
 
-⚠️ **모든 메트릭은 호출자별 라벨이 없다.** 경로별·모델별·키별 라벨이 어디에도 없으며 의도적이다: 축 키와
-모델 이름은 무한 카디널리티이고, 클라이언트가 라벨 값을 만들게 하는 게이트웨이는 자기 메트릭 레지스트리에
-대한 서비스 거부를 넘겨준 것이다. 키별·모델별 수치는 스크레이프가 아니라 원장에서 온다.
+⚠️ **메트릭에는 라벨이 붙고, 그 라벨 중 하나는 한때 호출자가 골랐다.** 이 문단은 예전에 "경로별·모델별·
+키별 라벨이 어디에도 없으며 의도적이다"라고 적혀 있었다. 그것은 카디널리티 통제에 대한 **부재 주장**이었고
+— 두 문단 위 `/metrics` 인증 문단과 같은 모양이다 — 틀렸다: `dorang_requests_total`은 `model`,
+`provider`, `credential`, `endpoint`, `status`를 싣고, 모델별 히스토그램은 `model`을 싣는다.
+
+키별 라벨도 스크레이프 안에 있다: `dorang_budget_spent_ratio{subject}`는 예산 주체(`key:…`, `user:…`,
+`team:…`)로 키가 매겨지고, capacity 축은 api-key id와 크리덴셜 id로, quota 패밀리는 크리덴셜로 매겨진다.
+네 줄 위 문단은 스크레이프가 "키별 지출, 크리덴셜별 쿼터 상태, 설정된 모든 모델 이름"을 싣는다고 처음부터
+말하고 있었다 — 두 문장이 같은 화면 안에서 서로를 반박하고 있었다.
+
+철회된 문장의 논거 자체는 옳았고 지금도 유효하다. 그래서 `dorang_requests_total`과 모델별 히스토그램의
+각 라벨을 무엇이 묶는지 적는다:
+
+| 라벨 | 무엇이 묶는가 | 호출자가 값을 만들 수 있는가 |
+|---|---|---|
+| `provider`, `credential` | 설정된 크리덴셜 집합 | 아니오 |
+| `endpoint` | 라우트 테이블 — 라우트 **이름**이지 요청 경로가 아니다 | 아니오 |
+| `status` | dorang이 답하는 상태 코드 | 아니오 |
+| `model` | 설정된 모델 집합 — `models[]`에 `aliases`를 더한 것, 즉 `GET /v1/models`가 게시하는 바로 그것 | 아니오. 그 집합에 없는 이름은 `__unknown__`이 된다 |
+
+여기서 다른 곳의 키별 라벨이 "아니오"인 이유도 `credential`과 같다: api-key id, 예산 주체, 크리덴셜 id는
+오퍼레이터가 쓰는 테이블의 행이지 요청이 싣고 오는 문자열이 아니다.
+
+`model`은 이 표에서 **마지막으로** "아니오"가 된 라벨이고, 그렇게 되기까지가 이 절이 존재하는 이유다.
+internal/server는 모델 이름을 요청 본문(또는 배포 경로 세그먼트)에서 읽어 **dorang이 거부하는 요청까지
+포함해** 그대로 계측한다. 그래서 한때는 정확히 한 모델만 허용된 키도 허용되지 않은 이름을 물어보는 것만으로
+라벨 값을 찍어낼 수 있었고, 시리즈 상한이 그것을 막는 유일한 장치였다. 지금은 그 바이트가 라벨의
+**입력**일 뿐이다: `Requests.Observe`는 설정이 서빙하는 이름만 그대로 통과시키고 나머지는 전부
+`__unknown__` 하나로 접는다. 인가가 아니라 **설정**이 경계이고, 그 경계는 조립 시점과 **모든 reload마다**
+`internal/app`이 다시 건넨다 — 기동 시점에 한 번만 고정된 경계는, 모델을 추가한 reload가 이미 소진된 채로
+발견하는 경계다.
+
+`__unknown__`과 `__overflow__`는 다른 말이고 구별해야 한다. `__unknown__`은 호출자가 이 게이트웨이가
+서빙하지 않는 이름을 물었다는 뜻이며 잃은 해상도가 없다 — 애초에 그 이름의 시리즈가 있었던 적이 없다.
+건강한 게이트웨이도 이 버킷을 계속 들고 있을 수 있다. `__overflow__`는 상한이 걸려 해상도를 **잃었다**는
+뜻이고, `dorang_metrics_cardinality_folds_total{family}`가 그 접힘을 센다. 물어본 이름 자체의 전체 해상도는
+메트릭이 아니라 원장에 있다: internal/meter가 거부된 요청까지 포함해 기록하고 `/spend/logs`가 그 행을
+서빙한다. 메트릭에 남는 것은 알람이 원하는 부분, 즉 서빙하지 않는 모델로 향한 트래픽의 **양**
+(`dorang_requests_total{model="__unknown__"}`)이다.
+
+남은 상한은 보안 통제가 아니라 메모리 예산이다. `metrics.DefaultMaxRequestSeries`(2048)는 다섯 라벨의
+*곱*을 묶고, `DefaultMaxModelSeries`(128)는 모델별 패밀리의 **하한**이다 — `SetAdmittedModels`가 설정된
+모델 집합 전체를 담도록 상한을 올리므로(설정된 이름 수 + 2), 모델 그룹이 300개인 배포는 접힌 대시보드가
+아니라 300개의 엔트리를 갖는다. 상한은 절대 내려가지 않고 엔트리는 절대 축출되지 않는다: 축출했다가 다시
+만든 시리즈는 카운터가 0부터 다시 시작하고, 그것은 `rate()`에게 프로세스 재시작으로 읽힌다. 그래서 실제로
+`__overflow__`가 나타났다면 그것은 호출자가 아니라 **배포가** 상한을 넘어섰다는 뜻이고, 이미 잃은 해상도는
+재시작으로만 돌아온다 — 상한을 올리는 것은 여유를 살 뿐 천장을 없애지 않는다. 알람은 §7.1. 요청별
+**비용** 귀속은 어느 쪽이든 영향받지 않는다: 원장(§9)에서 오고, 원장은 키가 있으며 접히지 않는다.
+
+> **업그레이드 노트(이 변경 이전 빌드에서 올라오는 경우).** 이름이 바뀌거나 사라진 것은 없고, 자기 모델
+> 이름을 그리는 대시보드는 영향받지 않는다. 달라지는 것: 설정에 **없는** `model` 라벨 값은 전에는 그대로
+> 나타났고(그리고 128개를 넘으면 `__overflow__`로) 이제는 `__unknown__`으로 나타난다. dorang이 서빙하지
+> 않는 모델 이름으로 그래프나 알람을 걸어 뒀다면 — `models[]`에서 지웠는데 패널에 남겨 둔 이름, 또는 일부러
+> 서빙하지 않는 프로브 대상 — 그 시리즈는 전진을 멈추고 트래픽은 `__unknown__` 아래에 나타난다.
+> `dorang_metrics_cardinality_folds_total{family="dorang_request_duration_seconds"}`는 이제 평평해야
+> 하고, 그것을 모델 이름 폭주의 대리 지표로 알람 걸어 뒀다면 알람을
+> `dorang_requests_total{model="__unknown__"}`으로 옮길 것(§7.1).
 
 ### 6.1 코어 메트릭
 
 | 메트릭 | 타입 | 재는 것 |
 |---|---|---|
-| `dorang_requests_total` | counter | 서빙된 요청 |
+| `dorang_requests_total{model,provider,credential,status,endpoint}` | counter | 서빙된 요청. 각 차원을 무엇이 묶는지는 위 라벨 표. `model="__unknown__"`은 이 설정이 서빙하지 않는 모델을 지목한 모든 요청을 한데 모은 것이다 — 이름은 `/spend/logs`에 있다 |
 | `dorang_responses_total{class}` | counter | 상태 클래스별 응답: `1xx`…`5xx` |
-| `dorang_request_duration_seconds{le}` | histogram | 게이트웨이 요청 소요. 버킷 100 µs–60 s |
+| `dorang_request_duration_seconds{model,le}` | histogram | 게이트웨이 요청 소요, **설정된** 모델마다 히스토그램 하나. 버킷 **50 µs–300 s**, 2 ms 아래로 촘촘해서 §15.1 목표를 답할 수 있다. 예전 판은 "100 µs–60 s"라고 적었는데 그것은 `internal/server`의 **폴백** 경계값이고 레지스트리가 배선되지 않았을 때만 서빙된다 — 조립된 게이트웨이에는 그런 경우가 없다. 여기 적힌 두 끝점은 `TestScrapedDurationBucketsAreTheRangeOperationsPublishes`가 고정한다 |
 | `dorang_request_bytes_total` | counter | 읽은 요청 본문 바이트 |
 | `dorang_response_bytes_total` | counter | 쓴 응답 본문 바이트 |
 | `dorang_unimplemented_total` | counter | 501로 답한 요청 |
@@ -716,13 +784,14 @@ shadow가 켜져 있으면 본문이 게이트 판정을 담은 `"shadow"` 객�
 | 인증 실패 | `rate(dorang_auth_failures_total[5m])` 상승 | 만료된 키, 클라이언트 설정에 남은 폐기된 키, 또는 다른 pepper로 발급된 키 | `dorangctl key list`가 키별 상태를 보여준다. *모든* 키가 실패하면 pepper를 의심할 것(§2.3) |
 | 재생 거부 | `rate(dorang_replay_refused_total[5m]) > 0` | 프로세스 전역 재생 예산이 가득 차 본문이 더 이상 보유되지 않고 그 요청들은 폴백할 수 없다 | 큰 본문 + 높은 동시성. 각각 하나만이면 괜찮다. `dorang_replay_bytes`를 볼 것 |
 | 본문 거부 | `rate(dorang_body_too_large_total[5m]) > 0` | 본문 상한 초과 요청 | 클라이언트가 전에 보내지 않던 것을 보내고 있다 — 흔히 임베딩된 문서 |
+| 라벨 카디널리티 접힘 | `increase(dorang_metrics_cardinality_folds_total[1h]) > 0` | 어떤 메트릭 패밀리가 시리즈 상한에 닿아 `__overflow__`로 접혔다. **공격이 아니라 배포가 상한을 넘어선 것이다** — 라벨 값은 전부 설정에서 오므로(§6) 호출자는 이 상한에 닿을 수 없다 | `{family}`를 볼 것. `dorang_requests_total`이면 다섯 라벨의 곱이 2048 튜플을 넘은 것이다: 프로바이더·크리덴셜·엔드포인트를 추가한 뒤라면 예상된 일이다. 모델별 패밀리는 reload마다 자기 상한을 설정된 모델 집합에 맞춰 올리므로, 거기서 접혔다면 보고할 가치가 있는 결함이다. 상한 상향은 여유를 살 뿐이고, 엔트리는 축출되지 않으므로 이미 잃은 해상도는 재시작이 필요하다 |
 
 ### 7.2 지연
 
 | 알람 | 식 | 의미 | 조치 |
 |---|---|---|---|
 | 요청 소요 p99 | `histogram_quantile(0.99, rate(dorang_request_duration_seconds_bucket[5m]))` | ⚠️ 업스트림 시간을 포함한다. 설계가 목표로 삼는 **게이트웨이 오버헤드가 아니다** | 이 시리즈에 대해 설계의 2 ms p99로 알람을 걸지 말 것. 자기 트래픽에 대해 측정한 baseline으로 걸 것 |
-| 최상위 버킷에 몰림 | 질량이 전부 `le="+Inf"` | 요청이 60초를 넘고 있다. 보통 긴 생성, 가끔 멈춘 업스트림 | `dorang_inflight_requests`와 상관 확인 — 멈춘 업스트림은 슬롯을 붙든다 |
+| 최상위 버킷에 몰림 | 질량이 전부 `le="+Inf"` | 요청이 최고 유한 경계인 **300초**(§6.1)를 넘고 있다. 보통 긴 생성, 가끔 멈춘 업스트림 | `dorang_inflight_requests`와 상관 확인 — 멈춘 업스트림은 슬롯을 붙든다 |
 
 > **공표된 목표에 대해.** 설계의 숫자는 *게이트웨이 오버헤드*다: 요청 라인과 헤더의 마지막 바이트를 읽은
 > 시점부터 업스트림에 첫 바이트를 쓸 때까지, 더하기 업스트림 마지막 바이트부터 클라이언트에 마지막 바이트를
@@ -900,6 +969,38 @@ systemctl restart dorang
 
 새 바이너리로 옛 설정에 `--check`하는 것이 가장 값싼 사전 점검이고, 실제로 일어나는 경우를 잡는다: 새
 스키마가 더 이상 받지 않는 키, 혹은 이제 요구하는 키.
+
+### "먼저 마이그레이션"의 대가는 무엇이고 누가 치르는가
+
+2단계는 플릿의 모든 노드가 아직 **옛** 바이너리로 돌고 있는 동안 새 스키마를 적용하고, 그 노드들은
+3단계가 자기에게 닿을 때까지 계속 서빙한다. 그러므로 위의 순서는 마이그레이션이 이전 릴리스를 계속
+돌 수 있게 남겨 둘 때만 안전하다. 그것은 dorang이 하는 약속이고, 약속으로 적어 둘 값이 있다:
+
+> **마이그레이션은 추가할 수 있고 넓힐 수 있다. 이전 릴리스가 읽거나 쓰는 것을 제거하거나 좁히는 일은
+> 결코 할 수 없다.** 폐기되는 컬럼은 코드가 사용을 멈춘 뒤 한 릴리스 동안 자리에 남아 있고, 그 다음
+> 릴리스에서 드롭된다.
+
+이것은 취향의 문제가 아니다. 마이그레이션 `0006`은 원래 `budget_state.reserved_nano`와
+`budget_state.reserved_until`을 그것들의 사용을 멈춘 바로 그 릴리스에서 드롭했다. 위에 적힌 대로
+정확히 따랐더니 플릿이 내려갔다: 옛 바이너리의 예산 경로는 두 컬럼을 `SELECT`와 `INSERT` 양쪽에서
+이름으로 부르고, 둘 다 `no such column: reserved_nano`로 실패하며, 예산 경로는 **fail-closed** 한다 —
+아직 롤링되지 않은 모든 노드에서, 예산이 걸린 모든 요청이 `503 budget_unavailable`이 된다. 드롭은
+철회되고 미뤄졌다. `internal/store/migrations/*/0006_budget_reservations_retired.sql`이 그 근거를
+담고 있고, `TestMigrateOntoADatabaseWithData`가 이제 이전 릴리스 자신의 문장들을 마이그레이션된 각
+스키마에 대해 실행하므로 다음 것이 같은 방식으로 나갈 수 없다.
+
+당신에게 오는 결과 둘:
+
+- **폐기가 진행 중일 때 릴리스를 건너뛰지 말 것.** 보장은 릴리스 하나 깊이다. N → N+2 점프는 2단계
+  절차의 양쪽 절반을 한 번에 가로지를 수 있고, 그러면 당신이 업그레이드해 나오는 그 바이너리는 중간
+  마이그레이션이 보호하려고 쓰인 대상이 아니다. 중간 릴리스를 거쳐 롤링하거나, 그 점프 동안 배포를
+  내려 둘 것.
+- **옛 바이너리는 2·3단계 동안 계속 쓰는 것이 정상이다.** 피해야 할 레이스가 아니라 보장이 덮는 바로
+  그 경우다. 하지 말아야 할 것은, 나머지보다 한 릴리스 넘게 **더 새로운** 노드에서 2단계를 돌리는
+  일이다.
+
+다운그레이드 경로는 여전히 없으므로(롤백 계획은 데이터베이스 복원) 보장은 한 방향으로만 성립한다:
+이전 릴리스가 새 스키마에서 살아남는 것이지, 그 반대가 아니다.
 
 ---
 
@@ -1146,7 +1247,7 @@ effective_used = max( provider_reported_used ,
 
 | 영역 | 상태 |
 |---|---|
-| **HTTP 관리** | 마운트됨(§3.1–3.3). 로테이션과 pend를 포함한 크리덴셜 수명주기 전체, 유저·팀·예산, `/spend/logs`, 집계 지출 리포트, capacity, catalog, health history, `/ui`가 서빙된다. 유저·팀의 `blocked` 플래그·예산 상한·rate 제한은 저장만 되는 것이 아니라 요청 경로에서 **강제된다**. 배포와 모델 alias는 `501 dependency_not_configured`로 답한다: 라우팅은 설정 파일에서 컴파일되고 그 두 테이블은 아무도 읽지 않으므로 파일 + `SIGHUP`을 쓸 것 |
+| **HTTP 관리** | 마운트됨(§3.1–3.3). 로테이션과 pend를 포함한 크리덴셜 수명주기 전체, 유저·팀·예산, `/spend/logs`, 집계 지출 리포트, capacity, catalog, health history, `/ui`가 서빙된다. 유저·팀의 `blocked` 플래그·예산 상한·rate 제한은 저장만 되는 것이 아니라 요청 경로에서 **강제된다**. 배포·alias의 **쓰기**는 `501 dependency_not_configured`로 답한다: 라우팅은 설정 파일에서 컴파일되고 그 두 테이블은 아무도 읽지 않으므로 파일 + `SIGHUP`을 쓸 것. 읽기 전용 모델 **화면**은 그 컴파일된 테이블에서 서빙된다 — 게이트웨이가 뻔히 아는 것을 감추는 일은, 아무것도 바꾸지 못할 쓰기를 거절하는 신중함과 같지 않다 |
 | **감사 기록 조회** | `audit_logs`는 모든 관리 변경이 기록하지만 `/audit/list`는 이름이 붙은 501이다. 테이블을 직접 조회할 것 |
 | `observability.otlp_endpoint` | exporter가 연결돼 있지 않다. 지연 내역은 기록되고 export되지 않는다 |
 | `capacity.*.rpm`, `.tpm` | **로드 시 거부**되며, 동작하는 자리를 이름으로 알려준다: 배포별 rate는 `deployments[].limits[]`, 호출자별 rate는 api 키 자신의 `rpm_limit`/`tpm_limit` |
@@ -1156,8 +1257,8 @@ effective_used = max( provider_reported_used ,
 | `on_route`에서의 재라우팅 | 훅은 선택된 배포를 보고 거부할 수 있지만 다른 것을 요구할 수는 없다 |
 | 최상위 `quotas:`, `budget:` 블록 | 스키마에 없다. 예산은 `dorangctl key create --budget-usd`로 키별 |
 | 기존 데이터베이스로부터의 크리덴셜 임포트 | `dorangctl import keys --from <dsn>`. 기본은 보고, `--commit` 으로 기록 — [MIGRATION.ko.md](MIGRATION.ko.md) §3.5. ⚠️ **이 행은 2026-07-29까지 "CLI 진입점이 없다"였고 사실이었다** |
-| prefix / cluster 메트릭 | 상태는 존재하고 아무것도 export하지 않는다. capacity와 health는 `/admin/capacity`, `/health/history`에서 읽을 수 있다 |
-| `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. ⚠️ **`providers[].usage_probe`는 2026-07-29에 이 행에서 빠졌다** — 배선되었다(§6.2). `providers[].metrics`도 빠졌고, 반대 방향이다: 로드에서 거부된다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
+| prefix / cluster 메트릭 | ⚠️ **이 행은 "상태는 존재하고 아무것도 export하지 않는다"라고 적혀 있었고, 지금은 거짓이다.** prefix 테이블은 `dorang_prefix_table_lookups_total`·`_hits_total`·`_evicted_total`·`_bytes`·`_entries`·`_hit_ratio`·`_saturation_ratio`로 나가고, 모델별 어피니티는 `dorang_prefix_routed_total`·`dorang_prefix_hits_total`·`dorang_prefix_hit_ratio`로 나간다 — 다만 `PrefixCollector`는 cache-affinity 라우팅이 설정됐을 때만 등록된다(꺼져 있을 때의 비율 0.0은 "캐시가 없다"가 아니라 "캐시가 쓸모없다"로 읽힌다). cluster 쪽은 `dorang_cluster_enabled`·`_expected_nodes`·`_is_leader`·`_term`과 `dorang_coordination_*`가 조건 없이 등록된다(`internal/app/metrics.go`). capacity와 health는 `/admin/capacity`, `/health/history`에서도 읽을 수 있다 |
+| `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | 로드되고 아무것도 하지 않는다. ⚠️ **`providers[].usage_probe`는 2026-07-29에 이 행에서 빠졌다** — 배선되었다(§6.2). `providers[].metrics`도 빠졌고, 반대 방향이다: 로드에서 거부된다. ⚠️ **`providers[].params.drop*`는 양방향으로 다 빠졌다**: `params.drop[]`은 살아 있고 — 인코더 앞에서 요청에 적용되며 `x-dorang-dropped-params`로 보고된다 — `params.drop_unsupported: false`는 로드 에러다. 표현할 수 없는 파라미터를 흘려보낼 곳이 변환 게이트웨이에는 없기 때문이다. 가드가 볼 수 있는 필드 이름만 `internal/config/consumed_test.go`에 실행 가능한 상태로 있고, 나머지는 [CONFIG.ko.md](CONFIG.ko.md) §23.1의 산문이라 손으로 다시 유도해야 한다 |
 | **백엔드 메트릭 스크레이핑** | 스크레이퍼가 없고, `providers[].metrics`는 이제 받아들여진 뒤 무시되는 것이 아니라 **로드에서 거부된다**. §12.4의 큐 깊이·캐시 사용률 신호에는 수집기가 없다. dorang 바깥에서도 트래픽을 받는 self-hosted 백엔드를 돌리는 경우가 아니라면 이것은 아무 대가도 물리지 않는다: `least_busy`는 dorang 자신의 실시간 capacity 점유로, `highest_tps`는 측정된 초당 출력 토큰으로 순위를 매기며 둘 다 폴이 필요 없다 — `models[].strategy`에 이름을 적을 것. [CONFIG.ko.md](CONFIG.ko.md) §6.2. ⚠️ 이 간극은 전에 "폴링 간격만 읽히지 않는다"로 축소돼 있었다 |
 
 ---

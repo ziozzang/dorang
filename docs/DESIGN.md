@@ -901,6 +901,34 @@ caller never asked for.
 
 ---
 
+### 6.5 Model access is per subject, and the incumbent expresses it from the other end
+
+A model allow-list hangs off the **key**, its **user** and its **team**, alongside the budget
+and the rate limits, and `Principal.Authorize` consults all three the same way it consults
+those: as a **serial veto**. Every subject must allow, and the first refusal names its own
+subject. So the effective set is the intersection, which has the property the whole shape rests
+on — **a key-level list narrows its team's and can never widen it.** A key issued with
+`models: ["*"]` under a team restricted to one model still reaches one model.
+
+An empty list is the unrestricted value. That is the right default for a subject nobody has an
+opinion about, and it is the load-bearing detail when migrating.
+
+**The incumbent states the same relation from the opposite end.** It carries
+`access_via_team_ids` on the model row — "only these teams may reach this model" — and dorang
+carries `models` on the team — "this team may reach only these models". The relation is the
+same and the inversion is **not mechanical**:
+
+- The source's restriction is complete on its own. One line on one model row excludes every
+  team not named.
+- dorang's is complete only when every OTHER team has a list. A team nobody gives a list to
+  reaches everything, including the model the source was gating.
+
+So an operator inverting it has to enumerate the teams, and an importer that quietly wrote
+nothing would leave a gated model open. `dorangctl import config` names the restriction **per
+row** for that reason, with the teams it found and the surface that expresses it — a team is a
+directory row administered over `/team/update`, not a line in the configuration file, which is
+why no import of a model table can land it.
+
 ## 7. Routing
 
 ### 7.1 Pipeline
@@ -2200,9 +2228,46 @@ Revision 2:
 
 ### 10.3 Parameters
 
-`drop_unsupported` (default on) filters against the kind's supported set; `params.drop[]`
-removes named parameters unconditionally; `params.set{}` and `params.default{}` inject.
-Every removal is reported.
+`params.drop[]` removes named parameters unconditionally; `params.set{}` and
+`params.default{}` inject. Every removal is reported, in `x-dorang-dropped-params`.
+
+**`params.drop[]` is not the capability set, and the difference is why it exists.** A
+capability states what a KIND can express: it is declared beside the encoder that implements
+it, it is the same for every deployment of that kind, and dorang decides it. A drop states
+what ONE endpoint REJECTS, and that is a fact only the operator has — the same `kind: openai`
+reaches OpenAI itself, a vLLM build from March, a vendor's compatibility shim and an internal
+proxy, and they do not accept the same fields. `max_tokens` is the case that makes it
+concrete: every encoder writes it, no capability bit will ever describe it — a bit means "this
+construct cannot cross", and the ceiling crosses fine everywhere — and an upstream that
+answers `400` to it is a real deployment rather than a hypothetical. Folding the drop into the
+capability set would leave the operator with no way to say it.
+
+It applies to the neutral request before the encoder runs, which places it **before** §10.1's
+material gate. That ordering is deliberate: `stop`, `n`, `logprobs` and `service_tier` are
+material, so a deployment that cannot express them answers `400` — and an operator who has
+named one in the drop list has already answered that question for this endpoint. The request
+is served with the field removed and the removal reported, rather than the operator's own
+instruction producing a refusal.
+
+Two classes of name are refused rather than dropped, both at load:
+
+- **Names whose removal changes what the model is asked** rather than how it samples: `model`,
+  `messages`, `system`, `prompt`, `input`, `stream`, `tools`, `tool_choice`,
+  `response_format`, `previous_response_id`, `store`. Dropping `tools` is not a parameter
+  drop, it is deleting the caller's function calling and answering `200`. §10.1 already has a
+  mechanism for a construct that cannot cross — it refuses, and `x-dorang-allow-lossy` is how
+  a caller consents — and an operator setting that routed around it silently would be a
+  second, disagreeing answer to the same question.
+- **A name the target's wire shape requires**: `max_tokens` on Anthropic's messages API, which
+  §10.7 already documents as refilled from the model catalog when the caller named none. The
+  drop would apply and the field would come straight back.
+
+**`drop_unsupported` has one value, and `false` is a load error.** It reads as "forward the
+parameter and let the provider refuse it", which is what the proxy the spelling comes from
+does — it re-emits the caller's own JSON. dorang converts: the encoder writes struct fields,
+and the knob a target lacks is a field that does not exist, so there is nothing to forward
+into. The honest disposition is a refusal naming `params.drop[]`, not a key that loads and
+changes nothing beside a neighbour that works.
 
 ### 10.4 Extension headers
 
@@ -2218,18 +2283,41 @@ Every removal is reported.
 | `x-dorang-cost-usd` | this request |
 | `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative. The ceiling comes from the authorization snapshot and is always known; the SPEND comes from the budget hold, which is hydrated by the reservation, so a request that reserves nothing (a zero-rated one) omits `-spend-usd` and `-budget-remaining-usd` rather than reporting a `0` nobody looked up. Same rule as the streamed cost header: absent claims nothing, zero claims a measurement |
-| `x-dorang-quota-*-used-pct` | credential quota windows |
+| `x-dorang-quota-*-used-pct` | credential quota windows. ⚠️ **Rendered and never emitted** — `Result.QuotaUsedPct` has no producer either; same box below |
 | `x-dorang-dropped-params` | what conversion removed: the knobs the target has no field for, the constructs §4.4 and §10.5 decline to send it (§10.1), and an ignored client priority hint (§10.5) |
 | `x-dorang-downgraded` | the structural constructs this request actually lost, by construct id, for a caller who consented with `x-dorang-allow-lossy` (§10.1). Absent unless a loss occurred |
-| `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form |
-| `retry-after` | on 429 |
+| `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form. ⚠️ **Specified, coded, and emitted by nothing — see the box below** |
+| `retry-after` | on `429`, `503` and `529`, whenever a delay is known (COMPATIBILITY §11.4) |
 
 **Header set is bounded — but standard HTTP headers are not telemetry and are never gated.**
-`Retry-After` and the `x-ratelimit-*` set are always attached. An earlier draft listed them
-among the extension headers, which taken literally means a `429` carries no `Retry-After`
-unless the caller asked for detail — and every SDK's backoff silently stops working. The rule
-is: a header the client **acts on** is unconditional; a header the client **reads** may be
-gated.
+`Retry-After` and the `x-ratelimit-*` set are never put behind the detail flag. An earlier draft
+listed them among the extension headers, which taken literally means a `429` carries no
+`Retry-After` unless the caller asked for detail — and every SDK's backoff silently stops
+working. The rule is: a header the client **acts on** is unconditional; a header the client
+**reads** may be gated.
+
+> ⚠️ **"Always attached" was the wrong verb for the `x-ratelimit-*` set, and it is corrected
+> here rather than left as an aspiration in the present tense.** `internal/server`'s
+> `stampHeaders` publishes the four names from `Result.RateLimit`, and **nothing in this
+> repository sets `Result.RateLimit` outside `internal/server`'s own tests** — so no response
+> dorang has ever sent carries one of them. The gate that would emit them is reached on every
+> response and its condition has never been true, which is §17.1's "a control that is reached
+> and can never fire" in its documentary form: three documents assert the behaviour, one test
+> asserts the *renderer*, and nothing asserts that a real request produces the header.
+> COMPATIBILITY §7.8 additionally declines to mirror `x-litellm-key-rpm-limit` **on the grounds
+> that dorang publishes the same facts in the standard form** — a justification resting on a
+> header that does not exist. `Result.RetryAfterSeconds` is the same shape and matters less,
+> because the `Retry-After` a client actually receives is stamped from `Error` by `WriteError`
+> on the live path.
+>
+> **`Result.QuotaUsedPct` is the third, and it has a reader who acts on it.** OPERATIONS §11.3
+> step 3 told an operator debugging a usage probe to read `x-dorang-quota-<window>-used-pct` off
+> a response; no response has ever carried one. So `stampHeaders` renders three header families
+> from `Result` and **all three of the fields they read have no producer** — which is not three
+> coincidences but one: `internal/app` fills `Result` for identification, cost and tokens, and
+> the three fields a *dispatcher other than dorang's own* would fill were never anybody's job.
+> Tracked in §17.1; the wiring is not taken here, and the documents that depended on it now say
+> so instead of promising it.
 
 Of dorang's own headers, only the identification and cost set is always attached:
 `x-dorang-request-id`, `-model`, `-upstream-model`, `-deployment`, `-cost-usd`, and
@@ -2736,6 +2824,40 @@ It is not a general secret scanner, and it must not become one. Matching *shapes
 resembling a key — would rewrite legitimate model output, and a caller asking a model to
 explain an API key format would get mangled text with no explanation. dorang blacklists
 **exact values it holds**, which it can be certain about, and leaves everything else alone.
+
+### 10.5b The operator's output ceiling refuses; it does not clamp
+
+`models[].deployments[].max_output_tokens` is an operator's ceiling on what one deployment may
+be asked to generate. A request naming a larger `max_tokens` cannot use that deployment.
+
+The incumbent's model table carries this per row and dorang had no field for it, so a
+migration lost it. Two dispositions were available and they are different products:
+
+- **Clamp** — lower the caller's number and dispatch. It answers `200` with a truncated
+  completion, and the only signal is `finish_reason`, which most clients do not branch on. The
+  caller reads a cut-off answer as a complete one. That is §10.5a's objection to compaction in
+  a smaller form: a plausible answer to a question the caller did not ask.
+- **Refuse** — filter the deployment out and name the ceiling. This is what dorang does.
+
+The second argument is the one that settles it: **a refusal is routable and a clamp is not.** A
+ceiling is per deployment, so a request over one deployment's ceiling is served by the sibling
+with a higher one, and by §7.6's `context_window` chain when there is no sibling. A clamp
+succeeds locally, so the request is silently truncated on the small deployment while a
+deployment that could have answered it in full sits idle. When nothing remains the refusal
+quotes the LARGEST ceiling that still refused, for the same reason the context refusal quotes
+the largest window: any smaller number is not the limit the caller is up against.
+
+It is a distinct code — `max_tokens_exceeded`, not `context_length_exceeded` — because the two
+facts are different and the fixes are opposite: shorten the conversation, versus ask for a
+shorter answer. It carries the `context_window` fallback CAUSE all the same, because the
+operator who wrote a chain for "this model is too small for this request" wrote one chain.
+
+**Only a ceiling an operator WROTE is enforced.** The same number arriving from `pkg/catalog`
+is a description of the model rather than a decision about it, and the catalog drifts — three
+entries moved in six days. A stale figure that refused traffic would turn a documentation lag
+into an outage, on a deployment where nobody asked for a limit. The routing table records
+which of the two sources the number came from, and the catalogued one is still used to reserve
+output for the context-fit check, where being approximately right is the whole job.
 
 ### 10.6 Generic passthrough engine
 
@@ -3316,6 +3438,82 @@ A single SPA embedded in the binary — no external assets, works offline. Versi
 three screens: **keys**, **models and deployments**, **usage and cost**. Request-log
 browsing, the price calculator, and batch management follow.
 
+The keys screen **mutates**: create, delete, rotate, cut a grace short, block, unblock, pend and
+release, which is the credential lifecycle of §11.2c and §11.6 in full.
+
+#### The argument this overturns, and what replaced it
+
+The UI was read-only, and the reason was good: it authenticates with a cookie, because a browser
+cannot be made to send a bearer header on a navigation, and *a cookie-authenticated mutating
+surface is a cross-site request forgery surface that would then need tokens, double-submit checks
+and a review of every form.* Two sentences held the whole model — **the API never accepts the
+cookie, and the UI never accepts a mutation** — and both were structural rather than reviewed.
+
+Half of that is given up. The cost is paid rather than avoided, because a mutating surface with
+weak forgery defences is worse than none: the operator believes it is safe.
+
+**The forgery defence is a per-session synchronizer token**, 32 bytes of `crypto/rand` minted with
+the session, held in the session table this process already keeps, rendered into every form and
+compared in constant time. Not a double-submit cookie: double-submit is only as strong as the
+weakest thing that can set a cookie on the parent domain — a sibling host on the same registrable
+domain, or one plaintext response mid-TLS-rollout — and there was already a server-side session to
+hang a real token on.
+
+What makes it structural rather than a rule reviewers must remember is *where it sits*. It is not a
+guard each handler calls. `authorize` is the **only** function that turns a request into the
+`viewer` value a screen or an action needs, and for any method other than GET and HEAD it refuses
+unless the body carries that session's token. A route added later without it has no scope to filter
+by, no principal to act as and no page to render. Two shapes reinforce it: there is exactly **one**
+mutating URL in the UI, and every action it performs is one **row of a table** that the dispatcher
+and the forgery test both read — so an action added tomorrow is covered by that test on the same
+commit. `SameSite=Strict` and an `Origin`/`Sec-Fetch-Site` check are layers over the token, not the
+mechanism.
+
+An action does not touch the key store. It calls the administration handler registered at the same
+path a script calls, in-process, with the signed-in operator as the principal — so the scope check,
+the audit row and the §11.2c invalidation are the API's and cannot drift from it.
+
+**The API still never accepts the cookie**, and that half is now enforced here rather than assumed
+of an authenticator this package does not own: the header map handed to authentication is a copy
+with `Cookie` removed, so the session cookie is not merely unread on the API — it is not present.
+
+**Mutating requires a session.** A view authorized by a bearer header — `curl`, or a deployment
+running the UI behind its own authenticating proxy — reads and cannot act. There is no browser
+client for a bearer header, so the only thing that path could add is a forgeable surface for a
+proxy whose cookie dorang cannot see and therefore cannot bind a token to.
+
+#### The one-time secret in a browser tab
+
+This is the real cost of the decision and it does not go away. §2.4's secret is returned exactly
+once; showing it on a screen puts it in the DOM, in that tab's back/forward cache, in whatever the
+browser writes for session restore, and in any screenshot or screen share of the window — none of
+which dorang can withdraw. **The page says exactly that, at the moment the secret is on it**, rather
+than in a document nobody reads at 3 a.m.
+
+What dorang can promise, it does: the secret is held in exactly one place — a slot on the session —
+for exactly one navigation; it is taken out under the same lock that reads it, so two tabs racing
+produce one page with the secret and one refusal; it is never written to a URL, a log line, an audit
+row or the store; the redirect after a mint is a **static path** carrying no handle to it; `HEAD` is
+refused so that no prefetch can consume it unseen; and a reload answers **410 Gone** with the only
+honest next step, which is to rotate.
+
+#### Confirmation
+
+Anything that stops a credential working or cannot be undone — delete, block, pend, rotate, cut —
+goes through a page that names the key, its team, its spend and its state, and says what will
+happen. The row control for those is a **link**, so a mis-click one pixel above the intended row
+costs a page load rather than a credential. The two that *restore* service, unblock and release, are
+one click: §11.6 requires a pended key to be released in one action, and an interstitial is not one.
+
+#### Deliberately still API-only
+
+`/key/update` and `/key/regenerate`. A browser form cannot express "leave this alone" and "set this
+to nothing" as different things without a third state per field, and §2.3's `clear` list exists
+precisely because those are different — a form posting the empty string for every untouched box
+would clear a budget nobody looked at. `regenerate` is `rotate` with a zero grace, which the
+rotation's confirmation offers as a field; two controls for one operation is one more thing to get
+wrong under pressure.
+
 ### 11.4 Users and teams
 
 Both the shape-compatible paths (§2.3) and a native admin API.
@@ -3578,6 +3776,43 @@ subject to sampling and a daily byte budget. `none` and `hash` are also availabl
 Requests, duration, TTFT, tokens, cost, capacity in-flight and wait time per axis,
 credential health, provider quota percentage, budget consumption ratio, prefix hit ratio,
 fallbacks by reason, metering drops, and spool depth.
+
+#### What may become a label value
+
+**A label value is drawn from configuration, never from a message.** Not from a request body,
+not from a response body, not from a URL path segment, not from an upstream error string. A
+label a message can choose is a memory leak with an HTTP interface, reachable by anyone holding
+one valid key, and a series cap is not an answer to it — a cap bounds memory and says nothing
+about resolution.
+
+`model` is the label that had to learn this. It is read out of the request body (or the Azure
+deployment path segment) and metered on every request including the refused ones, so the string
+arriving at the metrics layer is the caller's. Before admission existed, the only bound was a
+cap of 128 entries, entries were never evicted, and 128 fabricated names therefore spent the
+per-model table for the life of the process: every model *first seen afterwards*, including one
+a config reload had just added, folded to `__overflow__` and lost its duration, TTFT and
+prefix-hit series until a restart. Serving was unaffected; the operator went blind to it, and
+the blinding was remotely triggerable and did not heal.
+
+The fix is structural rather than numeric, which is §17.1's preference: the recorder is handed
+the configured model set — `models[]` plus `aliases`, exactly what `GET /v1/models` publishes —
+at assembly **and on every reload**, and a name outside it becomes `__unknown__`. One series, no
+matter how many names are asked for, so a flood occupies nothing. Two consequences worth
+stating:
+
+- **The bound has to follow a reload**, or the first legitimate model added after start-up finds
+  the table spent — the same defect arriving by a different door. The per-model cap is therefore
+  a *floor*, raised to hold whatever the running configuration declares.
+- **Eviction was considered and rejected.** These families include counters, and a series that
+  is withdrawn and later recreated restarts at zero, which `rate()` reads as a process restart.
+  Under an attack the churn would be driven by the caller, so an LRU would convert a one-shot
+  loss of resolution into a permanent corruption of every legitimate model's counters. Entries
+  are never evicted, on purpose.
+
+What that costs is the *names* of the models callers ask for and dorang does not serve. Those
+belong in keyed rows in a store rather than in series in a registry, and they are already there:
+the ledger records the model asked for on every request, refused ones included, and `/spend/logs`
+serves it. The *volume* stays on the metric, which is the part an alert wants.
 
 #### Three series that are emitted and were not written down
 
@@ -4552,6 +4787,103 @@ translating proxy answers in a third combination. So `DecodeResponsesResponse` i
 *request* direction and remain unreached by the same decision, which is still written down in
 `internal/backend/openai.go`. **Two of six moved for a stated reason and four did not**, which
 is the disposition this entry was reclassified to hold.
+
+#### The documentary twin: a claim that reads as a description and is an argument
+
+Everything above is code that nothing reaches. This entry is the same defect in prose, and it
+was found by sweeping for it rather than by tripping over it — which is the only reason it was
+found at all, because **nothing fails when a sentence stops being true.**
+
+Two grammars carry almost all of it:
+
+- An **absence claim** — "nothing exports it", "no caller", "this build does not act on it".
+  These are the highest-yield category, because they are written as observations and function as
+  arguments: an absence claim is the *premise* under which a reader decides not to plan around a
+  feature. It is true on the day it is written and nothing re-checks it.
+- A **completeness claim** — "on every 429 and 503", "always attached", "each one". A
+  completeness claim in prose is a test nobody runs.
+
+**Seven results from the 2026-08-03 sweep, and the third and seventh are the ones that
+generalize.**
+
+1. **COMPATIBILITY §11.4's title was an argument in the indicative mood, and it was wrong three
+   times.** "`Retry-After` is mandatory on every 429 and 503" was (a) false in the *code* for
+   503 — `internal/server` gated on `status == 429` in both places that could emit it, so a
+   provider's own `Retry-After` on an overloaded 503 or 529 was parsed by `internal/backend`,
+   carried the whole way on `Error.RetryAfterSeconds`, and dropped at the response writer; (b)
+   false about "dorang supplies its own estimate from … the capacity queue", which never
+   existed; (c) already self-confessing a fourth gap in a ⚠️ box. **The code half is fixed**, and
+   both directions are pinned by
+   `TestCompat11RetryAfterOnEveryRetrySignallingStatus` and
+   `TestCompat11RetryAfterIsNotGatedBehindTheDetailHeader` in
+   `internal/server/compat11_test.go` — three statuses that must carry it and three that must
+   not. The prose halves are narrowed with the reasons recorded, because inventing a delay is
+   worse than omitting one: a client cannot tell a guess from a measurement.
+2. **`README.md` describes `docs/COMPATIBILITY.md` as "wire contracts pinned as golden tests",
+   and §11.4 was not pinned by anything.** A contract that is stated and not pinned is this
+   section's defect in the documentary form, exactly. The rule that follows is narrow and
+   mechanical: **a normative sentence in COMPATIBILITY is only a contract once a named test
+   fails when it stops holding.**
+3. **`internal/server.stampHeaders` renders three header families off `Result`, and all three of
+   the fields they read have no producer anywhere outside that package's own tests** —
+   `Result.RateLimit`, `Result.RetryAfterSeconds`, `Result.QuotaUsedPct`. So the
+   `x-ratelimit-*` set, and `x-dorang-quota-*-used-pct`, have never been emitted by any
+   response dorang has sent. This is §8.1's clamp variant — a control reached on every response
+   whose condition can never be true — with the aggravation that **three documents describe the
+   behaviour and one instructs an operator to act on it**: §10.4 listed both as attached,
+   COMPATIBILITY §7.8 declined to mirror `x-litellm-key-rpm-limit` *on the grounds that dorang
+   publishes the standard-form name*, and OPERATIONS §11.3 step 3 told an operator debugging a
+   usage probe to read the quota header off a response. Not three coincidences but one shape:
+   `internal/app` fills `Result` for identification, cost and tokens, and the three fields *a
+   dispatcher other than dorang's own* would fill were never anybody's job. Recorded, not wired.
+4. **Four ledger rows were stale in the CLOSED direction, and one document asserted both
+   dispositions at once.** `docs/CONFIG.md` §9 said `key_rotation.strategy` "this build does not
+   act on it" while §23.1a in the same file said "Wired"; §23.1b asserted `admin.Config.Pricing`
+   unset while `internal/app/admin.go` sets it; §8.2's ⚠️ box — labelled by the document itself
+   "the single most important row" — said the capacity queue ceilings enforce nothing, while
+   `max_queue`/`max_queue_wait` are wired and `rpm`/`tpm` have become a load *error*;
+   `docs/OPERATIONS.md` §12 said prefix and cluster metrics have no exporter while seventeen
+   series ship. **Stale-closed is the worse direction.** A stale-open row does not cause a wrong
+   action by itself; it destroys the reader's ability to trust the rows beside it, and the live
+   items go with the dead ones.
+5. **The tell is duplication.** Three of those four were a §23.1-style ledger row that had been
+   struck, with a *copy* of it left standing somewhere the guard cannot reach — a per-key table
+   column, a trailing paragraph under a table, a callout box.
+   `internal/config/consumed_test.go` fails when a `knownUnwired` field becomes read, which is
+   what struck the originals; it has no way to reach a sentence in a "what breaks if it is
+   wrong" column. **A ledger entry that exists in two places has one guard and two claims.**
+6. **A status column reads like a category and is a claim about code.** COMPATIBILITY §11.2a
+   gave `503` to four of dorang's own refusals and `internal/router` has never returned `503`
+   for three of them: `state_pin_unroutable` is `400`, `stream_committed` is `500`, and
+   `credential_pin_exhausted` is `429`. The last one was hidden by a row that grouped
+   "exhausted / saturated" together — one row, two conditions, two statuses, and the `429`
+   invisible inside the `503`. The `type` columns were wrong with them, because `type` is a
+   function of the status. **A wire-contract row is one condition, one status, one producer.**
+7. **A claim that asserts its own freshness is not evidence of freshness.**
+   `docs/SECURITY-REVIEW.md` carried a paragraph reading *"Still true from that section,
+   re-verified rather than carried"* and naming three subsystems. All three were false:
+   `internal/probe` has an importer, `store.ImportKeys` has a non-test caller, and `quota.Budget`
+   does not exist at all — it was deleted, so "superseded" describes a type that is not there.
+   It sat directly below a correction table about carrying dispositions forward without
+   re-reading the code. The adjective was doing the work the grep should have done.
+
+Three rules, and they are the same rule at three scales:
+
+1. **An absence claim is only worth writing next to the command that establishes it**, and the
+   command has to name a symbol and a call site rather than a package — "`internal/luaext` has
+   no importers" cannot be falsified by reading `internal/luaext`.
+2. **An entry in a ledger is a table row.** A ledger item written as prose beside a table is one
+   nothing will ever walk, and both instances that survived longest here were exactly that.
+3. **A disposition is the same shape as the defect it disposes of** (rule 4 above), and the
+   *documentary* disposition is no exception: "nothing exports it" is a closure claim about the
+   rest of the tree, and it needs the same evidence a "closed" needs.
+
+One result from the sweep is worth recording as a pass. Every test named in the English
+documentation — 90 distinct `Test*` identifiers across all ten files — resolves to a real
+`func Test…` in the tree. The one apparent miss,
+`TestManualCompactBypassesOpenOuterGuardWithoutMutatingIt` in `docs/EXTENSIONS.md`, is a test in
+another repository cited there as prior art. Rule 4's "a disposition that names a test is only
+closed once that test exists" is being kept.
 
 ## 18. Open risks
 

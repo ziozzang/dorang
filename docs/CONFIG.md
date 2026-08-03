@@ -459,6 +459,9 @@ providers:
     params:
       drop_unsupported: true
       drop: []
+      # The default output-ceiling spelling for every deployment on this
+      # provider; a deployment may override it. §5.5 of COMPATIBILITY.md.
+      max_tokens_field: max_tokens
       set: {}
       default: {}
     retry: {max_attempts: 2, backoff: exponential, base: 500ms}
@@ -474,8 +477,9 @@ providers:
 | `timeout` | duration | `0` | Per-provider request timeout. A deployment may override it | Zero falls through to `server.request_timeout` |
 | `max_concurrency` | int | `0` | The `route` capacity axis — this provider's own ceiling | Negative is refused. `0` means the axis does not constrain, **not** a ceiling of zero |
 | `capacity_group` | string | `""` | Membership in the `provider_group` axis, for several providers sharing one upstream pool | A group not declared under `capacity.provider_groups` is refused, by name |
-| `params.drop_unsupported` | bool | `true` | Filters parameters the kind cannot express, rather than forwarding them | Turning it off surfaces upstream `400`s that the client has never seen. The reference proxy every existing client was built against drops silently, which is why this defaults on |
-| `params.drop[]` | []string | `[]` | Removes these parameters unconditionally | An empty or whitespace-only entry is refused |
+| `params.drop_unsupported` | bool | `true` | Filters parameters the kind cannot express, rather than forwarding them. **`true` is the only value**, because it is the only behaviour a converting gateway has | ⚠️ **`false` is refused at load** (§23.2). dorang converts rather than relaying, so a parameter the target's wire shape has no field for cannot be forwarded — there is nothing to forward it into. Every removal is reported in `x-dorang-dropped-params`, and a construct whose loss would change the answer is refused rather than dropped (§10.1) |
+| `params.drop[]` | []string | `[]` | Removes these parameters unconditionally, **before the encoder runs**. It is what an operator uses to say "this endpoint answers 400 to this field" — a fact about one upstream that no capability bit can carry. Every removal is reported in `x-dorang-dropped-params` | An empty, whitespace-padded, or **undroppable** entry is refused, by name. The undroppable set is `model`, `messages`, `system`, `prompt`, `input`, `stream`, `tools`, `tool_choice`, `response_format`, `previous_response_id`, `store`: removing one of those changes *what the model is asked* rather than *how it samples*, and §10.1 already answers that question — it refuses, and `x-dorang-allow-lossy` is how a caller consents. `max_tokens`/`max_completion_tokens` are additionally refused on an `anthropic`-shaped provider, at start-up: that wire shape **requires** the field and refills it from the catalog, so the drop would apply to nothing |
+| `params.max_tokens_field` | `max_tokens` \| `max_completion_tokens` | `max_tokens` | The **default** output-ceiling spelling for every deployment on this provider. `models[].deployments[].max_tokens_field` overrides it, and the deployment is the level that finally decides — see that row for why the choice exists at all. It is here because a whole endpoint usually agrees, and repeating a key on fifty-six deployments is how one of them ends up missing it | Any other value is refused at load, naming both accepted spellings. Unset means `max_tokens`, which is what every request carried before this key existed |
 | `params.set{}` | map | `{}` | Injects unconditionally, overriding the caller | ⚠️ This is the lever that can disable a safety mechanism. Setting `truncation: auto` or `truncate_prompt_tokens` here suppresses the very `400` that context-window fallback keys on, across the whole provider — see [EXTENSIONS.md](EXTENSIONS.md) §A.3a |
 | `params.default{}` | map | `{}` | Injects only when the caller did not send them | Safer than `set`, and still capable of the same harm with the same two parameters |
 | `retry.max_attempts` | int | `2` | In-provider retries, distinct from the fallback chain of §12 | Negative is refused |
@@ -834,12 +838,30 @@ it — listed here rather than in §23.1 because the key does not exist to be in
 | `global.max_concurrency` | int | unset | The process- or cluster-wide ceiling | Absent means no global ceiling. Omitting the whole `global:` block is different from writing `{max_concurrency: 0}` only in intent; both leave the axis unconstrained |
 | `interactive_reserve` | float | `0.3` | The fraction of **every** axis batch work may not occupy | Must be in `[0,1)`. `1.0` or higher is refused — it would make every axis unusable by batch entirely, which is expressible as `0.999…` and is more likely a typo |
 
-⚠️ **Only `max_concurrency` / `max_concurrent` is enforced.** The schema accepts `rpm`, `tpm`
-and `max_queue` on every capacity group, and `rpm`, `tpm`, `max_queue` and `max_queue_wait` on a
-principal. The validator checks them for sign and then **nothing reads them**: the capacity
-broker implements counted gauges only, with no token buckets and no queue-depth ceiling. See
-§23.1. A ceiling you believe you set and that does nothing is worse than no ceiling, so this is
-the single most important row in this document.
+⚠️ **`rpm` and `tpm` are not capacity axes and are refused at load.** A capacity axis counts
+concurrent reservations, released when a request finishes; a rate needs a time window, which
+`internal/quota` owns. The refusal names the working home: `models[].deployments[].limits[]`
+for a per-deployment rate, the api key's own `rpm_limit`/`tpm_limit` for a per-caller one
+(§23.2). A ceiling you believe you set and that does nothing is worse than no ceiling, which is
+why these are a load error rather than an inert key.
+
+**`max_queue` and `max_queue_wait` ARE enforced**, and bound the *waiting* rather than the
+running: `max_queue` caps how many requests may wait on an axis and refuses past it,
+`max_queue_wait` caps how long one principal's request may wait. `internal/app/build.go`
+carries both onto `capacity.Config.Queues` and `internal/capacity/broker.go` reads them; a
+**pinned** request is the one `max_queue_wait` applies to, since an unpinned one spills or falls
+back rather than queueing (§7.4a2, §7.6). Batch is exempt — it is the work that is meant to
+wait (§11.1).
+
+> ⚠️ **This box read "only `max_concurrency` / `max_concurrent` is enforced … the validator
+> checks them for sign and then nothing reads them" until 2026-08-03, and called itself "the
+> single most important row in this document".** It was stale in two opposite directions at
+> once: `rpm`/`tpm` had stopped being inert and become a *refusal*, and `max_queue`/
+> `max_queue_wait` had been *wired* — both changes recorded in §23.1a of this same file, four
+> rows apart, while this box went on denying them. That is the third instance in this document
+> of one ledger row struck and its duplicate left standing (see §9's `strategy` row and
+> §23.1b's `Pricing` paragraph), and the most expensive one, because an operator who reads a
+> queue ceiling as inert plans capacity around a bound that is in fact refusing traffic.
 
 ### 8.3 Why `interactive_reserve` is per-axis, and two arithmetic traps
 
@@ -880,7 +902,7 @@ key_rotation:
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
 |---|---|---|---|---|
-| `strategy` | `round_robin` \| `least_used` \| `failover` \| `random` | `least_used` when any rotation is configured, otherwise unset | Intended to order the key pool | Anything else is refused. ⚠️ **This build does not act on it** — credentials are tried in configuration order within a deployment. See §23.1 |
+| `strategy` | `round_robin` \| `least_used` \| `failover` \| `random` | `least_used` when any rotation is configured, otherwise unset | Orders the key pool: which of a deployment's credentials is *preferred*, offered to the broker as the first candidate. It is a hint, never an override — a saturated preference still spills to the next credential in configuration order, and a credential pin or a sticky entry outranks it, because those are statements about this conversation and a rotation is a statement about load | Anything else is refused, at load and again at assembly. ⚠️ **This row read "this build does not act on it" until 2026-08-03, and had been false since the strategy was wired** — while §23.1a two thousand lines down said "Wired", so the file contradicted itself. The claim was a second, unguarded copy of a §23.1 row that had been struck; `internal/config/consumed_test.go` holds §23.1's *table* as executable state and cannot see a duplicate of it in a per-key column. See §23.1a |
 | `providers.<name>` | map | — | The rotation policy for one provider's keys | The provider must be declared |
 | `providers.<name>.affinity_group` | string | `""` | A label for the pool | — |
 | `providers.<name>.stickiness.scope` | `session` \| `api_key` \| `user` \| `team` \| `tenant` \| `none` | `""` | The scope a credential pin is keyed on | Anything else is refused |
@@ -947,6 +969,8 @@ never infer a provider from it.
 | `deployments[].priority` | int | `0` | Orders the `priority` strategy. **Lower is preferred** | Negative is refused |
 | `deployments[].timeout` | duration | `0` | This deployment's request timeout. It also bounds the capacity reservation | Negative is refused |
 | `deployments[].stream_timeout` | duration | `0` | Streaming idle timeout | Negative is refused |
+| `deployments[].max_output_tokens` | int | `0` | An operator's **ceiling** on what this deployment may be asked to generate. A request naming a larger `max_tokens` cannot use this deployment: it routes to a sibling with a higher ceiling, then to §12's chain, and only then is refused with the largest ceiling named. Zero leaves the model catalog's own figure in place | Negative is refused. ⚠️ **It refuses; it does not clamp.** A clamp answers `200` with a truncated completion whose only signal is `finish_reason`, which most clients do not branch on — and it can never fail back, because it succeeded locally. ⚠️ It is enforced **only where you wrote it**: the same number arriving from `pkg/catalog` is a description of the model rather than a decision about it, and the catalog drifts — a stale entry that refused traffic would turn a documentation lag into an outage |
+| `deployments[].max_tokens_field` | `max_tokens` \| `max_completion_tokens` | inherits the provider, else `max_tokens` | Which spelling of the output ceiling this deployment's requests carry. **The two are not interchangeable and no value is right everywhere** (COMPATIBILITY §5.5): vLLM, SGLang, llama.cpp, ollama and most gateways accept only `max_tokens`, while current reasoning models on the vendor surface reject it and require `max_completion_tokens`. Both live behind `kind: openai`, and on `api.openai.com` both live behind the **same `base_url`** — which is why this is per deployment and cannot be a property of the kind or of the provider | Any other value is refused at load. Setting it on a provider whose wire shape has no such choice — `anthropic`, which requires `max_tokens` and offers no alternative — is a **start-up refusal** naming the key, on §23.2's rule that a key which loads and does nothing is worse than one that is refused. ⚠️ **Getting it wrong is not always a `400`.** A measured token-plan endpoint accepted `max_tokens: 16`, ignored it, and substituted a much larger ceiling: 116 completion tokens billed for a request that asked for 16, with `finish_reason: length` making the answer look as though the caller's own limit had been honoured. The loud failure is cheap; the silent one is billed |
 | `deployments[].limits[]` | list of `{metric, value}` | `[]` | Metric names: `max_concurrent`, `rpm`, `tpm`, `max_queue` | An unknown metric or a negative value is refused. ⚠️ **Only `rpm` and `tpm` do anything**, and they become a rolling-minute quota on the *credential*, not on the deployment — see below |
 | `aliases.<name>` | string | — | Virtual name → model group. Upstream receives the real id; the response body carries back the name the client asked for | An alias that is also a model name is refused. An alias whose target is another alias is refused: **aliases do not chain** |
 | `classes.<name>[]` | []string | — | Interchangeable groups | A class with no members is refused; a member listed twice is refused; a member that is not a declared model is refused |
@@ -1452,9 +1476,12 @@ observability:
 | `always_full_headers` | bool | `false` | Attaches the full extension header set to **every** response instead of only when a caller sends `x-dorang-detail: full` | Turning it on adds roughly thirty headers ahead of the first streamed byte, which risks intermediary header-size limits and costs the latency target it was serving |
 
 **The header rule, because it is easy to get backwards:** a header the client **acts on** is
-unconditional; a header the client **reads** may be gated. So `Retry-After` and the
-`x-ratelimit-*` set are always attached — gating `Retry-After` behind a telemetry flag means
-every SDK's backoff silently stops working on a `429`. Of dorang's own headers, only
+unconditional; a header the client **reads** may be gated. So `Retry-After` is never gated —
+putting it behind a telemetry flag means every SDK's backoff silently stops working on a `429`,
+a `503` or a `529`, which are the three statuses it goes out on (COMPATIBILITY §11.4). ⚠️ The
+`x-ratelimit-*` set is subject to the same rule and **is not emitted at all**: the renderer
+exists and nothing fills the value it reads. See DESIGN §10.4's box, and do not size a client
+against those four names. Of dorang's own headers, only
 `x-dorang-request-id`, `-model`, `-upstream-model`, `-deployment`, `-cost-usd` and
 `-replayable` (when false) are unconditional. The full list is in
 [OPERATIONS.md](OPERATIONS.md) §6.
@@ -1969,7 +1996,6 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 | Key | Status |
 |---|---|
 | `models[].deployments[].limits[]` with `metric: max_concurrent` or `max_queue` | Only `rpm` and `tpm` are consumed, and as a per-credential quota (§10.2) |
-| `providers[].params.drop`, `.drop_unsupported` | §10.3's two knobs never reach the conversion path — only the kind's own capability set decides what is dropped |
 | `routing.prefix.checkpoints` | The chain is cut logarithmically; `fixed` validates and selects nothing |
 | `models[].deployments[].stream_timeout` | Only the non-stream timeout reaches the upstream call |
 | `key_rotation.providers[].affinity_group` | Not read, and not validated either |
@@ -1981,9 +2007,19 @@ ceiling you believe you set and that does nothing is worse than no ceiling.
 `internal/config/consumed_test.go` holds this list as executable state rather than prose:
 adding a setting with no consumer fails the build, and so does wiring one without striking it
 from the list. It cannot see the rows whose Go field name is too common to search for —
-`Enabled`, `Endpoint`, `Interval`, `Drop`, `Scope`, `StreamTimeout` — which is why those are
-still written down here, and it is the whole reason this table exists beside the guard rather
-than being replaced by it.
+`Enabled`, `Endpoint`, `Interval`, `Drop`, `Scope`, `StreamTimeout`, `MaxOutputTokens` — which
+is why those are still written down here, and it is the whole reason this table exists beside
+the guard rather than being replaced by it.
+
+> **`providers[].params.drop` came off this table by being WIRED, and its neighbour by being
+> refused.** The row read "§10.3's two knobs never reach the conversion path", which was true
+> of both and was the wrong disposition for both. The two knobs are not one setting: `drop`
+> states what one endpoint rejects, which only an operator knows and no capability bit can
+> carry, so it is now applied and reported; `drop_unsupported: false` asks a converting gateway
+> to forward a field it has nowhere to put, so it is now a load error (§23.2). What made this
+> row expensive is that the importer WROTE into the live half — a real
+> `additional_drop_params` from an incumbent's model table, reported as a successful
+> translation into a field with no consumer.
 
 > **`providers[].metrics` was on this table twice over, and is now refused instead.** The row
 > first read *"The endpoint and the enabled flag are read; the poll interval is not"*, and
@@ -2003,10 +2039,13 @@ Everything below used to be in the table above.
 
 | Key | What it does now |
 |---|---|
+| `providers[].params.drop` | **Wired**, and it is the case for keeping this ledger: the row said "never reaches the conversion path" while `dorangctl import config` was writing a live incumbent setting into it and reporting success. An operator carrying `additional_drop_params: [max_tokens, max_completion_tokens]` — four model groups of a real 56-deployment table — migrated, saw no warning, and would have found out from the upstream's `400`. The list now reaches `canonical.Request.DropParams` through `backend.Spec`, is applied in `prepareRequest` before the encoder and before the §10.1 material gate, and every removal is reported in `x-dorang-dropped-params`. It clears a modelled field AND the pass-through map, because the vendor knob an operator is fighting is usually one dorang does not model. Refusals: the undroppable set, and `max_tokens` on an `anthropic`-shaped provider, both by name. `internal/app/upstream.go` passes `p.Params.Drop` into `backend.Spec.DropParams`, which is the line that makes the file able to reach the mechanism at all |
+| `models[].deployments[].max_output_tokens` | **New.** An operator's output ceiling, which the incumbent's model table carries per row (65536, 65000 on real deployments) and dorang had no field for, so the import lost it. It **refuses** rather than clamping, and it is enforced only where an operator wrote it — see §10 for both arguments. The importer deliberately does **not** translate the incumbent's `max_tokens` into it: that one is a DEFAULT for a caller who named none and this is a CEILING on a caller who named more, so they constrain opposite halves of the traffic and moving the literal would start failing requests that succeed today. `internal/app/build.go` passes `d.MaxOutputTokens` into `router.Deployment`, which is what makes the number an operator's DECISION rather than the catalog's DESCRIPTION — the router enforces only the value that arrived set |
+| `models[].deployments[].max_tokens_field`, `providers[].params.max_tokens_field` | **New, and the §23.1b direction closed.** `openai.EncodeOptions.MaxTokensField` had both constants, a working consumer in the encoder and no path from any configuration file, while COMPATIBILITY §5.5 said in bold that the spelling **is per-deployment configuration** — a promise true of the code and false of every deployment. It is per DEPLOYMENT rather than per provider or per kind because `api.openai.com` is one `base_url` that takes `max_tokens` for a chat model and refuses it for a reasoning one; the provider level is a default for the common case where a whole endpoint agrees. Unset stays `max_tokens`, so no existing deployment changes on upgrade. Refused at load for any third value, and refused at **start-up** on a wire shape with no such choice. ⚠️ The measurement that made this urgent: a live token plan accepted `max_tokens: 16`, ignored it and substituted a much larger ceiling — 116 completion tokens billed for a request that asked for 16, with `finish_reason: length` making it look as though the caller's limit had been honoured. A wrong spelling is not reliably a `400`; on a metered plan it is a bill |
 | `providers[].usage_probe` | **Wired.** §6.2's fetchers had been implemented, tested and imported by nothing at all — `internal/probe` had zero importers in the tree — so every quota decision ran on dorang's own view of dorang's own traffic, which §6.2 exists to say is not enough. `internal/app` now builds a prober per enabled provider, a tracker per credential that has a rule to gate, and polls off the request path. A `fetcher` no prober exists for is a start-up refusal naming the ones that do, because the schema cannot check it and a silent never-reporting probe is the state this closed. `allowances[]` is new alongside it and is what turns a reported percentage into a figure a rule can gate (§6.1a) |
 | `capacity.*.max_queue`, `capacity.principals.<id>.max_queue`, `.max_queue_wait` | Wired. `max_queue` bounds the wait queue per axis and refuses past it; `max_queue_wait` bounds how long one of a principal's requests may wait, and a **pinned** request is the one that uses it — an unpinned one spills or falls back rather than queueing (§7.4a2, §7.6). Batch is exempt: it is the work that is meant to wait (§11.1) |
 | `capacity.*.rpm`, `.tpm` on every group, on `global`, on `models[]` and on `principals` | **Refused**, with the working home named. A capacity axis counts concurrent reservations, released when a request finishes; a rate needs a time window, which `internal/quota` owns. Put a per-deployment rate on `models[].deployments[].limits[]` and a per-caller rate on the api key's own `rpm_limit`/`tpm_limit` |
-| `key_rotation.strategy` | Wired. All four names now choose the preferred credential; a credential pin and a sticky entry still outrank the rotation |
+| `key_rotation.strategy` | Wired. `internal/app/build.go` parses it with `router.ParseRotation` onto `router.Config.Rotation` — an unknown name is an assembly refusal, not a silent default — and `Router.rotate` in `internal/router/rotation.go` applies all four to pick the preferred credential; a credential pin and a sticky entry still outrank the rotation. ⚠️ **§9's own row went on saying "this build does not act on it" until 2026-08-03**, so the file asserted both dispositions at once. The row here was right; the copy was not. **A ledger entry that is duplicated into a per-key table is a second claim with no guard on it** — `consumed_test.go` fails when a `knownUnwired` field becomes read, which is what struck this row, and it has no way to reach a sentence in §9's "what breaks if it is wrong" column. Rows leaving §23.1 must be re-derived against the key's own table, not only against this one |
 | `observability.prometheus` | Wired. `false` removes the `/metrics` route, which then answers 501 like any other unserved route |
 | `observability.metrics.public` | New. `/metrics` authenticates and requires the master credential by default; this opens it deliberately |
 | `capacity.principals.<id>.client_priority` + `range` | New, and §10.5's own example now loads |
@@ -2023,6 +2062,26 @@ Everything below used to be in the table above.
 | `auth.miss_budget.rate`, `.burst` | New, and wired end to end. Same shape: the token bucket that bounds store lookups on keys nobody issued worked, and its two `auth.Config` fields had no path from YAML. A negative `rate` removes the bound; a negative `burst` is refused, because `internal/auth` reads it as absence. §5 |
 | `pricing.rules[].rates.request`, `.characters` | **Fixed, not new.** They validated and then refused to assemble with "rate does not belong to unit per_1m_tokens": the inline schema has no `unit:` key and wrote none, so every non-token rate it advertised was the `rates.images` defect — lint passed, the server would not start. The unit is now derived from the components a rule prices, and a rule mixing two units is refused at lint |
 | `pricing.rules[].rates.seconds` | **Replaced**, by `compute_seconds` and `audio_seconds`. One key named two billable quantities and priced whichever the field held — the request's wall time — so a transcription vendor that bills the recording was charged dorang's own latency. §13.1b |
+| `admin.Config.Pricing` (a §23.1b-direction knob, not a YAML key) | **Wired.** `internal/app/admin.go` sets `Pricing: &adminPricer{d: a.dispatch}`, so `POST /admin/pricing/preview` and `POST /spend/calculate` answer instead of `501 dependency_unavailable`, and DESIGN §8.4's "one engine, one answer" now holds for all three surfaces rather than for `dorangctl price` and the ledger only. The pricer reads the catalog off `dispatcher.state` rather than capturing one, because the catalog is immutable and swapped by pointer on `SIGHUP` — a captured one would quote the configuration the process started with, and checking that a `SIGHUP` took is the main reason the preview is opened. ⚠️ §23.1b went on asserting this open until 2026-08-03; see the box there for why that direction of staleness is the expensive one |
+
+> **The two rows above were one line short of true for one wave, and the note that said so is
+> what closed them.** `providers[].params.drop` and `models[].deployments[].max_output_tokens`
+> were built, refused where they cannot apply, and asserted by consequence tests in
+> `internal/backend` and `internal/router` — and the assignment that carries the value out of
+> `config.Config` was missing in both cases, so no configuration file could reach either. The
+> two lines exist now (`backend.Spec.DropParams` in `internal/app/upstream.go`,
+> `router.Deployment.MaxOutputTokens` in `internal/app/build.go`) and are held by behavioural
+> tests in `internal/app` — `TestParamsDropReachesTheUpstreamFromYAML` and
+> `TestMaxOutputTokensRefusesFromYAML` — which start at yaml text, drive a request through the
+> assembled gateway and read the answer off the wire: the dropped parameter absent from the
+> body a real socket received, the over-ceiling request refused before any upstream call is
+> spent. Reverting either assignment fails its named test.
+>
+> The generalization is worth keeping even though the instance is closed. A row that said
+> "Wired" while the file could not reach the mechanism would have been the same defect this
+> section catalogues, committed by the change that closed it — and a struct-field assertion
+> would not have distinguished the two states, because it observes the value in the same place
+> the code sets it (DESIGN §17.1's third rule).
 
 ### 23.1b The opposite direction: knobs that exist in Go and not in YAML
 
@@ -2051,11 +2110,23 @@ looked for rather than stumbled on:
 | `auth.Config.RehashQueue` | Depth of the asynchronous `legacy_sha256` → `dorang_v1` upgrade queue; 256 | An `auth.rehash_queue` key. It matters only during a legacy migration, and that is exactly when a fleet is upgrading every key it sees; overflow is visible as `dorang_auth_rehash_dropped_total` |
 | `auth.Config.MasterKeyID` | Names the master principal in logs and metering; `"master"` | Arguably none — it is a label, not a bound. Listed so the judgement is written down rather than re-made |
 
-One more of the same shape, outside these two types: **`admin.Config.Pricing` is never set by
-`internal/app`**, so `POST /admin/pricing/preview` and `POST /spend/calculate` answer
-`dependency_unavailable` ("pricing engine") in every deployment. DESIGN §8.4's "one engine, one
-answer" holds for `dorangctl price` and for the ledger; the two HTTP surfaces it names have a
-complete implementation behind a dependency nobody injects.
+> ⚠️ **`admin.Config.Pricing` was the fifth entry here and is closed; the paragraph asserting it
+> open outlived the fix.** It read "`admin.Config.Pricing` is never set by `internal/app`, so
+> `POST /admin/pricing/preview` and `POST /spend/calculate` answer `dependency_unavailable`
+> (pricing engine) in every deployment". `internal/app/admin.go` sets
+> `Pricing: &adminPricer{d: a.dispatch}` when it builds the admin API, and `adminPricer` reads
+> the price catalog off the dispatcher's live state rather than capturing one, so a `SIGHUP`
+> that edits `pricing.catalog` is visible in the preview — which is the main reason an operator
+> opens it. Both endpoints answer. Moved to §23.1a.
+>
+> **This is the §23.1 defect in the closed direction, and it is the worse direction.** An open
+> row that has been fixed makes every *other* row unreadable: a reader who checks one entry,
+> finds it stale, cannot tell which of the remaining four are still real, and the ledger stops
+> being worth consulting at all. The reason it survived is structural rather than careless —
+> it was a trailing *paragraph* under a table rather than a row in it, so neither the eye nor
+> any tooling that walks rows reaches it, and `consumed_test.go` "cannot see this direction at
+> all" by its own doc comment. **The rule this section adopts: an entry in either ledger is a
+> table row.** A ledger item written as prose beside a table is one nothing will ever check.
 
 ### 23.2 Designed, in the schema, and refused at load
 
@@ -2067,6 +2138,7 @@ use instead, rather than reading as a typo — and then fail validation.
 |---|---|
 | `providers[].metrics` — the **whole block**, any of `enabled`, `endpoint`, `interval` | **§12.4's backend metrics scrape has no collector. R17 is not built.** Nothing in the repository fetches the endpoint. The refusal names the working alternative, and it costs nothing: `least_busy` and `highest_tps` are implemented and do not depend on a scrape — the first ranks on this gateway's own live capacity occupancy of the axis the request would reserve, the second on output tokens per second measured from completed requests (§7.5a), and both treat "no samples yet" as no opinion rather than as a zero. Name them in `models[].strategy`. What a scrape would ADD is the engine's own queue depth and KV-cache utilization, which is a better signal in exactly one case: a self-hosted backend also serving traffic that did not come through dorang. Refused on the endpoint alone as well as on the flag, because writing an endpoint with the flag off is how a change is staged and answering that with silence is how the block survived two documentation passes |
 | `credentials[].key_ref` and every other `*_ref` | No secret resolver ships. Use `key_env` or `key_file`; a vault agent that writes a file or exports a variable satisfies both |
+| `providers[].params.drop_unsupported: false` | dorang **converts**; it does not relay. `false` asks for a parameter the target's wire shape has no field for to be forwarded anyway, and the encoder writes struct fields — the knob it lacks is a field that does not exist. The proxy this spelling comes from re-emits the caller's own JSON, which is the only shape in which the setting means anything. Every such removal is already reported in `x-dorang-dropped-params`, and a construct whose loss would change the answer is refused rather than dropped (§10.1) unless the caller sends `x-dorang-allow-lossy`. The refusal names `providers[].params.drop`, which is the knob that does remove a named parameter. **`true` still loads**: the refusal is about the claim, not about the key |
 | `capacity.*.rpm`, `.tpm` | A rate is not a gauge. `models[].deployments[].limits[]` for a per-deployment rate, the key's own `rpm_limit`/`tpm_limit` for a per-caller one |
 | `cluster.capacity_mode: shared-redis` | The protocol ships and no client speaks it. Use `shared-pg`, which has the same published overshoot of `0` |
 | `metering.numeric.enabled: false` | Numeric accounting cannot be turned off. Reduce `metering.trace.sample_rate` |

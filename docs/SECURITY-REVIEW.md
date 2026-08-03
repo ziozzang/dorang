@@ -17,6 +17,8 @@ The three defects already fixed — parser disagreement at the gate, credential 
 via redirect, and a control wired to nothing — were used as templates. All three shapes
 recur. The third recurs the most.
 
+> 한국어: [SECURITY-REVIEW.ko.md](SECURITY-REVIEW.ko.md)
+
 ---
 
 ## Findings
@@ -848,17 +850,25 @@ them converts three latent findings into live ones on the same commit.
 
 ### 2. Enforcement fields that reach no enforcement
 
+> ⚠️ **Re-derived 2026-08-03: eight of these nine rows are closed and only one carried a
+> closure marker.** The `usage_probe` row was struck when it was fixed; the other seven were
+> fixed and left reading as open, which is the direction this document's own correction section
+> calls the worse one — a reader who spot-checks one row, finds it stale, cannot tell which of
+> the rest are real. Each row below now carries its own disposition and the call site that
+> settles it. **`Result.QuotaUsedPct` is the one that is still open**, and it is stated as such
+> with the grep that establishes it.
+
 | Control | Defined | Read by | Consequence |
 |---|---|---|---|
-| `Limits.RPMLimit` | `internal/auth/principal.go:47` | `principal.go:165` only, and `Access.ObservedRPM` is never assigned | per-key/user/team request rate is unlimited |
-| `Limits.TPMLimit` | `internal/auth/principal.go:49` | `principal.go:168`, same | per-key/user/team token rate is unlimited |
-| `Limits.MaxParallel` | `internal/auth/principal.go:52` | nothing — the identifier does not occur in `internal/capacity` | per-subject concurrency ceiling is unlimited; the doc comment claiming capacity enforces it is false |
-| `capacity.{global,provider_groups,credential_groups,models,principals}.{rpm,tpm,max_queue,max_queue_wait}` | `internal/config/config.go:193-198`, `:235-241`, validated at `validate.go:388-407` | only `MaxConcurrency`/`MaxConcurrent` is copied (`internal/app/build.go:95-107`); `capacity.Config` has no such fields | four ceilings on every capacity axis load cleanly, warn about nothing, and enforce nothing |
+| `Limits.RPMLimit` | `internal/auth/principal.go:47` | ~~`principal.go:165` only, and `Access.ObservedRPM` is never assigned~~ → `internal/app/rates.go` | ~~per-key/user/team request rate is unlimited~~ **Closed.** `rates.go` is the missing producer — a rolling minute keyed by `kind+":"+id`, so a team ceiling counts across the team rather than against one of its keys. Its own doc comment records that the auth package's tests passed by setting the field themselves, which is §17.1 rule 1 |
+| `Limits.TPMLimit` | `internal/auth/principal.go:49` | ~~`principal.go:168`, same~~ → `internal/app/rates.go` | ~~per-key/user/team token rate is unlimited~~ **Closed**, same producer |
+| `Limits.MaxParallel` | `internal/auth/principal.go:52` | ~~nothing — the identifier does not occur in `internal/capacity`~~ → `internal/app/principal_policy.go:35` sets `rr.PrincipalMax` from `principal.maxParallel()` | ~~per-subject concurrency ceiling is unlimited~~ **Closed.** The ceiling reaches the broker as the principal axis's per-request maximum |
+| `capacity.{global,provider_groups,credential_groups,models,principals}.{rpm,tpm,max_queue,max_queue_wait}` | `internal/config/config.go:193-198`, `:235-241` | ~~only `MaxConcurrency`/`MaxConcurrent` is copied~~ → split in two | ~~four ceilings on every capacity axis load cleanly, warn about nothing, and enforce nothing~~ **Closed in both directions, which is why the row is worth keeping.** `rpm`/`tpm` are a **load error** now (`refuseRate` in `internal/config/validate.go`), naming `deployments[].limits[]` and the key's own `rpm_limit`/`tpm_limit`; `max_queue`/`max_queue_wait` are **wired** — `internal/app/build.go:95-108` fills `capacity.Config.Queues` and `internal/capacity/broker.go:380-400` reads it. A ceiling that loads and enforces nothing was the finding; neither half is that any more |
 | `providers[].usage_probe.*` | validated in `internal/config/validate.go` | ~~`quota.NewRegistry` and `Meter.AttachTracker` have no non-test callers~~ → `internal/app/usageprobe.go` | ~~`usage_probe.enabled: true` is accepted and inert; every quota decision silently runs local-only, understating usage for any credential also used outside dorang (DESIGN §6.2)~~ **Closed 2026-07-29.** A prober per enabled provider, a `quota.Tracker` per credential with a rule to gate, polled off the request path; a `fetcher` no prober exists for is a start-up refusal. `TestProviderReportedQuotaReachesTheMeter` in `internal/app` drives a provider-reported figure to a credential's own refusal with no local traffic at all |
-| `router.Request.Tenant` | `internal/router/request.go:82-84` | `router.go:642`; assigned only in `testing/scenario/harness.go:421` | session pins are shared across tenants (finding above) |
-| `budgetGate` on the batch path | `internal/app/budget.go` | `internal/app/dispatch.go:117` only | batch spend is unbudgeted (finding above) |
-| `Result.QuotaUsedPct` | `internal/server/deps.go:327-349` | `headers.go:258` | the `x-dorang-quota-*-used-pct` headers are never emitted; latent header-*name* injection if it is ever fed from provider-reported window names |
-| `config.KeyRotation.Strategy` | validated at `internal/config/validate.go:413-414` | nothing outside `internal/config` | key-pool rotation strategy is inert; affects distribution, not authorization |
+| `router.Request.Tenant` | `internal/router/request.go:82-84` | ~~`router.go:642`; assigned only in `testing/scenario/harness.go:421`~~ → `internal/app/dispatch.go:478` assigns it on the request path | ~~session pins are shared across tenants~~ **Closed** — finding 5 in the table below |
+| `budgetGate` on the batch path | `internal/app/budget.go` | ~~`internal/app/dispatch.go:117` only~~ → `internal/app/batch.go:290` calls `budget.reserveBatch` per row | ~~batch spend is unbudgeted~~ **Closed** — finding 1 below, pinned by `TestBatchExecutionIsBudgeted`. The grep this finding quoted (`grep -n "udget" internal/batch/*.go internal/app/batch.go …` returning nothing) now returns the hold, the settle and the row pricer |
+| `Result.QuotaUsedPct` | `internal/server/deps.go` | `headers.go` — **and nothing anywhere assigns the map outside `internal/server`'s own tests** | **STILL OPEN, re-derived at `5447598` rather than carried.** `x-dorang-quota-*-used-pct` has never been emitted by any response. Two documents depend on it and neither says so: DESIGN §10.4 lists it as an extension header, and OPERATIONS §11.3 step 3 instructs an operator debugging a probe to *read it off a response* — a troubleshooting step that cannot succeed. It is the third header family in `stampHeaders` whose renderer is reached and whose value has no producer, beside `Result.RateLimit` and `Result.RetryAfterSeconds` (DESIGN §10.4's box, §17.1). The latent header-*name* injection noted originally is unchanged and stays latent for the same reason: nothing feeds it |
+| `config.KeyRotation.Strategy` | validated at `internal/config/validate.go` | ~~nothing outside `internal/config`~~ → `internal/app/build.go` parses it onto `router.Config.Rotation`; `Router.rotate` applies all four names | ~~key-pool rotation strategy is inert~~ **Closed**; CONFIG §23.1a, and CONFIG §9's own row asserted the opposite until 2026-08-03 |
 
 Two of these deserve a note on how the gap survived. The RPM/TPM check is *unit-tested* —
 `internal/auth/auth_test.go:478-479` injects `a.ObservedRPM, a.ObservedTPM = 10, 100`
@@ -984,6 +994,30 @@ Recorded so the coverage claim is falsifiable, not as reassurance.
   `internal/admin/metrics.go` and `internal/shadow/metrics.go` are fixed-cardinality
   `atomic.Uint64` fields. There is no Prometheus client library in the tree at all, so no
   `WithLabelValues(callerString)` pattern exists to exploit.
+
+  ⚠️ **This bullet named three files and there were four.** `internal/metrics` is labelled, and
+  its `model` label was taken from the request body (or the deployment path segment) and metered
+  verbatim on every request *including refused ones* — so a key permitted exactly one model could
+  mint label values by asking for models it may not have. Memory and scrape size were bounded, by
+  a series cap; **resolution was not**. Entries are never evicted, so 128 fabricated names spent
+  the per-model table for the life of the process and every model first seen afterwards —
+  including a real one a config reload had just added — folded into `__overflow__` and lost its
+  duration, TTFT and prefix-hit series until a restart. A permanent, remotely triggerable denial
+  of resolution on the operator's dashboard; serving was never affected.
+
+  Closed by structural admission: `metrics.Requests.SetAdmittedModels` is handed the configured
+  model set (`models[]` plus `aliases`) at assembly **and on every reload**, and a name outside it
+  becomes `__unknown__` — one series regardless of how many names are asked for, so a flood
+  occupies nothing. The per-model cap is now a floor raised to hold the whole configured set,
+  which is what makes the reload case work. `TestTheConfiguredSetBoundsTheModelLabel` and
+  `TestAModelAddedAfterAFloodStillGetsItsOwnSeries` (`internal/metrics`) and
+  `TestModelLabelAdmissionFollowsAReload` (`internal/app`) are the guards; OPERATIONS.md §6 carries
+  the operator-facing version and the migration note.
+
+  The rule the bullet should have stated, and now does: **a label value is drawn from
+  configuration, never from a message** — not a request body, not a response body, not a URL path
+  segment, not an upstream error string. It is written where it is enforced, in
+  `SetAdmittedModels`, so the next label added has to answer it.
 - **Metering queues cannot become backpressure.** `internal/meter/ring.go:83-110` and
   `internal/meter/spool.go:55-69,372-402` are fixed-size and fail by dropping, never
   blocking; drops are counted and flip a `metering_degraded` flag.
@@ -1553,8 +1587,18 @@ later — the mechanism `internal/quota` already implements, one package over.
    control table above), `providers[].metrics.interval` (§12.4 — **the whole
    `metrics` block is a load error now**: nothing scrapes a backend, so it is
    refused rather than left inert, naming the strategies that need no scrape),
-   `providers[].params.drop` and `.drop_unsupported` (§10.3 — the two
-   knobs that say *which* parameters to drop never reach the conversion path),
+   `providers[].params.drop` and `.drop_unsupported` (§10.3 — **both closed,
+   in opposite directions**: `params.drop` is wired end to end, and
+   `drop_unsupported: false` is a load error naming it, because dorang converts
+   rather than relaying and there is nothing to forward an unmodelled parameter
+   INTO. `params.drop` was the longer of the two: the mechanism — the validated
+   list, the neutral-request removal, the `x-dorang-dropped-params` report — was
+   complete and `internal/app/upstream.go` never passed `p.Params.Drop` into
+   `backend.Spec`, so the feature was live and no configuration file could reach
+   it. That is this document's own dominant class committed by the change that
+   built the feature, and it is now held by
+   `TestParamsDropReachesTheUpstreamFromYAML` in `internal/app`, which asserts
+   the parameter's absence from the body a real socket received),
    `routing.prefix.checkpoints` (§7.4b), `models[].deployments[].stream_timeout`,
    `key_rotation.providers[].affinity_group` (not even validated),
    `cluster.redis_url_env` (§13 — required for `capacity_mode: shared-redis` and
@@ -1589,7 +1633,13 @@ It is a floor, not a proof:
   and `Timeout` occur everywhere, so four settings this sweep confirmed to be
   unwired — `providers[].metrics.interval`, `providers[].params.drop`,
   `providers[].usage_probe.interval`, `models[].deployments[].stream_timeout` —
-  are invisible to it and are tracked in `docs/CONFIG.md` §23.1 instead. It does
+  are invisible to it and are tracked in `docs/CONFIG.md` §23.1 instead.
+  `params.drop` is the one of the four that has since been wired, and the guard
+  played no part in noticing either its absence or its arrival — it reported
+  `Drop` as consumed throughout, which is precisely the vacuity this bullet
+  names. What caught it was a per-setting behavioural test in `internal/app`
+  driving `config.LoadBytes` through an assembled gateway, which is the only
+  instrument that covers the half the guard cannot. It does
   hold for the distinctive names, which is where new settings land:
   `MaxQueueWait`, `ClientPriority`, `PrefixTTL`, `AffinityGroup`.
 - **It says nothing about semantics.** Reading `MaxQueue` and comparing it against
@@ -1943,10 +1993,29 @@ were asserting something the code had closed when this pass began.
 | 7 | "## Not addressed", LOW: **route table enumerable before authentication** | Closed, in this same document | The "## `internal/admin` — mounted" section three headings above states it and names `TestTheRouteTableIsNotReadableBeforeAuthentication`. A document that closes a finding in one section and forwards it as open in another is the single-file version of the cross-file contradiction this pass found twice |
 | 8 | "### 3. Whole subsystems with no callers": **`internal/backend`** — no importer outside itself | The backend layer is the request path | Historical, and true when written; kept for the record. §17.1's "Extracting the backend layer" is the change that closed it |
 
-**Still true from that section**, re-verified rather than carried: `internal/probe`
-has zero importers (`grep` returns two comments and no import), `store.ImportKeys`
-has no non-test caller, and `quota.Budget` is deliberately superseded by the
-durable `cluster.Ledger` (DESIGN §18 W9).
+> ⚠️ **The paragraph that stood here claimed three of that section's entries were "still true,
+> re-verified rather than carried". All three are now false, and the third was false in a way
+> re-verification could not miss.** Quoted as it stood: *"`internal/probe` has zero importers
+> (`grep` returns two comments and no import), `store.ImportKeys` has no non-test caller, and
+> `quota.Budget` is deliberately superseded by the durable `cluster.Ledger` (DESIGN §18 W9)."*
+>
+> | Claim | The code, at `5447598` |
+> |---|---|
+> | `internal/probe` has zero importers | `grep -rl dorang/internal/probe --include=*.go` returns `internal/app/usageprobe.go`. A prober is built per enabled provider and polled off the request path; CONFIG §23.1a records `providers[].usage_probe` as wired |
+> | `store.ImportKeys` has no non-test caller | `cmd/dorangctl/importkeys.go:113` calls it. That file's own opening comment describes the gap this closed, so the caller and the correction shipped together |
+> | `quota.Budget` is superseded by `cluster.Ledger` | `quota.Budget` **does not exist**; `internal/app/budget.go:64-68` says it "has since been deleted". "Superseded" describes a type that is still there |
+>
+> **This is the sharpest instance of the class on this page, because of where it sits.** It is
+> the paragraph immediately below a correction table about carrying dispositions forward without
+> re-reading the code, and it says *re-verified rather than carried* in its own text. A claim
+> that asserts its own freshness is not evidence of freshness — it is the same disposition
+> copied forward with a stronger adjective. What the section below asks for ("`git grep` for an
+> import outside the package, run at the commit the claim is made for") is exactly what would
+> have caught all three, and exactly what was not done.
+>
+> Of that section's original list, what remains genuinely unreached is nothing this paragraph
+> named. The list is not restated here, because restating it would recreate the defect: an
+> absence claim is only worth writing next to the grep that establishes it.
 
 **One method to check the next time.** Every false entry above shares a tell: the
 disposition names a *package* rather than a symbol and a call site. "`internal/luaext`

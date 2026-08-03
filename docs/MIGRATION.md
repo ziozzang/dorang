@@ -196,7 +196,10 @@ dorangctl config lint /etc/dorang/config.yaml
 | `.api_base` / `.api_key` / the provider hint | normalized into `providers[]` + `credentials[]` |
 | `.rpm` / `.tpm` / `.max_parallel_requests` | `limits[]` on the deployment |
 | `.weight`, `.timeout`, `.stream_timeout` | deployment fields |
-| drop-unsupported and explicit drop lists | `params.drop_unsupported`, `params.drop[]` |
+| `additional_drop_params` / `drop_params: [...]` | `providers[].params.drop[]`. **Load-bearing**: applied to the request before the encoder runs, and reported in `x-dorang-dropped-params`. A name whose removal would change *what the model is asked* rather than *how it samples* — `tools`, `messages`, `response_format` and the rest — is **refused by name** rather than imported, and so is `max_tokens` on an `anthropic`-shaped provider |
+| `drop_params: false` | **not imported.** The source relays the caller's JSON, so "do not filter" means "let the provider answer 400". dorang converts, and a parameter the target's wire shape has no field for cannot be forwarded into anything — `params.drop_unsupported: false` is a load error. Writing it would have produced a file that fails your very next `config lint` |
+| `litellm_params.max_tokens` | **not imported, per row.** The source applies it as a DEFAULT for a caller who named none; dorang's `deployments[].max_output_tokens` is a CEILING that refuses a caller who named more. They constrain opposite halves of the traffic, so moving the literal would start failing requests that succeed today. dorang takes the default from the model catalog; write `max_output_tokens` yourself if you meant the cap |
+| `model_info.access_via_team_ids` | **not imported, per row** — and the capability is not missing. dorang's model allow-list is consulted for the key, its user AND its team, and every subject must allow, so a key-level list narrows its team's and can never widen it. A team is a directory row rather than a line in the configuration file, so the import has nowhere to put it: set it with `POST /team/update {"models": [...]}`. ⚠️ **The relation inverts.** The source says "only these teams may reach this model" and dorang says "this team may reach only these models", and an EMPTY dorang list allows EVERYTHING — so a team you never give a list to still reaches the model, and the restriction is only true once every other team has one |
 | per-token input/output cost | `pricing.rules[]` — **rescaled**: per-token rates are multiplied by 10⁶ and per-character rates by 10³, because dorang's fields are per 1M tokens and per 1K characters. The importer used to copy the literal, which made every imported card a millionth of its true price, silently — every request rounded to zero while `/spend/calculate` still reported the rule matched |
 | routing strategy | `models[].strategy` |
 | default / context-window / content-policy fallbacks | `fallbacks.on.*` |
@@ -231,10 +234,11 @@ what it meant; dorang does not.
 
 ### 2.3 After the import
 
-Three things the import cannot do for you:
+Four things the import cannot do for you:
 
 1. **Model the capacity axes.** A source configuration states `rpm`/`tpm`/`max_parallel_requests`
-   per deployment. dorang's model — per account across all models, *and* per (key, model) — is
+   per deployment. dorang's model — per account across all models, *and* per (provider,
+   upstream model) — is
    richer, and the shape that matters is usually not in the source file at all because the
    source file could not express it. Read [CONFIG.md](CONFIG.md) §8 and write the axes by hand.
 2. **Price anything it could not find a rate for, and check one price against the vendor's card.**
@@ -244,12 +248,137 @@ Three things the import cannot do for you:
    vendor's published card, and compare. A rate that is wrong by a factor rather than absent
    produces no warning at all — the rule matches, `"missing"` is `false`, and the figure is
    simply wrong. That is what the ×10⁶ defect looked like from the outside.
-3. **Tell you which deployments have an undeclared context window.** Run
-   `dorangctl catalog unverified`. An undeclared window is not zero and not unlimited; it neither
-   excludes a deployment nor qualifies it as "larger" for the context-window fallback chain. A
-   window declared **too large** is the dangerous direction: requests between the real limit and
-   the declared one fail outright, and context-window fallback never fires because dorang
-   believes they fit.
+3. **Re-express what the source stated on the model row and dorang states elsewhere.** Two
+   settings come out of the import as warnings rather than as configuration, and both are the
+   kind that reads as absent rather than as lost:
+   `model_info.access_via_team_ids` (a team's model allow-list, `POST /team/update`, and see
+   the inversion warning in §2.1 — this is the one that is silently PERMISSIVE if you skip it)
+   and `litellm_params.max_tokens` (a per-deployment default versus dorang's ceiling). Grep the
+   import report for `NOT imported`; that phrase is reserved for a setting that meant something.
+4. **Tell you which deployments have an undeclared context window.** Run
+   `dorangctl catalog explain <kind> <model>` for each deployment you route to and read the
+   `context_window` row: `undeclared` in the ORIGIN column is the answer. An undeclared window is
+   not zero and not unlimited; it neither excludes a deployment nor qualifies it as "larger" for
+   the context-window fallback chain. A window declared **too large** is the dangerous direction:
+   requests between the real limit and the declared one fail outright, and context-window
+   fallback never fires because dorang believes they fit.
+
+   > This step named `dorangctl catalog unverified` until that command was rewritten. It never
+   > reported context windows and does not now — it reports verification state, which is §2.4's
+   > subject and a different axis entirely.
+
+---
+
+### 2.4 What the catalog knows about its own entries
+
+Two commands read the catalog, and neither one guesses.
+
+`dorangctl catalog explain <kind> <model>` is the provenance view: one row per field with the
+resolved value, the layer that won it and the file that wrote it. It is what §2.3 item 4 uses,
+and it is the only place `undeclared` is distinguishable from `0`.
+
+`dorangctl catalog unverified` reports **verification state** — what happened the last time
+anybody put each entry to a live endpoint. It prints a count per state, then the two states that
+carry a finding with the evidence inline, then the two that carry none summarised by provider
+kind. `--state S` lists one state on its own.
+
+| State | What it means | What to do |
+|---|---|---|
+| `verified` | Asked, and it answered as itself | Nothing |
+| `denied` | Asked; this plan is not entitled. **The model exists** | Buy the entitlement or stop routing to it. This is not an absent model, and deleting the entry would lose a true fact |
+| `substituted` | Asked, and a **different** model answered | A live routing defect: you asked for one model, were served another, and are billed for the traffic. Stop routing to the name |
+| `citation_only` | Nobody could ask — no credential for that provider exists where this catalog is maintained | Nothing is wrong with the entry; its evidence is a citation rather than a probe. Close one with `catalog verify` and a key |
+| `unchecked` | Nobody has asked, and nothing says why | Backlog |
+
+The output, abridged, on the catalog this build ships:
+
+```
+245 catalogued models. What happened the last time an endpoint was asked:
+
+  verified       38   asked, and it answered as itself
+  denied         9    asked; this plan is not entitled. The model EXISTS
+  substituted    3    asked; a DIFFERENT model answered
+  citation_only  195  nobody could ask: no credential for the route here
+  unchecked      0    nobody has asked, and nothing says why
+
+substituted (3) — asked; a DIFFERENT model answered:
+  kind=glm model=glm-5.1
+      served instead: glm-5.2 (asked 2026-08-03)
+      200 OK, body `"model":"glm-5.2"`. Same on three consecutive runs.
+  …
+
+reasoning capability is unknown for 244 of 245 models. That is a different question and a
+different probe (DESIGN §10.2): a model can be verified to exist and still have an unknown
+reasoning control.
+```
+
+**Two axes, and the old output conflated them.** `unverified` never meant "we are not sure this
+model exists" — it meant the entry's **reasoning capability** is unknown, which is a different
+question with a different probe and a different answer. The command now keeps them visibly
+apart: the states above are about whether an endpoint answered to the name, and the reasoning
+count is one line on its own at the end. A model can be `verified` and still have an unknown
+reasoning control, and on the shipped catalog almost every one of them is. The command used to
+print a single flat list of everything undated, which was accurate and useless — an entry nobody
+had typed sat beside one that had been asked and had given a definite answer, and nothing in the
+output said which was which.
+
+#### Closing one: `dorangctl catalog verify`
+
+```
+dorangctl catalog verify --kind <kind> --key-env <VAR> [--write <file>]
+```
+
+This sends **one real request per catalogued entry on that kind** and reads the answer. A
+`/models` listing is evidence and not proof, and both directions have been observed on this
+catalog's own providers: a listing omitted a model that was still being served, and it named nine
+that refuse every request. It cannot see the third case at all — a substituted model answers
+`200`, and only the response body says which model actually replied.
+
+The probes are minimal, one short user turn with `--max-tokens` defaulting to 16, because they
+bill to your own plan. `--dry-run` prints what would be asked and asks nothing; it is the only
+mode that needs no credential:
+
+```
+$ dorangctl catalog verify --kind glm --dry-run
+would ask https://api.z.ai/api/coding/paas/v4 for 8 model(s), max_tokens=16:
+  glm-4.5  (chat)
+  glm-4.6  (chat)
+  …
+```
+
+`--model a,b` narrows to named entries, `--base-url` overrides the endpoint, `--timeout` is per
+request (120s), `--catalog` loads overlays first.
+
+**Three refusals are built in**, and each one is a conclusion the command will not draw:
+
+1. **The key is named by an environment variable and is never taken as a flag value.**
+   `--key-env VAR` takes the variable's *name*; there is no flag that accepts a key. A key passed
+   as a flag lands in shell history and in every `ps` on the box. An empty variable is refused
+   too, with the reason: an unasked model must stay unasked rather than acquire a date.
+2. **A 404 that names no missing model is a path error, not an absent model.** Absence is read
+   from the error's *language* — "does not exist", "no such model", "unknown model" — and never
+   from the model name appearing somewhere in the body, because a short model id occurs in almost
+   any message and the failure mode is a live entry reported as missing. A Responses-only
+   endpoint answering a chat request produces exactly this 404, and it is reported as a wrong
+   path.
+3. **If every probe fails 401/403 with none succeeding, nothing is written and the credential is
+   blamed.** One model refusing on a route where others answer is a fact about that model; every
+   model refusing identically is a fact about the key. This is not hypothetical: a token whose
+   scope lacked inference access returned 403 on every model, and recording that run would have
+   written two hundred-odd false denials into a catalog whose absences are supposed to mean
+   something. A bare 403 with no eligibility language concludes nothing on its own either — only
+   a refusal that names eligibility, on a route where something else succeeded, is a `denied`.
+
+`--write FILE` emits a catalog overlay loadable by the same loader that reads the embedded data,
+so the output of verification is input to the catalog with no transcription step in between. Load
+it with `--catalog` or `$DORANG_CATALOG_PATH`, and review it first — a `verified:` there says the
+endpoint answered to the name on that date, not that the entry's numbers are right.
+
+Only the three outcomes that are facts about a model are written: `verified`, `substituted` and
+`denied`. **A `retired` or `absent` result is reported and never written**, because acting on one
+is a *deletion* — the catalog's answer to a model that serves nobody is to remove the entry with
+the reason in a comment, and no tool should delete catalog rows on the strength of one HTTP
+response. Errors are not written either; they are facts about the network or the key.
 
 ---
 
@@ -650,8 +779,11 @@ Before moving production traffic:
       enforces this, but confirm you did not lower a bound to make it pass.
 - [ ] `cost_capped` false for the whole run.
 - [ ] The run spanned a representative period, including a peak.
-- [ ] `dorangctl catalog unverified` reviewed: no deployment carrying traffic has an undeclared
-      context window.
+- [ ] `dorangctl catalog explain` run for every deployment carrying traffic: none has an
+      `undeclared` context window (§2.3 item 4).
+- [ ] `dorangctl catalog unverified` reviewed (§2.4): **zero `substituted`** on any model you
+      route to — a substitution means you are billed for a model you did not ask for — and every
+      `denied` is a known entitlement gap rather than a surprise.
 - [ ] `dorangctl price` run on every model group, with no `no marginal_usage rule matched`.
 - [ ] The control-plane inventory from §1.2 has an answer — a replacement, a script rewrite, or
       an accepted gap.

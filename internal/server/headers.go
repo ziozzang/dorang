@@ -362,7 +362,16 @@ var InboundRequestIDHeaders = []string{
 //
 // Two headers are attached regardless of the detail flag because they are
 // standard HTTP a client acts on rather than dorang telemetry it merely reads:
-// Retry-After on a 429, and the rate-limit set when the dispatcher populated it.
+// Retry-After on the statuses [retryAfterStatus] admits, and the rate-limit set.
+//
+// ⚠️ Both read [Result], and NEITHER [Result.RetryAfterSeconds] NOR
+// [Result.RateLimit] has a producer anywhere in this repository outside this
+// package's own tests. So this is a seam for an embedder's own dispatcher, and
+// for the shipped gateway both branches are unreachable: the Retry-After a
+// client actually receives is stamped by [WriteError] off [Error], and the
+// `x-ratelimit-*` set is never stamped at all — which three documents assert it
+// always is. Tracked in DESIGN §17.1; do not read the two branches below as
+// evidence that the headers are emitted.
 //
 // costDeferred says that this response will be priced after its headers are on
 // the wire, which is every streamed answer: the dispatcher settles once the last

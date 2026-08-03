@@ -87,7 +87,7 @@ the ratio, not a preference.
 | 5.1 | `delta.tool_calls[].index` is **required**, non-optional. `id`, `type`, `function` are optional. |
 | 5.2 | Inbound assistant messages have `index` **stripped** from `tool_calls` before forwarding, so a client echoing a full assistant message is not rejected. |
 | 5.3 | Tool names are limited to 64 characters on the OpenAI side. Truncation must be recorded in a mapping and **round-tripped**, or the model's tool call cannot be matched back. **Plain truncation is not sufficient**: qualified tool names routinely share a long common prefix, so cutting at 64 collides and two different tools become one. The shortened form is `prefix + "_" + 8 hex of a hash of the full name`, with the mapping authoritative for restoring it. |
-| 5.5 | ⚠️ **`max_tokens` and `max_completion_tokens` are not interchangeable, and picking wrong breaks a T0 path.** Several widely deployed OpenAI-compatible servers accept only the former; current reasoning models on the vendor surface reject it in favour of the latter. There is no value that works everywhere, so the field is **per-deployment configuration**, defaulting to `max_tokens` for the compatible-server majority. See DESIGN §10.7, where this is one of the three named cross-protocol traps. |
+| 5.5 | ⚠️ **`max_tokens` and `max_completion_tokens` are not interchangeable, and picking wrong breaks a T0 path.** Several widely deployed OpenAI-compatible servers accept only the former; current reasoning models on the vendor surface reject it in favour of the latter. There is no value that works everywhere, so the field is **per-deployment configuration** — `models[].deployments[].max_tokens_field`, with `providers[].params.max_tokens_field` as the endpoint-wide default — defaulting to `max_tokens` for the compatible-server majority. **Per DEPLOYMENT and not per provider**, because `api.openai.com` is one `base_url` that takes `max_tokens` for a chat model and refuses it for a reasoning one. ⚠️ **Not every mismatch is a `400`.** A measured token-plan endpoint accepted `max_tokens: 16`, discarded it and substituted a far larger ceiling — 116 completion tokens billed against a request for 16, with `finish_reason: length` reporting the caller's own limit as honoured. On a metered plan the silent case is the expensive one, and nothing in the response distinguishes it from the correct one; the only signal is `usage.completion_tokens` exceeding what was asked for. This spelling had both constants and a working consumer in `openai.EncodeOptions` and **no configuration could select it** until the key existed, so the promise in this row was true of the code and false of every deployment — CONFIG §23.1b's direction, and the reason that section exists. See DESIGN §10.7, where this is one of the three named cross-protocol traps. |
 | 5.4 | Cross-protocol tool-use ids must be normalized consistently in both directions. |
 
 ## 6. `/v1/messages` — the highest-risk surface
@@ -215,7 +215,7 @@ three weeks later.
 | `x-litellm-model-api-base` | The upstream's URL is deployment topology, not a tenant's business. It is not on a dorang header either. |
 | `x-litellm-model-region` | dorang has no region concept on a deployment. |
 | `x-litellm-attempted-fallbacks`, `x-litellm-max-fallbacks` | dorang records which model a fallback came *from* (`x-dorang-fallback-from`), not a count and not a configured ceiling; the attempt counter does not separate retries from fallbacks. |
-| `x-litellm-key-rpm-limit`, `x-litellm-key-tpm-limit` | dorang publishes the same facts in the standard-form `x-ratelimit-limit-requests` / `-tokens`, which more clients already read. Mirroring them twice would create two names that can disagree. |
+| `x-litellm-key-rpm-limit`, `x-litellm-key-tpm-limit` | ⚠️ **This row's reason was checked and does not hold.** It read "dorang publishes the same facts in the standard-form `x-ratelimit-limit-requests` / `-tokens`, which more clients already read" — but nothing fills the value `internal/server` renders those four names from, so dorang publishes neither the legacy pair nor the standard one. See DESIGN §10.4's box and §17.1. The omission stands; its *justification* did not, and a reader migrating a rate-limit dashboard would have planned around a header that has never arrived. |
 | `x-litellm-overhead-duration-ms` | `x-dorang-queue-ms` is a capacity wait, not proxy overhead. They are near enough to be confused and not near enough to be equal. |
 | `x-litellm-timeout`, `x-litellm-applied-guardrails` | No dorang equivalent is computed per request. |
 | `x-litellm-response-cost-original` | The reference proxy reports a pre-adjustment cost beside the adjusted one. dorang's pricing applies its adjustment rules inside `Settle` and publishes one figure; §8.5's second figure is `x-dorang-notional-usd`, which is the **list-rate** equivalent and a different quantity — a discount is not a list price. Mirroring one onto the other would put a number under a name that does not mean it. |
@@ -561,12 +561,30 @@ codes a client is expected to *match*.
 | Key has no owning user or team | 403 | `permission_error` | `no_principal` | `permission_error` |
 | Credential store unreachable | 503 | `api_error` | `auth_unavailable` | `overloaded_error` |
 | Route is unknown (not merely unbuilt) | 501 | `api_error` | `route_unknown` | `api_error` |
-| Structural pin cannot be routed (§B.2) | 503 | `api_error` | `state_pin_unroutable` | `overloaded_error` |
-| Credential pin cannot be routed | 503 | `api_error` | `credential_pin_unroutable` | `overloaded_error` |
-| Credential pin exhausted / saturated | 503 | `api_error` | `credential_pin_exhausted`, `credential_pin_saturated` | `overloaded_error` |
+| Structural pin cannot be routed (§B.2) | **400** | `invalid_request_error` | `state_pin_unroutable` | `invalid_request_error` |
+| Credential pin cannot be routed | **400 or 503** | per status | `credential_pin_unroutable` | per status |
+| Credential pin exhausted | **429** | `rate_limit_error` | `credential_pin_exhausted` | `rate_limit_error` |
+| Credential pin saturated | 503 | `api_error` | `credential_pin_saturated` | `overloaded_error` |
 | Every fallback candidate already tried (§7.6) | 503 | `api_error` | `fallback_exhausted` | `overloaded_error` |
 | Fallback hop or wall-clock budget spent | varies | per status | `max_hops_exhausted`, `fallback_budget_elapsed` | per status |
-| Stream already committed, cannot hop (§7.6) | 503 | `api_error` | `stream_committed` | `overloaded_error` |
+| Stream already committed, cannot hop (§7.6) | **500** | `api_error` | `stream_committed` | `api_error` |
+
+> ⚠️ **Four of these rows carried `503` and the code has never returned `503` for three of
+> them.** Corrected 2026-08-03 against `internal/router`, which is the only producer of all six
+> codes; the `type` columns follow from `server.TypeForStatus`, so they moved with the statuses.
+> `state_pin_unroutable` is `400` — the request carries opaque state no deployment can accept,
+> which is a property of the request and not of the fleet's health, so a client that retries it
+> unchanged will fail identically. `stream_committed` is `500`: the answer was already partly
+> delivered and a second attempt would duplicate output, which is a fault and not back-pressure.
+> `credential_pin_exhausted` is `429` because it is a quota window recovering, and it is the one
+> pin refusal that carries a `Retry-After` (§11.4). `credential_pin_unroutable` is genuinely
+> two statuses from two call sites — `400` when no deployment can serve the pinned account at
+> all, `503` when every one that could is out of service — and that difference is the point of
+> the code, so it is stated rather than flattened.
+>
+> This is the §11.2a table's own failure mode rather than an isolated typo: a status column is a
+> claim about code that reads like a category, and grouping "exhausted / saturated" in one row
+> hid a `429` inside a `503`. **A wire-contract row is one condition, one status, one producer.**
 
 `secret_retired` is the one worth arguing about, because `invalid_api_key` is so nearly right.
 The fix for a retired secret is "use the secret the last rotation issued", not "get a new key".
@@ -625,14 +643,63 @@ This is a **known reduction in fidelity against the incumbent**, which does put 
 sentence in the body. It is deliberate. Restoring it for clients would be a new decision with a
 security review attached, not a bug fix.
 
-### 11.4 `Retry-After` is mandatory on every 429 and 503
+### 11.4 `Retry-After` goes out on every 429, 503 and 529 that has a number behind it
 
 Not gated behind a detail header (§10.4). A client acts on it; without it every SDK's backoff
-degrades to a fixed guess. When the upstream supplies one, it is honoured; when it does not
-and the condition is a dorang-side wait, dorang supplies its own estimate from the quota
-reset time or the capacity queue.
+degrades to a fixed guess — and that argument does not weaken as the status gets worse. It gets
+stronger: a rate-limited client can at least infer a window from its own request rate, and a
+client told the far side is overloaded has nothing to guess with at all.
 
-> ⚠️ **One case is not covered, and it is stated rather than left to be discovered.** "The
+**Where the number comes from. There are two producers and there is no third.**
+
+| Source | Reaches the client on |
+|---|---|
+| the upstream's own `Retry-After`, parsed by `internal/backend` off the response being relayed | every relayed `429`, `503` and `529` |
+| `router.Error.ResetAt` — the instant an exhausted **quota window** recovers, from dorang's own quota source | the two quota refusals, `insufficient_quota` and `credential_pin_exhausted`, both `429` (§11.2a) |
+
+The three statuses are the ones whose whole content is "come back later"; 529 is the Anthropic
+family's spelling of 503 and is treated as one throughout §11.2. Other 5xx are excluded on
+purpose: a `500` or a `502` says something went wrong, not that the far side will be ready at a
+stated time, so an upstream's stray header on one is not forwarded.
+
+Pinned by `TestCompat11RetryAfterOnEveryRetrySignallingStatus` and
+`TestCompat11RetryAfterIsNotGatedBehindTheDetailHeader` in `internal/server/compat11_test.go`,
+both directions — the three statuses that carry it and the three that must not.
+
+> ⚠️ **This section read "`Retry-After` is mandatory on every 429 and 503" until 2026-08-03, and
+> it was wrong in three independent ways — one of them a code defect and two of them promises
+> nothing had ever kept.** It is worth listing them, because the shape recurs (DESIGN §17.1):
+> a section whose title is an *argument* reads as a *description*, and nothing fails when the
+> world stops matching it.
+>
+> 1. **The 503 half was false in the code.** `internal/server` tested `status == 429` in both
+>    places that could emit the header, so an upstream's own `Retry-After` on an overloaded
+>    `503` or `529` was parsed, carried the whole way on `Error.RetryAfterSeconds`, and dropped
+>    at the response writer. **Fixed** — that is the table above, and the two named tests are
+>    what would fail if it regressed. The document was right and the code was wrong, which is
+>    why the title was widened rather than narrowed.
+> 2. **"dorang supplies its own estimate from … the capacity queue" was never true.** There is
+>    no capacity-queue estimate anywhere. `capacity_unavailable` and `no_healthy_deployment` —
+>    §11.2's two capacity rows, both `429` — carry no `Retry-After`, and neither does
+>    `credential_pin_saturated` (`503`). A queued request has already spent
+>    its whole wait budget by the time it is refused; nothing in the broker publishes when a
+>    reservation will free, so any number here would be invented. **Narrowed**, with the reason
+>    recorded, rather than closed by making one up: a header carrying a guess is worse than an
+>    absent one, because the client cannot tell it from a measurement (§7.8's rule).
+> 3. **dorang's own `503`s carry no estimate, and mostly cannot.** `fallback_exhausted`,
+>    `not_configured`, `budget_unavailable`, batch `draining` and `gateway_shutting_down` are
+>    conditions with no recovery instant to publish — the last one is a *node* going away and
+>    the answer is another node, not a later second. One exception is worth naming so it is not
+>    re-derived: `auth_unavailable` (§11.2a) is raised when the miss-budget bucket is empty
+>    ([CONFIG.md](CONFIG.md) §5), and that bucket has a known refill rate, so `1/rate` **is** an
+>    honest estimate and it is the one dorang-side `503` where this could be closed. Not taken;
+>    recorded here so the next reader starts from the argument rather than from the gap.
+>
+> The general form, since this is the second §11.4 claim to be wrong the same way: **"mandatory
+> on every X" is a completeness claim, and a completeness claim in prose is a test nobody runs.**
+> The table above is now pinned by name.
+
+> ⚠️ **A fourth case is not covered, and it is stated rather than left to be discovered.** "The
 > upstream supplies one" means a literal `Retry-After` header: `internal/backend`'s parser
 > reads that name and no other. An upstream that answers `429` carrying only
 > `x-ratelimit-reset-requests` — a window reset instant rather than a delay — supplies nothing

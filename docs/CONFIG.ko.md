@@ -431,8 +431,8 @@ providers:
 | `timeout` | duration | `0` | 프로바이더별 요청 타임아웃. 배포가 override 가능 | 0이면 `server.request_timeout`으로 떨어진다 |
 | `max_concurrency` | int | `0` | `route` capacity 축 — 이 프로바이더 자신의 상한 | 음수 거부. `0`은 0짜리 상한이 **아니라** 이 축이 제약하지 않음을 뜻한다 |
 | `capacity_group` | string | `""` | 여러 프로바이더가 하나의 업스트림 풀을 공유할 때의 `provider_group` 축 멤버십 | `capacity.provider_groups`에 선언되지 않은 그룹은 이름과 함께 거부 |
-| `params.drop_unsupported` | bool | `true` | kind가 표현할 수 없는 파라미터를 전달하지 않고 걸러낸다 | 끄면 클라이언트가 본 적 없는 업스트림 `400`이 노출된다. 기존 클라이언트들이 만들어진 대상 프록시가 조용히 드롭하며, 그것이 기본값 이유다 |
-| `params.drop[]` | []string | `[]` | 이 파라미터들을 무조건 제거 | 빈 항목이나 공백만 있는 항목은 거부 |
+| `params.drop_unsupported` | bool | `true` | kind가 표현할 수 없는 파라미터를 전달하지 않고 걸러낸다 | **`true`가 유일하게 유효한 값**이다. 변환 게이트웨이가 가질 수 있는 동작이 그것뿐이기 때문이다 — ⚠️ **`false`는 로드에서 거부된다**(§23.2). 표현할 수 없는 파라미터를 흘려보낼 곳이 없고, 호출자가 손실에 동의하는 경로는 `x-dorang-allow-lossy`다 |
+| `params.drop[]` | []string | `[]` | 이 파라미터들을 **인코더가 돌기 전에** 무조건 제거하고, 실제로 지워진 이름을 `x-dorang-dropped-params`로 보고한다 | 빈 항목·공백 패딩 항목은 거부. 무엇을 묻는지 자체를 바꾸는 이름도 거부된다: `model`, `messages`, `system`, `prompt`, `input`, `stream`, `tools`, `tool_choice`, `response_format`, `previous_response_id`, `store`. `anthropic` 형태의 프로바이더에서는 `max_tokens`/`max_completion_tokens`도 기동 시 추가로 거부된다. dorang이 모델링하지 않는 이름은 **일부러 받아들인다** — 벤더 고유 노브가 이 목록의 존재 이유다 |
 | `params.set{}` | map | `{}` | 호출자를 덮어쓰며 무조건 주입 | ⚠️ 안전 메커니즘을 끌 수 있는 레버다. 여기에 `truncation: auto`나 `truncate_prompt_tokens`를 넣으면 프로바이더 전체에서 context-window 폴백이 키로 삼는 바로 그 `400`이 억제된다 — [EXTENSIONS.ko.md](EXTENSIONS.ko.md) §A.3a |
 | `params.default{}` | map | `{}` | 호출자가 보내지 않았을 때만 주입 | `set`보다 안전하지만 같은 두 파라미터로 같은 해를 끼칠 수 있다 |
 | `retry.max_attempts` | int | `2` | 프로바이더 내 재시도, §12의 폴백 체인과 별개 | 음수 거부 |
@@ -1825,7 +1825,6 @@ key pepper, batch 블롭, shadow 리포트. 컨테이너 이미지는 그것을 
 | 키 | 상태 |
 |---|---|
 | `metric: max_concurrent` 또는 `max_queue`인 `models[].deployments[].limits[]` | `rpm`과 `tpm`만 소비되며, 크리덴셜별 쿼터로 (§10.2) |
-| `providers[].params.drop`, `.drop_unsupported` | §10.3의 두 노브는 변환 경로에 닿지 않는다 — 무엇이 떨어지는지는 kind 자신의 capability 집합만 정한다 |
 | `routing.prefix.checkpoints` | 체인은 로그 간격으로 잘린다; `fixed`는 검증만 되고 아무것도 선택하지 않는다 |
 | `models[].deployments[].stream_timeout` | 비스트리밍 타임아웃만 업스트림 호출에 닿는다 |
 | `key_rotation.providers[].affinity_group` | 읽히지 않고, 검증되지도 않는다 |
@@ -1849,6 +1848,15 @@ key pepper, batch 블롭, shadow 리포트. 컨테이너 이미지는 그것을 
 > 조언처럼 읽혔다. **이제 그 블록은 로드 에러다**(§23.2). 이 절이 계속 주장해 온 처분이고, 가드가 닿을 수
 > 없는 처분이다. 무력한 채로 두는 것의 대가를 볼 것: 같은 블록에 대한 두 개의 틀린 진술이, 같은 표에서,
 > 두 번의 패스에 걸쳐 있었다.
+
+> **`providers[].params.drop`은 배선되어서, 그 이웃은 거부되어서 이 표에서 내려왔다.** 그 행은
+> *"§10.3의 두 노브는 변환 경로에 닿지 않는다 — 무엇이 떨어지는지는 kind 자신의 capability 집합만
+> 정한다"*라고 적혀 있었고, 둘 다에 대해 참이었으며 둘 다에 대해 틀린 처분이었다. `params.drop[]`은
+> 인코더 앞에서 요청에 적용되고 지워진 이름을 `x-dorang-dropped-params`로 보고한다
+> (`internal/canonical/dropparam.go`, `internal/backend/provider.go`). `params.drop_unsupported:
+> false`는 이제 로드 에러다(§23.2). capability 집합과 drop 목록은 애초에 같은 질문에 대한 답이 아니다:
+> capability는 **kind**가 표현할 수 있는 것이고, drop은 **이 업스트림 인스턴스 하나**가 거부하는 것이며,
+> 후자는 오퍼레이터만 아는 사실이다.
 
 ### 23.1a 지난 패스 이후 닫힌 것
 

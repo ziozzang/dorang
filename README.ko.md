@@ -28,9 +28,15 @@ capacity:
     account-a: { max_concurrency: 3 }        # 계정당, 모델 무관
     account-b: { max_concurrency: 3 }
   models:
-    - { provider: coding-plan, model: model-x, max_concurrency: 7 }   # (키, 모델)당
+    - { provider: coding-plan, model: model-x, max_concurrency: 7 }   # (프로바이더, 모델)당
     - { provider: coding-plan, model: model-y, max_concurrency: 7 }
 ```
+
+모델 축의 키는 크리덴셜이 아니라 **프로바이더와 업스트림 모델**이다 — `internal/capacity`의
+`AxisModel`. 그래서 코딩 플랜 하나에 모델 두 개면 그 플랜에 키가 몇 개든 동시 14개이고,
+Ollama 계정 하나에 모델 두 개면 여전히 3개다. 그 상한은 크리덴셜 축에 있기 때문이다. 두 축의
+이 차이가 위 예시의 전부이며, 주장이 아니라 측정으로 확인한다: `testing/providers/`가 두 형태를
+하나의 게이트웨이에 같은 시점으로 통과시킨다.
 
 route · provider group · model · credential group · key 다섯 축을 **전량 또는 전무(all-or-nothing)로
 원자적으로** 예약한다. 한 슬롯을 잡은 채로 다른 슬롯을 기다리는 상태 자체가 존재하지 않으므로

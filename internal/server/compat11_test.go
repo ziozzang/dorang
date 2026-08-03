@@ -846,3 +846,84 @@ func TestGatewayFaultCarriesTheCompat11Code(t *testing.T) {
 		t.Errorf("body\n got %s\nwant %s", got, want)
 	}
 }
+
+// TestCompat11RetryAfterOnEveryRetrySignallingStatus is COMPATIBILITY §11.4,
+// pinned rather than asserted in prose.
+//
+// §11.4 is a wire contract and README calls this file's subject "wire contracts
+// pinned as golden tests"; the contract said "429 and 503" while the code tested
+// `status == 429` in both places that could emit the header, so a provider's own
+// `Retry-After` on an overloaded 503 or 529 was parsed by internal/backend,
+// carried on Error.RetryAfterSeconds the whole way to WriteError and dropped
+// there. The document was the only record of the promise, and prose does not
+// fail a build.
+//
+// Both directions are pinned. The negative half matters as much as the positive
+// one: §11.4 is now a claim about exactly three statuses, so a 500 or a 502
+// carrying an upstream's stray Retry-After must NOT publish it — a status that
+// makes no claim about recovery cannot be handed a delay to act on.
+func TestCompat11RetryAfterOnEveryRetrySignallingStatus(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"rate limited", http.StatusTooManyRequests, "11"},
+		{"unavailable", http.StatusServiceUnavailable, "11"},
+		{"anthropic overloaded", 529, "11"},
+		{"gateway fault carries no delay", http.StatusInternalServerError, ""},
+		{"bad gateway carries no delay", http.StatusBadGateway, ""},
+		{"a refusal is not a wait", http.StatusBadRequest, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t, func(o *Options) {
+				o.Logf = func(string, ...any) {}
+				o.Dispatcher = DispatchFunc(func(context.Context, *Request, http.ResponseWriter) error {
+					e := NewError(tc.status, TypeForStatus(tc.status), "upstream said wait")
+					// Exactly what internal/backend's upstreamError fills from
+					// the provider's own header, for any status it relays.
+					e.RetryAfterSeconds = 11
+					return e
+				})
+			})
+			w := do(s, post("/v1/chat/completions", `{"model":"model-x"}`))
+			if w.Code != tc.status {
+				t.Fatalf("status %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+			if got := w.Header().Get(HeaderRetryAfter); got != tc.want {
+				t.Errorf("Retry-After %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompat11RetryAfterIsNotGatedBehindTheDetailHeader is the other half of
+// §11.4's opening sentence, checked on the status the old gate did not cover.
+//
+// DESIGN §10.4's bounding rule is about the x-dorang-* set: a header the client
+// ACTS ON is unconditional, a header the client merely READS may be gated. A 503
+// that carries the delay only for callers who asked for telemetry would be the
+// rule applied backwards.
+func TestCompat11RetryAfterIsNotGatedBehindTheDetailHeader(t *testing.T) {
+	s := newTestServer(t, func(o *Options) {
+		o.Logf = func(string, ...any) {}
+		o.Dispatcher = DispatchFunc(func(context.Context, *Request, http.ResponseWriter) error {
+			e := NewError(http.StatusServiceUnavailable, TypeOverloaded, "the upstream provider is overloaded")
+			e.RetryAfterSeconds = 30
+			return e.WithCode("overloaded")
+		})
+	})
+	r := post("/v1/chat/completions", `{"model":"model-x"}`)
+	// No x-dorang-detail: full. The plain caller is the one this is for.
+	w := do(s, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(HeaderRetryAfter); got != "30" {
+		t.Fatalf("Retry-After %q, want 30 without the detail opt-in", got)
+	}
+	if got := w.Header().Get(HeaderAttempt); got != "" {
+		t.Errorf("the detail set leaked onto a plain caller: x-dorang-attempt = %q", got)
+	}
+}

@@ -172,7 +172,7 @@ dorangctl config lint /etc/dorang/config.yaml
 | `.rpm` / `.tpm` / `.max_parallel_requests` | 배포의 `limits[]` |
 | `.weight`, `.timeout`, `.stream_timeout` | 배포 필드 |
 | drop-unsupported와 명시적 drop 목록 | `params.drop_unsupported`, `params.drop[]` |
-| 토큰당 input/output 비용 | `pricing.rules[]` |
+| 토큰당 input/output 비용 | `pricing.rules[]` — **재스케일된다**: 토큰당 요율에는 10⁶을, 문자당 요율에는 10³을 곱한다. dorang의 필드는 100만 토큰당·1000자당이기 때문이다. importer는 예전에 리터럴을 그대로 복사했고, 그래서 임포트된 모든 가격표가 조용히 실제 가격의 100만분의 1이 되었다 — 모든 요청이 0으로 반올림되는데 `/spend/calculate`는 여전히 규칙이 매칭됐다고 보고했다 |
 | 라우팅 전략 | `models[].strategy` |
 | default / context-window / content-policy 폴백 | `fallbacks.on.*` |
 | `environment_variables` | **임포트되지 않음** — 프로세스 환경에 설정하고 `key_env`로 참조할 것 |
@@ -202,19 +202,135 @@ prefix 어피니티를 전부 비결정적으로 만든다. 이를 고정하는 
 
 ### 2.3 임포트 이후
 
-임포트가 대신 해 줄 수 없는 셋:
+임포트가 대신 해 줄 수 없는 넷:
 
 1. **capacity 축 모델링.** 원본 설정은 배포별로 `rpm`/`tpm`/`max_parallel_requests`를 진술한다. dorang의
-   모델 — 모든 모델에 걸친 계정별, *그리고* (키, 모델)별 — 은 더 풍부하고, 정작 중요한 형태는 원본 파일이
+   모델 — 모든 모델에 걸친 계정별, *그리고* (프로바이더, 모델)별 — 은 더 풍부하고, 정작 중요한 형태는 원본 파일이
    표현할 수 없었기에 원본 파일에 아예 없는 경우가 많다. [CONFIG.ko.md](CONFIG.ko.md) §8을 읽고 축을 직접
    쓸 것.
-2. **요율을 찾지 못한 것들의 가격 매기기.** 모든 모델 그룹에 대해
-   `dorangctl price <model> --input N --output N`을 돌릴 것. `no marginal_usage rule matched` 경고는 그
-   트래픽이 UNPRICED로 기록된다는 뜻이다.
-3. **컨텍스트 윈도우가 미선언인 배포 알려주기.** `dorangctl catalog unverified`를 돌릴 것. 미선언 윈도우는
-   0도 무제한도 아니다; 배포를 배제하지도, context-window 폴백 체인에서 "더 큰" 것으로 자격을 주지도
-   않는다. 윈도우가 **너무 크게** 선언된 것이 위험한 방향이다: 실제 한계와 선언값 사이의 요청이 그냥
-   실패하고, dorang이 맞는다고 믿기 때문에 context-window 폴백이 절대 발화하지 않는다.
+2. **요율을 찾지 못한 것들의 가격 매기기, 그리고 벤더 가격표와 가격 하나 대조하기.** 모든 모델 그룹에
+   대해 `dorangctl price <model> --input N --output N`을 돌릴 것. `no marginal_usage rule matched`
+   경고는 그 트래픽이 UNPRICED로 기록된다는 뜻이다. 그 다음, 벤더가 공개한 가격표로 손으로 계산할 수
+   있는 요청 하나에 대해 `POST /spend/calculate`를 호출해 비교할 것. 요율이 없는 것이 아니라 **배수만큼
+   틀린** 경우에는 경고가 전혀 나오지 않는다 — 규칙은 매칭되고 `"missing"`은 `false`이며, 숫자만 그냥
+   틀리다. ×10⁶ 결함이 바깥에서 보이던 모습이 정확히 그것이었다.
+3. **원본이 모델 행에 진술했고 dorang은 다른 곳에서 진술하는 것을 다시 표현하기.** 두 설정이 설정이 아니라
+   경고로 임포트를 빠져나오고, 둘 다 잃어버린 것이 아니라 원래 없던 것처럼 읽히는 종류다:
+   `model_info.access_via_team_ids`(팀의 모델 allow-list, `POST /team/update`, §2.1의 반전 경고를 볼 것 —
+   건너뛰면 조용히 **허용적**이 되는 쪽이 이것이다)와 `litellm_params.max_tokens`(배포별 기본값 대 dorang의
+   상한). 임포트 리포트에서 `NOT imported`를 grep할 것; 그 문구는 의미가 있었던 설정에만 쓴다.
+4. **컨텍스트 윈도우가 미선언인 배포 알려주기.** 라우팅하는 배포마다
+   `dorangctl catalog explain <kind> <model>`을 돌려 `context_window` 행을 읽을 것 — ORIGIN 칸의
+   `undeclared`가 답이다. 미선언 윈도우는 0도 무제한도 아니다; 배포를 배제하지도, context-window 폴백
+   체인에서 "더 큰" 것으로 자격을 주지도 않는다. 윈도우가 **너무 크게** 선언된 것이 위험한 방향이다: 실제
+   한계와 선언값 사이의 요청이 그냥 실패하고, dorang이 맞는다고 믿기 때문에 context-window 폴백이 절대
+   발화하지 않는다.
+
+   > 이 항목은 `dorangctl catalog unverified`가 다시 쓰이기 전까지 그 명령을 가리키고 있었다. 그 명령은
+   > 컨텍스트 윈도우를 보고한 적이 없고 지금도 보고하지 않는다 — 그것이 보고하는 것은 검증 상태이고,
+   > §2.4의 주제이며 완전히 다른 축이다.
+
+---
+
+### 2.4 카탈로그가 자기 항목에 대해 아는 것
+
+카탈로그를 읽는 명령이 둘 있고, 둘 다 추측하지 않는다.
+
+`dorangctl catalog explain <kind> <model>`은 출처 뷰다: 필드마다 해결된 값, 그것을 이긴 레이어, 그것을 쓴
+파일이 한 행씩 나온다. §2.3의 4번이 쓰는 것이 이것이고, `undeclared`와 `0`을 구별할 수 있는 유일한 자리다.
+
+`dorangctl catalog unverified`는 **검증 상태**를 보고한다 — 각 항목을 마지막으로 살아 있는 엔드포인트에
+물었을 때 무슨 일이 있었는가. 상태별 개수를 찍고, 발견을 담은 두 상태를 증거와 함께 나열하고, 담지 않은 두
+상태를 프로바이더 kind별로 요약한다. `--state S`는 한 상태만 따로 나열한다.
+
+| 상태 | 뜻 | 조치 |
+|---|---|---|
+| `verified` | 물었고, 자기 자신으로 답했다 | 없음 |
+| `denied` | 물었고, 이 플랜은 자격이 없다. **모델은 존재한다** | 자격을 사거나 그 이름으로 라우팅하는 것을 멈출 것. 부재 모델이 아니며, 항목을 지우면 참인 사실을 잃는다 |
+| `substituted` | 물었고, **다른** 모델이 답했다 | 살아 있는 라우팅 결함이다: 한 모델을 요청했고 다른 모델을 받았으며 그 트래픽에 대해 청구된다. 그 이름으로 라우팅하지 말 것 |
+| `citation_only` | 아무도 물을 수 없었다 — 이 카탈로그가 관리되는 곳에 그 프로바이더의 크리덴셜이 없다 | 항목이 잘못된 것이 아니다; 증거가 프로브가 아니라 인용일 뿐이다. 키가 있으면 `catalog verify`로 닫을 것 |
+| `unchecked` | 아무도 묻지 않았고, 왜인지도 아무것도 말하지 않는다 | 백로그 |
+
+이 빌드가 싣고 나오는 카탈로그에서의 실제 출력(축약):
+
+```
+245 catalogued models. What happened the last time an endpoint was asked:
+
+  verified       38   asked, and it answered as itself
+  denied         9    asked; this plan is not entitled. The model EXISTS
+  substituted    3    asked; a DIFFERENT model answered
+  citation_only  195  nobody could ask: no credential for the route here
+  unchecked      0    nobody has asked, and nothing says why
+
+substituted (3) — asked; a DIFFERENT model answered:
+  kind=glm model=glm-5.1
+      served instead: glm-5.2 (asked 2026-08-03)
+      200 OK, body `"model":"glm-5.2"`. Same on three consecutive runs.
+  …
+
+reasoning capability is unknown for 244 of 245 models. That is a different question and a
+different probe (DESIGN §10.2): a model can be verified to exist and still have an unknown
+reasoning control.
+```
+
+**축이 둘인데 예전 출력은 그것을 뭉갰다.** `unverified`는 "이 모델이 존재하는지 확신하지 못한다"는 뜻이었던
+적이 없다 — 그 항목의 **리즈닝 능력**을 모른다는 뜻이었고, 그것은 다른 질문이고 다른 프로브이며 다른 답이다.
+지금은 둘을 눈에 보이게 갈라 둔다: 위의 상태들은 엔드포인트가 그 이름에 답했는가에 대한 것이고, 리즈닝
+개수는 맨 끝에 한 줄로 따로 선다. 어떤 모델은 `verified`이면서도 리즈닝 제어가 미지일 수 있고, 실려 나오는
+카탈로그에서는 거의 전부가 그렇다. 예전에는 날짜 없는 것을 전부 한 줄짜리 평면 목록으로 찍었는데, 정확하고
+쓸모없었다 — 아무도 타이핑해 본 적 없는 항목이 물어봤고 확실한 답을 받은 항목 옆에 나란히 앉아 있었고,
+출력의 무엇도 둘 중 어느 쪽인지 말해 주지 않았다.
+
+#### 하나 닫기: `dorangctl catalog verify`
+
+```
+dorangctl catalog verify --kind <kind> --key-env <VAR> [--write <file>]
+```
+
+이것은 그 kind에 카탈로그된 **항목마다 진짜 요청을 하나씩** 보내고 답을 읽는다. `/models` 목록은 증거이지
+증명이 아니며, 이 카탈로그 자신의 프로바이더들에서 양방향이 다 관측됐다: 목록이 여전히 서빙되고 있는 모델을
+빠뜨렸고, 모든 요청을 거부하는 모델 아홉 개를 이름에 올렸다. 그리고 세 번째 경우는 아예 볼 수 없다 —
+치환된 모델은 `200`으로 답하고, 어느 모델이 실제로 답했는지는 응답 본문만이 말한다.
+
+프로브는 최소한이다. 짧은 user 턴 하나에 `--max-tokens` 기본값 16인데, 당신 자신의 플랜으로 청구되기
+때문이다. `--dry-run`은 무엇을 물을지 찍고 아무것도 묻지 않으며, 크리덴셜이 필요 없는 유일한 모드다:
+
+```
+$ dorangctl catalog verify --kind glm --dry-run
+would ask https://api.z.ai/api/coding/paas/v4 for 8 model(s), max_tokens=16:
+  glm-4.5  (chat)
+  glm-4.6  (chat)
+  …
+```
+
+`--model a,b`는 이름 붙인 항목으로 좁히고, `--base-url`은 엔드포인트를 덮어쓰며, `--timeout`은 요청당
+값(120초), `--catalog`는 오버레이를 먼저 싣는다.
+
+**거절 세 가지가 내장돼 있고**, 각각은 이 명령이 내리지 않기로 한 결론이다:
+
+1. **키는 환경변수 이름으로 지목되며 플래그 값으로는 절대 받지 않는다.** `--key-env VAR`는 변수의 *이름*을
+   받는다; 키 자체를 받는 플래그는 없다. 플래그로 넘긴 키는 셸 히스토리와 그 머신의 모든 `ps`에 남는다. 빈
+   변수도 사유와 함께 거절한다: 묻지 않은 모델은 날짜를 얻는 대신 묻지 않은 채로 남아야 한다.
+2. **없어진 모델을 지목하지 않는 404는 부재 모델이 아니라 경로 오류다.** 부재는 에러의 *언어*에서 읽는다 —
+   "does not exist", "no such model", "unknown model" — 모델 이름이 본문 어딘가에 나타나는 것에서 읽지
+   않는다. 짧은 모델 id는 거의 모든 메시지에 등장하고, 그 실패 양상은 살아 있는 항목을 없어졌다고 보고하는
+   것이다. Responses 전용 엔드포인트가 chat 요청에 답하면 정확히 이 404가 나오고, 잘못된 경로로 보고된다.
+3. **모든 프로브가 401/403으로 실패하고 하나도 성공하지 못하면 아무것도 쓰지 않고 크리덴셜을 탓한다.** 다른
+   것들이 답하는 라우트에서 한 모델만 거부하는 것은 그 모델에 대한 사실이지만, 모든 모델이 똑같이 거부하는
+   것은 그 키에 대한 사실이다. 가정이 아니다: 추론 접근 권한이 스코프에 없던 토큰이 모든 모델에 403을
+   반환했고, 그 실행을 기록했다면 부재가 뭔가를 뜻해야 하는 카탈로그에 이백여 개의 거짓 denial을 써넣었을
+   것이다. 자격 관련 문구가 없는 맨 403도 그것만으로는 아무 결론을 내지 않는다 — 다른 무언가가 성공한
+   라우트에서 자격을 지목하며 거부한 것만이 `denied`다.
+
+`--write FILE`은 임베디드 데이터를 읽는 그 로더가 그대로 실을 수 있는 카탈로그 오버레이를 내보낸다. 검증의
+출력이 옮겨 적는 단계 없이 카탈로그의 입력이 된다는 뜻이다. `--catalog`이나 `$DORANG_CATALOG_PATH`로 싣고,
+먼저 검토할 것 — 거기 적힌 `verified:`는 그 날짜에 엔드포인트가 그 이름에 답했다는 뜻이지, 그 항목의 숫자가
+맞다는 뜻이 아니다.
+
+모델에 대한 사실인 세 결과만 쓰인다: `verified`, `substituted`, `denied`. **`retired`나 `absent` 결과는
+보고되고 절대 쓰이지 않는다.** 그것에 따라 행동한다는 것은 *삭제*이기 때문이다 — 아무에게도 서빙하지 않는
+모델에 대한 카탈로그의 답은 사유를 주석에 남기고 항목을 지우는 것이고, HTTP 응답 하나를 근거로 카탈로그 행을
+지우는 도구가 있어서는 안 된다. 에러도 쓰이지 않는다; 그것은 네트워크나 키에 대한 사실이다.
 
 ---
 
@@ -322,11 +438,63 @@ dorangctl import keys --from postgres://user:pass@host/litellm --commit # 실제
 | `--commit` | 실제로 쓴다. 없으면 아무것도 쓰지 않고 리포트는 동일하다 |
 | `--table` | 원본 테이블, 기본 `LiteLLM_VerificationToken` |
 | `--on-missing-team` | `skip`(기본)은 팀이 없는 키를 거부한다 — 그 실패가 안전한 쪽인 이유는 §3.3 — `orphan`은 팀 참조를 떼고 임포트한다 |
+| `--on-untranslatable` | `skip`(기본)은 dorang이 표현할 수 없는 관용구를 허용목록에 담은 키를 거부하고, `clear`는 그 허용목록을 떼고 임포트한다. §3.6 참조 |
+| `--object-permission-table` | `object_permission_id`가 가리키는 원본 테이블, 기본 `LiteLLM_ObjectPermissionTable`. 이 테이블은 **읽힌다**: §3.6 참조 |
 | `--limit` | 원본 행을 최대 N개만 읽는다. 큰 테이블을 처음 볼 때 |
 | `--expect-admin-key` | 관리 크리덴셜이 행 중에 있다고 믿는다면 지정한다. 결코 없으며 리포트가 이유를 설명한다 |
 
 재실행은 안전하다: 이미 존재하는 키는 건드리지 않고 세기만 하므로, 재임포트가 그 사이에 한 폐기를 되돌릴 수
 없다.
+
+### 3.6 건너편에서 같은 뜻이 되지 않는 세 가지 관용구
+
+임포트는 기존 게이트웨이의 인가 컬럼을 그대로 싣는다. 그중 셋은 dorang이 적힌 대로 읽을 수 있는 진술이
+아니며, 그 첫 번째가 이 절이 존재하는 이유다.
+
+키 54개를 가진 실제 기존 게이트웨이에 대해 측정했다: 산술은 정확했다 — 54개 스캔, 4개 임포트, 팀 부재로
+50개 스킵, 모든 `lookup`이 원본 다이제스트의 `sha256(token)[:32]`와 일치 — 그런데 세 관용구 모두 의미가
+사라진 채 데이터로만 건너왔다. 리포트는 그중 어느 것도 언급하지 않았다. 지금은 한다: 셋 모두 키·컬럼·값과
+함께 리포트에 나타난다.
+
+**1. `object_permission_id` — fail-OPEN이었던 것, 그리고 이제 해소된 것.**
+키의 모델 제한은 키 자신의 `models` 컬럼에 있을 수도 있고, 키가 가리키는 `LiteLLM_ObjectPermissionTable`의
+행에 있을 수도 있다. 그 테이블을 읽지 않고 id만 실어 오면 dorang의 `models`는 **비게** 되고, 빈 허용목록은
+**모든** 모델을 허용한다 — 키가 갖고 있지 않던 접근 권한을 조용히 얻는 것이다.
+
+임포트는 이제 **그 테이블을 읽고** 행의 `models`를 키 자신의 허용목록에 접는다. 양쪽이 모두 제한하는 경우
+교집합을 취한다. 리포트는 각 건을 *object permissions resolved*로 센다. id를 **해소할 수 없을** 때 —
+테이블을 읽을 수 없거나, 행이 없거나, 행이 dorang에 허용목록이 없는 것(`vector_stores`, `mcp_servers`)을
+제한하거나, 키와 행에 공통 모델이 하나도 없을 때 — **키는 거부되고 이름이 적힌다.**
+`--on-untranslatable=clear`는 여기에는 어느 방향으로도 적용되지 않는다: 이것을 clear하는 것은 표현할 수 없는
+리터럴이 아니라 **제한 자체**를 떼는 것이고, 권한을 넓히는 일은 플래그가 결정할 사안이 아니다.
+
+**2. `allowed_routes: {llm_api_routes}` — 경로가 아니라 라우트 그룹.**
+기존 게이트웨이는 그룹 이름을 경로 집합으로 펼친다. dorang은 리터럴 경로, `*`, 또는 `/*`로 끝나는 접두사를
+매칭하므로, 그룹 이름은 어떤 요청과도 매칭되지 않고 키는 **모든** 라우트에 대해 `403 route_not_allowed`로
+거부된다 — `/v1/models`까지 포함해서. 실제 데이터베이스에서 임포트 가능한 키 4개 중 3개가 이것을 갖고 있었다.
+
+**3. `models: {all-team-models}` — 모델이 아니라 센티널.**
+같은 형태, 같은 방향이다: `all-team-models`, `all-proxy-models`, `all-model-access`,
+`no-default-models`는 모델 이름의 *집합*에 대한 지시인데, dorang은 그것을 아무도 서빙하지 않는 리터럴 모델
+하나로 읽는다. 실제 키 2개가 이것을 갖고 있었다.
+
+뒤의 둘은 **fail-closed**이며, 그래서 세 번째가 아니라 두 번째 우선순위다: 키는 인증되지만 아무것도 하지
+못한다. 둘 다 기본적으로 거부되고 리포트에 이름이 적힌다. 그래도 임포트하려면:
+
+```
+dorangctl import keys --from <dsn> --on-untranslatable=clear --commit
+```
+
+`clear`는 dorang이 표현할 수 없었던 허용목록을 떼어내며, 키 수준에서 그것은 **무제한**을 뜻한다 — 넓히는
+쪽이다. 그래서 옵트인이고, 이것이 건드린 모든 키는 리포트에 `cleared`로 이름이 적힌다. 모델 센티널의 경우
+센티널 항목만이 아니라 키 수준 목록 **전체**를 clear한다. "모든 팀 모델"을 포함하는 합집합은 *곧* 모든 팀
+모델이기 때문이다. 센티널만 떼고 옆의 리터럴을 남기면 키는 기존 게이트웨이에 있던 것보다 **좁아지며**,
+그것은 또 다른 종류의 틀린 답이고 더 조용한 답이다. 키 수준에서 무제한이 된 키도 여전히 그 팀과 유저의
+한도에 묶인다.
+
+라우트 그룹은 이름 목록이 아니라 **형태**로 판별한다: 경로가 아니고 `*`도 아닌 것은 dorang이 열거할 수 없는
+집합의 이름이다. 이 코드가 한 번도 본 적 없는 그룹도 거부되며, 그것이 fail-open이 될 수 없는 유일한
+방향이다.
 
 > **이 절은 정반대를 말하고 있었고, 당시에는 옳았다.** 원문은 *"크리덴셜 임포트에 CLI 진입점이 없다 …
 > `dorangctl` 서브커맨드도 관리 엔드포인트도 없다 … 재발급으로 계획할 것"* 이었다. importer는 완성돼
@@ -524,7 +692,11 @@ health 엔드포인트와 `/metrics` 모두 게이트 상태를 싣는다. `GET 
       강제하지만, 통과시키려고 상한을 낮추지 않았는지 확인할 것.
 - [ ] 실행 내내 `cost_capped`가 false.
 - [ ] 실행이 피크를 포함한 대표 기간을 덮었을 것.
-- [ ] `dorangctl catalog unverified` 검토: 트래픽을 싣는 어떤 배포도 미선언 컨텍스트 윈도우를 갖지 않을 것.
+- [ ] 트래픽을 싣는 모든 배포에 `dorangctl catalog explain`을 돌려, `undeclared` 컨텍스트 윈도우가 하나도
+      없을 것(§2.3의 4번).
+- [ ] `dorangctl catalog unverified` 검토(§2.4): 라우팅하는 어떤 모델에도 **`substituted`가 0**일 것 —
+      치환은 요청하지 않은 모델에 대해 청구되고 있다는 뜻이다 — 그리고 모든 `denied`가 놀라움이 아니라 이미
+      아는 자격 간극일 것.
 - [ ] 모든 모델 그룹에 `dorangctl price` 실행, `no marginal_usage rule matched` 없음.
 - [ ] §1.2의 컨트롤 플레인 목록에 답이 있을 것 — 대체재, 스크립트 재작성, 또는 받아들인 간극.
 - [ ] self-hosted 백엔드 플래그가 설정돼 있을 것([OPERATIONS.ko.md](OPERATIONS.ko.md) §5). 그 각각이

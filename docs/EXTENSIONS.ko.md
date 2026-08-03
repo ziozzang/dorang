@@ -203,7 +203,7 @@ compaction이 엉뚱한 시점에 — 검색 루프에서는 너무 이르게, �
 
 ### A.3 vLLM
 
-vLLM에는 compaction 엔드포인트가 **없지만**(§0.1), 조사 전체에서 유일하게 발견된 *서버측 컨텍스트 관리*
+vLLM에는 compaction 엔드포인트가 **없지만**(§0.2), 조사 전체에서 유일하게 발견된 *서버측 컨텍스트 관리*
 메커니즘이 있고, 비표준 라우트 표면이 넓다. 특히:
 
 - `POST /tokenize`, `/detokenize`, `GET /tokenizer_info`(플래그 게이트) — **opaque** 또는 gateway-owned.

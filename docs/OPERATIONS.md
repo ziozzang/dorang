@@ -78,12 +78,17 @@ Two registration details that are deliberate rather than accidental:
 | `route_unknown` | Anything else |
 
 A 501 carries `X-Dorang-Unimplemented: <path>`. A known path with the wrong method answers
-**405** with an `Allow` header and code `method_not_allowed`.
+**405** with an `Allow` header and code `method_not_allowed`. A request body that is present and
+is not JSON answers **415 `unsupported_media_type`** — it used to be *ignored*, which meant a
+form-encoded `POST /key/rotate?key_id=…` with `grace=0` answered 200 and rotated with the default
+24-hour grace, discarding the operator's request for an immediate cut. A bodyless call with every
+parameter in the query string is unaffected whatever `Content-Type` it declares.
 
 **The HTTP administrative surface is mounted.** `/key/*`, `/user/*`, `/team/*`, `/model/*`,
-`/budget/*`, `/spend/*`, `/admin/*` and the embedded read-only UI at `/ui` are served by
+`/budget/*`, `/spend/*`, `/admin/*` and the embedded operator UI at `/ui` are served by
 `cmd/dorang`, behind `DORANG_MASTER_KEY` or a key whose owning user holds an administrative role.
-Every mutation writes an `audit_logs` row.
+Every mutation writes an `audit_logs` row — including the ones taken from the UI, which calls the
+same routes with the signed-in operator as the actor.
 
 Not every endpoint has storage behind it. The ones that do not answer **501
 `dependency_not_configured`** naming the missing piece rather than a generic refusal — see §3.2
@@ -417,6 +422,39 @@ access to the node, cannot be done from a runbook over HTTP, and leaves no audit
 longer the procedure. It still works as a break-glass path if the administrative credential
 itself is what leaked.
 
+#### Doing it from the operator UI
+
+`/ui/keys` performs the whole credential lifecycle: **create, delete, rotate, cut a grace short,
+block, unblock, pend, release.** Each control calls the same route `curl` would — with the
+signed-in operator as the actor — so every one of them writes the same audit row and publishes the
+same invalidation, and the propagation numbers above are the same numbers. There is no second code
+path into the key store.
+
+Read this before you use it under pressure:
+
+- **A secret shown in a browser is a secret in that browser.** Creating or rotating from the UI puts
+  the one-time credential in the page's DOM, in the tab's back/forward cache, in whatever the
+  browser writes for session restore, and in any screenshot or screen share of that window. dorang
+  cannot withdraw any of those. The page says so while the secret is on it. It is shown **once**: a
+  reload answers `410 Gone`, and the only recovery is to rotate again. If you would not paste a
+  credential into that window, mint it with `dorangctl key create` or `POST /key/generate` instead —
+  the CLI writes the token to stdout so `> key.txt` captures exactly it.
+- **Delete, block, pend, rotate and cut go through a confirmation page** naming the key, its team,
+  its spend and its state. Unblock and release do not — restoring service is one action (§11.6).
+- **Prefer block to delete**, for the reason above: a blocked key is present and refused *as such*
+  (`403`), a deleted one is refused as unknown (`401`) and its ledger rows name an id nothing
+  resolves.
+- **Mutating needs a signed-in session.** A UI view authorized by a bearer header, or one behind
+  your own authenticating proxy with `admin.ui.sessions` disabled, reads and cannot act; use the API
+  from those.
+- **Editing a key's fields is still API-only** (`/key/update`). A form cannot tell "leave this
+  alone" from "set this to nothing", and a budget cleared by an untouched box is worse than a curl
+  command.
+
+If `metrics.ui_forgeries` in `GET /admin/status` is climbing, unsafe requests are arriving at `/ui` that
+cannot be proved to have come from `/ui`. A trickle is operators posting stale forms after their
+session ended; a rate is somebody else's page posting at your gateway.
+
 ### 3.2 What the administrative surface serves, and what it does not
 
 Mounted and working:
@@ -427,11 +465,11 @@ Mounted and working:
 | `/key/rotate`, `/key/rotate/cut`, `/key/secrets` | DESIGN §11.2c rotation: a new secret with a grace window, an early cut, and the list an operator reads to answer "did the client roll?". Same durable key id, so budget, spend, allow-list and ledger history are untouched |
 | `/key/pend`, `/key/release` | §11.6's reversible refusal. Distinct from block, because a pend is a statistical judgement that might be wrong and an operator releases it in one action |
 | `/spend/logs` | Per-request ledger. Requires one of `key_id`, `team_id`, `trace_id`, `tag` or `errors_only`, plus a bounded date range — §9.3 refuses an unbounded scan rather than answering it slowly |
-| `/global/spend/report` | Aggregated spend over a bounded range, read off DESIGN §9.4's rollups. `group_by` takes `day` and **one** of `model`, `key` or `team` — those are the keys the three materializations actually have. §9.4 keeps purpose-built rollups rather than a cube, so any other grouping (`user`, `tag`, `provider`, or two subject dimensions at once) answers **501** naming what is missing instead of turning into a table scan; `/spend/logs` joins those per request. `notional_spend` is reported as `null`, never as `0`: the rollups carry no list-rate column, and §8.5 forbids the flattering answer. `marginal_spend` and `subscription_spend` are read from their own columns and agree with `/spend/logs` row for row — they used to be `cost_nano` reported twice, so a flat plan's share was aggregated as marginal usage on the report an operator compares models by. Rows written before those columns existed report `0` for both, because the split was never recorded and there is nothing to recover it from |
+| `/global/spend/report` | Aggregated spend over a bounded range, read off DESIGN §9.4's rollups. `group_by` takes `day` and **one** of `model`, `key` or `team` — those are the keys the three materializations actually have. §9.4 keeps purpose-built rollups rather than a cube, so any other grouping (`user`, `tag`, `provider`, or two subject dimensions at once) answers **501** naming what is missing instead of turning into a table scan; `/spend/logs` joins those per request. `notional_spend` is the list-rate equivalent (§8.5) and is reported as `null`, never as `0`, whenever the window's figure is not whole: the rollups carry the sum **and** two counts — how many requests were priced at list rate and how many reached pricing with no notional rule — and a window with one of the second, or with none of the first (which is every bucket written before the counts existed), reports `notional_available: false`. A sum that is short by an unknown amount is exactly the flattering answer §8.5 forbids. The counts arrived with migration 0008; the `notional_nano` column has existed since 0002 and had no writer, so before that this field was `null` in every window of every deployment. `marginal_spend` and `subscription_spend` are read from their own columns and agree with `/spend/logs` row for row — they used to be `cost_nano` reported twice, so a flat plan's share was aggregated as marginal usage on the report an operator compares models by. Rows written before those columns existed report `0` for both, because the split was never recorded and there is nothing to recover it from |
 | `/admin/capacity` | Live broker occupancy per axis |
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | Where each catalogued model field came from |
 | `/health/history` | In-process ring; it starts empty on every restart |
-| `/ui` | Read-only operator UI. Sign in with an administrative credential; the session is one hour, which is also the lag before a revoked credential loses the UI |
+| `/ui` | Operator UI: keys, models & deployments, usage & cost. **The keys screen mutates** — create, delete, rotate, cut a grace, block, unblock, pend, release — by calling the routes above with the signed-in operator as the actor, so each one audits and publishes exactly as the API does; see §3.1 for what a secret shown in a browser costs. A mutation is refused unless the form carries that session's own token, which is the only thing a page on another origin cannot obtain; refusals are counted as `ui_forgeries` in `/admin/status`. **The API never accepts the cookie**: the header map handed to authentication is a copy with `Cookie` removed, so a session cookie replayed at `/key/delete` answers 401. Mutating requires a session — a header-authenticated view, including one behind your own proxy with sessions disabled, reads and cannot act. `/key/update` and `/key/regenerate` stay API-only (DESIGN §11.3 says why). Sign in with an administrative credential. The session is one hour, and that hour is a ceiling on an **idle** tab rather than a revocation lag: the key behind a session is re-checked against the store on every request, so blocking, deleting, pending or expiring it — or moving it to another team — ends the session on the next click. A role revoked on the owning *user* is not on the key and is still observed on the session TTL. The cookie is marked `Secure` when the browser's hop was TLS, including behind a proxy that terminates it and says so in `X-Forwarded-Proto` or `Forwarded`. The models screen reads the routing table this process **compiled**, which is why it answers while `/model/*` does not — see the note below |
 | `/user/new`, `/user/info`, `/user/update`, `/user/delete`, `/user/list` | Directory users. **`blocked` is enforced**: a blocked user's keys stop serving on the node that took the call before it answers, and on every other node within the same published bound a `/key/block` observes (§10.1) — measured **19.6 ms to a second node at `poll: 20ms`**, against a published 270 ms. `max_budget`, `budget_duration`, `rpm_limit`, `tpm_limit` and `models` are enforced too, as the user half of §11.2's three-subject envelope: the most restrictive of key, user and team wins. Deleting a user does **not** delete its keys — the keys are announced as revoked, and they then serve *unowned*, so ending someone's access means blocking or deleting the keys, not only the user |
 | `/team/new`, `/team/info`, `/team/update`, `/team/delete`, `/team/list`, `/team/member_add`, `/team/member_delete` | Directory teams. Same enforcement as users, plus `max_parallel_requests`, which is the one ceiling `teams` has and `users` does not. **Membership deliberately publishes no invalidation**: a key's team is `api_keys.team_id`, not `team_members`, so a membership change alters no authorization decision and a message about it is one no node could act on |
 | `/budget/new`, `/budget/info`, `/budget/update`, `/budget/delete`, `/budget/list` | Ceilings on a **key**, a **user** or a **team**, addressed as `budget_id: "team:eng"`. `spend` is read from the **durable counter the gate enforces against** (`budget_state`), not from the §9.4 rollups `/key/info` uses, because the question this route answers is "will a ceiling of X refuse?" and only the number the gate compares against can answer it — expect it to run slightly *ahead* of the ledger while a lease block is live (§9.6). **`/budget/delete` clears the ceiling and preserves the spend**: it is how you end a budget outage without making a billing decision, and it takes effect fleet-wide inside the published bound rather than on the cache TTL. Lowering a ceiling below recorded spend refuses with **400 `budget_exceeded`** naming the subject — on a node holding a live lease block, up to one block later (§5.6's published overshoot) |
@@ -685,18 +723,85 @@ admin key.
 
 Put it behind your network boundary as well; the two are not alternatives.
 
-⚠️ **Every metric is unlabelled by caller.** There are no per-path, per-model or per-key labels
-anywhere, deliberately: axis keys and model names are unbounded cardinality, and a gateway that
-lets a client mint label values has handed out a denial of service on its own metrics registry.
-Per-key and per-model figures come from the ledger, not from the scrape.
+⚠️ **Metrics are labelled, and one of the labels is derived from the request.** An earlier
+revision of this paragraph said there were "no per-path, per-model or per-key labels anywhere,
+deliberately". That was an absence claim about a cardinality control — the same shape as the
+`/metrics` authentication paragraph two boxes above — and it was wrong:
+`dorang_requests_total` carries `model`, `provider`, `credential`, `endpoint` and `status`, and
+the per-model histograms carry `model`.
+
+Per-key labels are elsewhere in the scrape too: `dorang_budget_spent_ratio{subject}` is keyed by
+budget subject (`key:…`, `user:…`, `team:…`), the capacity axes by api-key and credential id, and
+the quota families by credential. The paragraph above them, four lines up, has said the scrape
+"carries per-key spend, per-credential quota state and every configured model name" the whole
+time — the two sentences contradicted each other on the same screen.
+
+The reasoning behind the retracted sentence was sound and still holds, so here is what bounds
+each label on `dorang_requests_total` and the per-model histograms:
+
+| Label | Bounded by | Can a caller drive it? |
+|---|---|---|
+| `provider`, `credential` | the configured credential set | No |
+| `endpoint` | the route table — a route **name**, never the request path | No |
+| `status` | the status codes dorang answers | No |
+| `model` | the configured model set — `models[]` plus `aliases`, exactly what `GET /v1/models` publishes | No. A name that is not in it becomes `__unknown__` |
+
+The per-key labels answer No for the same reason `credential` does: an api-key id, a budget
+subject and a credential id are rows in a table an operator writes, not strings a request
+carries. `model` answers No for a different reason, and it is worth knowing which.
+
+**`model` is derived from the request and bounded by your configuration.** The value dorang reads
+is the model name out of the request body (or the deployment path segment), on every request
+**including the ones it refuses** — so the string arriving at the metrics layer is chosen by the
+caller, and a key permitted exactly one model can still put arbitrary bytes there by asking for
+models it may not have. Authorization is not the bound and never was. The bound is that the
+string only becomes a label value **if your configuration serves that name**; every other name
+is reported as `__unknown__`, which is one series no matter how many names are asked for. The
+admitted set follows a config reload, so a model you add is graphable on its own from the first
+request after the SIGHUP.
+
+> **Where the names went.** Collapsing every unserved name into one bucket loses a real signal:
+> `dorang_requests_total{model="__unknown__"}` tells you the *volume* of traffic asking for
+> models you do not serve, not *which* ones. The names are not lost, they are in the ledger —
+> `/spend/logs` records the model asked for on every request, refused ones included, at full
+> resolution. That is the right place for unbounded detail: it is keyed rows in a database, not
+> series in a Prometheus registry, and a registry is exactly the wrong container for a set whose
+> size a stranger chooses. Alert on the metric, then read the log for the names (§7.1).
+
+`__unknown__` and `__overflow__` are different conditions and are never the same value. The first
+is a healthy steady state — someone is asking for a model you do not serve, which is a typo, a
+stale client config, or a probe. The second means a cap engaged and resolution was **lost**, and
+it should not appear on the per-model families at all now that only configured names can occupy
+an entry (§7.1).
+
+Two caps remain, and they are memory budgets rather than the security control the `model` cap
+used to be. `DefaultMaxRequestSeries` (2048) bounds the *product* of the five labels on
+`dorang_requests_total`; `DefaultMaxModelSeries` (128) is a **floor** under the per-model
+families, raised at start-up and on every reload to hold your whole model set, so a deployment
+with three hundred model groups gets three hundred entries. Past a cap every dimension folds to
+`__overflow__` and `dorang_metrics_cardinality_folds_total{family}` counts the fold. Table
+entries are never evicted — deliberately, because a series that is withdrawn and later recreated
+restarts its counters, and a counter that restarts is a process restart to `rate()`. Per-request
+**cost** attribution is unaffected by any of this: it comes from the ledger (§9), which is keyed
+and not folded.
+
+> **Migration note (upgrading from a build before this change).** Nothing was renamed or removed,
+> and a dashboard that graphs your own model names is unaffected. What changes: a `model` label
+> value that is *not* in your configuration used to appear verbatim (and, past 128 of them, as
+> `__overflow__`); it now appears as `__unknown__`. If you graph or alert on a model name dorang
+> does not serve — a name you removed from `models[]` and left on a panel, or a deliberately
+> unserved probe target — that series stops advancing and the traffic appears under
+> `__unknown__` instead. `dorang_metrics_cardinality_folds_total{family="dorang_request_duration_seconds"}`
+> should now stay flat; if you were alerting on it as a proxy for a model-name flood, move that
+> alert to `dorang_requests_total{model="__unknown__"}` (§7.1).
 
 ### 6.1 Core metrics
 
 | Metric | Type | What it measures |
 |---|---|---|
-| `dorang_requests_total` | counter | Requests served |
+| `dorang_requests_total{model,provider,credential,status,endpoint}` | counter | Requests served. See the label table above for what bounds each dimension. `model="__unknown__"` is every request that named a model this configuration does not serve, pooled — `/spend/logs` has the names |
 | `dorang_responses_total{class}` | counter | Responses by status class: `1xx`…`5xx` |
-| `dorang_request_duration_seconds{le}` | histogram | Gateway request duration. Buckets from 100 µs to 60 s |
+| `dorang_request_duration_seconds{model,le}` | histogram | Gateway request duration, one histogram per **configured** model. Buckets from **50 µs to 300 s**, dense below 2 ms so the §15.1 target is answerable. An earlier revision said "100 µs to 60 s" — those are `internal/server`'s **fallback** bounds, served only when no registry is wired, which is no assembled gateway. `TestScrapedDurationBucketsAreTheRangeOperationsPublishes` pins the two endpoints printed here |
 | `dorang_request_bytes_total` | counter | Request body bytes read |
 | `dorang_response_bytes_total` | counter | Response body bytes written |
 | `dorang_unimplemented_total` | counter | Requests answered 501 |
@@ -758,19 +863,27 @@ readiness.
 Every response carries these, unconditionally:
 
 `X-Dorang-Request-Id`, `X-Dorang-Model`, `X-Dorang-Upstream-Model`, `X-Dorang-Deployment`,
-`X-Dorang-Cost-Usd`, plus `Retry-After` on a 429 and the `X-Ratelimit-*` set when known.
+`X-Dorang-Cost-Usd`, plus `Retry-After` on a `429`, a `503` or a `529` whenever a delay is known
+([COMPATIBILITY.md](COMPATIBILITY.md) §11.4).
 
 The rule is: **a header the client acts on is unconditional; a header the client reads may be
 gated.** Gating `Retry-After` behind a telemetry flag means every SDK's backoff silently stops
 working, which an earlier draft did by taking the "bounded header set" rule literally.
+
+> ⚠️ **The line above listed "the `X-Ratelimit-*` set when known" until 2026-08-03. That set has
+> never been emitted.** `internal/server` renders the four names from `Result.RateLimit` and
+> nothing assigns that value, so no response dorang has sent carries one. Do not point a
+> rate-limit dashboard at them; per-key rate state is on `/metrics` (`dorang_quota_*`) and in
+> `/key/info`. Same for `X-Dorang-Quota-<Window>-Used-Pct` in the detail list below — see §11.3
+> step 3. [DESIGN.md](DESIGN.md) §10.4 and §17.1 hold the disposition.
 
 Send `X-Dorang-Detail: full` (or set `observability.always_full_headers`) to add:
 
 `X-Dorang-Provider`, `-Credential`, `-Attempt`, `-Fallback-From`, `-Route-Reason`, `-Queue-Ms`,
 `-Ttft-Ms`, `-Latency-Ms`, `-Tokens-Input`, `-Tokens-Output`, `-Tokens-Cache-Read`,
 `-Tokens-Cache-Write`, `-Tokens-Reasoning`, `-Notional-Usd`, `-Spend-Usd`, `-Budget-Usd`,
-`-Budget-Remaining-Usd`, `-Quota-<Window>-Used-Pct`, `-Dropped-Params`,
-`-Native-Stop-Reason`, `-Replayable`.
+`-Budget-Remaining-Usd`, `-Quota-<Window>-Used-Pct` (⚠️ never emitted — see the box above),
+`-Dropped-Params`, `-Native-Stop-Reason`, `-Replayable`.
 
 A counter header is **omitted at zero**, because an absent counter and a counter of zero are
 different claims. `X-Dorang-Replayable` appears only when it is `false`, and it is
@@ -802,13 +915,15 @@ Each row is a condition worth paging on, what it actually means, and the first a
 | Auth failures | `rate(dorang_auth_failures_total[5m])` rising | Expired keys, a revoked key still in a client's config, or a key issued under a different pepper | `dorangctl key list` shows state per key. If *every* key fails, suspect the pepper (§2.3) |
 | Replay refusals | `rate(dorang_replay_refused_total[5m]) > 0` | The process-wide replay budget is full, so bodies are no longer retained and those requests cannot fall back | Large bodies plus high concurrency. Either is fine alone. Watch `dorang_replay_bytes` |
 | Body refusals | `rate(dorang_body_too_large_total[5m]) > 0` | Requests over the body cap | A client is sending something it did not send before — often an embedded document |
+| Unserved models asked for | `rate(dorang_requests_total{model="__unknown__"}[5m]) > 0` | Requests are naming models this configuration does not serve. Usually a client left pointing at a name you removed, or a deployment that half-applied; occasionally someone probing what you run. The label is pooled on purpose — one series regardless of how many names are asked for (§6) | Read `/spend/logs` filtered to the window: it records the model asked for on every request, refused ones included, so the **names** are there at full resolution. If it is one client, fix its config; if the name was yours and you meant to keep it, put it back in `models[]` and SIGHUP — the series returns on the next request |
+| Label cardinality folding | `increase(dorang_metrics_cardinality_folds_total[1h]) > 0` | A metric family hit its series cap and folded to `__overflow__`. **This is a deployment outgrowing a cap, not an attack** — a caller cannot reach these caps, because every label value is drawn from configuration (§6) | Check `{family}`. `dorang_requests_total` is the five-label product outgrowing 2048 tuples: expect it after adding providers, credentials or endpoints. The per-model families raise their own cap to your model set on every reload, so a fold there is a defect worth reporting. Raising a cap buys headroom; entries are never evicted, so the resolution already lost needs a restart |
 
 ### 7.2 Latency
 
 | Alert | Expression | What it means | Do |
 |---|---|---|---|
 | Gateway overhead p99 | `histogram_quantile(0.99, rate(dorang_request_duration_seconds_bucket[5m]))` | ⚠️ This includes upstream time. It is **not** the gateway-overhead figure the design targets | Do not alert on the design's 2 ms p99 against this series. Alert on a baseline you measured for your own traffic |
-| Duration histogram flat at the top bucket | all mass in `le="+Inf"` | Requests are exceeding 60 s. Usually a long generation, occasionally a wedged upstream | Correlate with `dorang_inflight_requests` — a wedged upstream holds slots |
+| Duration histogram flat at the top bucket | all mass in `le="+Inf"` | Requests are exceeding **300 s**, the highest finite bound (§6.1). Usually a long generation, occasionally a wedged upstream | Correlate with `dorang_inflight_requests` — a wedged upstream holds slots |
 
 > **On the published targets.** The design's numbers are *gateway overhead*: from the last byte
 > of the request line and headers being read to the first byte written upstream, plus from the
@@ -1236,8 +1351,14 @@ so a lagging poll cannot erase a burst. If you are diagnosing a quota decision:
    the credential must have a rule for the figure to gate: quota is keyed by (window, metric),
    and the rule comes from `models[].deployments[].limits[]`. A probe enabled for a credential
    with no rule is logged at start-up saying exactly that.
-3. `x-dorang-quota-<window>-used-pct` on a response (with `X-Dorang-Detail: full`) is what the
-   router saw for that request.
+3. ⚠️ **This step does not work and is left here rather than deleted, because an operator who
+   remembers it needs to know why.** It read: *"`x-dorang-quota-<window>-used-pct` on a response
+   (with `X-Dorang-Detail: full`) is what the router saw for that request."* The header is
+   rendered from `server.Result.QuotaUsedPct`, and **nothing assigns that map** — no response
+   dorang has sent carries one, with or without the detail opt-in. Use `dorang_quota_*` on
+   `/metrics` and the start-up line that names a probe-enabled credential with no rule; both are
+   real. Tracked in [SECURITY-REVIEW.md](SECURITY-REVIEW.md) §"Enforcement fields that reach no
+   enforcement" and [DESIGN.md](DESIGN.md) §17.1.
 4. ⚠️ **Rolling windows are exact only under `capacity_mode: local`.** A rolling 5-hour allowance
    has no natural period boundary, so shared and leased modes key it to an epoch-aligned grid.
    A "5 hours" that resets on a grid is a real approximation.
@@ -1297,7 +1418,7 @@ Operationally relevant gaps, so you do not plan around something that is not the
 
 | Area | Status |
 |---|---|
-| **HTTP administration** | Mounted (§3.1–3.3). The credential lifecycle including rotation and pend, users, teams, budgets, `/spend/logs`, the aggregate spend reports, capacity, catalog, health history and `/ui` are served. A user or team `blocked` flag, budget ceiling and rate limit are **enforced** on the request path, not merely stored. Deployments and model aliases answer `501 dependency_not_configured`: routing is compiled from the configuration file and nothing reads those two tables, so use the file plus `SIGHUP` |
+| **HTTP administration** | Mounted (§3.1–3.3). The credential lifecycle including rotation and pend, users, teams, budgets, `/spend/logs`, the aggregate spend reports, capacity, catalog, health history and `/ui` are served, and the UI performs that lifecycle itself rather than only displaying it. A user or team `blocked` flag, budget ceiling and rate limit are **enforced** on the request path, not merely stored. Deployment and alias **writes** answer `501 dependency_not_configured`: routing is compiled from the configuration file and nothing reads those two tables, so use the file plus `SIGHUP`. The read-only models **screen** is served from that compiled table, because withholding what the gateway plainly knows is not the same caution as refusing a write that would change nothing |
 | **Audit trail readback** | `audit_logs` is written by every administrative mutation and `/audit/list` is a named 501. Query the table directly |
 | `observability.otlp_endpoint` | No exporter is wired. The latency breakdown is recorded and not exported |
 | `capacity.*.rpm`, `.tpm` | **Refused at load**, naming the working home: `deployments[].limits[]` for a per-deployment rate, the api key's own `rpm_limit`/`tpm_limit` for a per-caller one |
@@ -1307,8 +1428,8 @@ Operationally relevant gaps, so you do not plan around something that is not the
 | Credential import from an incumbent database | `dorangctl import keys --from <dsn>`, reporting by default and writing with `--commit` — see [MIGRATION.md](MIGRATION.md) §3.5. ⚠️ **This row read "has no CLI entry point" until 2026-07-29**, and it was true: the importer was complete in the store and reachable from nothing an operator could type |
 | Rate limiting across nodes | The rolling minute is per process. An N-node deployment enforces N times every `rpm_limit` and `tpm_limit`. The durable ledger would close it, at a store write per request — not taken |
 | `tpm_limit` bounds the NEXT request | A token count does not exist until settlement, so one enormous request can cross the ceiling once before anything refuses |
-| Prefix / cluster metrics | State exists; nothing exports it. Capacity and health are readable at `/admin/capacity` and `/health/history` |
-| `providers[].params.drop*`, `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. ⚠️ **`providers[].usage_probe` left this row on 2026-07-29** — it is wired (§6.2), and `providers[].metrics` left it too, in the other direction: it is refused at load. The list is held as executable state in `internal/config/consumed_test.go` for the field names that guard can see; the rest are prose in [CONFIG.md](CONFIG.md) §23.1, which is why that half has to be re-derived by hand rather than trusted |
+| Prefix / cluster metrics | ⚠️ **This row read "state exists; nothing exports it", and it is false in both halves.** The prefix table exports `dorang_prefix_table_lookups_total`, `_hits_total`, `_evicted_total`, `_bytes`, `_entries`, `_hit_ratio` and `_saturation_ratio`, and per-model affinity exports `dorang_prefix_routed_total`, `dorang_prefix_hits_total` and `dorang_prefix_hit_ratio` — with the one caveat that `PrefixCollector` is registered **only when cache-affinity routing is configured**, because a ratio of 0.0 with the feature off reads as "the cache never helps" rather than "there is no cache" (§12.3's rule 3). `ClusterCollector` is registered **unconditionally** (`internal/app/metrics.go`) and exports `dorang_cluster_enabled`, `dorang_cluster_expected_nodes` and the `dorang_coordination_*` set on every node; `dorang_cluster_is_leader` and `dorang_cluster_term` appear only where an election exists, because absent and "lost it" are not the same fact. Capacity and health are readable at `/admin/capacity` and `/health/history` as well |
+| `routing.prefix.checkpoints`, `deployments[].stream_timeout`, `key_rotation.…affinity_group`/`…stickiness.scope`, `cluster.redis_url_env`, `observability.log_level`/`.log_format` | Load and do nothing. ⚠️ **`providers[].usage_probe` left this row on 2026-07-29** — it is wired (§6.2), and `providers[].metrics` left it too, in the other direction: it is refused at load. ⚠️ **`providers[].params.drop*` left it in BOTH directions**: `params.drop[]` is wired — applied to the request before the encoder and reported in `x-dorang-dropped-params` — and `params.drop_unsupported: false` is a load error, because a converting gateway has nothing to forward an unrepresentable parameter into. The list is held as executable state in `internal/config/consumed_test.go` for the field names that guard can see; the rest are prose in [CONFIG.md](CONFIG.md) §23.1, which is why that half has to be re-derived by hand rather than trusted |
 | **Backend metrics scraping** | There is no scraper, and `providers[].metrics` is now **refused at load** rather than accepted and ignored. §12.4's queue-depth and cache-utilization signals have no collector. This costs you nothing unless you are running a self-hosted backend that also serves traffic from outside dorang: `least_busy` ranks on dorang's own live capacity occupancy and `highest_tps` on measured output tokens per second, both without a poll — name them in `models[].strategy`. See [CONFIG.md](CONFIG.md) §6.2. ⚠️ The gap was previously understated as "the poll interval is not read" |
 
 ---
