@@ -167,6 +167,9 @@ type rule struct {
 	rates    rateSet
 	tiers    []tier
 	tierMode TierMode
+	// util is the utilization factor this rule scales its marginal cost by, or nil.
+	// See utilization.go.
+	util *utilization
 	// maxComponents is the largest number of component lines this rule can produce.
 	// It sizes the Cost.Components slice in one allocation.
 	maxComponents int
@@ -615,6 +618,8 @@ type rawRule struct {
 	Tiers    []rawTier `yaml:"tiers"`
 	TierMode string    `yaml:"tier_mode"`
 
+	Utilization *rawUtilization `yaml:"utilization"`
+
 	AmountPerPeriod string `yaml:"amount_per_period"`
 	Period          string `yaml:"period"`
 
@@ -748,6 +753,15 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 		}
 	}
 
+	// Before the class switch for the same reason the ambiguous second key is: the
+	// block is refused on every class it cannot mean anything on, in one place, with
+	// the whole answer.
+	if raw.Utilization != nil {
+		if err := compileUtilization(raw.Utilization, r); err != nil {
+			return nil, err
+		}
+	}
+
 	switch class {
 	case ClassMarginal, ClassNotional:
 		if err := compileUsage(raw, r); err != nil {
@@ -766,6 +780,11 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 		if err := compileAdjustment(raw, r); err != nil {
 			return nil, err
 		}
+	}
+	// The utilization factor emits a component line of its own, so the one-allocation
+	// bound for the breakdown has to make room for it.
+	if r.util.declared() {
+		r.maxComponents++
 	}
 	return r, nil
 }

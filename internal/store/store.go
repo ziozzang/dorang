@@ -349,6 +349,16 @@ func nullStr(s string) any {
 	return s
 }
 
+// nullZeroInt turns a zero into a SQL NULL, for a column whose zero is a claim rather
+// than a value. A utilization factor of 0 is not "1.0x applied"; it is "this rule does
+// not price on utilization", and a NULL says that where a 0 would not.
+func nullZeroInt(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
 // nullMicros turns the zero time into a SQL NULL.
 func nullMicros(t time.Time) any {
 	if t.IsZero() {

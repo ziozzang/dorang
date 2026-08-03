@@ -196,6 +196,11 @@ type spendLogView struct {
 	// when no notional rule matched, so that a flat plan cannot be made to
 	// look infinitely efficient by an absent rule.
 	Notional *Money `json:"notional_spend"`
+	// Utilization is the §8.6 disclosure of a price that MOVED, and is absent —
+	// not zero — on every rate card that does not price on occupancy. A reader
+	// summing invoices needs it for one question: whether this row's charge is
+	// the rate card's number or a multiple of it, and which.
+	Utilization *utilizationView `json:"utilization,omitempty"`
 
 	LatencyMS      int64 `json:"latency_ms"`
 	TTFTMS         int64 `json:"ttft_ms"`
@@ -209,6 +214,36 @@ type spendLogView struct {
 	BatchID       string   `json:"batch_id,omitempty"`
 	NodeID        string   `json:"node_id,omitempty"`
 	Tags          []string `json:"tags"`
+}
+
+// utilizationView is the three values that make a variable charge reconcilable: what the
+// rate was multiplied by, what it was multiplied by it FOR, and whether that was a
+// measurement at all.
+//
+// `source` is the load-bearing one. A factor of 1.000000 is what an idle backend and an
+// unobserved backend both produce, and they are the two facts VLLM.md §3.1 says must never
+// be confused — so a view that carried only the factor would answer the easy half of the
+// dispute and drop the half that is actually contested.
+type utilizationView struct {
+	Multiplier string `json:"multiplier"`
+	Occupancy  string `json:"occupancy,omitempty"`
+	Source     string `json:"source"`
+}
+
+// ppmDecimal renders a parts-per-million figure as a six-place decimal. A factor is a
+// term of a bill and has to read as a number, not as 1450000.
+func ppmDecimal(ppm int64) string {
+	if ppm < 0 {
+		ppm = 0
+	}
+	var b []byte
+	b = strconv.AppendInt(b, ppm/1_000_000, 10)
+	b = append(b, '.')
+	frac := ppm % 1_000_000
+	for div := int64(100_000); div > 0; div /= 10 {
+		b = append(b, byte('0'+(frac/div)%10))
+	}
+	return string(b)
 }
 
 func viewLog(r LogRow) spendLogView {
@@ -250,6 +285,19 @@ func viewLog(r LogRow) spendLogView {
 	if r.NotionalKnown {
 		m := Money(r.NotionalNano)
 		v.Notional = &m
+	}
+	if r.UtilSource != "" {
+		u := utilizationView{
+			Multiplier: ppmDecimal(r.UtilMultiplierPPM),
+			Source:     r.UtilSource,
+		}
+		// The occupancy only when it was actually measured. Rendering 0.000000
+		// beside `source: "no_load_header"` would put a measurement of an idle
+		// backend on a row that says nobody looked.
+		if r.UtilSource == "observed" {
+			u.Occupancy = ppmDecimal(r.UtilPPM)
+		}
+		v.Utilization = &u
 	}
 	return v
 }

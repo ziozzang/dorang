@@ -885,7 +885,14 @@ func adminLogRow(r store.RequestLog) admin.LogRow {
 		// NotionalKnown stays false: the ledger has no notional column in this
 		// build, and reporting a missing list rate as zero is the one thing
 		// DESIGN §8.5 says not to do.
-		LatencyMS: r.LatencyMS, TTFTMS: r.TTFTMS, QueueMS: r.QueueMS,
+		// The §8.6 disclosure. It has a producer in this build, unlike the
+		// notional pair above it: the columns, the writer and this reader
+		// arrived together, because a variable price whose factor the ledger
+		// does not carry is an invoice nobody can dispute.
+		UtilMultiplierPPM: r.UtilMultiplierPPM,
+		UtilPPM:           r.UtilPPM,
+		UtilSource:        r.UtilSource,
+		LatencyMS:         r.LatencyMS, TTFTMS: r.TTFTMS, QueueMS: r.QueueMS,
 		CapacityWaitMS: r.CapacityWaitMS, UpstreamMS: r.UpstreamMS,
 		FallbackCount: r.FallbackCount, Streamed: r.Streamed,
 		TraceID: r.TraceID, SessionID: r.SessionID, NodeID: r.NodeID,

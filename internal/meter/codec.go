@@ -30,11 +30,11 @@ import (
 // correctness", and nothing is reported as damage.
 const (
 	spoolMagic = "DRSP"
-	// Version 5 adds the trace's cost decomposition (marginal and subscription).
-	spoolVersion   = 5
+	// Version 6 adds the utilization disclosure (factor, occupancy, source).
+	spoolVersion   = 6
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 5
+	traceCodecVer  = 6
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -250,8 +250,11 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = binary.AppendVarint(dst, t.CostNano)
 	dst = binary.AppendVarint(dst, t.MarginalCostNano)
 	dst = binary.AppendVarint(dst, t.SubscriptionCostNano)
+	dst = binary.AppendVarint(dst, t.UtilMultiplierPPM)
+	dst = binary.AppendVarint(dst, t.UtilPPM)
 	dst = binary.AppendVarint(dst, int64(t.Retries))
 
+	dst = appendStr(dst, t.UtilSource)
 	dst = appendStr(dst, t.FallbackReason)
 	dst = appendStr(dst, t.ErrorMessage)
 	return dst
@@ -314,12 +317,14 @@ func decodeTrace(p []byte) (Trace, error) {
 	t.CostNano = num()
 	t.MarginalCostNano = num()
 	t.SubscriptionCostNano = num()
+	t.UtilMultiplierPPM = num()
+	t.UtilPPM = num()
 	t.Retries = int(num())
 
 	if err != nil {
 		return Trace{}, errCorrupt
 	}
-	if !str(&t.FallbackReason) || !str(&t.ErrorMessage) {
+	if !str(&t.UtilSource) || !str(&t.FallbackReason) || !str(&t.ErrorMessage) {
 		return t, errCorrupt
 	}
 	return t, nil
