@@ -130,6 +130,18 @@ func (a *meterAdapter) Record(ev server.Event) {
 // (key, hour) and ledger rows are keyed by request id.
 type storeSink struct {
 	st *store.Store
+	// nodeID stamps every ledger row with the process that served it.
+	//
+	// It lives on the sink rather than on meter.Trace because the node is a
+	// property of THIS PROCESS and not of a request: every trace this sink ever
+	// writes came from here, so carrying it per-trace would widen the spool
+	// record by a string that is the same on every row.
+	//
+	// The column existed, the store wrote it and read it back, and nothing ever
+	// set it — 52,766 rows of NULL on a two-node cluster, where "which node
+	// served this" is the first question an operator asks and the ledger could
+	// not answer it (DESIGN §17.1).
+	nodeID string
 }
 
 // WriteRollups implements meter.Sink.
@@ -203,6 +215,7 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 		logs = append(logs, store.RequestLog{
 			ID:               t.RequestID,
 			TS:               t.Time,
+			NodeID:           s.nodeID,
 			APIKeyID:         t.APIKeyID,
 			SecretID:         t.SecretID,
 			UserID:           t.UserID,

@@ -671,7 +671,7 @@ func meterConfig(cfg *config.Config, st *store.Store, now func() time.Time) (met
 		}
 	}
 	return meter.Config{
-		Sink:            &storeSink{st: st},
+		Sink:            &storeSink{st: st, nodeID: nodeID(cfg)},
 		Now:             now,
 		FlushInterval:   cfg.Metering.FlushInterval.Duration(),
 		SampleRate:      cfg.Metering.Trace.Rate(),

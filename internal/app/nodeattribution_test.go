@@ -1,0 +1,97 @@
+package app
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/store"
+)
+
+// Which node served this request, asked of the ledger.
+//
+// `request_logs.node_id` existed, [store.Store.InsertRequestLogs] wrote it and
+// [store.Store] scanned it back, and nothing between the gateway and the row
+// ever set it. On the operator's two-node cluster that was 52,766 rows of NULL,
+// and "which node served this" is the first question asked when one node in a
+// pair misbehaves — the ledger is where it has to be answerable, because a
+// response header is gone by the time anyone asks.
+//
+// The assertion is the ROW, not the field. A test that set storeSink.nodeID and
+// then read storeSink.nodeID back would observe one value in the place that
+// produced it, which DESIGN §17.1 rule 3 rejects: this drives a request through
+// the assembled gateway and reads what the store holds afterwards.
+func TestTheLedgerNamesTheNodeThatServed(t *testing.T) {
+	const nodeYAML = wiringYAML + `
+cluster:
+  enabled: true
+  capacity_mode: shared-pg
+  min_leasable: 4
+  node_id: node-under-test
+`
+	a := newWiringApp(t, nodeYAML, func(c *config.Config) {
+		// The cluster guard refuses `local` beside cluster.enabled, and the
+		// shared modes coordinate through the store this app already has.
+		c.Cluster.CapacityMode = config.CapacityModeSharedPG
+	})
+	secret := issueKey(t, a, nil)
+
+	// Any request that reaches metering will do; the upstream is unreachable on
+	// purpose, because a FAILED request needs its node recorded just as much as
+	// a served one — arguably more, since that is the row an operator reads when
+	// they suspect one node of a pair.
+	if w := callWith(a, secret, http.MethodGet, "/v1/models", ""); w.Code != http.StatusOK {
+		t.Fatalf("/v1/models = %d: %s", w.Code, w.Body.String())
+	}
+	if err := a.Meter.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	rows := ledgerRows(t, a)
+	if len(rows) == 0 {
+		t.Fatal("the request wrote no ledger row at all")
+	}
+	for _, r := range rows {
+		if r.NodeID != "node-under-test" {
+			t.Errorf("ledger row %s carries node_id %q, want %q — the column is written "+
+				"and read but nothing populated it, so a multi-node deployment cannot "+
+				"attribute a request to a process",
+				r.ID, r.NodeID, "node-under-test")
+		}
+	}
+}
+
+// ledgerRows reads back every request log the app has written.
+func ledgerRows(t *testing.T, a *App) []store.RequestLog {
+	t.Helper()
+	now := time.Now()
+	page, err := a.Store.ListErrors(context.Background(),
+		store.TimeRange{Start: now.Add(-time.Hour), End: now.Add(time.Hour)},
+		store.Page{Limit: 50})
+	if err != nil && !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("ListErrors: %v", err)
+	}
+	if len(page.Rows) > 0 {
+		return page.Rows
+	}
+	// ListErrors only returns non-2xx rows; a served request needs the by-key
+	// query, which is the one an operator uses anyway.
+	keys, err := a.Store.ListAPIKeys(context.Background(), store.APIKeyFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAPIKeys: %v", err)
+	}
+	var out []store.RequestLog
+	for _, k := range keys {
+		p, err := a.Store.ListRequestsByKey(context.Background(), k.ID,
+			store.TimeRange{Start: now.Add(-time.Hour), End: now.Add(time.Hour)},
+			store.Page{Limit: 50})
+		if err != nil {
+			t.Fatalf("ListRequestsByKey: %v", err)
+		}
+		out = append(out, p.Rows...)
+	}
+	return out
+}
