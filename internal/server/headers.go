@@ -106,6 +106,37 @@ const (
 	// HeaderNotionalUSD is the list-rate equivalent (DESIGN §8.5) — an
 	// estimate, never billed.
 	HeaderNotionalUSD = "X-Dorang-Notional-Usd"
+	// HeaderUtilizationMultiplier is the factor a utilization-priced rule
+	// applied to this request's rate, as a six-place decimal (DESIGN §8.6).
+	//
+	// It is in the ALWAYS-ON set, beside the cost it explains, and it is the one
+	// addition to that set this feature makes. §10.4 bounds the always-on
+	// headers to identification and cost; a factor the charge was multiplied by
+	// is not telemetry about the charge, it is a term of it, and a caller who
+	// receives x-dorang-cost-usd without it cannot reproduce the number from any
+	// rate card. It is emitted whenever the rule declares a factor — including
+	// when the factor is 1.000000 — because the whole distinction the feature
+	// rests on is between "the backend was idle" and "we did not observe it",
+	// and both of those charge 1.000000x.
+	HeaderUtilizationMultiplier = "X-Dorang-Utilization-Multiplier"
+	// HeaderUtilizationSource names the observation the factor came from, or the
+	// refusal that stood in for it: `observed`, `streamed`, `no_load_header`,
+	// `zero_is_ambiguous`, `not_a_fraction`, and the rest of
+	// internal/loadsignal's vocabulary. Always-on for the same reason: without
+	// it a 1.000000x is unattributable.
+	HeaderUtilizationSource = "X-Dorang-Utilization-Source"
+	// HeaderUtilizationCeiling is the most the factor could have been, from the
+	// rule's own max_multiplier. It is what makes the price PREDICTABLE despite
+	// moving: a caller cannot know the occupancy in advance but can bound the
+	// bill, which is DESIGN §5.6's rule about publishing a maximum as a number
+	// rather than as a reassurance.
+	HeaderUtilizationCeiling = "X-Dorang-Utilization-Ceiling"
+	// HeaderUtilization is the measured occupancy itself, as a fraction. It is
+	// behind x-dorang-detail rather than always on, because it is a statement
+	// about the OPERATOR's fleet rather than about the caller's request — how
+	// full their machines are is not something every tenant needs on every
+	// response — while the factor above is a term of that tenant's own bill.
+	HeaderUtilization = "X-Dorang-Utilization"
 	// The cumulative spend view.
 	HeaderSpendUSD           = "X-Dorang-Spend-Usd"
 	HeaderBudgetUSD          = "X-Dorang-Budget-Usd"
@@ -339,6 +370,18 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 		var b [32]byte
 		h.Set(HeaderCostUSD, string(appendNanoUSD(b[:0], r.CostNanoUSD)))
 	}
+	// Beside the cost and under the same condition a stream imposes on it: for a
+	// streamed answer these headers went out before the price existed, so they
+	// are omitted rather than made to claim a factor nobody has computed — the
+	// same rule LegacyHeaderResponseCost follows, for the same reason. The
+	// number for a stream travels in the ledger, joined by x-dorang-request-id.
+	if r.UtilizationPriced && !costDeferred {
+		h.Set(HeaderUtilizationMultiplier, ppmDecimal(r.UtilizationMultiplierPPM))
+		h.Set(HeaderUtilizationCeiling, ppmDecimal(r.UtilizationCeilingPPM))
+		if r.UtilizationSource != "" {
+			h.Set(HeaderUtilizationSource, r.UtilizationSource)
+		}
+	}
 	if cfg.legacyHeaders {
 		stampLegacyHeaders(h, rq, r, costDeferred)
 	}
@@ -394,6 +437,12 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	setInt(h, HeaderTokensCacheWrite, u.CacheWrite)
 	setInt(h, HeaderTokensReasoning, u.Reasoning)
 
+	if r.UtilizationPriced && !costDeferred && r.UtilizationSource == utilizationObserved {
+		// Only when it was actually observed. Emitting 0.000000 on a fallback
+		// would be a measurement of an idle backend that nobody made, which is
+		// the single failure this feature is built around.
+		h.Set(HeaderUtilization, ppmDecimal(int64(r.UtilizationPPM)))
+	}
 	if r.NotionalPriced {
 		// NotionalPriced, not Priced. They are separate flags because they are
 		// separate questions (DESIGN §8.5 rule 5): a request can be billed
@@ -455,6 +504,29 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	if rq.Body != nil && !rq.Body.Replayable() {
 		h.Set(HeaderReplayable, "false")
 	}
+}
+
+// utilizationObserved is internal/loadsignal's token for a reading that was actually
+// taken. It is a literal rather than an import because internal/server imports no
+// sibling of internal/app's; the two spellings agreeing is asserted by
+// TestUtilizationHeadersMatchTheLoadSignalVocabulary.
+const utilizationObserved = "observed"
+
+// ppmDecimal renders a parts-per-million figure as a six-place decimal, allocating one
+// small string. A factor is a term of the bill and has to be readable as a number, not
+// as 1450000.
+func ppmDecimal(ppm int64) string {
+	if ppm < 0 {
+		ppm = 0
+	}
+	var b [24]byte
+	out := strconv.AppendInt(b[:0], ppm/1_000_000, 10)
+	out = append(out, '.')
+	frac := ppm % 1_000_000
+	for div := int64(100_000); div > 0; div /= 10 {
+		out = append(out, byte('0'+(frac/div)%10))
+	}
+	return string(out)
 }
 
 // setInt sets a header to a non-zero integer, and omits it at zero. An absent

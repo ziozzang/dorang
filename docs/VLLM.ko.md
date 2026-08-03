@@ -157,6 +157,31 @@ Ray 아래에서는 모든 이름의 `:`가 `_`로 치환된다. API 서버 프�
 한계: 비스트리밍 응답 전용이고, `/v1/chat/completions`와 `/v1/completions`에서만 동작한다.
 스트리밍 트래픽은 스크레이프로 폴백. 또 요청마다 INFO 로그를 남겨 dorang의 처리량 목표에서는 시끄럽다.
 
+**값은 순수한 JSON이 아니다.** vLLM은 포맷 이름, 공백, 그다음 문서를 쓰므로 헤더를 통째로 넘긴
+디코더는 실패한다:
+
+```
+endpoint-load-metrics: JSON {"named_metrics": {"kv_cache_utilization": 0.4}}
+endpoint-load-metrics: TEXT named_metrics.kv_cache_utilization=0.4
+```
+
+`named_metrics`에는 float 값 필드만 들어가고, KV 수치의 이름은 거기서 `kv_cache_utilization`이다 —
+같은 분수의 Prometheus 철자인 `kv_cache_usage_perc`가 아니다.
+
+> **§3.1의 네 번째 함정이 여기서도, 위장한 채 살아남는다.** 이 헤더도 "메트릭 없음"과 "유휴"를
+> 구별하지 않는다 — 오히려 스크레이프보다 *나쁘다*. 스크레이프는 시리즈 0개로 눈에 띄게 실패하지만
+> 이쪽은 성공한다. vLLM은 보고를 이렇게 만든다:
+>
+> ```python
+> kv_cache_utilization=(last_req_metrics.gpu_kv_cache_utilisation
+>                       if last_req_metrics is not None else 0.0)
+> ```
+>
+> 그래서 요청에 대한 메트릭이 없던 엔진이 빈 기계를 주장하는 잘 형성된 헤더를 돌려준다. 어떤
+> 소비자든 정확한 `0.0`을 유휴가 아니라 미상으로 다뤄야 한다. dorang의 사용률 가격(DESIGN §8.6)에서
+> 그 거부는 공짜다 — 점유율 0에서 가격 계수는 어느 쪽이든 1.0이다 — 그래서 그 읽기는 버려지고
+> 행에는 아무도 하지 않은 측정 대신 "관측되지 않음"이 기록된다.
+
 ### 3.3 `/load`는 함정이다 — 쓰지 말 것
 
 `{"server_load": N}`을 반환해 least-busy 라우터가 원하는 바로 그 신호처럼 보인다.

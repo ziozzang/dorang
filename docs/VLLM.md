@@ -174,6 +174,33 @@ Limits: non-streaming responses only, and only on `/v1/chat/completions` and
 `/v1/completions`. Fall back to scraping for streaming traffic. It also logs at INFO on every
 request, which is noisy at dorang's throughput targets.
 
+**The value is not bare JSON.** vLLM writes the format name, a space, and then the document,
+so a decoder handed the header whole fails:
+
+```
+endpoint-load-metrics: JSON {"named_metrics": {"kv_cache_utilization": 0.4}}
+endpoint-load-metrics: TEXT named_metrics.kv_cache_utilization=0.4
+```
+
+`named_metrics` carries only float-valued fields, and the KV figure is spelled
+`kv_cache_utilization` there — not `kv_cache_usage_perc`, which is the Prometheus spelling of
+the same fraction.
+
+> **§3.1's fourth trap survives here, disguised.** The header does not distinguish "no
+> metrics" from "idle" either — it is *worse* than the scrape, because the scrape fails
+> visibly with zero series and this succeeds. vLLM builds the report as
+>
+> ```python
+> kv_cache_utilization=(last_req_metrics.gpu_kv_cache_utilisation
+>                       if last_req_metrics is not None else 0.0)
+> ```
+>
+> so an engine that had no metrics for the request returns a well-formed header claiming an
+> empty machine. Any consumer must treat an exact `0.0` as unknown rather than as idle.
+> For dorang's utilization pricing (DESIGN §8.6) that refusal is free — the price factor at
+> zero occupancy is 1.0 either way — so the reading is discarded and the row records "not
+> observed" instead of a measurement nobody made.
+
 ### 3.3 `/load` is a trap — do not use it
 
 It returns `{"server_load": N}` and looks like exactly the signal a least-busy router wants.

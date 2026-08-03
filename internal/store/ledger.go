@@ -49,6 +49,20 @@ type RequestLog struct {
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
 
+	// UtilMultiplierPPM is the factor a utilization-priced rule applied to this
+	// request's rate, in parts per million (1_000_000 is 1.0x), and UtilPPM the
+	// occupancy it came from (DESIGN §8.6). UtilSource is where that reading came
+	// from, or which refusal stood in for it.
+	//
+	// All three are zero and empty on an ordinary rate card, and are written as
+	// SQL NULL there: a rule that does not price on utilization has no factor,
+	// and a 1_000_000 would claim it had one and that the backend was measured.
+	// UtilSource is the discriminator — "observed" and "no_load_header" produce
+	// the same charge on an idle backend and are not the same fact about it.
+	UtilMultiplierPPM int64
+	UtilPPM           int64
+	UtilSource        string
+
 	LatencyMS      int64
 	TTFTMS         int64
 	QueueMS        int64
@@ -150,7 +164,8 @@ const requestLogCols = `l.ts, l.id, l.api_key_id, l.user_id, l.team_id, l.creden
 	l.reasoning_tokens, l.total_tokens, l.cost_nano, l.marginal_cost_nano,
 	l.subscription_cost_nano, l.latency_ms, l.ttft_ms, l.queue_ms, l.capacity_wait_ms,
 	l.upstream_ms, l.fallback_count, l.streamed, l.trace_id, l.session_id, l.node_id,
-	l.batch_id, l.metadata, l.secret_id`
+	l.batch_id, l.metadata, l.secret_id, l.util_multiplier_ppm, l.util_ppm,
+	l.util_source`
 
 const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_id,
 	provider_id, deployment_id, model_group, upstream_model, endpoint,
@@ -158,9 +173,9 @@ const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_i
 	reasoning_tokens, total_tokens, cost_nano, marginal_cost_nano,
 	subscription_cost_nano, latency_ms, ttft_ms, queue_ms, capacity_wait_ms,
 	upstream_ms, fallback_count, streamed, trace_id, session_id, node_id,
-	batch_id, metadata, secret_id`
+	batch_id, metadata, secret_id, util_multiplier_ppm, util_ppm, util_source`
 
-const requestLogInsertArity = 34
+const requestLogInsertArity = 37
 
 // ---------------------------------------------------------------------------
 // Writing
@@ -241,7 +256,8 @@ func (s *Store) insertLogChunk(ctx context.Context, tx *sql.Tx, rows []RequestLo
 			r.CostNano, r.MarginalCostNano, r.SubscriptionCostNano,
 			r.LatencyMS, r.TTFTMS, r.QueueMS, r.CapacityWaitMS, r.UpstreamMS,
 			r.FallbackCount, r.Streamed, nullStr(r.TraceID), nullStr(r.SessionID),
-			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata, nullStr(r.SecretID))
+			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata, nullStr(r.SecretID),
+			nullZeroInt(r.UtilMultiplierPPM), nullZeroInt(r.UtilPPM), nullStr(r.UtilSource))
 	}
 	_, err := s.txExec(ctx, tx, b.String(), args...)
 	return err
@@ -582,7 +598,8 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		us                                            int64
 		keyID, userID, teamID, credID, provID, deplID sql.NullString
 		errClass, traceID, sessionID, nodeID, batchID sql.NullString
-		secretID                                      sql.NullString
+		secretID, utilSource                          sql.NullString
+		utilMul, utilPPM                              sql.NullInt64
 	)
 	err := rows.Scan(&us, &r.ID, &keyID, &userID, &teamID, &credID, &provID, &deplID,
 		&r.ModelGroup, &r.UpstreamModel, &r.Endpoint, &r.Status, &errClass,
@@ -590,7 +607,7 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		&r.TotalTokens, &r.CostNano, &r.MarginalCostNano, &r.SubscriptionCostNano,
 		&r.LatencyMS, &r.TTFTMS, &r.QueueMS, &r.CapacityWaitMS, &r.UpstreamMS,
 		&r.FallbackCount, &r.Streamed, &traceID, &sessionID, &nodeID, &batchID, &r.Metadata,
-		&secretID)
+		&secretID, &utilMul, &utilPPM, &utilSource)
 	if err != nil {
 		return RequestLog{}, err
 	}
@@ -607,6 +624,9 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 	r.NodeID = str(nodeID)
 	r.BatchID = str(batchID)
 	r.SecretID = str(secretID)
+	r.UtilMultiplierPPM = utilMul.Int64
+	r.UtilPPM = utilPPM.Int64
+	r.UtilSource = str(utilSource)
 	return r, nil
 }
 

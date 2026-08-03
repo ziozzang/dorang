@@ -81,8 +81,16 @@ func (a *meterAdapter) Record(ev server.Event) {
 		CostNano:             r.CostNanoUSD,
 		MarginalCostNano:     r.MarginalNanoUSD,
 		SubscriptionCostNano: r.SubscriptionNanoUSD,
-		Latency:              time.Duration(ev.DurationNS),
-		TTFT:                 time.Duration(r.TTFTNS),
+		// The utilization disclosure, carried on every priced request whose rule
+		// declares a factor — the fallbacks included. A row that records the
+		// factor only when the price moved cannot answer "was this request
+		// charged at a premium, and if not, why not", which is the question an
+		// invoice dispute is.
+		UtilMultiplierPPM: r.UtilizationMultiplierPPM,
+		UtilPPM:           int64(r.UtilizationPPM),
+		UtilSource:        r.UtilizationSource,
+		Latency:           time.Duration(ev.DurationNS),
+		TTFT:              time.Duration(r.TTFTNS),
 		Trace: meter.TraceInfo{
 			RequestID:     ev.RequestID,
 			UpstreamModel: r.UpstreamModel,
@@ -205,6 +213,9 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			// marginal figure and a sunk plan cost must not enter it.
 			MarginalCostNano:     t.MarginalCostNano,
 			SubscriptionCostNano: t.SubscriptionCostNano,
+			UtilMultiplierPPM:    t.UtilMultiplierPPM,
+			UtilPPM:              t.UtilPPM,
+			UtilSource:           t.UtilSource,
 			LatencyMS:            t.Latency.Milliseconds(),
 			TTFTMS:               t.TTFT.Milliseconds(),
 			QueueMS:              t.QueueWait.Milliseconds(),

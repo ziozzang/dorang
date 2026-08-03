@@ -267,8 +267,25 @@ type Event struct {
 	// adjustments in order), so the difference is the net adjustment.
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
-	Latency              time.Duration
-	TTFT                 time.Duration
+	// UtilMultiplierPPM, UtilPPM and UtilSource are the disclosure of a price
+	// that MOVED (DESIGN §8.6): the factor a utilization-priced rule applied to
+	// this request's rate, in parts per million, the backend occupancy it was
+	// computed from, and where that reading came from.
+	//
+	// They travel to the ledger for the reason the response headers publish the
+	// same three values: a caller cannot predict a price that varies, so the row
+	// has to carry enough to re-derive it. Without UtilSource the other two are
+	// not enough — a factor of 1.000000 is what an idle backend and an
+	// UNOBSERVED backend both produce, and VLLM.md §3.1 exists because those two
+	// are indistinguishable from their numbers alone.
+	//
+	// All three are zero and empty on an ordinary rate card, and are stored as
+	// SQL NULL there rather than as a 1.000000 nobody applied.
+	UtilMultiplierPPM int64
+	UtilPPM           int64
+	UtilSource        string
+	Latency           time.Duration
+	TTFT              time.Duration
 
 	Trace TraceInfo
 }
@@ -394,6 +411,10 @@ type Trace struct {
 	// decomposition. See [Event] for why they travel beside the total.
 	MarginalCostNano     int64
 	SubscriptionCostNano int64
+	// The utilization disclosure. See [Event] for what each one is.
+	UtilMultiplierPPM int64
+	UtilPPM           int64
+	UtilSource        string
 
 	Retries        int
 	FallbackReason string

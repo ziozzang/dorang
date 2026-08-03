@@ -122,6 +122,26 @@ func (c *Catalog) Explain(req Request) Explanation {
 				"the plan cost and never exceed it. It is imputed for accounting; routing "+
 				"compares MarginalNano only")
 	}
+	if cost.UtilizationPriced {
+		if cost.UtilizationFallback != UtilFallbackNone {
+			ex.Notes = append(ex.Notes,
+				"the utilization factor was NOT applied and the base rate was charged: "+
+					cost.UtilizationFallback.Why())
+		} else {
+			ex.Notes = append(ex.Notes, "the marginal cost was scaled by "+
+				formatPPM(cost.UtilizationMultiplierPPM)+"x for a backend occupancy of "+
+				formatPPM(int64(cost.UtilizationPPM))+
+				"; the factor's range is [1.000000, "+
+				formatPPM(cost.UtilizationCeilingPPM)+"] and a missing observation "+
+				"charges the bottom of it")
+		}
+		if cost.UtilizationCeiling {
+			ex.Notes = append(ex.Notes,
+				"the utilization factor was bound by max_multiplier rather than by the "+
+					"occupancy: above this point the price no longer tracks the measurement "+
+					"it is derived from, which is what the ceiling is for")
+		}
+	}
 	if cost.Floored {
 		ex.Notes = append(ex.Notes,
 			"the adjustments exceeded the cost they applied to: the total was clamped to zero, "+
@@ -178,6 +198,25 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		m, err := evalUsage(winner, req, &cost.Components)
 		if err != nil {
 			return Cost{}, err
+		}
+		// The utilization factor, if the rule declares one. It scales the marginal
+		// amount and nothing else: the plan share is a function of elapsed time and
+		// has no occupancy, and the notional figure is a VENDOR's list price, which
+		// does not move with the operator's own GPU (§8.5).
+		if winner.util.declared() {
+			scaled, ppm, atCeiling, fb, err := applyUtilization(winner, req, m, &cost.Components)
+			if err != nil {
+				return Cost{}, err
+			}
+			m = scaled
+			cost.UtilizationPriced = true
+			cost.UtilizationMultiplierPPM = ppm
+			cost.UtilizationCeilingPPM = winner.util.ceilingPPM
+			cost.UtilizationCeiling = atCeiling
+			cost.UtilizationFallback = fb
+			if fb == UtilFallbackNone {
+				cost.UtilizationPPM = req.UtilizationPPM
+			}
 		}
 		marginal = m
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/loadsignal"
 	"github.com/ziozzang/dorang/internal/luaext"
 	"github.com/ziozzang/dorang/internal/mask"
 	"github.com/ziozzang/dorang/internal/prefix"
@@ -554,6 +555,9 @@ type result struct {
 	// body is the converted non-streaming answer, held rather than written so
 	// that pricing lands on the request before the headers are stamped.
 	body []byte
+	// loadMetrics is the engine's own occupancy report from this response, if it
+	// sent one (VLLM.md §3.2). Empty means no report — never an idle backend.
+	loadMetrics string
 	// contentType labels body. It is not always application/json: speech
 	// answers audio and a transcription asked for in srt or vtt answers text,
 	// and mislabelling either gives the client something it cannot play or
@@ -706,6 +710,7 @@ func backendResult(br backend.Result) result {
 		total:       br.Total,
 		body:        br.Body,
 		contentType: br.ContentType,
+		loadMetrics: br.LoadMetrics,
 	}
 	if br.Err == nil {
 		res.outcome = router.Outcome{
@@ -797,6 +802,7 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		return
 	}
 	now := d.now()
+	util, refusal := observeUtilization(c, dec, res, now)
 	cost, err := st.pricing.Settle(pricing.Request{
 		Provider:         dec.Provider,
 		Model:            dec.UpstreamModel,
@@ -819,7 +825,12 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		Seconds:      res.total.Seconds(),
 		AudioSeconds: res.usage.AudioSeconds,
 		Billed:       billedUnit(res.usage.Billed),
-		At:           now,
+		// How contended the backend was while this request ran, when it said
+		// (DESIGN §8.6). Zero with the flag clear is the ABSENCE of a reading and
+		// prices at the base rate; it is never read as an idle machine.
+		UtilizationPPM:      util,
+		UtilizationObserved: refusal == loadsignal.RefusalNone,
+		At:                  now,
 	})
 	if err != nil {
 		d.logf("app: pricing %s/%s: %v", dec.Provider, dec.UpstreamModel, err)
@@ -900,6 +911,24 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		rq.Result.SubscriptionNanoUSD = cost.SubscriptionNano
 		rq.Result.Priced = true
 	}
+	if cost.UtilizationPriced {
+		// The factor and where it came from, on every priced request whose rule
+		// declares one — INCLUDING the fallbacks. A response that carries a
+		// multiplier only when the price moved leaves a caller unable to tell
+		// "the backend was idle" from "we never looked", which is the one
+		// distinction this whole feature turns on.
+		rq.Result.UtilizationPriced = true
+		rq.Result.UtilizationMultiplierPPM = cost.UtilizationMultiplierPPM
+		rq.Result.UtilizationCeilingPPM = cost.UtilizationCeilingPPM
+		rq.Result.UtilizationPPM = cost.UtilizationPPM
+		rq.Result.UtilizationSource = refusal.String()
+		if cost.UtilizationFallback != pricing.UtilFallbackNone {
+			// At the same volume as an unpriced model, and for the same reason:
+			// a price that quietly stopped moving is a price nobody audits.
+			d.logf("app: utilization pricing on %s/%s fell back to the base rate (%s): %s",
+				dec.Provider, dec.UpstreamModel, refusal, refusal.Why())
+		}
+	}
 	if !cost.NotionalMissing {
 		rq.Result.NotionalNanoUSD = cost.NotionalNano
 		// §8.5 rule 5: missing is reported, never zero. Without this flag the
@@ -919,6 +948,51 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		Requests:     1,
 	})
 }
+
+// observeUtilization turns this response into the occupancy figure the price engine
+// takes, or into the named reason there is none.
+//
+// The three refusals it can produce itself are the three the transport knows about, and
+// they are checked in the order that keeps the most specific one: a streamed answer never
+// had a report to read, so reporting "no header" for it would send an operator looking for
+// a header that was never going to arrive.
+//
+// It never returns a usable figure alongside a refusal, and never a refusal alongside a
+// figure. That is the invariant the whole feature rests on — a fraction of zero is a
+// measurement and prices at the base rate; an absent measurement is not, and prices at the
+// base rate too, while saying something different in the row.
+func observeUtilization(c *call, dec *router.Decision, res result, now time.Time) (int32, loadsignal.Refusal) {
+	var obs loadsignal.Observation
+	switch {
+	case c != nil && c.stream:
+		// vLLM's load report is non-streaming only (VLLM.md §3.2), and no scrape
+		// stands behind it in this build — see internal/loadsignal's package
+		// documentation for why a polled gauge is a good routing signal and a bad
+		// pricing one. Streamed traffic is charged the base rate and says so.
+		obs = loadsignal.Refuse(dec.Deployment, now, loadsignal.RefusalStreamed)
+	default:
+		obs = loadsignal.Parse(res.loadMetrics, dec.Deployment, now)
+	}
+	if r := obs.Usable(dec.Deployment, now, maxObservationAge); r != loadsignal.RefusalNone {
+		return 0, r
+	}
+	ppm, err := pricing.UtilizationFromFraction(obs.Fraction)
+	if err != nil {
+		// Unreachable through Parse, which applies the same range rule. It is
+		// checked anyway because the two guards are meant to be independent: this
+		// one is the last line before a rate is multiplied by the number.
+		return 0, loadsignal.RefusalNotAFraction
+	}
+	return ppm, loadsignal.RefusalNone
+}
+
+// maxObservationAge bounds how long an occupancy reading may travel between the response
+// that produced it and the settlement of that same request.
+//
+// It is not a poll interval — nothing here is polled, and the real span is microseconds. It
+// is a guard on the wiring, so that a later refactor cannot start carrying one request's
+// contention into another request's price without the ledger row saying `stale`.
+const maxObservationAge = 30 * time.Second
 
 // billedUnit carries the vendor's stated billing unit across the one package
 // boundary that separates the decoders from the price engine.

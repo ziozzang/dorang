@@ -934,7 +934,10 @@ const backendMetricsHome = "`least_busy` and `highest_tps` are implemented and n
 	"on output tokens per second measured from completed requests (§7.5a). Name them in " +
 	"models[].strategy and remove this block. What a scrape would add is the ENGINE's queue " +
 	"depth and KV-cache utilization, which is only a better signal for a self-hosted backend " +
-	"also serving traffic that did not come through dorang"
+	"also serving traffic that did not come through dorang. Utilization PRICING (DESIGN " +
+	"§8.6) does not need it either and is deliberately built without it: it reads vLLM's " +
+	"per-request load header, because a scraped gauge has an age rather than an interval " +
+	"and cannot be attributed to the request it would be billed against"
 
 // validateProbeAllowances checks the shape of §6.2's window mappings.
 //

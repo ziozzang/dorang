@@ -71,7 +71,7 @@ not add hot-path cost. That is precisely why §10.1 uses a neutral intermediate 
 | R14 | Two or more nodes, highly available | §13 |
 | R15 | chat/completions, messages, responses; metadata and reasoning-level mapping | §10 |
 | R16 | Cost and statistics in extension headers | §10.4 |
-| R17 | Backend metrics integration — **not built**; `providers[].metrics` is refused at load and §12.4 names what serves `least_busy`/`highest_tps` instead | §12.4 |
+| R17 | Backend metrics integration — **not built**; `providers[].metrics` is refused at load and §12.4 names what serves `least_busy`/`highest_tps` instead. §8.6's utilization pricing is a second consumer that deliberately does not need it | §12.4, §8.6 |
 | R18 | Pass scheduling priority through to the backend | §7.5, §10.5 |
 | R19 | Batch API | §11.1 |
 | R20 | Go, with rigorous unit and scenario tests | §14 |
@@ -1477,6 +1477,138 @@ at any grain rather than only in aggregate.
 A subscription's own rate card is also the natural place to notice that a plan has become a
 bad deal. dorang does not act on that — it is not the gateway's decision — but it makes the
 number impossible to miss.
+
+### 8.6 Utilization pricing — a busy GPU-second is not an idle one
+
+**Off by default. It exists only where a `marginal_usage` rule declares a `utilization:`
+block, and there is no configuration key that turns it on globally** — a price that varies
+is a business decision, not a tuning one, and it is made per rate card.
+
+On hardware the operator owns there is no vendor invoice to reconcile against. The real
+cost of a request is the fraction of the machine it occupied for as long as it occupied it,
+and a token rate on such a deployment is already a proxy for that. So a rule may scale its
+own marginal rate by how contended the backend was:
+
+```yaml
+  - id: owned-h100
+    class: marginal_usage
+    match: { provider: local, model: llama-70b }
+    unit: per_compute_second
+    compute_seconds: "0.000800"
+    utilization:
+      slope: "1.0"            # factor = 1 + slope x occupancy
+      max_multiplier: "2.0"   # the ceiling, required
+```
+
+It is the same reasoning that gave `per_compute_second` its own axis (§10.7): a wall-clock
+second and an audio second are different units, and a contended GPU-second and an idle one
+are different amounts of the same unit. The factor therefore multiplies **the marginal cost
+only**. A plan share accrues with elapsed time and has no occupancy; a `notional_rate` is a
+*vendor's* published list price and does not move with the operator's own GPU, so scaling
+both sides of the §8.5 comparison would make it say nothing.
+
+#### The published ceiling
+
+DESIGN §5.6 requires a bounded-error mechanism to publish its maximum as a number rather
+than as "approximately accurate". The same rule applies to a bounded-variance price:
+
+```
+factor        =  1 + slope x occupancy,   capped at max_multiplier
+range         =  [1.000000, max_multiplier]                       always
+worst charge  =  base rate x max_multiplier
+              <= base rate x 4.000                                 refused at load above this
+```
+
+`max_multiplier` is **required**, and a catalog declaring more than **4.000** fails to load.
+That cap is not an opinion about prices; it bounds what a *mis-scaled metric* can do to an
+invoice, so a $100 day cannot become a $10,000 day. `slope` must be non-negative, which is
+what makes the range's bottom exactly 1.0 — and that is the property the whole design rests
+on: **the fallback is the cheapest thing the rule can charge**, so broken telemetry costs
+the operator their premium and can never overcharge a caller.
+
+The three figures travel on every response whose rule declares a factor, beside
+`x-dorang-cost-usd`, and into three ledger columns:
+
+| | |
+|---|---|
+| `x-dorang-utilization-multiplier` | the factor applied, six decimals |
+| `x-dorang-utilization-ceiling` | `max_multiplier` — what the bill is bounded by |
+| `x-dorang-utilization-source` | where the reading came from, or which refusal stood in |
+| `x-dorang-utilization` | the occupancy itself — **`x-dorang-detail` only**, because how full the operator's fleet is belongs to the operator, not to every tenant |
+
+#### The observation, and the one sampling point
+
+vLLM returns an ORCA load report on the response to the request it describes when that
+request carries `endpoint-load-metrics-format: JSON` (VLLM.md §3.2). No server flag. That
+is an observation **of this request**, not a gauge of unknown age, and it is the only
+sampling point dorang accepts.
+
+**No `/metrics` scraper is built, and R17 stays refused** — for a *pricing* reason, not an
+engineering one. A gauge has an age, not an interval, so pricing a request with one means
+picking an instant: admission, which says nothing about the minutes the request then ran
+for, or settlement, which is the occupancy after it left. Neither instant is a property of
+the request. A poll is also node-local, so two nodes at different phases of one interval
+charge different amounts for the same request into one shared ledger. The same signal is
+adequate for **routing**, where a wrong decision is cheap and self-correcting, and
+inadequate for an invoice. §12.4's refusal now says so.
+
+The cost of that decision is stated rather than hidden: **the load report is
+non-streaming-only, so every streamed answer is charged the base rate** and reports
+`x-dorang-utilization-source: streamed`. In an agent deployment that is most traffic.
+
+#### A zero is never idle, and here it is worse than usual
+
+§3.1 of VLLM.md warns that `--disable-log-stats` leaves `/metrics` answering `200` with
+zero `vllm:` series, and that "reachable, no series" must be distinguished from "idle"
+because they look identical and mean opposite things. **The load header does not dissolve
+that trap; it disguises it.** vLLM builds the report as
+
+```python
+kv_cache_utilization=(last_req_metrics.gpu_kv_cache_utilisation
+                      if last_req_metrics is not None else 0.0)
+```
+
+so an engine with no metrics for the request emits a *well-formed header claiming an empty
+machine*. A scrape at least fails visibly. This succeeds and is wrong.
+
+So an exact zero is refused rather than believed, and the refusal is **free**: at zero
+occupancy the factor is `1 + slope x 0 = 1.0`, which is what the fallback charges anyway.
+The one reading dorang cannot trust is the one reading that does not move the price. Nobody
+pays a different amount; the row says *we do not know* instead of *the machine was empty*.
+
+Every other way an observation can fail gets its own recorded reason, because "was this
+request charged a premium, and if not, why not" is the question an invoice dispute is:
+`no_load_header`, `no_kv_metric`, `zero_is_ambiguous`, `not_a_fraction`, `wrong_format`,
+`malformed`, `streamed`, `wrong_deployment`, `stale`.
+
+`not_a_fraction` is the 100x guard. `kv_cache_usage_perc` is a **fraction** despite its name
+(VLLM.md §3.1: "1 means 100 percent usage"), so a percentage-scaled source is a hundred
+times too large and every arithmetic step after it succeeds. It is refused rather than
+clamped: a clamp would price at the ceiling and look plausible forever.
+
+#### The feedback loop with routing, and why nothing is damped
+
+`least_busy` routes *away* from occupancy; this charges *more* for it. A cost-based router
+on top would close the loop — traffic to the cheap backend, the cheap backend fills, its
+price passes its neighbour's, traffic swings back — and `quota.Ranker`'s damping and jitter
+exist for exactly that shape.
+
+Neither is used, because **the loop is open**. A routing quote is priced before the request
+runs, and the occupancy it will run at is not knowable then — the same argument
+`NoPriceComputeNotMeasured` already makes about the same instant for wall time. A quote
+therefore carries no observation, prices at 1.0x, and the factor has no gain in any routing
+decision. `TestUtilizationPricingChangesNoRoutingDecision` asserts it as an identity: the
+same fleet, the same router, with and without the block, produces the same choices tick for
+tick. `TestTheClosedLoopWouldOscillate` builds the loop deliberately and measures what is
+being avoided — 0 backend switches over the last 200 ticks against 137.
+
+Damping is also refused on its own merits, and this is the second thing not built. An EWMA
+over observations is **node-local state**, and a price computed from node-local state
+differs between two nodes serving one caller — which is the objection to the scraper,
+reintroduced through the back door. Jitter is worse: `quota.Ranker` may perturb a *ranking*
+freely because nobody is billed for a ranking, but a jittered price is two different bills
+for two identical requests, keyed on a hash of the node id, and neither the caller nor the
+operator can reproduce either one.
 
 ### 8.2 Matching, pre-indexed **[R1-10]**
 
@@ -3492,6 +3624,16 @@ for routing is opt-in behind a flag.
 > this gateway. That case is real and is what R17 is for. The traps below are why a collector
 > is not the hard part of it — a vLLM started with `--disable-log-stats` answers `200` with
 > zero series, which a naive scraper reads as *idle* and routes toward.
+>
+> **§8.6's utilization pricing is not the consumer that unblocks this, and it was built
+> without one on purpose.** A price needs an observation of a REQUEST, and a gauge has an
+> age rather than an interval: pricing a request with one means picking an instant that is
+> not a property of it, and a poll is node-local, so two nodes at different phases of one
+> interval bill the same request differently into one shared ledger. The same staleness that
+> merely misroutes is a wrong invoice. §8.6 therefore reads vLLM's per-request load header
+> (VLLM.md §3.2) and charges the base rate everywhere that header is absent. When a scraper
+> is built, it should be built for routing, and pricing should keep out of it until it can
+> report an interval.
 
 For vLLM specifically — a **day-zero** backend, not an afterthought — the metric names,
 their four traps, the per-response load header that beats polling, and the load endpoint

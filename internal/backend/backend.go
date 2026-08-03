@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/loadsignal"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -320,6 +321,12 @@ type Result struct {
 	FirstByteSent bool
 	// Attempts counts the in-provider attempts made.
 	Attempts int
+	// LoadMetrics is the engine's own `endpoint-load-metrics` report, verbatim,
+	// or empty when the response carried none (VLLM.md §3.2). It is the input to
+	// utilization pricing and is deliberately unparsed here: an empty string
+	// means "no report", never "an idle backend", and only the layer that prices
+	// on it is in a position to record that distinction.
+	LoadMetrics string
 
 	// Err is nil on success.
 	Err *server.Error
@@ -449,6 +456,20 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 	if c.Stream {
 		hreq.Header.Set("Accept", "text/event-stream")
 	}
+	// Ask a vLLM engine to report its own occupancy on this response (VLLM.md
+	// §3.2). No server flag is needed and no other backend is asked: the header
+	// is a vLLM extension, and sending a dorang-invented header to a hosted
+	// vendor's API is at best ignored and at worst a 400.
+	//
+	// It is sent for streamed calls too even though the report only comes back
+	// on a buffered one, because the condition dorang can test here is the
+	// ENGINE and the condition that decides whether vLLM answers is its own.
+	// Asking and getting nothing is a refusal this build records by name
+	// (loadsignal.RefusalNoHeader); not asking would make the absence dorang's
+	// doing and unreportable.
+	if p.engine == EngineVLLM {
+		hreq.Header.Set(loadsignal.RequestHeader, loadsignal.RequestFormat)
+	}
 	if cerr := b.applyCredential(p, t.Credential, hreq.Header); cerr != nil {
 		cancel()
 		return nil, &attemptError{err: credentialError(t.Credential), credential: true}
@@ -503,6 +524,12 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	defer resp.Body.Close()
 	res.Status = resp.StatusCode
 	res.RetryAfter = retryAfter(resp.Header)
+	// The engine's own occupancy report, read here because this is the last
+	// place resp.Header exists — the response is closed on the way out of this
+	// function and both the streamed and the buffered branch are below. The
+	// value is carried raw and parsed by the pricing layer, so this package
+	// keeps no opinion about what a load report means.
+	res.LoadMetrics = resp.Header.Get(loadsignal.Header)
 
 	// A 30x never reaches the redirect-following code because the client is
 	// built not to have any (§10.6). It arrives here as an ordinary response

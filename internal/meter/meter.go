@@ -323,9 +323,15 @@ func (m *Meter) recordTrace(ev *Event, ts time.Time) {
 		// no producer.
 		MarginalCostNano:     ev.MarginalCostNano,
 		SubscriptionCostNano: ev.SubscriptionCostNano,
-		Retries:              ev.Trace.Retries,
-		FallbackReason:       ev.Trace.FallbackReason,
-		ErrorMessage:         ev.Trace.ErrorMessage,
+		// And the disclosure of a price that moved, for the same reason: a
+		// variable charge whose factor the row does not carry cannot be
+		// reconciled against anything.
+		UtilMultiplierPPM: ev.UtilMultiplierPPM,
+		UtilPPM:           ev.UtilPPM,
+		UtilSource:        ev.UtilSource,
+		Retries:           ev.Trace.Retries,
+		FallbackReason:    ev.Trace.FallbackReason,
+		ErrorMessage:      ev.Trace.ErrorMessage,
 	}
 	if !m.ring.push(&t, excerpt) {
 		m.smpl.refund(size)

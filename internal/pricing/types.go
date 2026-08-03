@@ -387,6 +387,32 @@ type Request struct {
 	// Unstated is the zero value and constrains nothing.
 	Billed BilledUnit
 
+	// UtilizationPPM is how contended the backend was while this request ran, in parts
+	// per million of full: 1_000_000 is a saturated engine. It is an integer and not a
+	// fraction because a price input never passes through binary floating point (§8.3);
+	// [UtilizationFromFraction] is the boundary that converts one, and it is also where
+	// a percentage-scaled reading is refused rather than billed at 100x.
+	//
+	// It is meaningful only with UtilizationObserved set. A zero here with the flag
+	// clear is the ABSENCE of a reading, and the two must never be confused — see the
+	// flag.
+	UtilizationPPM int32
+	// UtilizationObserved says an occupancy was actually measured for this request.
+	//
+	// It is a separate field from the value for the reason VLLM.md §3.1 gives about
+	// `--disable-log-stats`: a backend that reports nothing and a backend that is idle
+	// produce the same number and mean opposite things. For routing that misdirects
+	// traffic. For pricing it is the difference between "this request ran on an empty
+	// machine" and "we do not know what it ran on", and only one of those is a
+	// measurement. Clear, the rate is charged unscaled and [Cost.UtilizationFallback]
+	// says so on the response and in the ledger.
+	//
+	// A ROUTING QUOTE never sets it, and cannot: the occupancy a request will run at is
+	// not knowable before it runs, exactly as its wall time is not
+	// ([NoPriceComputeNotMeasured] says the same about the same instant). That is what
+	// keeps the utilization factor out of the routing loop entirely.
+	UtilizationObserved bool
+
 	// At is the instant used to evaluate time-dependent predicates and to place a
 	// subscription period. Zero means "now".
 	At time.Time
@@ -572,6 +598,34 @@ type Cost struct {
 	// per-request price — so the caller is expected to count it and warn rather than to
 	// read a zero as an ordinary free request.
 	Floored bool
+
+	// UtilizationPriced reports that the winning marginal rule declares a utilization
+	// factor, so the three fields below carry a meaning. It is false for every rule that
+	// does not, which is every rule in an ordinary catalog — the absence of these
+	// headers and columns then means "this price does not move", not "we forgot".
+	UtilizationPriced bool
+	// UtilizationMultiplierPPM is the factor that was APPLIED to the marginal cost, in
+	// parts per million (1_000_000 is 1.0x). It is what an invoice dispute is settled
+	// with, so it is the applied figure and never the one the catalog would have
+	// applied: on a fallback it is exactly 1_000_000 and UtilizationFallback says why.
+	UtilizationMultiplierPPM int64
+	// UtilizationPPM is the occupancy the factor was computed from, and is meaningful
+	// only when UtilizationFallback is UtilFallbackNone.
+	UtilizationPPM int32
+	// UtilizationCeilingPPM is the rule's declared max_multiplier, in parts per million.
+	// It travels with every priced request rather than being looked up, because DESIGN
+	// §5.6's rule about a bounded-error mechanism is that it publishes its bound as a
+	// NUMBER — and the place a caller can act on that number is beside the charge it
+	// bounds, not in a document.
+	UtilizationCeilingPPM int64
+	// UtilizationCeiling reports that the factor was bound by max_multiplier rather than
+	// by the occupancy. It is published because it is the one condition under which the
+	// price stops tracking the measurement it claims to track — beyond the ceiling, two
+	// requests at 90% and at 100% are charged identically, and a caller comparing them
+	// deserves to know which of the two numbers stopped moving.
+	UtilizationCeiling bool
+	// UtilizationFallback says why the applied factor is 1.0x. See [UtilFallback].
+	UtilizationFallback UtilFallback
 
 	// NotionalMissing reports that no notional_rate rule matched, so NotionalNano is
 	// unavailable rather than zero (§8.5). It is a separate flag from Missing because the

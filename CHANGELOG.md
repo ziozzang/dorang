@@ -11,6 +11,47 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ## Unreleased
 
+### Utilization pricing, and two things deliberately not built
+
+- **A `marginal_usage` rule may scale its rate by how contended the backend was**
+  (`utilization: {slope, max_multiplier}`, DESIGN §8.6). Off unless a rate card asks
+  for it; there is no global switch, because a price that varies is a business
+  decision. The factor's range is `[1.0, max_multiplier]`, `max_multiplier` is
+  required, and a catalog declaring more than **4.000x** fails to load — a bound on
+  what a mis-scaled metric can do to an invoice, not an opinion about prices. The
+  factor, the ceiling and the provenance travel on the response beside
+  `x-dorang-cost-usd` and into three ledger columns.
+
+- **vLLM emits `kv_cache_utilization: 0.0` for two different facts**, and one of them
+  is not "idle". Read out of vLLM's own source: the field defaults to `0.0` when the
+  engine had no metrics for the request, so a well-formed load header claims an empty
+  machine. This is VLLM.md §3.1's `--disable-log-stats` trap wearing a disguise, and
+  it is *worse* than the scrape it was supposed to replace: a scrape fails visibly
+  with zero series, this succeeds and is wrong. dorang refuses an exact zero. The
+  refusal is free — at zero occupancy the factor is 1.0 either way — so nobody pays a
+  different amount and the row says "not observed" instead of a measurement nobody
+  made.
+
+- **No `/metrics` scraper, and R17 stays refused** — for a pricing reason. A gauge has
+  an *age*, not an interval, so pricing a request with one means picking an instant
+  that is not a property of that request; and a poll is node-local, so two nodes at
+  different phases of one interval bill the same request differently into one shared
+  ledger. The same signal is fine for routing, where a wrong decision is cheap and
+  self-correcting. The cost of that call is stated rather than hidden: **every
+  streamed answer is charged the base rate**, which in an agent deployment is most
+  traffic.
+
+- **No damping and no jitter**, though `quota.Ranker` has both written for this exact
+  shape. They are not needed: a routing quote carries no observation, because the
+  occupancy a request will run at is not knowable before it runs — so the loop between
+  "route away from load" and "charge more for load" is open, and a test asserts the
+  routing trajectory is identical tick-for-tick with the feature on and off. Building
+  the loop deliberately gives 137 backend switches over 200 ticks against 0. Damping
+  is refused on its own merits too: an EWMA is node-local state, and a price computed
+  from node-local state is the scraper's objection let back in through the door.
+  A jittered *ranking* costs nobody anything; a jittered *price* is two bills for two
+  identical requests, keyed on a hash of the node id.
+
 ### Verified against a real deployment
 
 - **LiteLLM replacement**: a real agent client ran the same multi-turn,

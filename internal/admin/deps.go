@@ -561,6 +561,13 @@ type LogRow struct {
 	// unavailable, never as zero.
 	NotionalNano  int64
 	NotionalKnown bool
+	// The utilization disclosure (§8.6): the factor applied to this request's
+	// rate in parts per million, the occupancy it came from, and where that
+	// reading came from. UtilSource is empty on an ordinary rate card, which is
+	// how a reader tells "this price does not move" from "it moved by 1.000000".
+	UtilMultiplierPPM int64
+	UtilPPM           int64
+	UtilSource        string
 
 	LatencyMS      int64
 	TTFTMS         int64

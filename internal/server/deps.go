@@ -486,6 +486,30 @@ type Result struct {
 	// caller asked for the mechanism and the mechanism fired.
 	Downgraded string
 
+	// UtilizationPriced reports that the winning price rule scales its rate by
+	// how contended the backend was (DESIGN §8.6), so the four fields below carry
+	// a meaning and are published. It is false for every ordinary rate card,
+	// where the absence of these headers means "this price does not move".
+	UtilizationPriced bool
+	// UtilizationMultiplierPPM is the factor that was APPLIED, in parts per
+	// million: 1_000_000 is 1.0x. On a fallback it is exactly 1_000_000 and
+	// UtilizationSource says why.
+	UtilizationMultiplierPPM int64
+	// UtilizationCeilingPPM is the rule's declared maximum. A price that moves
+	// has to publish the most it can move to, as a number, beside the charge it
+	// bounds — DESIGN §5.6's rule for a bounded-error mechanism, applied to a
+	// bounded-variance price.
+	UtilizationCeilingPPM int64
+	// UtilizationPPM is the occupancy the factor came from, and is meaningful
+	// only when UtilizationSource is "observed".
+	UtilizationPPM int32
+	// UtilizationSource names where the reading came from, or which refusal
+	// stood in for it — the internal/loadsignal vocabulary, verbatim. It is what
+	// makes an absent premium auditable rather than invisible: "observed" and
+	// "no_load_header" produce the same charge on an idle backend and are not the
+	// same fact about it.
+	UtilizationSource string
+
 	RateLimit         RateLimit
 	RetryAfterSeconds int
 }
