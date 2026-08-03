@@ -78,4 +78,40 @@
 // same discipline governs numbers: a context window that has not been observed
 // is undeclared, which is not the same as zero, because a wrong window feeds
 // context-window fallback routing and misroutes silently.
+//
+// # What the absence of a date means
+//
+// `verified:` records one outcome — a request naming the model was answered,
+// by it. Everything else fell into "no date", and that single absence covered
+// four unrelated situations that call for opposite actions. Asking the
+// providers produced all four in one afternoon:
+//
+//   - Nobody has asked. The entry was transcribed from a third-party catalog.
+//   - Somebody asked and the plan is not entitled: "Access to model denied.
+//     Please make sure you are eligible for using the model." That is not a
+//     retirement — a retirement names a date and a reference id — so the model
+//     EXISTS, its context window is real, and another account reaches it.
+//     Dating it would be false and deleting it would destroy the only written
+//     record of a real model.
+//   - Somebody asked and a DIFFERENT model answered. Three z.ai names return
+//     200 with a body naming another model. This is the outcome that looks
+//     most like success, and every number the catalog holds for the requested
+//     name then describes a model the caller is not talking to.
+//   - Nobody could ask: no credential for the route exists here, so no entry
+//     under that kind has been checked or can be.
+//
+// A [Probe] records the two middle cases on an entry and the last on a kind,
+// and [Catalog.Verification] collapses all of it into one answer per entry. The
+// value is in what an undated entry means afterwards: with every state stated,
+// "no date and no probe" narrows to "nobody has asked yet", which is a backlog
+// item somebody can close rather than a shrug.
+//
+// A probe never becomes policy. A denial does not make a model unroutable —
+// entitlement belongs to an account, and this catalog ships to operators with
+// different plans. A substitution does not authorise rewriting the request to
+// the served name. Both are knowledge, recorded so a human can act on them.
+//
+// A retirement stays a DELETION rather than a state, and the line is principled:
+// a retired model serves nobody, so the entry is knowledge that expired, while
+// a denied model is knowledge that is correct and merely out of reach from here.
 package catalog

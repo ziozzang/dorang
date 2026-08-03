@@ -45,6 +45,7 @@ type modelEntry struct {
 	reasoning         Reasoning
 	pricing           Pricing
 	verified          string
+	probe             Probe
 	note              string
 	origins           map[string]fieldSource
 }
@@ -401,7 +402,11 @@ func (c *Catalog) compose(kind, model string, trace bool) (ModelInfo, map[string
 		mo := entry.origins
 		out.ModelKnown = true
 		out.Verified = entry.verified
+		out.Probe = entry.probe
 		note(FieldVerified, LayerModel, mo)
+		if !entry.probe.IsZero() {
+			note(FieldProbe, LayerModel, mo)
+		}
 		if entry.category != "" {
 			out.Category = entry.category
 			note(FieldCategory, LayerModel, mo)
@@ -455,6 +460,7 @@ var modelInfoFields = []string{
 	FieldReasoning,
 	FieldPricing,
 	FieldVerified,
+	FieldProbe,
 	FieldNote,
 }
 
@@ -498,7 +504,7 @@ func (c *Catalog) ExplainKind(name string) ([]FieldOrigin, bool) {
 		FieldAPI, FieldBaseURL, FieldCache, FieldReasoningHint, FieldCategory,
 		FieldContextWindow, FieldMaxOutputTokens,
 		FieldSupportsTools, FieldSupportsStreaming,
-		FieldMetrics, FieldPriority, FieldVerified, FieldNote,
+		FieldMetrics, FieldPriority, FieldVerified, FieldProbe, FieldNote,
 	}
 	out := make([]FieldOrigin, 0, len(fields))
 	for _, f := range fields {
@@ -552,6 +558,8 @@ func renderModelField(info ModelInfo, f string) string {
 		return renderPricing(info.Pricing)
 	case FieldVerified:
 		return info.Verified
+	case FieldProbe:
+		return info.Probe.String()
 	case FieldNote:
 		return info.Note
 	}
@@ -584,6 +592,8 @@ func renderKindField(kd KindDefaults, f string) string {
 		return kd.Priority
 	case FieldVerified:
 		return kd.Verified
+	case FieldProbe:
+		return kd.Probe.String()
 	case FieldNote:
 		return kd.Note
 	}
@@ -635,6 +645,66 @@ func (c *Catalog) matchPrefix(kind, model string) (prefixRule, bool) {
 // the kind, from a sibling model, or from the model's name.
 func (c *Catalog) Reasoning(kind, model string) Reasoning {
 	return c.Model(kind, model).Reasoning
+}
+
+// Verification answers "what happened the last time anybody asked the endpoint
+// about this model?" — the question `verified:` alone could only half answer.
+//
+// A date meant asked-and-answered. Its absence meant four unrelated things at
+// once: nobody asked; somebody asked and the plan was not entitled; somebody
+// asked and a different model answered; nobody here could ask at all. They call
+// for opposite actions, and only the last two are gaps. This collapses the
+// entry's date, the entry's probe and the kind's probe into one answer, in that
+// order of specificity.
+//
+// An unknown kind or model is [VerificationUnchecked]: nobody has asked about a
+// model the catalog does not list, which is true and is the safe reading.
+func (c *Catalog) Verification(kind, model string) Verification {
+	canon := c.canonical(kind)
+	if entry, ok := c.models[ModelRef{Kind: canon, Model: model}]; ok {
+		if entry.verified != "" {
+			return VerificationVerified
+		}
+		switch entry.probe.Result {
+		case ProbeDenied:
+			return VerificationDenied
+		case ProbeSubstituted:
+			return VerificationSubstituted
+		}
+	}
+	// The kind speaks only where the entry is silent: an entry that was
+	// probed was probed, whatever the route's general state.
+	if kd, ok := c.kinds[canon]; ok && kd.Probe.Result == ProbeCitationOnly {
+		return VerificationCitationOnly
+	}
+	return VerificationUnchecked
+}
+
+// ModelsByVerification groups every catalog entry by [Catalog.Verification],
+// each group in declaration order.
+//
+// It is what a report is built from. Every state is present as a key, including
+// the empty ones, so a caller iterating [VerificationStates] renders a stable
+// table rather than a table whose rows appear and vanish with the data.
+func (c *Catalog) ModelsByVerification() map[Verification][]ModelRef {
+	out := make(map[Verification][]ModelRef, len(verificationOrder))
+	for _, v := range verificationOrder {
+		out[v] = nil
+	}
+	for _, ref := range c.modelRefs {
+		v := c.Verification(ref.Kind, ref.Model)
+		out[v] = append(out[v], ref)
+	}
+	return out
+}
+
+// Probe returns the recorded live answer for one model that did not establish
+// it, or the zero Probe when there is none. It resolves kind aliases.
+//
+// A caller wanting to know the state should use [Catalog.Verification]; this is
+// for reporting the evidence behind it — the refusal text, the substituted id.
+func (c *Catalog) Probe(kind, model string) Probe {
+	return c.Model(kind, model).Probe
 }
 
 // UnverifiedModels lists every catalog entry whose reasoning capability is

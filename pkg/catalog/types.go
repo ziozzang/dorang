@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -150,6 +151,178 @@ func (r Reasoning) String() string {
 	return string(c)
 }
 
+// ProbeResult records what a live endpoint said when it was asked about a
+// model and the answer was not the model answering.
+//
+// `verified:` covers exactly one outcome — asked, and it answered as itself.
+// Everything else collapsed into "no date", which made a model nobody had ever
+// asked about indistinguishable from one that had been asked and had given a
+// definite, useful answer. These are the definite answers.
+type ProbeResult string
+
+// Probe results.
+const (
+	// ProbeNone is the zero value: no probe is recorded.
+	ProbeNone ProbeResult = ""
+
+	// ProbeDenied means the endpoint refused because the credential's plan is
+	// not entitled to the model — not because the model does not exist. The
+	// two are different facts and only the error text separates them: a
+	// retirement says so, with a date and a reference ("kimi-k2.5 was retired
+	// at 2026-07-31"), while an entitlement refusal talks about eligibility.
+	// The model is real, its context window is real, and another account's
+	// plan can reach it. Dating such an entry would be false; deleting it
+	// would throw away knowledge nothing else in the deployment records.
+	//
+	// Entitlement is a property of (account, model), not of the model. The
+	// note carries the verbatim refusal, because that text is the only
+	// evidence that this is entitlement and not absence.
+	ProbeDenied ProbeResult = "denied"
+
+	// ProbeSubstituted means the request succeeded and a DIFFERENT model
+	// answered: the endpoint accepted the name and served something else,
+	// naming it in the response. This is the outcome a listing can never
+	// reveal and the one that looks most like success — a 200 with a body.
+	// It matters because every number the catalog holds for the requested
+	// name (context window, max output, price) then describes a model the
+	// caller is not talking to.
+	//
+	// Served names what answered. Nothing in dorang rewrites the request to
+	// it: recording that the endpoint substitutes is not permission to
+	// substitute.
+	ProbeSubstituted ProbeResult = "substituted"
+
+	// ProbeCitationOnly is a KIND-level result: every model entry under this
+	// kind was transcribed from a third-party catalog and not one has been
+	// checked against the endpoint, because no credential for this route was
+	// available where this catalog is maintained.
+	//
+	// It is deliberately a statement about the data rather than about the
+	// reader: an operator holding a key for the provider is not being told
+	// they lack one, and their probe results overlay this. It exists so that
+	// "nobody could look" is distinguishable from "nobody has looked yet",
+	// which is the difference between a boundary and a backlog.
+	ProbeCitationOnly ProbeResult = "citation_only"
+)
+
+// probeResultLevel records where each result may legally appear. Entitlement is
+// per (account, model) and substitution is per model name, so both belong on an
+// entry; the absence of any credential is a property of the route, so it
+// belongs on the kind and would be 195 identical copies on the entries.
+var probeResultLevel = map[ProbeResult]string{
+	ProbeDenied:       LayerModel,
+	ProbeSubstituted:  LayerModel,
+	ProbeCitationOnly: LayerKind,
+}
+
+// Probe is one recorded answer from a live endpoint that did not establish the
+// model. It is the third state the two-state `verified:`/absent split could not
+// express (DESIGN §10.2).
+type Probe struct {
+	// Result is what happened. ProbeNone means no probe is recorded, which is
+	// not the same as a probe that found nothing.
+	Result ProbeResult
+
+	// Date is the YYYY-MM-DD the probe was made. It is required with any
+	// non-empty Result, for the same reason `verified:` is a date rather than
+	// a flag: the answer is about a moment, and an entitlement can be bought.
+	Date string
+
+	// Served is the model id that answered, for ProbeSubstituted only. It is
+	// the whole content of that finding.
+	Served string
+
+	// Note carries the evidence, verbatim where there is any. It is required
+	// for ProbeDenied because the refusal text is the only thing that
+	// separates "not entitled" from "does not exist".
+	Note string
+}
+
+// IsZero reports whether no probe is recorded.
+func (p Probe) IsZero() bool { return p.Result == ProbeNone }
+
+// String renders one probe as a report line, for example
+// "substituted(served=glm-5.2) 2026-08-03".
+func (p Probe) String() string {
+	if p.IsZero() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(string(p.Result))
+	if p.Served != "" {
+		b.WriteString("(served=")
+		b.WriteString(p.Served)
+		b.WriteString(")")
+	}
+	if p.Date != "" {
+		b.WriteString(" ")
+		b.WriteString(p.Date)
+	}
+	return b.String()
+}
+
+// Verification is the answer to "what happened the last time anybody asked the
+// endpoint about this model?". It is derived, never stored: one entry cannot
+// carry two answers to that question, and the loader refuses data that tries.
+//
+// The point of the enumeration is what the ABSENCE of a date means. Before it,
+// undated covered four unrelated situations at once, and an operator reading
+// the catalog could not tell a model that had been checked and refused from one
+// nobody had ever typed.
+type Verification string
+
+// Verification states.
+const (
+	// VerificationVerified: asked on a date, and it answered as itself.
+	VerificationVerified Verification = "verified"
+
+	// VerificationDenied: asked, and refused on entitlement. The model exists.
+	VerificationDenied Verification = "denied"
+
+	// VerificationSubstituted: asked, and a different model answered.
+	VerificationSubstituted Verification = "substituted"
+
+	// VerificationCitationOnly: never asked, and nothing here could ask —
+	// the kind has no credential where this catalog is maintained. The
+	// boundary of what this build can establish, stated rather than implied.
+	VerificationCitationOnly Verification = "citation_only"
+
+	// VerificationUnchecked: nobody has asked, and nothing says why. This is
+	// a backlog item, and after the states above it is a much smaller and
+	// much more actionable set than "everything undated" was.
+	VerificationUnchecked Verification = "unchecked"
+)
+
+// Established reports whether the endpoint answered as this model. It is false
+// for every other state including substituted, where a request succeeded: a 200
+// from a different model establishes that model, not this one.
+func (v Verification) Established() bool { return v == VerificationVerified }
+
+// Asked reports whether anybody has put this entry to a live endpoint. It
+// separates the two states that carry a finding from the two that carry none,
+// which is the split `verified:` alone could not express.
+func (v Verification) Asked() bool {
+	switch v {
+	case VerificationVerified, VerificationDenied, VerificationSubstituted:
+		return true
+	}
+	return false
+}
+
+// verificationOrder is the reporting order: what was established, then what was
+// asked and answered otherwise, then what was not asked. Alphabetical would put
+// the backlog above the findings.
+var verificationOrder = []Verification{
+	VerificationVerified,
+	VerificationDenied,
+	VerificationSubstituted,
+	VerificationCitationOnly,
+	VerificationUnchecked,
+}
+
+// VerificationStates lists every state in reporting order.
+func VerificationStates() []Verification { return slices.Clone(verificationOrder) }
+
 // Decimal is an exact decimal literal kept as text. Prices are parsed as exact
 // decimals and multiplied in wider precision at accounting time (REVIEW R1-11);
 // binding them to float64 here would round before the arithmetic that cares.
@@ -250,9 +423,17 @@ type KindDefaults struct {
 	Metrics  string
 	Priority string
 
-	// Verified is the YYYY-MM-DD date this kind's shape was last checked.
+	// Verified is the YYYY-MM-DD date this kind's shape was last checked
+	// against the live endpoint, which requires a credential for it.
 	Verified string
-	Note     string
+
+	// Probe records why this kind's entries carry no dates, when the reason is
+	// known. The only kind-level result is [ProbeCitationOnly]. It is mutually
+	// exclusive with Verified: a kind whose shape was confirmed against the
+	// endpoint was confirmed with a credential.
+	Probe Probe
+
+	Note string
 }
 
 // ModelRef names one catalog entry. Kind and Model are kept apart so no caller
@@ -296,6 +477,7 @@ const (
 	FieldReasoning         = "reasoning"
 	FieldPricing           = "pricing"
 	FieldVerified          = "verified"
+	FieldProbe             = "probe"
 	FieldNote              = "note"
 )
 
@@ -472,6 +654,16 @@ type ModelInfo struct {
 	// against the provider. It says nothing about reasoning capability, which
 	// carries its own date in Reasoning.Verified.
 	Verified string
+
+	// Probe is the recorded answer from a live endpoint that did NOT establish
+	// this model — an entitlement refusal, or a different model answering. It
+	// is mutually exclusive with Verified, because both answer the same
+	// question and a stale date beside a fresh refusal is exactly the
+	// ambiguity Probe exists to remove.
+	//
+	// Use [Catalog.Verification] rather than reading this and Verified in
+	// turn; it collapses both, plus the kind's own probe, into one answer.
+	Probe Probe
 
 	// KindKnown and ModelKnown report which layers had data. ModelKnown is
 	// true only on an exact match of the whole name: a prefix rule never

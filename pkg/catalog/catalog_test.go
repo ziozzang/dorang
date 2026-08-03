@@ -56,66 +56,162 @@ func TestDefaultParses(t *testing.T) {
 		t.Fatal("Default() has no kinds")
 	}
 
-	// The 2026-07-28 live fetch, pinned. These are the entries dorang's own
-	// operator confirmed against the provider, which is what `verified:`
-	// means; everything absorbed from a third-party catalog deliberately
-	// carries no date and is excluded here. Counting only the dated entries
-	// keeps this assertion about the fetch, not about how much has since been
-	// read out of somebody else's repository.
-	perKind := map[string]int{}
-	dated := 0
+	// The live passes, pinned per kind. This assertion is what caught the last
+	// edit, so it is tightened rather than loosened: it now pins the whole
+	// per-kind VERIFICATION STATE, not just how many entries carry a date.
+	//
+	// The two are different guards. Counting dates would have let a probed
+	// entry lose its finding and rejoin the undated crowd unnoticed, which is
+	// exactly the collapse `probe:` exists to prevent — and it is the shape
+	// the qwen and glm passes actually produced, where a kind holds entries in
+	// two states at once.
+	got := map[string]map[Verification]int{}
 	for _, ref := range c.Models() {
-		if c.Model(ref.Kind, ref.Model).Verified == "" {
-			continue
+		v := c.Verification(ref.Kind, ref.Model)
+		if got[ref.Kind] == nil {
+			got[ref.Kind] = map[Verification]int{}
 		}
-		perKind[ref.Kind]++
-		dated++
+		got[ref.Kind][v]++
 	}
-	want := map[string]int{
+	want := map[string]map[Verification]int{
 		// 2026-08-03: 19 → 18. kimi-k2.5 and minimax-m2.5 were retired
 		// upstream on 2026-07-31 — confirmed by asking, not by their absence
 		// from /v1/models, because a model can stop being listed and keep
 		// serving. deepseek-v4-flash:0731 was added: the endpoint returns the
 		// rolling name AND the dated pin as separate ids, and the catalog's
 		// rule is to list what the endpoint returns.
-		"ollama-cloud":    18,
-		"glm":             8,
-		"qwen":            2,
-		"xai":             2,
-		"codex-responses": 4,
-		"jina":            3,
+		"ollama-cloud": {VerificationVerified: 18},
+
+		// 2026-08-03, by asking: five of the eight answered as themselves and
+		// three answered as a different model. All eight were dated
+		// 2026-07-28 by a pass that read the /models listing, which is how a
+		// listing lies — it names what the route accepts, not what serves.
+		"glm": {VerificationVerified: 5, VerificationSubstituted: 3},
+
+		// 2026-08-03: the whole qwen block asked model by model. Six answered;
+		// nine refused on entitlement with AccessDenied.Unpurchased. Four of
+		// the six came off the absorbed list in that pass.
+		"qwen": {VerificationVerified: 6, VerificationDenied: 9},
+
+		"xai":             {VerificationVerified: 2},
+		"codex-responses": {VerificationVerified: 4},
+		"jina":            {VerificationVerified: 3},
 	}
-	for kind, n := range want {
-		if perKind[kind] != n {
-			t.Errorf("kind %q has %d dated models, want %d", kind, perKind[kind], n)
+	for kind, wantStates := range want {
+		for _, v := range VerificationStates() {
+			if got[kind][v] != wantStates[v] {
+				t.Errorf("kind %q has %d models in state %q, want %d",
+					kind, got[kind][v], v, wantStates[v])
+			}
 		}
 	}
-	sum := 0
-	for _, n := range want {
-		sum += n
-	}
-	if dated != sum {
-		t.Errorf("catalog has %d dated models, want %d", dated, sum)
-	}
 
-	// Absorbed data must never acquire a date by accident. A date is a claim
-	// that somebody looked, and the whole absorbed set is on the probe list
-	// precisely because nobody did.
+	// Absorbed data must never acquire a live answer by accident. A date is a
+	// claim that somebody looked, and a probe is a claim that somebody looked
+	// and got a definite answer; a kind with no credential can produce
+	// neither, so every entry under one must be citation_only.
 	for _, ref := range c.Models() {
-		info := c.Model(ref.Kind, ref.Model)
-		if info.Verified == "" {
+		v := c.Verification(ref.Kind, ref.Model)
+		if !v.Asked() {
 			continue
 		}
 		if _, ok := want[ref.Kind]; !ok {
-			t.Errorf("kind=%s model=%s carries verified=%s but is not from the dated fetch",
-				ref.Kind, ref.Model, info.Verified)
+			t.Errorf("kind=%s model=%s is in state %q but is not from a live pass",
+				ref.Kind, ref.Model, v)
 		}
 	}
 
+	// Nothing is merely undated any more: every entry that was not asked has a
+	// kind that says why nobody could. VerificationUnchecked is still a real
+	// state — a new entry on a credentialled kind lands there — but reaching
+	// zero is the point of the exercise, and a non-zero count is a row
+	// somebody added without saying which of the four situations it is in.
+	if by := c.ModelsByVerification(); len(by[VerificationUnchecked]) != 0 {
+		t.Errorf("%d entries are in state %q; every one should carry a live "+
+			"answer or sit under a kind marked %q: %v",
+			len(by[VerificationUnchecked]), VerificationUnchecked,
+			ProbeCitationOnly, by[VerificationUnchecked][:min(5, len(by[VerificationUnchecked]))])
+	}
+
 	// Retired upstream, so deliberately absent. Re-adding it needs a fetch,
-	// not a memory.
+	// not a memory. A retirement is the one live answer that stays a deletion:
+	// a retired model serves nobody, so the entry is knowledge that expired,
+	// while a denied model is knowledge that is correct and out of reach.
 	if c.Model("ollama-cloud", "deepseek-v3.2").ModelKnown {
 		t.Error("deepseek-v3.2 is present; the provider no longer offers it")
+	}
+}
+
+// TestEmbeddedProbeEvidence checks that every recorded probe carries what makes
+// it readable as evidence rather than as an assertion.
+//
+// A denial without the refusal text is indistinguishable from a model that does
+// not exist, which is the whole distinction the state was added to draw, and a
+// substitution without the served id has no content at all. The loader enforces
+// both; this fails when the embedded data drifts into a shape that is legal but
+// says nothing.
+func TestEmbeddedProbeEvidence(t *testing.T) {
+	c := Default()
+	by := c.ModelsByVerification()
+
+	if len(by[VerificationDenied]) == 0 || len(by[VerificationSubstituted]) == 0 {
+		t.Fatal("no probed entries; the 2026-08-03 pass recorded both kinds")
+	}
+	for _, ref := range by[VerificationDenied] {
+		p := c.Probe(ref.Kind, ref.Model)
+		if !strings.Contains(p.Note, "eligible") {
+			t.Errorf("kind=%s model=%s: denial note %q does not quote the refusal; "+
+				"the text is the only thing separating entitlement from absence",
+				ref.Kind, ref.Model, p.Note)
+		}
+	}
+	for _, ref := range by[VerificationSubstituted] {
+		p := c.Probe(ref.Kind, ref.Model)
+		if p.Served == "" {
+			t.Errorf("kind=%s model=%s: substituted with no served id", ref.Kind, ref.Model)
+		}
+		if p.Served == ref.Model {
+			t.Errorf("kind=%s model=%s: served itself, which is verified, not substituted",
+				ref.Kind, ref.Model)
+		}
+		// The served model must itself be catalogued on the same kind, or the
+		// finding points nowhere an operator can follow.
+		if !c.Model(ref.Kind, p.Served).ModelKnown {
+			t.Errorf("kind=%s model=%s: served %q is not an entry on this kind",
+				ref.Kind, ref.Model, p.Served)
+		}
+	}
+}
+
+// TestCitationOnlyKindsCoverTheAbsorbedSet checks the boundary claim in both
+// directions: a kind marked citation_only must have no live answers under it,
+// and a kind with absorbed entries and no credential must be marked.
+//
+// Without the second half the marker rots by omission — a provider added later
+// looks merely unread, which is the state the marker exists to eliminate.
+func TestCitationOnlyKindsCoverTheAbsorbedSet(t *testing.T) {
+	c := Default()
+
+	asked := map[string]bool{}
+	for _, ref := range c.Models() {
+		if c.Verification(ref.Kind, ref.Model).Asked() {
+			asked[ref.Kind] = true
+		}
+	}
+	for _, ref := range c.Models() {
+		kd, ok := c.Kind(ref.Kind)
+		if !ok {
+			t.Fatalf("model %v has no kind", ref)
+		}
+		marked := kd.Probe.Result == ProbeCitationOnly
+		switch {
+		case marked && asked[ref.Kind]:
+			t.Errorf("kind %q is marked %q but has entries with live answers",
+				ref.Kind, ProbeCitationOnly)
+		case !marked && !asked[ref.Kind]:
+			t.Errorf("kind %q has catalogued entries, none of them asked, and no %q "+
+				"marker; it is indistinguishable from a backlog", ref.Kind, ProbeCitationOnly)
+		}
 	}
 }
 
@@ -719,6 +815,323 @@ models:
 		if strings.Contains(line, "qwen3.7-max") {
 			t.Errorf("still listed after being verified: %q", line)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// probe: the third state
+// ---------------------------------------------------------------------------
+
+// TestProbeRecordsWhatADateCannot is the state's reason for existing: three
+// facts that a date-or-nothing field flattens into one.
+func TestProbeRecordsWhatADateCannot(t *testing.T) {
+	c := loadWith(t, `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+models:
+  - { kind: acme, model: "answers", verified: 2026-07-28 }
+  - kind: acme
+    model: "not-entitled"
+    context_window: 262144
+    probe:
+      result: denied
+      date: 2026-07-28
+      note: '403: you are not eligible for using the model'
+  - kind: acme
+    model: "aliased"
+    probe:
+      result: substituted
+      date: 2026-07-28
+      served: "answers"
+  - { kind: acme, model: "nobody-asked" }
+`)
+
+	for _, tc := range []struct {
+		model string
+		want  Verification
+	}{
+		{"answers", VerificationVerified},
+		{"not-entitled", VerificationDenied},
+		{"aliased", VerificationSubstituted},
+		{"nobody-asked", VerificationUnchecked},
+	} {
+		if got := c.Verification("acme", tc.model); got != tc.want {
+			t.Errorf("Verification(acme, %s) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+
+	// The denial preserves the knowledge that deleting the entry would throw
+	// away: the model exists and its window is recorded.
+	if got := c.Model("acme", "not-entitled").ContextWindow; got != 262144 {
+		t.Errorf("a denied entry lost its context window: got %d", got)
+	}
+
+	// Only "verified" means the endpoint answered as this model. A 200 from a
+	// substitute establishes the substitute.
+	if VerificationSubstituted.Established() {
+		t.Error("substituted counts as established; a different model answering is not this model answering")
+	}
+	if !VerificationSubstituted.Asked() || VerificationUnchecked.Asked() {
+		t.Error("Asked() does not separate the states that carry a finding from the ones that do not")
+	}
+}
+
+// TestKindProbeMakesTheBoundaryVisible checks that "nobody could ask" is a
+// different answer from "nobody has asked yet", which is the whole difference
+// between a boundary and a backlog.
+func TestKindProbeMakesTheBoundaryVisible(t *testing.T) {
+	c := loadWith(t, `
+version: 1
+kinds:
+  nokey:
+    api: openai-chat
+    probe: { result: citation_only, date: 2026-08-03 }
+  haskey:
+    api: openai-chat
+models:
+  - { kind: nokey, model: "transcribed" }
+  - { kind: haskey, model: "backlog" }
+`)
+	if got := c.Verification("nokey", "transcribed"); got != VerificationCitationOnly {
+		t.Errorf("Verification(nokey, transcribed) = %q, want %q", got, VerificationCitationOnly)
+	}
+	if got := c.Verification("haskey", "backlog"); got != VerificationUnchecked {
+		t.Errorf("Verification(haskey, backlog) = %q, want %q", got, VerificationUnchecked)
+	}
+
+	// An entry that WAS asked keeps its own answer: the kind speaks only where
+	// the entry is silent.
+	c2 := loadWith(t, `
+version: 1
+kinds:
+  nokey:
+    api: openai-chat
+    probe: { result: citation_only, date: 2026-08-03 }
+models:
+  - { kind: nokey, model: "somebody-asked", verified: 2026-08-03 }
+`)
+	if got := c2.Verification("nokey", "somebody-asked"); got != VerificationVerified {
+		t.Errorf("a kind marker overrode an entry's own answer: got %q", got)
+	}
+}
+
+// TestProbeRulesRefuseDataThatSaysNothing covers each load-time rule. Every one
+// exists so the absence of a date stays meaningful; a probe that parses but
+// carries no evidence would put the ambiguity straight back.
+func TestProbeRulesRefuseDataThatSaysNothing(t *testing.T) {
+	const kinds = `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+models:
+`
+	for _, tc := range []struct{ name, entry, want string }{
+		{
+			"denial without the refusal text",
+			`  - { kind: acme, model: "m", probe: { result: denied, date: 2026-07-28 } }`,
+			"only evidence separating an entitlement refusal",
+		},
+		{
+			"substitution without the served id",
+			`  - { kind: acme, model: "m", probe: { result: substituted, date: 2026-07-28 } }`,
+			"needs probe.served",
+		},
+		{
+			"served on a result that is not a substitution",
+			`  - { kind: acme, model: "m", probe: { result: denied, date: 2026-07-28, served: "x", note: "not eligible" } }`,
+			"only meaningful for",
+		},
+		{
+			"a probe with no date",
+			`  - { kind: acme, model: "m", probe: { result: denied, note: "not eligible" } }`,
+			"probe needs a date",
+		},
+		{
+			"a date and a probe in one entry",
+			`  - { kind: acme, model: "m", verified: 2026-07-28, probe: { result: denied, date: 2026-07-28, note: "not eligible" } }`,
+			"they answer the same question",
+		},
+		{
+			"an empty probe",
+			`  - { kind: acme, model: "m", probe: { date: 2026-07-28 } }`,
+			"probe.result is required",
+		},
+		{
+			"an unknown result",
+			`  - { kind: acme, model: "m", probe: { result: maybe, date: 2026-07-28 } }`,
+			"unknown probe result",
+		},
+		{
+			"a kind-level result on a model",
+			`  - { kind: acme, model: "m", probe: { result: citation_only, date: 2026-07-28 } }`,
+			"belongs on the kind",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mustLoadFail(t, kinds+tc.entry, tc.want)
+		})
+	}
+
+	// And the mirror image at kind level.
+	mustLoadFail(t, `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+    probe: { result: denied, date: 2026-07-28, note: "not eligible" }
+`, "belongs on the model")
+
+	mustLoadFail(t, `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+    verified: 2026-07-28
+    probe: { result: citation_only, date: 2026-07-28 }
+`, "they answer the same question")
+}
+
+// TestProbeAndVerifiedShareOneSlotAcrossLayers is the overlay path, and the
+// reason `dorangctl catalog verify --write` produces loadable data.
+//
+// Under plain field-wise merge an overlay that dates an entry the embedded data
+// marked denied would inherit the denial and collide with itself, so the only
+// way to record a probe result would be `merge: replace` — which also discards
+// the context window and the citation the probe said nothing about.
+func TestProbeAndVerifiedShareOneSlotAcrossLayers(t *testing.T) {
+	base := `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+models:
+  - kind: acme
+    model: "m"
+    context_window: 262144
+    probe: { result: denied, date: 2026-07-28, note: "you are not eligible" }
+`
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "0-base.yaml")
+	if err := os.WriteFile(basePath, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Entitlement bought: a later layer dates it, and the denial goes.
+	over := filepath.Join(dir, "1-over.yaml")
+	if err := os.WriteFile(over, []byte(`
+version: 1
+models:
+  - { kind: acme, model: "m", verified: 2026-08-03 }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Loader{Paths: []string{basePath, over}}.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := c.Verification("acme", "m"); got != VerificationVerified {
+		t.Errorf("state = %q, want %q; the later answer must win", got, VerificationVerified)
+	}
+	if !c.Probe("acme", "m").IsZero() {
+		t.Error("the superseded probe is still present; it would collide with the date")
+	}
+	if got := c.Model("acme", "m").ContextWindow; got != 262144 {
+		t.Errorf("context window %d; superseding an answer must not discard the rest of the entry", got)
+	}
+
+	// And the other direction: entitlement lost, a probe supersedes the date.
+	dated := filepath.Join(dir, "0-dated.yaml")
+	if err := os.WriteFile(dated, []byte(`
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+models:
+  - { kind: acme, model: "m", context_window: 262144, verified: 2026-07-28 }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	denied := filepath.Join(dir, "1-denied.yaml")
+	if err := os.WriteFile(denied, []byte(`
+version: 1
+models:
+  - { kind: acme, model: "m", probe: { result: denied, date: 2026-08-03, note: "no longer eligible" } }
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Loader{Paths: []string{dated, denied}}.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := c2.Verification("acme", "m"); got != VerificationDenied {
+		t.Errorf("state = %q, want %q", got, VerificationDenied)
+	}
+	if got := c2.Model("acme", "m").Verified; got != "" {
+		t.Errorf("stale verified %q survived beside a fresh denial", got)
+	}
+}
+
+// TestModelsByVerificationIsTotalAndStable: every entry lands in exactly one
+// state, and every state is a key even when empty, so a report renders the same
+// table whatever the data says.
+func TestModelsByVerificationIsTotalAndStable(t *testing.T) {
+	c := Default()
+	by := c.ModelsByVerification()
+
+	if len(by) != len(VerificationStates()) {
+		t.Errorf("grouped into %d states, want %d keys always present",
+			len(by), len(VerificationStates()))
+	}
+	total := 0
+	seen := map[ModelRef]bool{}
+	for _, v := range VerificationStates() {
+		if _, ok := by[v]; !ok {
+			t.Errorf("state %q is missing as a key", v)
+		}
+		for _, ref := range by[v] {
+			if seen[ref] {
+				t.Errorf("%v appears in more than one state", ref)
+			}
+			seen[ref] = true
+			if got := c.Verification(ref.Kind, ref.Model); got != v {
+				t.Errorf("%v grouped under %q but reports %q", ref, v, got)
+			}
+		}
+		total += len(by[v])
+	}
+	if total != len(c.Models()) {
+		t.Errorf("grouped %d entries, catalog has %d", total, len(c.Models()))
+	}
+
+	// Unknown kinds and models are unchecked, not an error: nobody has asked
+	// about a model the catalog does not list.
+	if got := c.Verification("no-such-kind", "no-such-model"); got != VerificationUnchecked {
+		t.Errorf("unknown entry reports %q, want %q", got, VerificationUnchecked)
+	}
+}
+
+// TestLintFlagsAProbeDatedInTheFuture: the same rule `verified:` already had.
+// A probe date records what an endpoint said, and it has not said it yet.
+func TestLintFlagsAProbeDatedInTheFuture(t *testing.T) {
+	c := loadWith(t, `
+version: 1
+kinds:
+  acme:
+    api: openai-chat
+models:
+  - { kind: acme, model: "m", probe: { result: denied, date: 2099-01-01, note: "not eligible" } }
+`)
+	var found bool
+	for _, p := range c.Validate() {
+		if p.Field == "probe.date" && p.Severity == SeverityError {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a probe dated 2099 produced no error: %v", c.Validate())
 	}
 }
 

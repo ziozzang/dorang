@@ -2,16 +2,20 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
-// runCatalog implements `catalog explain` and `catalog unverified`.
+// runCatalog implements `catalog explain`, `catalog unverified` and
+// `catalog verify`.
 func (e env) runCatalog(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(e.stderr, "usage: dorangctl catalog explain <kind> <model> | dorangctl catalog unverified")
+		fmt.Fprintln(e.stderr, "usage: dorangctl catalog explain <kind> <model>")
+		fmt.Fprintln(e.stderr, "       dorangctl catalog unverified [--state <state>]")
+		fmt.Fprintln(e.stderr, "       dorangctl catalog verify --kind <kind> [--key-env VAR] [--write FILE]")
 		return 2
 	}
 	switch args[0] {
@@ -19,6 +23,8 @@ func (e env) runCatalog(args []string) int {
 		return e.catalogExplain(args[1:])
 	case "unverified":
 		return e.catalogUnverified(args[1:])
+	case "verify":
+		return e.catalogVerify(args[1:])
 	}
 	return e.fail("unknown catalog subcommand %q", args[0])
 }
@@ -98,14 +104,35 @@ func writeOrigins(e env, origins []catalog.FieldOrigin) {
 	_ = tw.Flush()
 }
 
-// catalogUnverified lists the models whose capabilities nobody has confirmed.
+// stateBlurb is the one-line meaning of each verification state, in the terms
+// an operator has to act in. The states differ by what the operator should DO —
+// buy entitlement, stop routing to a name, get a credential, send a request —
+// and a bare enum name does not carry that.
+var stateBlurb = map[catalog.Verification]string{
+	catalog.VerificationVerified:     "asked, and it answered as itself",
+	catalog.VerificationDenied:       "asked; this plan is not entitled. The model EXISTS",
+	catalog.VerificationSubstituted:  "asked; a DIFFERENT model answered",
+	catalog.VerificationCitationOnly: "nobody could ask: no credential for the route here",
+	catalog.VerificationUnchecked:    "nobody has asked, and nothing says why",
+}
+
+// catalogUnverified reports what the catalog knows about its own knowledge.
 //
-// It is the probe list: a model here is one dorang will answer questions about
-// from data that carries no verification date, and §4.3 is explicit that an
-// unverified capability is not the same as an absent one.
+// It used to print one flat list of everything undated, which was accurate and
+// useless: an entry nobody had typed sat beside one that had been asked and had
+// given a definite answer, and the operator could not tell them apart or tell
+// which of them was their problem to fix. The states differ by what to do about
+// them, so they are reported apart, findings first — a substitution is a live
+// routing defect, while a citation-only row is a credential nobody has.
+//
+// Reasoning capability is a separate axis with a separate probe (DESIGN §10.2),
+// and is summarised at the end rather than mixed in: a model can be verified to
+// exist and still have an unknown reasoning control, and folding the two into
+// one "unverified" count is what made the old output unreadable.
 func (e env) catalogUnverified(args []string) int {
 	fs := newFlagSet("catalog unverified", e)
 	overlays := fs.String("catalog", "", "extra model catalog files or directories, comma separated")
+	state := fs.String("state", "", "list only this state: "+strings.Join(stateNames(), ", "))
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -113,17 +140,99 @@ func (e env) catalogUnverified(args []string) int {
 	if err != nil {
 		return e.fail("%v", err)
 	}
-	models := cat.UnverifiedModels()
-	if len(models) == 0 {
-		fmt.Fprintln(e.stdout, "every catalogued model carries a verification date")
+	by := cat.ModelsByVerification()
+
+	if *state != "" {
+		want := catalog.Verification(*state)
+		if _, ok := stateBlurb[want]; !ok {
+			return e.fail("unknown state %q; want one of %s", *state, strings.Join(stateNames(), ", "))
+		}
+		for _, ref := range by[want] {
+			e.writeStateLine(cat, want, ref)
+		}
 		return 0
 	}
-	fmt.Fprintf(e.stdout, "%d model(s) need a probe:\n", len(models))
-	for _, m := range models {
-		fmt.Fprintf(e.stdout, "  %s\n", m)
+
+	total := len(cat.Models())
+	fmt.Fprintf(e.stdout, "%d catalogued models. What happened the last time an endpoint was asked:\n\n", total)
+	tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+	for _, v := range catalog.VerificationStates() {
+		fmt.Fprintf(tw, "  %s\t%d\t%s\n", v, len(by[v]), stateBlurb[v])
 	}
+	_ = tw.Flush()
+
+	// The two states that carry a finding, listed with the finding. These are
+	// the actionable ones and there are few of them, which is the whole payoff.
+	for _, v := range []catalog.Verification{catalog.VerificationDenied, catalog.VerificationSubstituted} {
+		if len(by[v]) == 0 {
+			continue
+		}
+		fmt.Fprintf(e.stdout, "\n%s (%d) — %s:\n", v, len(by[v]), stateBlurb[v])
+		for _, ref := range by[v] {
+			e.writeStateLine(cat, v, ref)
+		}
+	}
+
+	// Never asked, by kind. Per entry this is 195 lines that all say the same
+	// thing; per kind it is the credential list an operator can act on.
+	for _, v := range []catalog.Verification{catalog.VerificationUnchecked, catalog.VerificationCitationOnly} {
+		if len(by[v]) == 0 {
+			continue
+		}
+		perKind := map[string]int{}
+		var order []string
+		for _, ref := range by[v] {
+			if perKind[ref.Kind] == 0 {
+				order = append(order, ref.Kind)
+			}
+			perKind[ref.Kind]++
+		}
+		slices.Sort(order)
+		fmt.Fprintf(e.stdout, "\n%s (%d across %d kinds) — %s:\n", v, len(by[v]), len(order), stateBlurb[v])
+		tw := tabwriter.NewWriter(e.stdout, 0, 4, 2, ' ', 0)
+		for _, k := range order {
+			fmt.Fprintf(tw, "    %s\t%d\n", k, perKind[k])
+		}
+		_ = tw.Flush()
+		fmt.Fprintf(e.stdout, "  list them with --state %s; close one with "+
+			"`dorangctl catalog verify --kind <kind>` and a credential\n", v)
+	}
+
+	// The other axis, kept visibly separate.
+	unknownReasoning := len(cat.UnverifiedModels())
+	fmt.Fprintf(e.stdout, "\nreasoning capability is unknown for %d of %d models. "+
+		"That is a different question and a different probe (DESIGN §10.2): "+
+		"a model can be verified to exist and still have an unknown reasoning control.\n",
+		unknownReasoning, total)
 	return 0
 }
+
+// writeStateLine prints one entry with whatever evidence its state carries.
+func (e env) writeStateLine(cat *catalog.Catalog, v catalog.Verification, ref catalog.ModelRef) {
+	// Labelled, never joined: a model name may contain any character, and a
+	// joined identifier would invite the splitting REVIEW C3 forbids.
+	fmt.Fprintf(e.stdout, "  kind=%s model=%s\n", ref.Kind, ref.Model)
+	p := cat.Probe(ref.Kind, ref.Model)
+	if p.Served != "" {
+		fmt.Fprintf(e.stdout, "      served instead: %s (asked %s)\n", p.Served, p.Date)
+	} else if p.Date != "" {
+		fmt.Fprintf(e.stdout, "      asked %s\n", p.Date)
+	}
+	if p.Note != "" {
+		fmt.Fprintf(e.stdout, "      %s\n", collapseSpace(p.Note))
+	}
+}
+
+func stateNames() []string {
+	out := make([]string, 0, len(catalog.VerificationStates()))
+	for _, v := range catalog.VerificationStates() {
+		out = append(out, string(v))
+	}
+	return out
+}
+
+// collapseSpace folds a folded-YAML note onto one line so a list stays scannable.
+func collapseSpace(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 func layerList(layers []string) string {
 	if len(layers) == 0 {

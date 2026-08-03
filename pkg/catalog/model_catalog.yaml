@@ -5,8 +5,35 @@
 # REVIEW C3). Names appear here exactly as the provider returns them.
 #
 # `verified: YYYY-MM-DD` on an entry records when the model's EXISTENCE was
-# confirmed against the provider. It says nothing about reasoning capability,
-# which carries its own date.
+# confirmed against the provider: a request naming it was answered, by it. It
+# says nothing about reasoning capability, which carries its own date, and
+# nothing about the numbers on the same line, which carry their own citations.
+#
+# What the ABSENCE of that date means
+# -----------------------------------
+# It used to mean four unrelated things at once, and an operator could not tell
+# them apart. A `probe:` block now records the answers that are definite
+# without establishing the model, so the states are:
+#
+#   verified: DATE          asked; it answered as itself
+#   probe: denied           asked; this account's plan is not entitled. The
+#                           model EXISTS — the refusal text says eligibility,
+#                           not absence — so deleting the entry would throw
+#                           away a context window another plan can reach
+#   probe: substituted      asked; a DIFFERENT model answered, named in
+#                           `served`. A 200 with a body, and every number here
+#                           describes a model the caller is not talking to
+#   kind: probe:            nobody could ask: no credential for that route
+#     citation_only         exists where this catalog is maintained, so every
+#                           entry under it is transcription and always has been
+#   (nothing)               nobody has asked, and nothing says why. A backlog
+#                           item, and now a small one
+#
+# `dorangctl catalog unverified` reports these separately, and `dorangctl
+# catalog verify --kind K` is what produces them. A retirement is still a
+# DELETION rather than a state: a retired model serves nobody, so the entry is
+# knowledge that expired, while a denied model is knowledge that is correct and
+# merely out of reach from here.
 #
 # Reasoning
 # ---------
@@ -21,15 +48,19 @@
 # Catalog.UnverifiedModels lists everything still unprobed.
 #
 # The model lists in the FIRST HALF of this file were fetched from the live
-# endpoints on 2026-07-28 and carry that date. Reasoning capability was NOT
-# probed in that pass, so exactly one entry claims a concrete capability:
-# qwen3.8-max-preview, whose effort scale is in use in an operator
+# endpoints on 2026-07-28 and asked again on 2026-08-03. Reasoning capability
+# was NOT probed in either pass, so exactly one entry claims a concrete
+# capability: qwen3.8-max-preview, whose effort scale is in use in an operator
 # configuration today.
 #
 # The SECOND HALF was absorbed from third-party catalogs (openclaw,
-# hermes-agent) and carries NO date, deliberately. Read the banner above it
-# before using any number from it. `verified:` means dorang's operator checked;
-# reading somebody else's repository is not checking.
+# hermes-agent). It was uniformly undated until 2026-08-03, when the one
+# provider block behind a credential here — qwen — was asked model by model.
+# Thirteen of the ~200 absorbed entries now carry a live answer; the rest are
+# still transcription, and their kinds say so with `probe: citation_only`
+# rather than leaving them looking merely unread. Read the banner above the
+# second half before using any number from it. `verified:` means dorang's
+# operator checked; reading somebody else's repository is not checking.
 #
 # `context_window` and `max_output_tokens` are in tokens; 0 or absent means
 # undeclared, and callers must treat that like unknown rather than as a bound.
@@ -85,6 +116,21 @@ models:
   # =========================================================================
   # Z.AI coding plan — https://api.z.ai/api/coding/paas/v4  (kind: glm)
   # Model list fetched from the live endpoint on 2026-07-28: 8 models.
+  # ASKED 2026-08-03, one minimal request each. Five answered as themselves.
+  # THREE ANSWERED AS SOMETHING ELSE.
+  #
+  # This is the finding that a listing cannot produce and that a status code
+  # cannot either: `glm-5.1` returns 200, with a body, whose `model` field says
+  # `glm-5.2`. So does `glm-5`. `glm-4.5-air` answers as `glm-4.7`. Stable
+  # across three runs on 2026-08-03, and the field is not a constant — the
+  # other five echo their own names back, so it tracks what served.
+  #
+  # A 200 is the outcome that looks most like success, which is exactly why it
+  # needed a state. Routing to `glm-5.1` here does not get glm-5.1: it gets
+  # glm-5.2's behaviour, and every number this catalog holds for `glm-5.1`
+  # then describes a model the caller is not talking to. Nothing in dorang
+  # rewrites the request to the served name — recording that the endpoint
+  # substitutes is not permission to substitute.
   #
   # Note the collision with Ollama Cloud: `glm-5.1` and `glm-5.2` exist on
   # both providers. They are different entries because the key is (kind,
@@ -92,14 +138,35 @@ models:
   # comes only from configuration (DESIGN §2.1 rule 2).
   # =========================================================================
 
-  - { kind: glm, model: "glm-4.5",       verified: 2026-07-28 }
-  - { kind: glm, model: "glm-4.5-air",   verified: 2026-07-28 }
-  - { kind: glm, model: "glm-4.6",       verified: 2026-07-28 }
-  - { kind: glm, model: "glm-4.7",       verified: 2026-07-28 }
-  - { kind: glm, model: "glm-5",         verified: 2026-07-28 }
-  - { kind: glm, model: "glm-5-turbo",   verified: 2026-07-28 }
-  - { kind: glm, model: "glm-5.1",       verified: 2026-07-28 }
-  - { kind: glm, model: "glm-5.2",       verified: 2026-07-28 }
+  - { kind: glm, model: "glm-4.5",       verified: 2026-08-03 }
+  - { kind: glm, model: "glm-4.6",       verified: 2026-08-03 }
+  - { kind: glm, model: "glm-4.7",       verified: 2026-08-03 }
+  - { kind: glm, model: "glm-5-turbo",   verified: 2026-08-03 }
+  - { kind: glm, model: "glm-5.2",       verified: 2026-08-03 }
+
+  - kind: glm
+    model: "glm-4.5-air"
+    probe:
+      result: substituted
+      date: 2026-08-03
+      served: "glm-4.7"
+      note: >-
+        200 OK, body `"model":"glm-4.7"`. Dated verified: 2026-07-28 by the
+        first pass, which read the /models listing; asking is what found it.
+  - kind: glm
+    model: "glm-5"
+    probe:
+      result: substituted
+      date: 2026-08-03
+      served: "glm-5.2"
+      note: '200 OK, body `"model":"glm-5.2"`. Same on three consecutive runs.'
+  - kind: glm
+    model: "glm-5.1"
+    probe:
+      result: substituted
+      date: 2026-08-03
+      served: "glm-5.2"
+      note: '200 OK, body `"model":"glm-5.2"`. Same on three consecutive runs.'
 
   # =========================================================================
   # Qwen token plan
@@ -108,7 +175,7 @@ models:
 
   - kind: qwen
     model: "qwen3.8-max-preview"
-    verified: 2026-07-28
+    verified: 2026-08-03
     context_window: 983616
     max_output_tokens: 131072
     reasoning:
@@ -125,7 +192,7 @@ models:
 
   - kind: qwen
     model: "qwen3.7-max"
-    verified: 2026-07-28
+    verified: 2026-08-03
     max_output_tokens: 65536
     # Reasoning deliberately left unknown. The verified effort scale above was
     # established for qwen3.8-max-preview specifically; carrying it across to a
@@ -159,20 +226,39 @@ models:
   # looked. These are the cheapest entries on the unverified list to close.
   # =========================================================================
 
-  - { kind: jina, model: "jina-embeddings-v5-text-nano",  verified: 2026-07-28, category: embedding }
-  - { kind: jina, model: "jina-embeddings-v5-text-small", verified: 2026-07-28, category: embedding }
-  - { kind: jina, model: "jina-reranker-v3",              verified: 2026-07-28, category: rerank }
+  # Asked 2026-08-03 on the surface each one actually serves — the embeddings
+  # pair against /v1/embeddings, the reranker against /v1/rerank. All three
+  # answered, each echoing its own name. A chat probe would have said nothing
+  # about them, which is why the checker dispatches on `category` rather than
+  # sending one request shape at everything.
+  - { kind: jina, model: "jina-embeddings-v5-text-nano",  verified: 2026-08-03, category: embedding }
+  - { kind: jina, model: "jina-embeddings-v5-text-small", verified: 2026-08-03, category: embedding }
+  - { kind: jina, model: "jina-reranker-v3",              verified: 2026-08-03, category: rerank }
 
   # =========================================================================
   # ABSORBED 2026-07-28 from openclaw and hermes-agent. Read this before
   # trusting any number below it.
   # =========================================================================
   #
-  # Everything from here down was read out of another repository. NOT ONE of
-  # these entries carries `verified:`, and that is the point: `verified:` means
-  # dorang's operator confirmed the entry against the provider, and reading
-  # somebody else's catalog is not that. Every entry below is on the probe
-  # list by construction.
+  # Everything from here down was read out of another repository. `verified:`
+  # means dorang's operator confirmed the entry against the provider, and
+  # reading somebody else's catalog is not that, so every entry below arrived
+  # on the probe list by construction.
+  #
+  # Thirteen of them have since come off it. On 2026-08-03 the qwen block was
+  # asked model by model — the only absorbed provider a credential exists for
+  # here — and four now carry `verified: 2026-08-03` while nine carry
+  # `probe: {result: denied}`. Their numbers are still openclaw's; a date on
+  # those rows says the endpoint answers to the name, nothing more.
+  #
+  # The other ~195 rows were not skipped for lack of effort. There is no
+  # credential for their routes where this catalog is maintained, so no request
+  # can be sent and no date can honestly be written. Their KINDS say exactly
+  # that with `probe: {result: citation_only}` in provider_defaults.yaml, which
+  # is what separates "nobody could look" from "nobody has looked yet". An
+  # operator who does hold a key closes the gap with
+  # `dorangctl catalog verify --kind <kind> --write overlay.yaml`; the overlay
+  # supersedes both the kind marker and these rows.
   #
   # Each provider block cites the file it came from; each entry cites the line
   # of its own `"id"` in that file. openclaw's `openclaw.plugin.json`
@@ -291,20 +377,46 @@ models:
   # -------------------------------------------------------------------------
   # https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1  (openclaw provider qwen-token-plan)
   # extensions/qwen/openclaw.plugin.json
+  #
+  # PROBED 2026-08-03, one minimal chat request each. This is the block that
+  # produced the `probe:` state: four of the thirteen answered, and the other
+  # nine refused with
+  #
+  #   403 {"error":{"message":"Access to model denied. Please make sure you
+  #        are eligible for using the model.","type":"AccessDenied.Unpurchased"}}
+  #
+  # which is NOT a retirement. Ollama's retirements name a date and a reference
+  # id ("kimi-k2.5 was retired at 2026-07-31"); this one talks about
+  # eligibility, and the code is literally `Unpurchased`. The models exist and
+  # the plan is not entitled to them. Dating them would be false, deleting them
+  # would discard a context window that another plan can reach, and leaving
+  # them bare would make them indistinguishable from the ones nobody has asked
+  # about. They carry `probe: {result: denied}`.
+  #
+  # The numbers on every row below are still openclaw's, cited by line. A
+  # `verified:` here dates the model's EXISTENCE on this route (the banner at
+  # the top of this file), not its window: the probe asks whether the endpoint
+  # answers to the name, and no request reveals a context window.
   # -------------------------------------------------------------------------
-  - { kind: qwen, model: "qwen3.7-plus", context_window: 1000000, max_output_tokens: 65536 }   # :105
-  - { kind: qwen, model: "qwen3.6-plus", context_window: 1000000, max_output_tokens: 65536 }   # :114
-  - { kind: qwen, model: "qwen3.6-flash", context_window: 1000000, max_output_tokens: 65536 }   # :123
-  - { kind: qwen, model: "deepseek-v4-pro", context_window: 1000000, max_output_tokens: 393216 }   # :132
-  - { kind: qwen, model: "deepseek-v4-flash", context_window: 1000000, max_output_tokens: 393216 }   # :141
-  - { kind: qwen, model: "deepseek-v3.2", context_window: 131072, max_output_tokens: 65536 }   # :150
-  - { kind: qwen, model: "kimi-k2.7-code", context_window: 262144, max_output_tokens: 98304 }   # :159
-  - { kind: qwen, model: "kimi-k2.6", context_window: 262144, max_output_tokens: 98304 }   # :168
-  - { kind: qwen, model: "kimi-k2.5", context_window: 262144, max_output_tokens: 98304 }   # :177
-  - { kind: qwen, model: "glm-5.2", context_window: 1000000, max_output_tokens: 131072 }   # :186
-  - { kind: qwen, model: "glm-5.1", context_window: 202752, max_output_tokens: 131072 }   # :195
-  - { kind: qwen, model: "glm-5", context_window: 202752, max_output_tokens: 16384 }   # :204
-  - { kind: qwen, model: "MiniMax-M2.5", context_window: 196608, max_output_tokens: 32768 }   # :213
+  - { kind: qwen, model: "qwen3.7-plus", verified: 2026-08-03, context_window: 1000000, max_output_tokens: 65536 }   # :105
+  - { kind: qwen, model: "qwen3.6-flash", verified: 2026-08-03, context_window: 1000000, max_output_tokens: 65536 }   # :123
+  - { kind: qwen, model: "deepseek-v4-pro", verified: 2026-08-03, context_window: 1000000, max_output_tokens: 393216 }   # :132
+  - { kind: qwen, model: "glm-5.2", verified: 2026-08-03, context_window: 1000000, max_output_tokens: 131072 }   # :186
+
+  # Present on the route, out of reach on this plan. `qwen3.6-plus` refusing
+  # while `qwen3.6-flash` answers is what makes this per-model rather than
+  # per-provider: entitlement is bought tier by tier, not route by route.
+  - { kind: qwen, model: "qwen3.6-plus", context_window: 1000000, max_output_tokens: 65536,   # :114
+      probe: &qwen_denied { result: denied, date: 2026-08-03,
+        note: 'HTTP 403 AccessDenied.Unpurchased: "Access to model denied. Please make sure you are eligible for using the model."' } }
+  - { kind: qwen, model: "deepseek-v4-flash", context_window: 1000000, max_output_tokens: 393216, probe: *qwen_denied }   # :141
+  - { kind: qwen, model: "deepseek-v3.2", context_window: 131072, max_output_tokens: 65536, probe: *qwen_denied }   # :150
+  - { kind: qwen, model: "kimi-k2.7-code", context_window: 262144, max_output_tokens: 98304, probe: *qwen_denied }   # :159
+  - { kind: qwen, model: "kimi-k2.6", context_window: 262144, max_output_tokens: 98304, probe: *qwen_denied }   # :168
+  - { kind: qwen, model: "kimi-k2.5", context_window: 262144, max_output_tokens: 98304, probe: *qwen_denied }   # :177
+  - { kind: qwen, model: "glm-5.1", context_window: 202752, max_output_tokens: 131072, probe: *qwen_denied }   # :195
+  - { kind: qwen, model: "glm-5", context_window: 202752, max_output_tokens: 16384, probe: *qwen_denied }   # :204
+  - { kind: qwen, model: "MiniMax-M2.5", context_window: 196608, max_output_tokens: 32768, probe: *qwen_denied }   # :213
 
   # -------------------------------------------------------------------------
   # https://api.groq.com/openai/v1  (openclaw provider groq)

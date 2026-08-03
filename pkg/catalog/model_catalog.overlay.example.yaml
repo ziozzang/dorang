@@ -34,8 +34,9 @@
 #   `unknown` stands. See the accompanying report.
 # * No pricing. No price was verified, and a fabricated one flows into routing
 #   and invoices (model_catalog.yaml header).
-# * No `verified:`. That date means dorang's operator confirmed the entry
-#   against the provider. Reading somebody else's repository is not that.
+# * No `verified:` and no `probe:`. Both record what a live endpoint said, and
+#   reading somebody else's repository is neither. See "Recording what an
+#   endpoint said" below for the shape an operator who DID ask should write.
 # * No supports_tools / supports_streaming. The `ollama-cloud`, `glm` and
 #   `qwen` kinds already default both to true in provider_defaults.yaml and
 #   every source agrees (e.g. <operator config: jikjicode.yaml>:134-135 for
@@ -326,6 +327,51 @@ models:
   - { kind: zai-paas, model: "glm-4.5-air",   context_window: 131072,  max_output_tokens: 98304 }   # :191
   - { kind: zai-paas, model: "glm-4.5-flash", context_window: 131072,  max_output_tokens: 98304 }   # :205
   - { kind: zai-paas, model: "glm-4.5v",      context_window: 64000,   max_output_tokens: 16384 }   # :219
+
+# Recording what an endpoint said
+# -------------------------------
+# Nothing above was asked, so nothing above carries a live answer. This is the
+# shape for an operator who DOES hold a credential — and it is what
+# `dorangctl catalog verify --kind <kind> --key-env <VAR> --write <file>`
+# emits, so the loop from "ask the endpoint" to "loadable catalog data" has no
+# transcription step in it.
+#
+# `verified:` and `probe:` share ONE slot. They answer the same question — what
+# happened the last time anybody asked — so stating both on one entry is a load
+# error, and stating one HERE clears whatever the embedded data said. That is
+# what makes an overlay the right tool: a plain field-wise merge would leave a
+# fresh date standing next to a stale refusal, and `merge: replace` would also
+# throw away the context window the probe said nothing about.
+#
+# models:
+#
+#   # Asked, and it answered as itself. The date says the endpoint answers to
+#   # the name — not that the numbers on the entry are right.
+#   - { kind: qwen, model: "kimi-k2.6", verified: 2026-08-03 }
+#
+#   # Asked, and refused on entitlement. This is NOT a retirement: the model
+#   # exists and another plan reaches it, so the entry stays and keeps its
+#   # window. The note carries the refusal verbatim because that text is the
+#   # only thing separating "not entitled" from "not there" — the loader
+#   # refuses a denial without one.
+#   - kind: qwen
+#     model: "kimi-k2.5"
+#     probe:
+#       result: denied
+#       date: 2026-08-03
+#       note: 'HTTP 403 AccessDenied.Unpurchased: "Access to model denied.
+#         Please make sure you are eligible for using the model."'
+#
+#   # Asked, and a DIFFERENT model answered — a 200 with a body, which is why
+#   # no listing and no status code can find this. `served` names what came
+#   # back. Recording it is not permission to route to it.
+#   - kind: glm
+#     model: "glm-5.1"
+#     probe:
+#       result: substituted
+#       date: 2026-08-03
+#       served: "glm-5.2"
+#       note: '200 OK, response model field says "glm-5.2"'
 
 # An overlay may declare provider kinds, not only patch them. This one is
 # absent from the embedded data entirely, and the model entries above name it.

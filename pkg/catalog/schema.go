@@ -142,7 +142,11 @@ type kindDoc struct {
 	Metrics           field[string] `yaml:"metrics"`
 	Priority          field[string] `yaml:"priority"`
 	Verified          field[string] `yaml:"verified"`
+	Probe             *probeDoc     `yaml:"probe"`
 	Note              field[string] `yaml:"note"`
+
+	// Provenance for the block that merges whole rather than field-wise.
+	probeFrom fieldSource
 }
 
 // prefixDoc has no reasoning field, and that is deliberate. A prefix rule
@@ -172,12 +176,25 @@ type modelDoc struct {
 	Reasoning         *reasoningDoc `yaml:"reasoning"`
 	Pricing           *pricingDoc   `yaml:"pricing"`
 	Verified          field[string] `yaml:"verified"`
+	Probe             *probeDoc     `yaml:"probe"`
 	Note              field[string] `yaml:"note"`
 
-	// Provenance for the two blocks that merge whole rather than field-wise.
+	// Provenance for the blocks that merge whole rather than field-wise.
 	// Unexported, so they are neither read from nor accepted in YAML.
 	reasoningFrom fieldSource
 	pricingFrom   fieldSource
+	probeFrom     fieldSource
+}
+
+// probeDoc is the on-disk shape of a recorded live answer that did not
+// establish the model. One shape at both levels, so there is one vocabulary,
+// one validator and one rendering; which results are legal is decided by the
+// level, not by the shape.
+type probeDoc struct {
+	Result string `yaml:"result"`
+	Date   string `yaml:"date"`
+	Served string `yaml:"served"`
+	Note   string `yaml:"note"`
 }
 
 type reasoningDoc struct {
@@ -383,6 +400,38 @@ func mergeKind(dst, src *kindDoc, from fieldSource) {
 	mergeField(&dst.Priority, src.Priority, from)
 	mergeField(&dst.Verified, src.Verified, from)
 	mergeField(&dst.Note, src.Note, from)
+	supersede(&dst.Verified, &dst.Probe, &dst.probeFrom, src.Verified, src.Probe, from)
+}
+
+// supersede keeps `verified:` and `probe:` as ONE slot across layers.
+//
+// They are two answers to one question — what happened the last time an
+// endpoint was asked — and within a document stating both is a load error. But
+// an overlay is how a probe result reaches the catalog, and under field-wise
+// merge an overlay that dates an entry the embedded data marked `denied` would
+// inherit the denial and collide with itself. Making the later layer replace
+// the earlier answer is the same rule the single-document check enforces,
+// applied across layers: the newest answer is the answer.
+//
+// `merge: replace` is the alternative and it is the wrong tool here — it would
+// also discard the context window and the citation that came with the entry,
+// which the probe said nothing about.
+func supersede(dstVerified *field[string], dstProbe **probeDoc, dstProbeFrom *fieldSource,
+	srcVerified field[string], srcProbe *probeDoc, from fieldSource) {
+	switch {
+	case srcProbe != nil:
+		*dstProbe = srcProbe
+		*dstProbeFrom = from
+		if srcVerified.set {
+			// Both in one document: leave them both standing so the resolver
+			// reports the contradiction rather than silently picking one.
+			return
+		}
+		*dstVerified = field[string]{}
+	case srcVerified.set:
+		*dstProbe = nil
+		*dstProbeFrom = fieldSource{}
+	}
 }
 
 func mergePrefix(dst, src *prefixDoc, from fieldSource) {
@@ -413,6 +462,10 @@ func mergeModel(dst, src *modelDoc, from fieldSource) {
 		dst.Pricing = src.Pricing
 		dst.pricingFrom = from
 	}
+	// A probe is one answer from one moment: result, date and evidence are a
+	// single claim, and merging them field-wise could leave a fresh date on a
+	// stale result. It shares its slot with `verified:`.
+	supersede(&dst.Verified, &dst.Probe, &dst.probeFrom, src.Verified, src.Probe, from)
 }
 
 // build validates the accumulated documents and freezes them into a Catalog.
@@ -592,6 +645,10 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 	if err := checkDate(in.Verified.get()); err != nil {
 		errs = append(errs, fmt.Errorf("kinds[%q]: verified: %w", name, err))
 	}
+	probe, err := resolveProbe(fmt.Sprintf("kinds[%q]", name), LayerKind, in.Verified.get(), in.Probe)
+	if err != nil {
+		errs = append(errs, err)
+	}
 	if v := in.ContextWindow.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("kinds[%q]: context_window is negative", name))
 	}
@@ -615,6 +672,7 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		FieldMetrics:           in.Metrics.origin,
 		FieldPriority:          in.Priority.origin,
 		FieldVerified:          in.Verified.origin,
+		FieldProbe:             in.probeFrom,
 		FieldNote:              in.Note.origin,
 	}
 	return KindDefaults{
@@ -631,8 +689,89 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		Metrics:           in.Metrics.get(),
 		Priority:          in.Priority.get(),
 		Verified:          in.Verified.get(),
+		Probe:             probe,
 		Note:              in.Note.get(),
 	}, origins, nil
+}
+
+// resolveProbe enforces the rules that give a recorded probe its meaning.
+//
+// Every one of them exists so that the ABSENCE of a date says something
+// definite. A probe without a date is a claim about no moment; a result at the
+// wrong level is a claim about the wrong subject; a denial without its refusal
+// text cannot be told from a model that simply is not there, which is the
+// distinction the whole state exists to draw. And a probe beside `verified:` is
+// two answers to one question, so the loader refuses it rather than picking.
+func resolveProbe(where, level, verified string, in *probeDoc) (Probe, error) {
+	if in == nil {
+		return Probe{}, nil
+	}
+	var errs []error
+
+	result := ProbeResult(in.Result)
+	wantLevel, known := probeResultLevel[result]
+	switch {
+	case result == ProbeNone:
+		errs = append(errs, fmt.Errorf("%s: probe.result is required; an empty "+
+			"probe records nothing and is not the same as no probe", where))
+	case !known:
+		errs = append(errs, fmt.Errorf("%s: unknown probe result %q", where, in.Result))
+	case wantLevel != level:
+		errs = append(errs, fmt.Errorf(
+			"%s: probe result %q belongs on the %s, not the %s: %s",
+			where, result, wantLevel, level, probeLevelReason(result)))
+	}
+
+	if err := checkDate(in.Date); err != nil {
+		errs = append(errs, fmt.Errorf("%s: probe.date: %w", where, err))
+	} else if in.Date == "" {
+		errs = append(errs, fmt.Errorf(
+			"%s: probe needs a date; it records what an endpoint said at a "+
+				"moment, and an entitlement can be bought the next day", where))
+	}
+	if verified != "" {
+		errs = append(errs, fmt.Errorf(
+			"%s: carries both verified: and probe:; they answer the same "+
+				"question and only one can be the last answer. A probe that "+
+				"supersedes a date replaces it", where))
+	}
+
+	if result == ProbeSubstituted && in.Served == "" {
+		errs = append(errs, fmt.Errorf(
+			"%s: probe result %q needs probe.served, the model id that "+
+				"answered; without it the finding has no content",
+			where, ProbeSubstituted))
+	}
+	if result != ProbeSubstituted && in.Served != "" {
+		errs = append(errs, fmt.Errorf(
+			"%s: probe.served is only meaningful for %q, not %q",
+			where, ProbeSubstituted, result))
+	}
+	if result == ProbeDenied && strings.TrimSpace(in.Note) == "" {
+		errs = append(errs, fmt.Errorf(
+			"%s: probe result %q needs a note carrying the refusal verbatim; "+
+				"that text is the only evidence separating an entitlement "+
+				"refusal from a model that does not exist", where, ProbeDenied))
+	}
+
+	if len(errs) > 0 {
+		return Probe{}, errors.Join(errs...)
+	}
+	return Probe{Result: result, Date: in.Date, Served: in.Served, Note: in.Note}, nil
+}
+
+// probeLevelReason explains a level mismatch in terms of what the fact is about,
+// so the message teaches the rule instead of restating it.
+func probeLevelReason(r ProbeResult) string {
+	switch r {
+	case ProbeDenied:
+		return "entitlement is a property of (account, model), and one plan reaches some models on a route and not others"
+	case ProbeSubstituted:
+		return "substitution is a property of one model name on one route"
+	case ProbeCitationOnly:
+		return "a missing credential is a property of the route, and stating it per entry would be one identical copy per model"
+	}
+	return ""
 }
 
 // resolveModel turns one model document into the top lookup layer. Booleans
@@ -664,6 +803,10 @@ func resolveModel(ref ModelRef, in *modelDoc) (modelEntry, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
+	probe, err := resolveProbe(where, LayerModel, in.Verified.get(), in.Probe)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	if len(errs) > 0 {
 		return modelEntry{}, errors.Join(errs...)
@@ -678,6 +821,7 @@ func resolveModel(ref ModelRef, in *modelDoc) (modelEntry, error) {
 		reasoning:         reasoning,
 		pricing:           pricing,
 		verified:          in.Verified.get(),
+		probe:             probe,
 		note:              in.Note.get(),
 		origins: map[string]fieldSource{
 			FieldCategory:          in.Category.origin,
@@ -688,6 +832,7 @@ func resolveModel(ref ModelRef, in *modelDoc) (modelEntry, error) {
 			FieldReasoning:         in.reasoningFrom,
 			FieldPricing:           in.pricingFrom,
 			FieldVerified:          in.Verified.origin,
+			FieldProbe:             in.probeFrom,
 			FieldNote:              in.Note.origin,
 		},
 	}, nil

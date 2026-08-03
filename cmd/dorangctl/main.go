@@ -78,7 +78,16 @@ commands:
   config check [file]          alias for config lint
   catalog explain <kind> <model>
                                show which file set each resolved field
-  catalog unverified           list models whose capabilities are not verified
+  catalog unverified [--state S]
+                               report every catalogued model by what happened the
+                               last time an endpoint was asked about it: verified,
+                               denied (the plan is not entitled — the model exists),
+                               substituted (a different model answered), citation_only
+                               (no credential for the route), unchecked
+  catalog verify --kind K --key-env VAR [--write FILE]
+                               ask the endpoint about every entry on a kind, one
+                               minimal request each, and report what it said.
+                               --write emits the results as a loadable overlay
   price <model> --input N --output N
                                preview the cost of one request, rule by rule
   import config <file>         convert a foreign proxy configuration, with warnings

@@ -53,6 +53,16 @@ func (c *Catalog) Validate() []Problem {
 					kd.Verified),
 			})
 		}
+		if d := kd.Probe.Date; d != "" && d > today {
+			ps = append(ps, Problem{
+				Severity: SeverityError,
+				Source:   org[FieldProbe].source,
+				Kind:     name,
+				Field:    "probe.date",
+				Message: fmt.Sprintf("probe date %s is in the future; a date records what an endpoint said, and it has not said it yet",
+					d),
+			})
+		}
 		if kd.ContextWindow > 0 {
 			ps = append(ps, Problem{
 				Severity: SeverityWarning,
@@ -124,22 +134,42 @@ func (c *Catalog) Validate() []Problem {
 
 		// A slice, not a map: findings must come out in the same order every
 		// run or a lint gate becomes flaky for reasons unrelated to the data.
-		for _, d := range []struct{ field, date string }{
-			{FieldVerified, e.verified},
-			{"reasoning.verified", e.reasoning.Verified},
-			{"pricing.verified", e.pricing.Verified},
+		for _, d := range []struct{ field, date, source string }{
+			{FieldVerified, e.verified, org[FieldVerified].source},
+			{"reasoning.verified", e.reasoning.Verified, org[FieldVerified].source},
+			{"pricing.verified", e.pricing.Verified, org[FieldVerified].source},
+			{"probe.date", e.probe.Date, org[FieldProbe].source},
 		} {
 			field, date := d.field, d.date
 			if date != "" && date > today {
 				ps = append(ps, Problem{
 					Severity: SeverityError,
-					Source:   org[FieldVerified].source,
+					Source:   d.source,
 					Kind:     ref.Kind,
 					Model:    ref.Model,
 					Field:    field,
 					Message:  fmt.Sprintf("verified date %s is in the future; a date records what was checked, and it has not been", date),
 				})
 			}
+		}
+
+		// A kind that says nobody could ask, in the same file as an entry that
+		// says somebody did. Scoped to one source on purpose: an operator with
+		// a credential overlaying real dates onto a citation-only kind is the
+		// intended workflow, not a defect, and warning about it would make the
+		// marker something operators route around.
+		if kd, ok := c.kinds[ref.Kind]; ok && kd.Probe.Result == ProbeCitationOnly &&
+			(e.verified != "" || !e.probe.IsZero()) &&
+			c.kindOrigins[ref.Kind][FieldProbe].source == probeEvidenceSource(e, org) {
+			ps = append(ps, Problem{
+				Severity: SeverityWarning,
+				Source:   c.kindOrigins[ref.Kind][FieldProbe].source,
+				Kind:     ref.Kind,
+				Model:    ref.Model,
+				Field:    FieldProbe,
+				Message: fmt.Sprintf("kind %s is marked %q, but this entry in the same file records a live answer; "+
+					"one of the two is stale", ref.Kind, ProbeCitationOnly),
+			})
 		}
 
 		if !e.pricing.IsZero() {
@@ -188,6 +218,15 @@ func (c *Catalog) Validate() []Problem {
 		return 0
 	})
 	return ps
+}
+
+// probeEvidenceSource names the file that supplied whichever live answer this
+// entry carries, so the citation-only contradiction can be scoped to one file.
+func probeEvidenceSource(e modelEntry, org map[string]fieldSource) string {
+	if e.verified != "" {
+		return org[FieldVerified].source
+	}
+	return org[FieldProbe].source
 }
 
 func isChatLike(c Category) bool {
