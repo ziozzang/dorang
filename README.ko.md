@@ -106,6 +106,7 @@ reached)"이며, 설계서 §17.1이 그 사례와 규칙을 기록하고 있다
 - [호환성](docs/COMPATIBILITY.md) — 골든 테스트로 고정된 와이어 계약과 오류 분류
 - [적대적 검토](docs/REVIEW.md) — 이 설계에 대한 지적과 처리 결과
 - [보안 검토](docs/SECURITY-REVIEW.md) — 지적 사항과 처리 상태
+- [성능](docs/PERFORMANCE.md) — 교체 대상 게이트웨이와의 실측 비교, 측정 방법과 그 한계
 
 ## 라이선스
 

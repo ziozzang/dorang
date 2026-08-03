@@ -114,6 +114,7 @@ the instances and the rule they produced.
 - [Compatibility](docs/COMPATIBILITY.md) — wire contracts pinned as golden tests, and the error taxonomy
 - [Adversarial review](docs/REVIEW.md) — findings against this design and their dispositions
 - [Security review](docs/SECURITY-REVIEW.md) — findings and their current state
+- [Performance](docs/PERFORMANCE.md) — measured against the gateway it replaces, with the method and its limits
 
 ## License
 
