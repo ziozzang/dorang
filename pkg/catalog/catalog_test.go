@@ -72,7 +72,13 @@ func TestDefaultParses(t *testing.T) {
 		dated++
 	}
 	want := map[string]int{
-		"ollama-cloud":    19,
+		// 2026-08-03: 19 → 18. kimi-k2.5 and minimax-m2.5 were retired
+		// upstream on 2026-07-31 — confirmed by asking, not by their absence
+		// from /v1/models, because a model can stop being listed and keep
+		// serving. deepseek-v4-flash:0731 was added: the endpoint returns the
+		// rolling name AND the dated pin as separate ids, and the catalog's
+		// rule is to list what the endpoint returns.
+		"ollama-cloud":    18,
 		"glm":             8,
 		"qwen":            2,
 		"xai":             2,
