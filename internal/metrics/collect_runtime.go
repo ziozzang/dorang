@@ -2,9 +2,11 @@ package metrics
 
 import (
 	"database/sql"
+	"os"
 	"runtime"
 	"runtime/debug"
 	rtmetrics "runtime/metrics"
+	"strconv"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/batch"
@@ -459,6 +461,15 @@ func NewBuildCollector(version, commit string, now func() time.Time) *BuildColle
 			{Name: "/memory/classes/heap/objects:bytes"},
 			{Name: "/gc/cycles/total:gc-cycles"},
 			{Name: "/sched/goroutines:goroutines"},
+			// The two histograms, and the reason they were added: a p99 of
+			// 30–42 ms against a p90 of 2.3 ms was measured at concurrency 64
+			// and could not be attributed to anything, because the only two
+			// candidates — a stop-the-world pause and time spent runnable but
+			// not running — were the two things this scrape did not publish.
+			// Heap, goroutines and GC COUNT were already here; neither of them
+			// can tell a tail from a mean.
+			{Name: "/gc/pauses:seconds"},
+			{Name: "/sched/latencies:seconds"},
 		},
 	}
 }
@@ -521,6 +532,110 @@ func (c *BuildCollector) Collect(w *Writer) {
 
 	w.Metric("dorang_goroutines", Gauge, "Goroutines currently running.")
 	w.Uint(uintValue(c.samples[3]))
+
+	w.Metric("dorang_gc_pause_seconds", Histogram,
+		"Stop-the-world GC pause durations. Every request in flight during a pause pays it, so "+
+			"this is the first thing to read when a p99 stands far above a p90 that looks fine. "+
+			"`dorang_gc_cycles_total` counts pauses and cannot distinguish a hundred short ones "+
+			"from one long one.")
+	writeRuntimeHist(w, c.samples[4])
+
+	w.Metric("dorang_sched_latency_seconds", Histogram,
+		"Time goroutines spent runnable but not running. This is oversubscription rather than "+
+			"work: with more requests in flight than GOMAXPROCS, a request can be finished in CPU "+
+			"terms and still be waiting for a thread to run on. Read beside "+
+			"`dorang_gc_pause_seconds` — between them they account for a tail the handler's own "+
+			"duration cannot explain.")
+	writeRuntimeHist(w, c.samples[5])
+
+	w.Metric("dorang_maxprocs", Gauge,
+		"GOMAXPROCS. `dorang_sched_latency_seconds` rises when offered concurrency exceeds it, "+
+			"which is the difference between a gateway that is slow and one that is merely "+
+			"oversubscribed.")
+	w.Int(int64(runtime.GOMAXPROCS(0)))
+
+	w.Metric("dorang_os_threads", Gauge,
+		"OS threads the runtime has created. A thread is created when every existing one is "+
+			"blocked in a syscall, so a count far above GOMAXPROCS means blocking calls rather "+
+			"than computation.")
+	n, _ := runtime.ThreadCreateProfile(nil)
+	w.Int(int64(n))
+
+	if fds, ok := openFDs(); ok {
+		w.Metric("dorang_open_file_descriptors", Gauge,
+			"Descriptors the process holds. Every upstream connection, store connection and "+
+				"accepted request holds at least one, so an unbounded rise is the shape of a "+
+				"connection that is never closed. Absent where the count cannot be read, "+
+				"because zero would say the process holds none.")
+		w.Int(int64(fds))
+	}
+}
+
+// writeRuntimeHist renders a runtime/metrics histogram in the cumulative bucket
+// form, and DELIBERATELY EMITS NO `_sum`.
+//
+// The runtime does not publish one. It could be approximated from bucket
+// midpoints, and that is exactly the move this codebase refused for
+// `Retry-After` in COMPATIBILITY §11.4: a guessed value is worse than an absent
+// one, because nothing downstream can tell it from a measured one. Anyone
+// computing `rate(_sum)/rate(_count)` would get an average of the bucket
+// layout rather than of the data. `histogram_quantile()` needs only the buckets
+// and is unaffected.
+//
+// The runtime's first bucket opens at -Inf, which is not a legal `le` and would
+// make the family unparseable; its count is folded into the first finite bound,
+// where it belongs — a pause cannot be negative.
+func writeRuntimeHist(w *Writer, s rtmetrics.Sample) {
+	if s.Value.Kind() != rtmetrics.KindFloat64Histogram {
+		// This Go release does not publish that name. Nothing is written, and
+		// [Writer.Metric] defers its HELP/TYPE until the first sample, so the
+		// family is ABSENT rather than flat at zero — "the runtime does not
+		// report this" and "the value is zero" are different facts.
+		return
+	}
+	h := s.Value.Float64Histogram()
+	if h == nil || len(h.Buckets) < 2 {
+		return
+	}
+	var scratch [40]byte
+	var cum uint64
+	for i, count := range h.Counts {
+		cum += count
+		hi := h.Buckets[i+1]
+		if hi > maxFloat {
+			continue // the +Inf bucket is written once, after the loop
+		}
+		le := append(scratch[:0], "le=\""...)
+		le = appendFloat(le, hi)
+		le = append(le, '"')
+		w.sampleName("_bucket", le)
+		w.b = strconv.AppendUint(w.b, cum, 10)
+		w.b = append(w.b, '\n')
+	}
+	w.sampleName("_bucket", append(scratch[:0], `le="+Inf"`...))
+	w.b = strconv.AppendUint(w.b, cum, 10)
+	w.b = append(w.b, '\n')
+
+	w.sampleName("_count", nil)
+	w.b = strconv.AppendUint(w.b, cum, 10)
+	w.b = append(w.b, '\n')
+	w.lbl = w.lbl[:0]
+}
+
+// openFDs counts the process's open descriptors, reporting false where that
+// cannot be known rather than guessing.
+func openFDs() (int, bool) {
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0, false
+	}
+	// ReadDir held a descriptor of its own while listing, so the entry for it is
+	// in the result and is closed by the time this returns. Subtracting it keeps
+	// the number from depending on how it was measured.
+	if n := len(ents) - 1; n > 0 {
+		return n, true
+	}
+	return 0, true
 }
 
 // uintValue reads a runtime/metrics sample, tolerating a name this Go release

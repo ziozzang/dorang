@@ -135,21 +135,40 @@ scheduler latency are the obvious candidates.
 
 **Obvious, and unverified**, because of 6b.
 
-### 6b. dorang exposes no Go runtime metrics
+### 6b. The scrape could not explain a tail — corrected, then fixed
 
-`/metrics` publishes **131 metric families and zero `go_*` or `process_*`
-series.** No GC pause, no goroutine count, no heap, no file descriptors. The
-Prometheus Go and process collectors are not registered.
+> ⚠️ **This section first claimed dorang published no runtime metrics at all,
+> and that was wrong.** It was written from a grep for `go_*` and `process_*`,
+> which returned nothing because dorang has no `client_golang` dependency and
+> spells its own runtime series with the project prefix. `dorang_goroutines`,
+> `dorang_memory_heap_bytes`, `dorang_memory_bytes` and `dorang_gc_cycles_total`
+> were all being published. The error is left visible rather than edited away,
+> because it is the same failure this document warns about in §1: a measurement
+> taken with the wrong instrument, believed because it produced a number.
 
-So the tail in 6a cannot be diagnosed from outside the process, and neither
-could a goroutine leak, a heap climb, or FD exhaustion in production. For a
-gateway that documents an allocation-free hot path as a central property, the
-runtime evidence for that property is not observable in a running deployment.
+The narrower finding survives, and it is the one that mattered. **Nothing
+published could distinguish a tail from a mean.** A count of GC cycles cannot
+tell a hundred short pauses from one long one, and time spent *runnable but not
+running* — the other candidate at 4× oversubscription — had no series at all.
 
-These are recorded here rather than in `docs/SECURITY-REVIEW.md` because neither
-is a defect in what dorang does — one is an unexplained shape and the other is a
-missing view. Both should be closed before any claim in §2 is repeated without
-this document attached.
+Now added, in `BuildCollector`:
+
+| series | answers |
+|---|---|
+| `dorang_gc_pause_seconds` | stop-the-world pause **durations**, not just cycles |
+| `dorang_sched_latency_seconds` | time goroutines were runnable but not running |
+| `dorang_maxprocs` | what the concurrency is being compared against |
+| `dorang_os_threads` | threads created — far above GOMAXPROCS means blocking calls |
+| `dorang_open_file_descriptors` | absent where `/proc` is not readable, never zero |
+
+Both histograms deliberately emit **no `_sum`**. The runtime does not publish
+one, and it could be approximated from bucket midpoints — which is exactly the
+move COMPATIBILITY §11.4 refused for a guessed `Retry-After`: nothing downstream
+can tell an approximation from a measurement. `histogram_quantile()` needs only
+the buckets and is unaffected; `rate(_sum)/rate(_count)` is unavailable because
+the data for it does not exist.
+
+The diagnosis this enabled is in §6c.
 
 ---
 
