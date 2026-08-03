@@ -432,20 +432,41 @@ Mounted and working:
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | Where each catalogued model field came from |
 | `/health/history` | In-process ring; it starts empty on every restart |
 | `/ui` | Read-only operator UI. Sign in with an administrative credential; the session is one hour, which is also the lag before a revoked credential loses the UI |
+| `/user/new`, `/user/info`, `/user/update`, `/user/delete`, `/user/list` | Directory users. **`blocked` is enforced**: a blocked user's keys stop serving on the node that took the call before it answers, and on every other node within the same published bound a `/key/block` observes (§10.1) — measured **19.6 ms to a second node at `poll: 20ms`**, against a published 270 ms. `max_budget`, `budget_duration`, `rpm_limit`, `tpm_limit` and `models` are enforced too, as the user half of §11.2's three-subject envelope: the most restrictive of key, user and team wins. Deleting a user does **not** delete its keys — the keys are announced as revoked, and they then serve *unowned*, so ending someone's access means blocking or deleting the keys, not only the user |
+| `/team/new`, `/team/info`, `/team/update`, `/team/delete`, `/team/list`, `/team/member_add`, `/team/member_delete` | Directory teams. Same enforcement as users, plus `max_parallel_requests`, which is the one ceiling `teams` has and `users` does not. **Membership deliberately publishes no invalidation**: a key's team is `api_keys.team_id`, not `team_members`, so a membership change alters no authorization decision and a message about it is one no node could act on |
+| `/budget/new`, `/budget/info`, `/budget/update`, `/budget/delete`, `/budget/list` | Ceilings on a **key**, a **user** or a **team**, addressed as `budget_id: "team:eng"`. `spend` is read from the **durable counter the gate enforces against** (`budget_state`), not from the §9.4 rollups `/key/info` uses, because the question this route answers is "will a ceiling of X refuse?" and only the number the gate compares against can answer it — expect it to run slightly *ahead* of the ledger while a lease block is live (§9.6). **`/budget/delete` clears the ceiling and preserves the spend**: it is how you end a budget outage without making a billing decision, and it takes effect fleet-wide inside the published bound rather than on the cache TTL. Lowering a ceiling below recorded spend refuses with **400 `budget_exceeded`** naming the subject — on a node holding a live lease block, up to one block later (§5.6's published overshoot) |
 
-Answering **501 `dependency_not_configured`** in this build, because the storage behind them does
-not exist yet — `internal/store` has no Go code for `users`, `teams`, `team_members`,
-`deployments` or `model_aliases`:
+Answering **501 `dependency_not_configured`** in this build:
 
 | Path | Missing piece | Use instead |
 |---|---|---|
-| `/user/*`, `/team/*` | directory | `dorangctl`, or the database |
 | `/model/*`, `/model_group/info` | model registry | configuration + `SIGHUP` |
-| `/budget/*` | budget store | `dorangctl key create --budget-usd` |
+| `/budget/*` naming a `credential` or `global` subject | a ceiling column. §9.2 puts the ceiling on the subject row, and `api_keys`, `users` and `teams` are the three rows that have one | a per-key, per-user or per-team ceiling; provider-side quota is §6.2, not a budget |
 | `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | a per-day per-subject per-**model** cube, which §9.4 deliberately does not materialize | `/global/spend/report` for the single-dimension question, `/spend/logs` for the per-request one |
 | `/admin/credentials/health`, `/admin/quota` | quota registry | `/metrics` |
 | `/spend/calculate`, `/admin/pricing/preview` | pricing engine | — |
 | `/admin/config/reload` | reloader | `SIGHUP` |
+
+> **`/model/*` is not waiting on a table.** `deployments` and `model_aliases` have existed since
+> the first migration; what does not exist is a *reader*. The routing table is compiled from
+> `models[]`, aliases and classes in the configuration file, and nothing in the binary reads those
+> two tables. An adapter over them would answer `200`, write the row you asked for, and route no
+> traffic differently — a control that is a note, which is the failure the rest of this section
+> exists to remove. It stays a named 501 until routing reads the table or the table is dropped.
+>
+> **A control that only records is worse than a 501**, and it is worth stating why, because the
+> user and team routes above were closed for exactly that reason and not for the one that was
+> written down. `internal/store` had no Go code for `users` or `teams`, which is true and was the
+> smaller half. The larger half was that the authorization envelope the gateway builds carried
+> **only the key**: DESIGN §11.2 defines three subjects and `auth.Principal` has always had fields
+> for all three, but nothing populated the user and team ones, and every guard that reads them is
+> nil-guarded. So `users.blocked` refused nothing, a team ceiling bound nothing, and a team's rate
+> and concurrency limits reached no gate — at no latency, on every node. Had `/user/update` been
+> mounted over that, blocking a user would have answered `200`, written the row, announced it to
+> the fleet, and changed nothing anywhere. The credential read now joins its owning user and team
+> **in the same statement** (§2.4's one-round-trip rule is intact), and the tests for these routes
+> assert a *refused request* rather than a written row, because a row assertion passes against the
+> defect.
 
 ### 3.3 Administrative scope
 
@@ -472,6 +493,16 @@ What a team-scoped administrator gets:
 | Minting a key on another team, or on no team | **403** — a key on no team would be a *global* administrator |
 | Changing a user's `user_role` | **403** — the role is what decides who administers, so writing it is escalation |
 | `/model/*`, `/admin/*`, `/global/spend/report`, `/user/new`, `/team/new`, `/health/history` | **403** — deployment-wide, and there is no honest per-team view of "reload the configuration" |
+
+> **Blocking a user disqualifies its administrative keys, and that now includes yours.** A
+> credential that is blocked, pended, expired or over budget is not an administrator whatever its
+> user's role says — this was always the rule, and it only became reachable for the *user* and
+> *team* subjects in this build. The one to watch is budget: if you set `teams.spend_nano` above
+> that team's `max_budget_nano` (through `/team/update` or an import — the request path counts
+> against `budget_state`, not this column), that team's scoped administrators lose the surface,
+> including the ability to raise the ceiling they are stuck behind. **`DORANG_MASTER_KEY` is
+> out-of-band and authorizes unconditionally**, so it is always the way back in. That is what it
+> is for; §3.4.
 
 A credential that authenticates but may not administer gets **403**, not 401: a working key being
 told its key does not work sends the operator to the wrong problem. **401** means no usable
@@ -1266,7 +1297,7 @@ Operationally relevant gaps, so you do not plan around something that is not the
 
 | Area | Status |
 |---|---|
-| **HTTP administration** | Mounted (§3.1–3.3). The credential lifecycle including rotation and pend, `/spend/logs`, capacity, catalog, health history and `/ui` are served; users, teams, deployments, budgets and the aggregate spend reports answer `501 dependency_not_configured` because `internal/store` has no code for those tables. Use `dorangctl` for those |
+| **HTTP administration** | Mounted (§3.1–3.3). The credential lifecycle including rotation and pend, users, teams, budgets, `/spend/logs`, the aggregate spend reports, capacity, catalog, health history and `/ui` are served. A user or team `blocked` flag, budget ceiling and rate limit are **enforced** on the request path, not merely stored. Deployments and model aliases answer `501 dependency_not_configured`: routing is compiled from the configuration file and nothing reads those two tables, so use the file plus `SIGHUP` |
 | **Audit trail readback** | `audit_logs` is written by every administrative mutation and `/audit/list` is a named 501. Query the table directly |
 | `observability.otlp_endpoint` | No exporter is wired. The latency breakdown is recorded and not exported |
 | `capacity.*.rpm`, `.tpm` | **Refused at load**, naming the working home: `deployments[].limits[]` for a per-deployment rate, the api key's own `rpm_limit`/`tpm_limit` for a per-caller one |

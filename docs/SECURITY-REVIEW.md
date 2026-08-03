@@ -1866,14 +1866,28 @@ cannot be audited or trusted, only believed.
    half). One `LoadByLookup` per unauthenticated request; the negative TTL bounds
    repeats of the same key and nothing bounds distinct ones. The first pass
    called this the largest thing left open and it still is.
-2. **`internal/store` has no directory, no model registry and no budget-ceiling
-   storage.** `users`, `teams`, `team_members`, `deployments` and `model_aliases`
-   are tables with no Go code, so `/user/*`, `/team/*`, `/model/*` and
-   `/budget/*` answer `501 dependency_not_configured` — and a **team-level**
-   `rpm_limit`/`tpm_limit` cannot be put on a stored row at all, which is why the
-   per-subject rate ceiling is proved at the gate
-   (`TestTeamRPMCountsEveryKeyUnderTheTeam`,
-   `TestSettledTokensReachEverySubjectOfTheRequest`) and not over HTTP.
+2. **`internal/store` has no model registry.** `deployments` and `model_aliases`
+   are tables with no Go code, so `/model/*` and `/model_group/info` answer
+   `501 dependency_not_configured`. Note the reason has to be stated more
+   carefully than "no store layer": those two tables also have no *reader*, since
+   routing is compiled from the configuration file, so writing them would change
+   no routing decision.
+
+   *(This entry also named `users`, `teams`, `team_members` and the budget
+   ceilings, and closing that half found something worse than a missing store
+   layer. The tables were only the smaller obstacle: `cluster.AuthPrincipal`
+   built an `auth.Principal` with the KEY's limits and left `User` and `Team`
+   nil, so `users.blocked`, `teams.blocked`, the ceilings and the team rate
+   limits reached no decision on any node at any latency — a **team-level**
+   `rpm_limit` could not be put on a stored row, and would not have been enforced
+   if it had been. It was invisible for the same reason it was harmless-looking:
+   every guard that reads an owner envelope is nil-guarded, correctly, because an
+   unowned key has none. The credential read now LEFT-joins both owners in the
+   same statement, `AuthPrincipal` takes them as a required argument, and the
+   directory and budget routes are wired — see DESIGN W12. The per-subject rate
+   ceiling is still proved at the gate — `TestTeamRPMCountsEveryKeyUnderTheTeam`,
+   `TestSettledTokensReachEverySubjectOfTheRequest` — and is now also reachable
+   from a stored row.)*
 3. **`/audit/list`**: rows are written by every administrative mutation and still
    cannot be read over the API. `internal/admin/routes.go` names it as the one
    stub whose reason says "until this ships" rather than describing a refusal.

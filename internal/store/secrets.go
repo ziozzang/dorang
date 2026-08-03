@@ -446,6 +446,12 @@ func (s *Store) KeyLookups(ctx context.Context, keyID string) ([]string, error) 
 type KeyRecord struct {
 	Key    *APIKey
 	Secret *KeySecret
+	// Owners is the key's owning user and team, either nil when unowned. It is
+	// on the record rather than fetched beside it because DESIGN §11.2's
+	// authorization envelope is all three subjects at once: a snapshot entry
+	// built from a key whose owner was read a moment later would be an entry
+	// whose three halves describe two different instants.
+	Owners Owners
 }
 
 // ListKeyRecords returns every (key, secret) pair, for a snapshot reload.
@@ -458,32 +464,69 @@ type KeyRecord struct {
 // RETIRED rather than as unknown — the same reason §2.4 gives for loading
 // expired rows — and the authenticator gives a refusing row the short negative
 // lifetime, so they cost a few bytes and no freshness.
+//
+// # The owners are interned
+//
+// A deployment's keys share a small number of users and teams — that is what a
+// team is — and this runs on every rejoin AND on the periodic reload, which is
+// `entry_ttl/2` apart. Materializing a fresh User and Team per SECRET would
+// build fifty thousand copies of a few dozen rows every half-TTL, including a
+// JSON decode of each one's model allow-list. They are therefore built once per
+// id and shared.
+//
+// Sharing is safe because nothing downstream mutates them: [auth.Principal] is
+// documented immutable and its limits are copied out of these rows field by
+// field, so what the records share is a read-only row and not a decision.
 func (s *Store) ListKeyRecords(ctx context.Context, limit int) ([]KeyRecord, error) {
 	if limit <= 0 {
 		limit = 10000
 	}
 	rows, err := s.query(ctx, `SELECT `+prefixCols(apiKeyColumns, "k")+`, `+
-		prefixCols(keySecretColumns, "s")+`
-		  FROM api_key_secrets s JOIN api_keys k ON k.id = s.key_id
+		prefixCols(keySecretColumns, "s")+`, `+ownerCols+`
+		  FROM api_key_secrets s JOIN api_keys k ON k.id = s.key_id`+ownerJoin+`
 		 ORDER BY s.key_id, s.generation LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []KeyRecord
+	users := map[string]*User{}
+	teams := map[string]*Team{}
 	for rows.Next() {
 		var (
 			k  APIKey
 			kt apiKeyScan
 			v  KeySecret
 			vt keySecretScan
+			ut userScan
+			tt teamScan
 		)
-		if err := rows.Scan(append(kt.dests(&k), vt.dests(&v)...)...); err != nil {
+		dest := append(kt.dests(&k), vt.dests(&v)...)
+		dest = append(dest, ut.dests()...)
+		dest = append(dest, tt.dests()...)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		kt.finish(&k)
 		vt.finish(&v)
-		out = append(out, KeyRecord{Key: &k, Secret: &v})
+		var own Owners
+		if ut.id.Valid {
+			if u, ok := users[ut.id.String]; ok {
+				own.User = u
+			} else {
+				own.User = ut.user()
+				users[ut.id.String] = own.User
+			}
+		}
+		if tt.id.Valid {
+			if tm, ok := teams[tt.id.String]; ok {
+				own.Team = tm
+			} else {
+				own.Team = tt.team()
+				teams[tt.id.String] = own.Team
+			}
+		}
+		out = append(out, KeyRecord{Key: &k, Secret: &v, Owners: own})
 	}
 	return out, rows.Err()
 }

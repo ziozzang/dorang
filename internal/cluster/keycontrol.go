@@ -275,7 +275,7 @@ func (l *KeyLoader) LoadAll(ctx context.Context) ([]auth.Record, error) {
 	}
 	out := make([]auth.Record, 0, len(rows))
 	for i := range rows {
-		rec, err := AuthRecord(rows[i].Key, rows[i].Secret, l.Tiers)
+		rec, err := AuthRecord(rows[i].Key, rows[i].Secret, rows[i].Owners, l.Tiers)
 		if err != nil {
 			// One unreadable row must not cost the whole snapshot. It is
 			// skipped, which leaves that key to the per-key store path, where
@@ -301,7 +301,9 @@ func (l *KeyLoader) LoadAll(ctx context.Context) ([]auth.Record, error) {
 // configured set and is applied to the key's own limits, so the envelope the
 // hot path enforces is already narrowed — a tier that only decided a default
 // somewhere else would be a tier the request path never sees.
-func AuthRecord(k *store.APIKey, sec *store.KeySecret, tiers *auth.TierSet) (auth.Record, error) {
+func AuthRecord(k *store.APIKey, sec *store.KeySecret, own store.Owners,
+	tiers *auth.TierSet) (auth.Record, error) {
+
 	if k == nil || sec == nil {
 		return auth.Record{}, errors.New("cluster: AuthRecord needs a key and a secret")
 	}
@@ -313,7 +315,7 @@ func AuthRecord(k *store.APIKey, sec *store.KeySecret, tiers *auth.TierSet) (aut
 	if err != nil {
 		return auth.Record{}, err
 	}
-	p, err := AuthPrincipal(k, tiers)
+	p, err := AuthPrincipal(k, own, tiers)
 	if err != nil {
 		return auth.Record{}, err
 	}
@@ -351,7 +353,39 @@ func AuthRecord(k *store.APIKey, sec *store.KeySecret, tiers *auth.TierSet) (aut
 // configured set and is applied to the key's own limits, so the envelope the hot
 // path enforces is already narrowed — a tier that only decided a default
 // somewhere else would be a tier the request path never sees.
-func AuthPrincipal(k *store.APIKey, tiers *auth.TierSet) (auth.Principal, error) {
+//
+// # The owners, and why they are an argument
+//
+// DESIGN §11.2's envelope is THREE subjects — the key, its user, its team — and
+// the most restrictive wins. [auth.Principal] has carried all three since it was
+// written and [auth.Principal.Authorize] enforces all three; this function
+// populated the first and left the other two nil. Every guard downstream is
+// nil-guarded, so nothing broke and nothing was enforced: `users.blocked` and
+// `teams.blocked` refused nothing, a team's `max_budget_nano` bound nothing, and
+// a team's rate and concurrency ceilings were read from a nil pointer that is
+// treated as "declares no limit". That is the shape §17.1 calls this codebase's
+// dominant failure — a control that exists and is not reached — and it was not
+// a latency problem: a user block took effect at no latency, ever.
+//
+// The owners are therefore a REQUIRED argument rather than an optional lookup
+// this function could do for itself. It has no store handle and must not grow
+// one — it is called from the bulk loader, from the credential miss path and
+// from the batch executor, and a per-call fetch inside it would put two store
+// round trips on each of them. Making it an argument means every construction
+// site has to answer "what are this key's owners?", which is exactly the
+// question that went unasked; a zero [store.Owners] is a legitimate answer
+// ("this key is unowned"), and it is the one an honest caller supplies.
+//
+// # What the tier does and does not narrow
+//
+// The tier is applied to the KEY's limits only. A tier is granted to a
+// credential (§11.6), not to a person or an organization, and applying it to all
+// three envelopes would narrow one grant three times — a tier capping requests
+// per minute at 60 would produce a key, a user and a team each independently
+// capped at 60, which is not what "the most restrictive wins" means. The user's
+// and the team's limits are their own, and Authorize already takes the strictest
+// across all three.
+func AuthPrincipal(k *store.APIKey, own store.Owners, tiers *auth.TierSet) (auth.Principal, error) {
 	if k == nil {
 		return auth.Principal{}, errors.New("cluster: AuthPrincipal needs a key")
 	}
@@ -394,5 +428,57 @@ func AuthPrincipal(k *store.APIKey, tiers *auth.TierSet) (auth.Principal, error)
 		PriorityClass: class,
 		Tags:          k.Tags,
 		Key:           limits,
+		User:          userLimits(own.User),
+		Team:          teamLimits(own.Team),
 	}, nil
+}
+
+// userLimits is the authorization envelope of a `users` row, or nil when the key
+// has no owning user.
+//
+// nil and "a user that declares nothing" are deliberately different values even
+// though [auth.Principal.Authorize] treats them alike today: nil says the join
+// found no row, and a present envelope full of zeroes says the row exists and
+// restricts nothing. The distinction is what makes [auth.Principal.RequireOwner]
+// mean something, and it is what a future check on ownership would read.
+//
+// Neither Pended nor MaxParallel is set: `users` has no pend column (§11.6's
+// pend is the token guard's judgement about a CREDENTIAL) and no
+// max_parallel column. Writing zero values for them would be indistinguishable
+// from a limit the operator set, and only `teams` has the concurrency column.
+func userLimits(u *store.User) *auth.Limits {
+	if u == nil {
+		return nil
+	}
+	return &auth.Limits{
+		Blocked:          u.Blocked,
+		Models:           u.Models,
+		MaxBudgetNanoUSD: u.MaxBudgetNano,
+		SpentNanoUSD:     u.SpendNano,
+		BudgetPeriod:     u.BudgetPeriod,
+		BudgetResetAt:    u.BudgetResetAt,
+		RPMLimit:         u.RPMLimit,
+		TPMLimit:         u.TPMLimit,
+	}
+}
+
+// teamLimits is [userLimits] for a `teams` row. It carries max_parallel, which
+// the team table has and the users table does not — internal/capacity narrows a
+// request to the smallest ceiling declared across the three subjects, and a team
+// concurrency cap that never reached it was a configured limit with no effect.
+func teamLimits(t *store.Team) *auth.Limits {
+	if t == nil {
+		return nil
+	}
+	return &auth.Limits{
+		Blocked:          t.Blocked,
+		Models:           t.Models,
+		MaxBudgetNanoUSD: t.MaxBudgetNano,
+		SpentNanoUSD:     t.SpendNano,
+		BudgetPeriod:     t.BudgetPeriod,
+		BudgetResetAt:    t.BudgetResetAt,
+		RPMLimit:         t.RPMLimit,
+		TPMLimit:         t.TPMLimit,
+		MaxParallel:      t.MaxParallel,
+	}
 }

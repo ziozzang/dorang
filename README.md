@@ -29,9 +29,17 @@ capacity:
     account-a: { max_concurrency: 3 }        # per account, any model
     account-b: { max_concurrency: 3 }
   models:
-    - { provider: coding-plan, model: model-x, max_concurrency: 7 }   # per (key, model)
+    - { provider: coding-plan, model: model-x, max_concurrency: 7 }   # per (provider, model)
     - { provider: coding-plan, model: model-y, max_concurrency: 7 }
 ```
+
+The model axis is keyed by **provider and upstream model**, not by credential —
+`AxisModel` in `internal/capacity`. So two models on one coding plan is 14 in
+flight however many keys that plan has, while two models on one Ollama account is
+still 3, because that ceiling sits on the credential axis. That difference between
+the two axes is the whole point of the example, and it is measured rather than
+asserted: `testing/providers/` drives both shapes through one gateway at one
+instant.
 
 Five axes — route, provider group, model, credential group, key — are reserved
 **atomically, all-or-nothing**, so a waiter never holds one slot while queuing for

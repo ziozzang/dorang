@@ -441,6 +441,46 @@ func TestCheckAcceptsTheShippedExample(t *testing.T) {
 	}
 }
 
+// TestCheckWarnsAboutAPerTokenRateAndStillStarts is the gateway's half of the
+// advisory `dorangctl config lint` prints. --check is the last thing that runs
+// before a deploy, and it answered `ok` while every request priced to a
+// millionth of its card (CONFIG §13.1c) — the rule matched, so nothing else
+// had anything to say.
+//
+// It stays an `ok`. A wrong price is a wrong invoice; refusing to start over
+// one is a wrong invoice for everybody upstream at the same time (§8.3).
+func TestCheckWarnsAboutAPerTokenRateAndStillStarts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dorang.yaml")
+	const cfg = `version: 1
+server: {env: development}
+providers:
+  - {name: p1, kind: openai, base_url: "https://example.invalid/v1"}
+credentials:
+  - {id: c1, provider: p1, key: dev-secret}
+models:
+  - name: m1
+    deployments: [{provider: p1, upstream_model: u1, credentials: [c1]}]
+pricing:
+  currency: USD
+  rules:
+    - {id: r1, class: marginal_usage, match: {provider: p1}, rates: {input: "0.000003"}}
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, code := runChild(t, dir, "--check", "--config", path)
+	if code != 0 {
+		t.Fatalf("--check exited %d on a legal configuration:\n%s", code, out)
+	}
+	if !strings.Contains(out, "ok") {
+		t.Errorf("--check no longer reports the outcome:\n%s", out)
+	}
+	if !strings.Contains(out, "per MILLION tokens") {
+		t.Errorf("--check said ok and nothing else about a rate a millionth of its card:\n%s", out)
+	}
+}
+
 func TestVersionAndUsage(t *testing.T) {
 	out, code := runChild(t, t.TempDir(), "--version")
 	if code != 0 || strings.TrimSpace(out) == "" {

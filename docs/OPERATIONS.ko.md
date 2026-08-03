@@ -377,20 +377,37 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 | `/admin/catalog/explain`, `/admin/catalog/unverified` | 카탈로그 모델 필드의 출처 |
 | `/health/history` | 인프로세스 링. 재시작할 때마다 비어 있는 상태로 시작한다 |
 | `/ui` | 읽기 전용 운영 UI. 관리 크리덴셜로 로그인하며 세션은 1시간이다 — 폐기된 크리덴셜이 UI를 잃기까지의 지연이기도 하다 |
+| `/user/new`, `/user/info`, `/user/update`, `/user/delete`, `/user/list` | 디렉터리 유저. **`blocked`가 강제된다**: 막힌 유저의 키는 호출을 받은 노드에서 응답 전에 서빙을 멈추고, 다른 모든 노드에서는 `/key/block`이 지키는 것과 같은 공표 상한 안에 멈춘다(§10.1) — `poll: 20ms`에서 두 번째 노드까지 **19.6 ms** 측정, 공표된 270 ms 대비. `max_budget`·`budget_duration`·`rpm_limit`·`tpm_limit`·`models`도 §11.2 세 주체 봉투의 유저 절반으로서 강제된다: 키·유저·팀 중 가장 제한적인 것이 이긴다. 유저를 지워도 그 키는 **지워지지 않는다** — 키는 revoked로 공표되고 그 뒤 *소유자 없이* 서빙되므로, 접근을 끝내려면 유저만이 아니라 키를 막거나 지워야 한다 |
+| `/team/new`, `/team/info`, `/team/update`, `/team/delete`, `/team/list`, `/team/member_add`, `/team/member_delete` | 디렉터리 팀. 유저와 같은 강제에 더해 `max_parallel_requests` — `teams`에는 있고 `users`에는 없는 유일한 상한이다. **멤버십은 의도적으로 무효화를 공표하지 않는다**: 키의 팀은 `team_members`가 아니라 `api_keys.team_id`이므로 멤버십 변경은 어떤 인가 판단도 바꾸지 않고, 그에 대한 메시지는 어느 노드도 행동할 수 없는 메시지다 |
+| `/budget/new`, `/budget/info`, `/budget/update`, `/budget/delete`, `/budget/list` | **키**·**유저**·**팀**의 상한. `budget_id: "team:eng"`처럼 주체로 지정한다. `spend`는 `/key/info`가 쓰는 §9.4 롤업이 아니라 **게이트가 실제로 비교하는 내구 카운터**(`budget_state`)에서 읽는다. 이 경로가 답하는 질문은 "상한을 X로 내리면 거부되는가"이고 게이트가 비교하는 숫자만 그것을 답할 수 있기 때문이다 — 리스 블록이 살아 있는 동안은 원장보다 조금 앞서 달린다(§9.6). **`/budget/delete`는 상한을 지우고 지출은 보존한다**: 과금 판단을 하지 않고 예산 장애를 끝내는 방법이며, 캐시 TTL이 아니라 공표 상한 안에 플릿 전체에 적용된다. 기록된 지출보다 낮게 상한을 내리면 주체를 명시한 **400 `budget_exceeded`**로 거부된다 — 살아 있는 리스 블록을 쥔 노드에서는 최대 한 블록 뒤에(§5.6이 공표하는 overshoot) |
 
-이 빌드에서 **501 `dependency_not_configured`**로 답하는 것. 뒤에 있어야 할 저장소가 아직 없기
-때문이다 — `internal/store`에는 `users`, `teams`, `team_members`, `deployments`, `model_aliases`에
-대한 Go 코드가 없다:
+이 빌드에서 **501 `dependency_not_configured`**로 답하는 것:
 
 | 경로 | 없는 것 | 대신 사용 |
 |---|---|---|
-| `/user/*`, `/team/*` | 디렉터리 | `dorangctl`, 또는 데이터베이스 |
 | `/model/*`, `/model_group/info` | 모델 레지스트리 | 설정 + `SIGHUP` |
-| `/budget/*` | 예산 저장소 | `dorangctl key create --budget-usd` |
+| `credential`·`global` 주체를 지정한 `/budget/*` | 상한 컬럼. §9.2는 상한을 주체 행에 두고, 그 행을 가진 것은 `api_keys`·`users`·`teams` 셋뿐이다 | 키·유저·팀 단위 상한. 프로바이더 쪽 쿼터는 예산이 아니라 §6.2다 |
 | `/user/daily/activity`, `/team/daily/activity`, `/tag/daily/activity` | 일자별 × 주체별 × **모델별** 큐브. §9.4가 의도적으로 물질화하지 않는다 | 단일 차원 질문은 `/global/spend/report`, 요청별은 `/spend/logs` |
 | `/admin/credentials/health`, `/admin/quota` | 쿼터 레지스트리 | `/metrics` |
 | `/spend/calculate`, `/admin/pricing/preview` | 가격 엔진 | — |
 | `/admin/config/reload` | 리로더 | `SIGHUP` |
+
+> **`/model/*`은 테이블을 기다리는 것이 아니다.** `deployments`와 `model_aliases`는 첫 마이그레이션부터
+> 있었다. 없는 것은 *읽는 쪽*이다. 라우팅 테이블은 설정 파일의 `models[]`·alias·class에서 컴파일되고,
+> 바이너리 안의 어떤 코드도 그 두 테이블을 읽지 않는다. 그 위에 어댑터를 붙이면 `200`을 답하고 요청한
+> 행을 쓰고는 트래픽 라우팅은 하나도 바뀌지 않는다 — 메모에 불과한 컨트롤이고, 이 절의 나머지가 없애려는
+> 바로 그 실패다. 라우팅이 그 테이블을 읽거나 테이블이 없어질 때까지 이름을 말하는 501로 남는다.
+>
+> **기록만 하는 컨트롤은 501보다 나쁘다.** 위 유저·팀 경로가 닫혀 있던 이유가 정확히 그것이었고, 적혀
+> 있던 이유는 그것이 아니었으므로 적어 둘 값어치가 있다. `internal/store`에 `users`·`teams`의 Go 코드가
+> 없었던 것은 사실이고 그것이 작은 쪽 절반이었다. 큰 쪽 절반은 게이트웨이가 만드는 인가 봉투가 **키만**
+> 담고 있었다는 것이다: DESIGN §11.2는 세 주체를 정의하고 `auth.Principal`은 셋 모두를 위한 필드를 늘
+> 가지고 있었지만, 유저와 팀 필드를 채우는 코드가 없었고 그것을 읽는 모든 가드는 nil 가드다. 그래서
+> `users.blocked`는 아무것도 거부하지 않았고, 팀 상한은 아무것도 묶지 않았으며, 팀의 rate·동시성 제한은
+> 어떤 게이트에도 닿지 않았다 — 지연 없이, 모든 노드에서. 그 위에 `/user/update`를 마운트했다면 유저를
+> 막는 호출이 `200`을 답하고 행을 쓰고 플릿에 공표하고, 어디서도 아무것도 바꾸지 않았을 것이다. 이제
+> 크리덴셜 읽기가 소유 유저와 팀을 **같은 문장에서** 조인하며(§2.4의 1왕복 규칙은 그대로), 이 경로들의
+> 테스트는 쓰인 행이 아니라 *거부된 요청*을 검증한다. 행 검증은 이 결함을 통과시키기 때문이다.
 
 ### 3.3 관리 범위(scope)
 
@@ -416,6 +433,14 @@ curl -s "http://gateway:4000/key/list?limit=200" \
 | 다른 팀에, 또는 어느 팀에도 속하지 않게 키 발급 | **403** — 팀 없는 키는 *전역* 관리자가 된다 |
 | 사용자의 `user_role` 변경 | **403** — role이 누가 관리자인지를 결정하므로 그것을 쓰는 것은 권한 상승이다 |
 | `/model/*`, `/admin/*`, `/global/spend/report`, `/user/new`, `/team/new`, `/health/history` | **403** — 배포 전역이며 "설정을 리로드한다"의 팀별 뷰라는 것은 없다 |
+
+> **유저를 막으면 그 유저의 관리 키도 자격을 잃는다. 그리고 이제 당신의 키도 거기 포함된다.** 막히거나
+> pend되거나 만료되거나 예산을 넘긴 크리덴셜은 소유 유저의 role이 무엇이든 관리자가 아니다 — 규칙은 늘
+> 그랬고, *유저*와 *팀* 주체에 대해서 그것이 실제로 닿게 된 것이 이 빌드다. 주의할 것은 예산이다:
+> `teams.spend_nano`를 그 팀의 `max_budget_nano`보다 크게 설정하면(`/team/update`나 임포트로. 요청
+> 경로는 이 컬럼이 아니라 `budget_state`에 센다) 그 팀의 범위 관리자는 관리 표면을 잃고, 자기가 갇힌
+> 상한을 올릴 수단도 함께 잃는다. **`DORANG_MASTER_KEY`는 out-of-band이고 무조건 인가되므로** 언제나
+> 돌아올 길이다. 그것이 그 키의 용도다. §3.4.
 
 인증은 됐지만 관리 권한이 없는 크리덴셜은 401이 아니라 **403**을 받는다. 동작하는 키에게 키가 동작하지
 않는다고 말하면 운영자를 엉뚱한 문제로 보내기 때문이다. **401**은 쓸 수 있는 크리덴셜이 없다는 뜻이고,
@@ -1121,7 +1146,7 @@ effective_used = max( provider_reported_used ,
 
 | 영역 | 상태 |
 |---|---|
-| **HTTP 관리** | 마운트됨(§3.1–3.3). 로테이션과 pend를 포함한 크리덴셜 수명주기 전체, `/spend/logs`, capacity, catalog, health history, `/ui`는 서빙된다. 사용자·팀·배포·예산과 집계 지출 리포트는 `internal/store`에 해당 테이블 코드가 없어 `501 dependency_not_configured`로 답한다. 그것들은 `dorangctl`을 쓸 것 |
+| **HTTP 관리** | 마운트됨(§3.1–3.3). 로테이션과 pend를 포함한 크리덴셜 수명주기 전체, 유저·팀·예산, `/spend/logs`, 집계 지출 리포트, capacity, catalog, health history, `/ui`가 서빙된다. 유저·팀의 `blocked` 플래그·예산 상한·rate 제한은 저장만 되는 것이 아니라 요청 경로에서 **강제된다**. 배포와 모델 alias는 `501 dependency_not_configured`로 답한다: 라우팅은 설정 파일에서 컴파일되고 그 두 테이블은 아무도 읽지 않으므로 파일 + `SIGHUP`을 쓸 것 |
 | **감사 기록 조회** | `audit_logs`는 모든 관리 변경이 기록하지만 `/audit/list`는 이름이 붙은 501이다. 테이블을 직접 조회할 것 |
 | `observability.otlp_endpoint` | exporter가 연결돼 있지 않다. 지연 내역은 기록되고 export되지 않는다 |
 | `capacity.*.rpm`, `.tpm` | **로드 시 거부**되며, 동작하는 자리를 이름으로 알려준다: 배포별 rate는 `deployments[].limits[]`, 호출자별 rate는 api 키 자신의 `rpm_limit`/`tpm_limit` |

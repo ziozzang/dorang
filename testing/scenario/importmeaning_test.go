@@ -94,7 +94,7 @@ func TestAnImportedKeyCannotReachAModelItsPermissionRowFenced(t *testing.T) {
 
 	// The same adapter the gateway builds its principals with. Reading
 	// k.Models directly would assert the column and not the fence.
-	p, err := cluster.AuthPrincipal(k, nil)
+	p, err := cluster.AuthPrincipal(k, store.Owners{}, nil)
 	if err != nil {
 		t.Fatalf("AuthPrincipal: %v", err)
 	}

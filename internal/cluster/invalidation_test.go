@@ -65,14 +65,14 @@ func newInvNode(t *testing.T, st *store.Store, id string, now func() time.Time, 
 type authStore struct{ st *store.Store }
 
 func (s *authStore) LoadByLookup(ctx context.Context, lookup string) (auth.Record, error) {
-	k, sec, err := s.st.ResolveKeyByLookup(ctx, lookup)
+	rec, err := s.st.ResolveKeyRecord(ctx, lookup)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return auth.Record{}, auth.ErrNotFound
 		}
 		return auth.Record{}, err
 	}
-	return AuthRecord(k, sec, nil)
+	return AuthRecord(rec.Key, rec.Secret, rec.Owners, nil)
 }
 
 func newInvKey(t *testing.T, st *store.Store, token string) *store.APIKey {
@@ -441,7 +441,7 @@ func TestAuthRecordAppliesTheTierAndNarrowsNothingUpward(t *testing.T) {
 		TokenHash:  "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
 		HashScheme: store.SchemeDorangV1,
 	}
-	rec, err := AuthRecord(k, sec, tiers)
+	rec, err := AuthRecord(k, sec, store.Owners{}, tiers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +458,7 @@ func TestAuthRecordAppliesTheTierAndNarrowsNothingUpward(t *testing.T) {
 	// A row naming a tier the configuration no longer has is an error, not a
 	// silent move to whichever tier the default happens to be.
 	k.Tier = "platinum"
-	if _, err := AuthRecord(k, sec, tiers); err == nil {
+	if _, err := AuthRecord(k, sec, store.Owners{}, tiers); err == nil {
 		t.Error("a key naming an unconfigured tier was resolved silently")
 	}
 }

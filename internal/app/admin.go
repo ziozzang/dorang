@@ -29,14 +29,13 @@ import (
 //
 // # What is wired, and what is not
 //
-// Not everything. The surface declares thirteen dependencies and this process
-// can honestly supply six of them; the rest have no storage behind them at all
-// — `internal/store` has no Go code for `users`, `teams`, `team_members`,
-// `deployments` or `model_aliases`, and no range-aggregating report query.
-// Those endpoints answer `501 dependency_not_configured` NAMING the missing
-// piece, which is the answer `internal/admin` was built to give and is the one
-// an operator can act on. Handing them a half-working adapter over a table
-// nobody writes would be worse than a 501: it would look like it worked.
+// Not everything, and the line is drawn on one question: does the row this
+// surface writes reach a decision the gateway makes? Where it does, the endpoint
+// is served. Where it cannot, the endpoint answers `501
+// dependency_not_configured` NAMING the missing piece, which is the answer
+// `internal/admin` was built to give and is the one an operator can act on.
+// Handing them a half-working adapter over a table nobody reads would be worse
+// than a 501: it would look like it worked.
 //
 // Wired:
 //
@@ -55,11 +54,24 @@ import (
 //     name instead of turned into a table scan.
 //   - Capacity and Catalog — read-only reporting off objects App already holds.
 //   - Health history — an in-process ring, which is what the package ships.
+//   - Directory — users, teams and membership, over the `users`, `teams` and
+//     `team_members` tables. See [adminDirectory]. It is wired together with the
+//     owner join in [store.Store.ResolveKeyRecord] and never before it: a
+//     `blocked` flag the authorizer cannot read is worse than no route, because
+//     it reads as a control and is a note.
+//   - Budgets — the ceiling on a key, a user or a team. See [adminBudgets].
 //
 // Not wired, and named rather than implied:
 //
-//   - Directory (users, teams, members), ModelRegistry (deployments, aliases),
-//     BudgetStore (ceilings): no store layer exists.
+//   - ModelRegistry (deployments, aliases). This one is NOT waiting on a store
+//     layer; it is waiting on a reader. The routing table is compiled from
+//     configuration by [buildRouter] — `models[]`, aliases and classes out of
+//     internal/config — and the `deployments` and `model_aliases` tables have no
+//     reader anywhere in the binary. An adapter over them would let an operator
+//     POST /model/new, get a 200, see the row in the database, and route no
+//     traffic differently, which is precisely the "stores a value nobody reads"
+//     failure the Directory work above exists to remove. It stays a 501 that
+//     names the gap until routing reads the table or the table is dropped.
 //   - The daily-activity endpoints. They ask for a second, per-day per-subject
 //     per-MODEL breakdown, and no materialization is keyed on two dimensions at
 //     once. /global/spend/report answers the single-dimension question and
@@ -187,6 +199,12 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		Ledger: &adminLedger{st: a.Store},
 		Spend:  &adminSpendReporter{st: a.Store, now: a.now},
 
+		// Users, teams and the ceilings on them. Both are wired only because
+		// the authorization envelope now carries what they write — see
+		// [adminDirectory] and [adminBudgets].
+		Directory: &adminDirectory{st: a.Store},
+		Budgets:   &adminBudgets{st: a.Store, now: a.now},
+
 		// The invalidation half of DESIGN §11.2c. Without it every credential
 		// mutation on this surface — block first among them — was a durable
 		// write the fleet honoured when its snapshot next refreshed, 60 s later
@@ -274,6 +292,19 @@ func (ad *adminAuthenticator) AuthenticateHeader(ctx context.Context, h http.Hea
 	// exactly the subject-level questions — blocked, expired, no owner —
 	// without asking about a model or a route, neither of which an
 	// administrative call has.
+	//
+	// This check reaches further than it used to, and the consequence is worth
+	// stating rather than discovering. Now that a principal carries its owning
+	// user and team, blocking a user disqualifies that user's administrative
+	// keys too — which is right, and is the point. Authorize also asks about
+	// BUDGET, and a team whose `teams.spend_nano` an operator has set above its
+	// `max_budget_nano` would therefore lose its team-scoped administrators,
+	// including their ability to raise the ceiling. Three things keep that from
+	// being a trap: the column is written by imports and by `/team/update`, not
+	// by the request path (the gate counts against `budget_state`); the failure
+	// is fail-closed rather than fail-open; and the master credential is
+	// out-of-band and authorizes unconditionally, so `DORANG_MASTER_KEY` is
+	// always the way out. OPERATIONS §3.2 says so.
 	if err := p.Authorize(auth.Access{Now: ad.now()}); err != nil {
 		return notAdmin, nil
 	}

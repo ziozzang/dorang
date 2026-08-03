@@ -37,6 +37,35 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ### Correctness
 
+- **A user block, a team block, and every user- and team-level limit reached no
+  decision on any node, at any latency.** DESIGN §11.2 authorizes against three
+  subjects — the key, its user, its team — and `auth.Principal` has carried
+  fields for all three since it was written. The one conversion that builds a
+  principal from a stored row populated the key's and left the other two nil,
+  because the credential read joined `api_keys` and `api_key_secrets` and nothing
+  else. Every guard downstream is nil-guarded, correctly, since an unowned key
+  genuinely has no owner — so nothing failed, no test caught it, and
+  `users.blocked`, `teams.blocked`, both `max_budget_nano` columns, both rate
+  ceilings and `teams.max_parallel` decided nothing. A 60-second propagation
+  window was the smaller half of the story; the larger half was that there was
+  nothing to propagate. The credential read now LEFT-joins the owning user and
+  team **in the same statement** — §2.4's one-round-trip rule is intact, and
+  there is a test that counts — and `cluster.AuthPrincipal` takes the owners as a
+  required argument, so a construction site cannot omit them silently. A user
+  block now reaches a second node in **19.6 ms** at `poll: 20ms` against the
+  published 270 ms, and has no window at all on the node that took the call.
+  Recorded as W12.
+- `/user/*`, `/team/*` and `/budget/*` stop answering `501` — `internal/store`
+  gained the `users`, `teams` and `team_members` code it never had, and
+  `internal/app` wires the `Directory` and `BudgetStore` seams `internal/admin`
+  had declared and nothing filled. A team ceiling is now a real budget hold
+  against its own durable counter, and `/budget/delete` clears a ceiling while
+  preserving the spend recorded under it, which is how an operator ends a budget
+  outage. `/model/*` stays `501` **on purpose**: `deployments` and
+  `model_aliases` have a schema and no *reader* — routing is compiled from the
+  configuration file — so an adapter over them would answer `200`, write the row
+  and route no traffic differently, which is the same "stores a value nobody
+  reads" failure the rest of this entry is about.
 - A Gemini deployment was routed *and* encoded against the OpenAI wire shape's
   capability set, while its encoder has no field for `cache_control`, `logprobs`,
   `service_tier`, a thinking block or a structured system prompt. Both §10.1

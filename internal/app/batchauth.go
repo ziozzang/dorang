@@ -75,7 +75,19 @@ func (l *storePrincipalLoader) principalByKeyID(ctx context.Context, keyID strin
 		}
 		return nil, err
 	}
-	p, err := cluster.AuthPrincipal(k, l.tiers)
+	// The owners are read separately here and in ONE statement on the
+	// interactive path, because the two paths start from different things: this
+	// one has an api key id and no index key, so there is no secret row to join
+	// through. The envelope it produces is identical, which is what matters — a
+	// batch row belonging to a blocked user's key must be refused for the same
+	// reason and by the same rule as an interactive request from it. This is off
+	// the request path and behind [ownerResolver]'s cache, so the extra reads
+	// are per distinct owner per window rather than per row.
+	own, err := l.st.LoadOwners(ctx, k.UserID, k.TeamID)
+	if err != nil {
+		return nil, err
+	}
+	p, err := cluster.AuthPrincipal(k, own, l.tiers)
 	if err != nil {
 		return nil, err
 	}

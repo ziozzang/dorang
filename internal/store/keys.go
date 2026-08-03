@@ -355,8 +355,8 @@ func (s *Store) GetAPIKeyByLookup(ctx context.Context, lookup string) (*APIKey, 
 	return scanAPIKey(row)
 }
 
-// resolveKeyQuery selects a key and the one secret an index key belongs to, in
-// ONE statement.
+// resolveKeyQuery selects a key, the one secret an index key belongs to, and the
+// key's owning user and team, in ONE statement.
 //
 // §2.4's rule that one lookup selects the row and only verification branches
 // survives rotation intact: a key with two live secrets is two rows in
@@ -364,9 +364,17 @@ func (s *Store) GetAPIKeyByLookup(ctx context.Context, lookup string) (*APIKey, 
 // probe followed by a primary-key probe inside a single query. Splitting it
 // into two round trips would double the cost of every authentication miss, and
 // there is a test that counts the statements.
+//
+// The owners ride the same statement for exactly that reason. DESIGN §11.2's
+// envelope is three subjects, and until they were joined here nothing could
+// populate the second and third: `users.blocked` and `teams.blocked` were
+// columns no code path observed, so a blocked user was not slow to take effect,
+// it took no effect at all. Reading them separately would have made a user's
+// limits cost two extra round trips per authentication miss, which is the price
+// that gets a join quietly dropped again.
 var resolveKeyQuery = `SELECT ` + prefixCols(apiKeyColumns, "k") + `, ` +
-	prefixCols(keySecretColumns, "s") + `
-	  FROM api_key_secrets s JOIN api_keys k ON k.id = s.key_id
+	prefixCols(keySecretColumns, "s") + `, ` + ownerCols + `
+	  FROM api_key_secrets s JOIN api_keys k ON k.id = s.key_id` + ownerJoin + `
 	 WHERE s.lookup = ?`
 
 // ResolveKeyByLookup returns the key AND the specific secret an index key
@@ -377,24 +385,49 @@ var resolveKeyQuery = `SELECT ` + prefixCols(apiKeyColumns, "k") + `, ` +
 // digest to verify against and its own expiry, which belongs to the secret. A
 // caller handed only the key would verify a grace-period credential against the
 // current secret's digest and refuse it.
+//
+// It DROPS the owners the same statement already fetched. That is right for its
+// callers — [Store.AuthenticateKey] and the CLI, which report on a credential —
+// and wrong for the gateway, which has to enforce the owners' limits; that one
+// calls [Store.ResolveKeyRecord]. Both are one query, and it is the same query.
 func (s *Store) ResolveKeyByLookup(ctx context.Context, lookup string) (*APIKey, *KeySecret, error) {
+	rec, err := s.ResolveKeyRecord(ctx, lookup)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rec.Key, rec.Secret, nil
+}
+
+// ResolveKeyRecord is [Store.ResolveKeyByLookup] with the owning user and team
+// the same statement already read.
+//
+// This is the credential path's entry point. The record it returns is everything
+// [github.com/ziozzang/dorang/internal/cluster.AuthRecord] needs to build the
+// three-subject envelope §11.2 defines, so there is no second read and no
+// opportunity for the gateway's copy of a user's limits to be older than its
+// copy of the key's.
+func (s *Store) ResolveKeyRecord(ctx context.Context, lookup string) (KeyRecord, error) {
 	var (
 		k  APIKey
 		kt apiKeyScan
 		v  KeySecret
 		vt keySecretScan
+		ut userScan
+		tt teamScan
 	)
 	dest := append(kt.dests(&k), vt.dests(&v)...)
+	dest = append(dest, ut.dests()...)
+	dest = append(dest, tt.dests()...)
 	err := s.queryRow(ctx, resolveKeyQuery, lookup).Scan(dest...)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, ErrNotFound
+		return KeyRecord{}, ErrNotFound
 	}
 	if err != nil {
-		return nil, nil, err
+		return KeyRecord{}, err
 	}
 	kt.finish(&k)
 	vt.finish(&v)
-	return &k, &v, nil
+	return KeyRecord{Key: &k, Secret: &v, Owners: Owners{User: ut.user(), Team: tt.team()}}, nil
 }
 
 // GetAPIKey fetches a key row by id.

@@ -78,6 +78,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *check {
+		// Valid is not the same as intended. --check is the last thing that runs
+		// before a deploy and the last chance to say that a rate is a millionth
+		// of what its card says; it stays an `ok` because pricing is never a
+		// reason to refuse to serve (§8.3).
+		for _, a := range cfg.Advisories() {
+			fmt.Fprintf(stderr, "dorang: warning: %s\n", a)
+		}
 		fmt.Fprintf(stdout, "%s: ok\n", describeSource(configPath, explicit))
 		return 0
 	}

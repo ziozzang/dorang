@@ -25,7 +25,7 @@ at three levels. They have very different costs.
 | **Wire** | Client SDKs work unmodified against dorang. Byte-level contracts, covered by golden tests | None — it either works or it is a bug ([COMPATIBILITY.md](COMPATIBILITY.md)) |
 | **Configuration** | `dorangctl import config` converts a declarative model-list file and reports what it could not represent | An afternoon, plus the warnings |
 | **Credentials** | `dorangctl import keys` migrates them from the incumbent's database (§3.5); existing keys keep working during a bounded window; expiry and revocation are honoured | A day, and it needs a decision about the window |
-| **Administrative** | Shape-compatible management paths so existing scripts keep working | **Partial** — the credential lifecycle, spend, capacity, catalog, health history and the UI are served; users, teams, models and budgets answer 501. The list is §1.2. *(This cell said "Not in this build")* |
+| **Administrative** | Shape-compatible management paths so existing scripts keep working | **Partial** — the credential lifecycle, users, teams, budgets, spend, capacity, catalog, health history and the UI are served; models answer 501. The list is §1.2. *(This cell said "Not in this build", then "users, teams, models and budgets answer 501")* |
 
 Before planning, size the surface. An audit of a live 505-path proxy deployment against its
 actually-attached clients found:
@@ -72,23 +72,36 @@ build you are cutting over to.
 
 Served: the whole credential lifecycle (`/key/generate`, `/info`, `/update`, `/delete`, `/list`,
 `/block`, `/unblock`, `/regenerate`, plus `/key/rotate`, `/rotate/cut`, `/secrets`, `/pend`,
-`/release`), `/spend/logs`, `/global/spend/report`, `/admin/capacity`,
+`/release`), **`/user/*`**, **`/team/*`** (including `member_add` / `member_delete`),
+**`/budget/*`**, `/spend/logs`, `/global/spend/report`, `/admin/capacity`,
 `/admin/catalog/explain`, `/admin/catalog/unverified`, `/health/history`, and the embedded
 read-only `/ui`.
 
 Answering **501 `dependency_not_configured`**, naming the missing piece rather than refusing
-generically: `/user/*`, `/team/*`, `/model/*`, `/model_group/info`, `/budget/*`, the three
-`/{user,team,tag}/daily/activity` endpoints, `/admin/credentials/health`, `/admin/quota`,
-`/spend/calculate`, `/admin/pricing/preview` and `/admin/config/reload`. `internal/store` has no
-Go code for `users`, `teams`, `team_members`, `deployments` or `model_aliases`, which is why.
+generically: `/model/*`, `/model_group/info`, a `/budget/*` call naming a `credential` or `global`
+subject, the three `/{user,team,tag}/daily/activity` endpoints, `/admin/credentials/health`,
+`/admin/quota`, `/spend/calculate`, `/admin/pricing/preview` and `/admin/config/reload`.
+
+`/model/*` is the one worth understanding before you plan around it. It is **not** waiting on a
+table — `deployments` and `model_aliases` have been in the schema since the first migration. It is
+waiting on a *reader*: the routing table is compiled from the configuration file, and nothing in
+the binary reads those two tables, so an adapter over them would answer `200`, write your row and
+route no traffic differently. Model and deployment administration is still `SIGHUP` plus the file.
 
 So, for a cutover:
 
 - Key issuance, listing and revocation work **over HTTP** — `cmd/dorang/revoke_test.go` runs the
   leaked-key incident end to end, blocking a working key with one call and watching the next
   request from it be refused. `dorangctl key …` remains available and is the same store.
-- User, team and budget administration still have no interface. `SIGHUP` replaces
-  `/admin/config/reload`.
+- **User, team and budget administration now have an interface, and it is enforced.** A blocked
+  user's keys stop serving on the node that took the call before it answers and fleet-wide within
+  the bound §10.1 publishes for a revocation (measured 19.6 ms at `poll: 20ms` against 270 ms).
+  A team ceiling is a real budget hold against its own durable counter; clearing one restores
+  service without erasing the spend recorded under it. Two behaviours to know before you script
+  against them: deleting a user does **not** delete its keys (they are announced as revoked and
+  then serve *unowned*), and `/budget/*` addresses a budget by **subject** — `budget_id:
+  "team:eng"` — because dorang has no reusable named-budget object; §9.2 puts the ceiling on the
+  subject row. That is the one place the request body differs from the incumbent's.
 - Any script or dashboard your incumbent drives through the 501 list **will not work after
   cutover.** Inventory them first — but inventory them against the list above, not against a
   blanket.
@@ -103,6 +116,27 @@ So, for a cutover:
 > Two documents were right and this one was never updated. A claim that survives in one file
 > after being corrected in two others is not a typo; it is the absence of a step that re-derives
 > every document from the code.
+
+> ⚠️ **The surface grew again, and if you sized a migration against the previous revision of this
+> section you have less work than you planned, not more.** `/user/*`, `/team/*` and `/budget/*`
+> answered 501 until 2026-08-03 and are served now; only `/model/*` is left of the four this
+> section used to list. If your cutover plan carried "write a replacement for user and team
+> administration" as a line item, that line is closed, and the inventory in the checklist below
+> should be re-run against §1.2 as it now reads rather than against the copy you took.
+>
+> One thing that changed underneath is worth knowing even if you never call these routes: a
+> **user or team `blocked` flag, budget ceiling, rate limit and model allow-list are now enforced
+> on the request path.** They were columns nothing read — the gateway's authorization envelope
+> carried only the key — so any of them you had already put in the database, by the `INSERT`s this
+> section used to send you to, applied to **nothing**, at any latency, on any node.
+>
+> `dorangctl import keys` does not create `users` or `teams` rows, so a plain import cannot have
+> planted them; hand-written rows and rows loaded by your own migration script can. If you have
+> any, read `users.blocked`, `teams.blocked` and `max_budget_nano` on both tables **before** you
+> cut over. Rows that were inert are now live, and the first place you would notice is a tenant
+> being refused. The importer's own warning — *"imported keys reference teams that are not
+> present; their team-scoped limits do not apply"* — described the intended behaviour correctly
+> and was, until this build, equally true of the teams that *were* present.
 
 ### 1.3 The administrative credential
 
@@ -126,7 +160,8 @@ warning — never silently dropped and never guessed at.
 The T0 and T1 inference surface is built — chat completions, completions, embeddings, messages,
 rerank, moderations, audio, images, Responses, models, batches and files, plus the Azure-style
 deployment-in-the-path aliases. What still answers **501** is `/v1/ocr`, `/v1/vector_stores`,
-`/v1/assistants`, and the entire administrative shape (§1.2).
+`/v1/assistants`, and the part of the administrative shape §1.2 lists as unserved — which is now
+`/model/*` and a short tail, not the whole of it.
 
 If your incumbent serves something on that list and a client uses it, that traffic cannot cut
 over yet. [OPERATIONS.md](OPERATIONS.md) §0 has the current list — check it against the build you

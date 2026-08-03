@@ -42,15 +42,20 @@ type authStore struct {
 // both must authenticate to the same principal; a lookup that resolved only the
 // current secret would refuse the caller who has not rolled yet as an unknown
 // key, which is the failure a grace period exists to prevent.
+//
+// The owning user and team come back on the same record, from the same
+// statement, because DESIGN §11.2's envelope is three subjects and a cached
+// entry whose three halves were read at three instants is an entry that can
+// refuse on a limit that has been lifted and serve on one that has been set.
 func (s *authStore) LoadByLookup(ctx context.Context, lookup string) (auth.Record, error) {
-	k, sec, err := s.st.ResolveKeyByLookup(ctx, lookup)
+	rec, err := s.st.ResolveKeyRecord(ctx, lookup)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return auth.Record{}, auth.ErrNotFound
 		}
 		return auth.Record{}, err
 	}
-	return cluster.AuthRecord(k, sec, s.tiers)
+	return cluster.AuthRecord(rec.Key, rec.Secret, rec.Owners, s.tiers)
 }
 
 // Rehash implements auth.Rehasher.

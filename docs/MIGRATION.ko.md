@@ -22,7 +22,7 @@
 | **와이어** | 클라이언트 SDK가 수정 없이 dorang에 동작한다. 골든 테스트로 덮인 바이트 수준 계약 | 없음 — 되거나 버그이거나 ([COMPATIBILITY.ko.md](COMPATIBILITY.ko.md)) |
 | **설정** | `dorangctl import config`가 선언적 model-list 파일을 변환하고 표현할 수 없던 것을 보고 | 반나절 + 경고 처리 |
 | **크리덴셜** | `dorangctl import keys`가 기존 시스템의 데이터베이스에서 옮겨 온다(§3.5). 기존 키가 제한된 창 동안 계속 동작하고, 만료와 폐기가 존중된다 | 하루, 그리고 창에 대한 결정 필요 |
-| **관리** | 기존 스크립트와 UI가 계속 동작하도록 형태 호환 관리 경로 | **부분** — 크리덴셜 수명주기·지출·용량·카탈로그·health 히스토리·UI는 서빙되고, 유저·팀·모델·예산은 501이다. 목록은 §1.2 (이 칸은 "이 빌드에 없다"였다) |
+| **관리** | 기존 스크립트와 UI가 계속 동작하도록 형태 호환 관리 경로 | **부분** — 크리덴셜 수명주기·유저·팀·예산·지출·용량·카탈로그·health 히스토리·UI는 서빙되고, 모델은 501이다. 목록은 §1.2 (이 칸은 "이 빌드에 없다"였고, 그다음엔 "유저·팀·모델·예산은 501"이었다) |
 
 계획 전에 표면 크기를 볼 것. 505개 경로를 가진 실제 프록시 배포를 실제로 붙어 있는 클라이언트와 대조 감사한
 결과:
@@ -64,21 +64,33 @@ importer는 평문 키를 필요로 하지도 받지도 않는다 — 호출자�
 
 서빙: 크리덴셜 수명주기 전체(`/key/generate`·`/info`·`/update`·`/delete`·`/list`·`/block`·
 `/unblock`·`/regenerate`, 그리고 `/key/rotate`·`/rotate/cut`·`/secrets`·`/pend`·`/release`),
+**`/user/*`**, **`/team/*`**(`member_add`·`member_delete` 포함), **`/budget/*`**,
 `/spend/logs`, `/global/spend/report`, `/admin/capacity`, `/admin/catalog/explain`,
 `/admin/catalog/unverified`, `/health/history`, 읽기 전용 `/ui`.
 
-**501 `dependency_not_configured`** — 통짜 거부가 아니라 없는 조각을 이름으로 말한다: `/user/*`,
-`/team/*`, `/model/*`, `/model_group/info`, `/budget/*`, `/{user,team,tag}/daily/activity` 셋,
-`/admin/credentials/health`, `/admin/quota`, `/spend/calculate`, `/admin/pricing/preview`,
-`/admin/config/reload`. `internal/store`에 `users`·`teams`·`team_members`·`deployments`·
-`model_aliases`에 대한 Go 코드가 없기 때문이다.
+**501 `dependency_not_configured`** — 통짜 거부가 아니라 없는 조각을 이름으로 말한다: `/model/*`,
+`/model_group/info`, `credential`·`global` 주체를 지정한 `/budget/*`,
+`/{user,team,tag}/daily/activity` 셋, `/admin/credentials/health`, `/admin/quota`,
+`/spend/calculate`, `/admin/pricing/preview`, `/admin/config/reload`.
+
+계획을 세우기 전에 이해할 값어치가 있는 것은 `/model/*`이다. 그것은 테이블을 기다리는 것이 **아니다** —
+`deployments`와 `model_aliases`는 첫 마이그레이션부터 스키마에 있었다. 기다리는 것은 *읽는 쪽*이다:
+라우팅 테이블은 설정 파일에서 컴파일되고 바이너리 안의 어떤 코드도 그 두 테이블을 읽지 않으므로, 그 위의
+어댑터는 `200`을 답하고 행을 쓰고 트래픽 라우팅은 하나도 바꾸지 않는다. 모델·배포 관리는 여전히
+`SIGHUP` + 파일이다.
 
 컷오버 관점에서:
 
 - 키 발급·목록·폐기는 **HTTP로 동작한다** — `cmd/dorang/revoke_test.go`가 유출 키 사고를 끝에서 끝까지
   돌린다: 호출 하나로 동작하던 키를 막고, 그 키의 다음 요청이 거부되는 것을 본다. `dorangctl key …`도
   그대로 쓸 수 있고 같은 스토어다.
-- 유저·팀·예산 관리는 여전히 인터페이스가 없다. `/admin/config/reload` 대신 `SIGHUP`.
+- **유저·팀·예산 관리는 이제 인터페이스가 있고, 강제된다.** 막힌 유저의 키는 호출을 받은 노드에서 응답
+  전에 서빙을 멈추고, 플릿 전체로는 §10.1이 폐기에 대해 공표하는 상한 안에 멈춘다(`poll: 20ms`에서
+  19.6 ms 측정, 270 ms 대비). 팀 상한은 자기 내구 카운터에 대한 실제 예산 홀드이고, 상한을 지우면 그 아래
+  기록된 지출을 지우지 않고 서비스가 복구된다. 스크립트를 쓰기 전에 알아야 할 동작 둘: 유저를 지워도 그
+  키는 지워지지 않고(revoked로 공표된 뒤 *소유자 없이* 서빙된다), `/budget/*`은 예산을 **주체**로 지정한다
+  — `budget_id: "team:eng"`. dorang에는 재사용 가능한 이름 붙은 예산 객체가 없고 §9.2가 상한을 주체 행에
+  두기 때문이다. 요청 본문이 기존 프록시와 다른 유일한 지점이다.
 - 기존 배포가 위 501 목록의 경로로 구동하는 스크립트나 대시보드는 **컷오버 후 동작하지 않는다.** 먼저
   목록을 만들되, 통짜가 아니라 위 목록에 대해 만들 것.
 
@@ -88,6 +100,24 @@ importer는 평문 키를 필요로 하지도 받지도 않는다 — 호출자�
 > 안에서 같은 문장을 이미 고쳐 두었고 `OPERATIONS.ko.md` §3.2는 마운트된 표면을 상세히 적고 있었다 —
 > 두 문서가 맞고 이 문서만 갱신되지 않았다. 두 곳에서 고쳐진 뒤에도 한 곳에 살아남은 주장은 오타가
 > 아니라, 모든 문서를 코드에서 다시 유도하는 단계가 없다는 뜻이다.
+
+> ⚠️ **표면이 또 자랐다. 이 절의 이전 판에 맞춰 마이그레이션 규모를 잡았다면 할 일은 계획보다 늘어난 게
+> 아니라 줄었다.** `/user/*`·`/team/*`·`/budget/*`는 2026-08-03까지 501이었고 지금은 서빙된다. 이 절이
+> 열거하던 넷 중 남은 것은 `/model/*` 하나다. 컷오버 계획에 "유저·팀 관리 대체재를 만든다"가 항목으로
+> 있었다면 그 항목은 닫혔고, 아래 체크리스트의 목록 작성은 당신이 떠 간 사본이 아니라 지금의 §1.2에 대해
+> 다시 돌려야 한다.
+>
+> 이 경로를 한 번도 호출하지 않더라도 알아 둘 값어치가 있는 변화가 하나 있다: **유저·팀의 `blocked`
+> 플래그, 예산 상한, rate 제한, 모델 허용목록이 이제 요청 경로에서 강제된다.** 그것들은 아무도 읽지 않는
+> 컬럼이었다 — 게이트웨이의 인가 봉투는 키만 담고 있었다 — 그래서 이 절이 예전에 안내하던 `INSERT`로 이미
+> 데이터베이스에 넣어 둔 값은 **아무것에도** 적용되지 않았다. 지연 없이, 모든 노드에서.
+>
+> `dorangctl import keys`는 `users`·`teams` 행을 만들지 않으므로 평범한 임포트만으로는 심어질 수 없다.
+> 손으로 쓴 행이나 자체 마이그레이션 스크립트가 넣은 행은 가능하다. 그런 것이 있다면 컷오버 **전에**
+> `users.blocked`, `teams.blocked`, 두 테이블의 `max_budget_nano`를 읽어 볼 것. 무해했던 행이 이제
+> 살아 있고, 처음 알아차리는 지점은 테넌트가 거부되는 순간이다. 임포터 자신의 경고 — *"임포트된 키가 존재
+> 하지 않는 팀을 참조한다. 그 팀 범위 제한은 적용되지 않는다"* — 는 의도한 동작을 정확히 기술한 것이었고,
+> 이 빌드 전까지는 *존재하는* 팀에 대해서도 똑같이 참이었다.
 
 ### 1.3 관리 크리덴셜
 
@@ -107,8 +137,8 @@ importer는 추측하지 않고 보고한다. 인식되지 않는 최상위 섹�
 
 T0와 T1 추론 표면은 구축돼 있다 — chat completions, completions, embeddings, messages, rerank,
 moderations, audio, images, Responses, models, batches, files, 그리고 경로에 배포명이 들어가는 Azure
-형태 alias까지. 여전히 **501**인 것은 `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`, 그리고 관리 표면
-전체(§1.2)다.
+형태 alias까지. 여전히 **501**인 것은 `/v1/ocr`, `/v1/vector_stores`, `/v1/assistants`, 그리고 §1.2가
+미서빙으로 적은 관리 표면 — 이제 전체가 아니라 `/model/*`과 짧은 꼬리다.
 
 기존 게이트웨이가 그 목록의 무언가를 서빙하고 클라이언트가 쓰고 있다면 그 트래픽은 아직 컷오버할 수 없다.
 현재 목록은 [OPERATIONS.ko.md](OPERATIONS.ko.md) §0에 있으며, 이 문단이 아니라 실제로 컷오버할 빌드에
