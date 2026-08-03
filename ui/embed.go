@@ -38,7 +38,14 @@ func Templates() fs.FS { return must(fs.Sub(files, "templates")) }
 
 // Pages names the page templates, without the ".html" suffix. Each one is
 // parsed together with layout.html and defines a "content" block.
-func Pages() []string { return []string{"keys", "models", "usage", "login", "message"} }
+//
+// "newkey", "confirm" and "secret" are the three pages the credential
+// lifecycle needs beyond the table: the form that mints, the interstitial that
+// names a key before something irreversible happens to it, and the one page in
+// dorang that ever displays a plaintext credential.
+func Pages() []string {
+	return []string{"keys", "models", "usage", "login", "message", "newkey", "confirm", "secret"}
+}
 
 func must(f fs.FS, err error) fs.FS {
 	if err != nil {

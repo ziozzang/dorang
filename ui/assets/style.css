@@ -258,7 +258,111 @@ footer.foot {
 .login input[type="password"] { width: 100%; }
 .login button { width: 100%; margin-top: 0.6rem; }
 
+/* ---------------------------------------------------------------------------
+ * The mutating controls.
+ *
+ * Two rules, and both are about a mis-click. A destructive control is red and
+ * is a LINK to a confirmation page; a restoring one is green and is the button
+ * that actually does it. Nothing that cannot be undone is ever the thing under
+ * the cursor when the row shifts.
+ * ------------------------------------------------------------------------ */
+
+a.button, button.primary, button.danger, button.link {
+  display: inline-block;
+  font: inherit;
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  text-decoration: none;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+
+a.button:hover, button.primary:hover, button.danger:hover { border-color: var(--accent); }
+
+button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+button.danger  { border-color: var(--bad); color: var(--bad); font-weight: 600; }
+
+form.controls .spacer { flex: 1 1 auto; }
+
+td.actions { white-space: nowrap; }
+td.actions > a, td.actions > form { margin-right: 0.5rem; }
+td.actions a { text-decoration: none; }
+td.actions a:hover { text-decoration: underline; }
+td.actions a.danger { color: var(--bad); }
+
+form.inline { display: inline; }
+
+/* A one-click control is a button and must not be mistaken for a form: it
+ * looks like the links beside it and behaves like the POST it is. */
+button.link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+}
+button.link:hover { text-decoration: underline; }
+button.link.ok { color: var(--ok); }
+
+.row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.8rem; }
+.muted { color: var(--muted); font-size: 0.85rem; }
+
+form.stack { display: block; }
+form.stack .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+label.field small { color: var(--muted); font-size: 0.75rem; font-weight: 400; }
+label.field input[type="text"], label.field.wide input { width: 100%; }
+label.field.wide { margin-top: 0.5rem; }
+
+dl.card {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 0.9rem;
+  margin: 0.8rem 0;
+  font-size: 0.9rem;
+}
+dl.card dt { color: var(--muted); }
+dl.card dd { margin: 0; overflow-wrap: anywhere; }
+dl.card dd.mono { font-family: var(--mono); }
+dl.card dd.wrap { white-space: normal; }
+
+.confirm { max-width: 46rem; }
+.confirm.danger { border-left: 3px solid var(--bad); }
+.consequence {
+  border-left: 3px solid var(--warn);
+  padding: 0.5rem 0.8rem;
+  margin: 1rem 0;
+  background: var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+}
+
+/* The one page in dorang that shows a plaintext credential. It is deliberately
+ * loud: the operator has one navigation to act, and a calm page is one they
+ * scroll past. */
+.secret { max-width: 52rem; border-left: 3px solid var(--warn); }
+.secret input#secret-value {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 1rem;
+  padding: 0.5rem 0.6rem;
+  border-color: var(--warn);
+}
+.secret .warn-block {
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  padding: 0.6rem 0.9rem;
+  margin: 1.2rem 0;
+}
+.secret .warn-block h2 { margin-top: 0.2rem; }
+.secret .warn-block p { color: var(--text); }
+
 @media (max-width: 640px) {
   header.top { gap: 0.5rem; }
   main { padding: 0.6rem; }
+  dl.card { grid-template-columns: 1fr; }
 }

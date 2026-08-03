@@ -55,6 +55,11 @@ const (
 	CodeNotFound         = "not_found"
 	CodeConflict         = "conflict"
 	CodeMethodNotAllowed = "method_not_allowed"
+	// CodeUnsupportedMedia is a request body in an encoding this surface does
+	// not read. It exists because the alternative to refusing one is IGNORING
+	// one, and a parameter that was sent, discarded and answered 200 is worse
+	// than any refusal. See [decodeOptionalBody].
+	CodeUnsupportedMedia = "unsupported_media_type"
 	CodeNotImplemented   = "not_implemented"
 	CodeDependencyOff    = "dependency_not_configured"
 	CodeInternal         = "internal_error"
@@ -62,6 +67,16 @@ const (
 	// audited. It is its own code because the operator's follow-up is different
 	// from any other 500: the change happened and the trail is incomplete.
 	CodeAuditWriteFailed = "audit_write_failed"
+	// CodeCrossSiteRefused is an unsafe request to the operator UI that could
+	// not be proved to have come from the UI itself — no session token, the
+	// wrong one, or an origin that is not this gateway.
+	//
+	// It is distinct from CodeForbidden on purpose. Forbidden means the
+	// credential is not entitled; this means the request may well have been
+	// entitled and was not shown to have been INTENDED, which is the whole of
+	// what a forgery defence decides. The operator's follow-up differs too:
+	// sign in again and repeat the action.
+	CodeCrossSiteRefused = "cross_site_refused"
 )
 
 // Error envelope types. The vocabulary matches the one dorang's inference

@@ -952,6 +952,48 @@ type fakeReloader struct{ res ReloadResult }
 
 func (f fakeReloader) Reload(context.Context) (ReloadResult, error) { return f.res, nil }
 
+// fakeSpend answers "what has this key spent" from the SAME ledger rows the
+// report endpoints aggregate.
+//
+// It sums them rather than returning a number a test typed, because the defect
+// this fake exists to catch is a surface that disagrees with the ledger. A
+// fixture that carried its own answer could not tell the two apart.
+//
+// A key with no rows is ABSENT from the map rather than present at zero, which
+// is what [SpendReporter] requires: absent means "the counter has nothing to
+// say", and the caller then keeps the stored column and knows it.
+type fakeSpend struct {
+	st  *fakeStore
+	err error
+	// calls counts batched lookups, so a test can assert a page of keys costs
+	// one call rather than one per row.
+	calls atomic.Int64
+}
+
+func (f *fakeSpend) KeySpend(_ context.Context, refs []KeySpendRef) (map[string]int64, error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return nil, f.err
+	}
+	want := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		want[r.ID] = true
+	}
+	f.st.mu.Lock()
+	defer f.st.mu.Unlock()
+	out := map[string]int64{}
+	for _, l := range f.st.logs {
+		if l.APIKeyID != "" && want[l.APIKeyID] {
+			out[l.APIKeyID] += l.CostNano
+		}
+	}
+	return out, nil
+}
+
+// withSpend wires the spend reporter over the harness's own ledger, so that
+// "what the page shows" and "what the ledger holds" are comparable in one test.
+func withSpend(c *Config) { c.Spend = &fakeSpend{st: c.Ledger.(*fakeStore)} }
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------

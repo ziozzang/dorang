@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -105,6 +106,16 @@ func viewKey(k *Key) keyView {
 // hydrateSpend replaces the stored spend column with what the keys have
 // actually spent, in place, before they are rendered.
 //
+// It hangs off [API] and takes a context rather than hanging off [call],
+// because a call is one JSON request and this enrichment is not about JSON. It
+// WAS a method on call, and the consequence was not theoretical: /key/info and
+// /key/list were hydrated, the operator UI's keys screen could not reach the
+// method at all, and `/ui/keys` rendered `api_keys.spend_nano` — which is zero
+// on every deployment — in a column headed "spend" while /key/list beside it
+// reported the ledger's figure for the same key. The value that reaches a
+// screen and the value that reaches a script are now produced by one function,
+// which is the only arrangement in which they cannot disagree.
+//
 // It is done here rather than inside [viewKey] because viewKey also builds the
 // before/after documents of the audit trail, and those must keep the value the
 // operator's mutation actually wrote. An audit diff whose `spend` moves on its
@@ -116,8 +127,8 @@ func viewKey(k *Key) keyView {
 // incident-response route down for an accounting figure. A key the reporter has
 // no row for keeps its stored value for the same reason — absent is not zero,
 // and the counter has nothing to say about a key that has never been budgeted.
-func (c *call) hydrateSpend(keys ...*Key) {
-	if c.a.cfg.Spend == nil || len(keys) == 0 {
+func (a *API) hydrateSpend(ctx context.Context, keys ...*Key) {
+	if a.cfg.Spend == nil || len(keys) == 0 {
 		return
 	}
 	refs := make([]KeySpendRef, 0, len(keys))
@@ -129,7 +140,7 @@ func (c *call) hydrateSpend(keys ...*Key) {
 	if len(refs) == 0 {
 		return
 	}
-	spend, err := c.a.cfg.Spend.KeySpend(c.ctx(), refs)
+	spend, err := a.cfg.Spend.KeySpend(ctx, refs)
 	if err != nil {
 		return
 	}
@@ -484,7 +495,7 @@ func (c *call) keyInfo() error {
 	if err != nil {
 		return err
 	}
-	c.hydrateSpend(k)
+	c.a.hydrateSpend(c.ctx(), k)
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"key": viewKey(k)})
 	return nil
 }
@@ -679,7 +690,7 @@ func (c *call) keyList() error {
 	// One batched lookup for the page, not one per row: a per-row query is how
 	// a list endpoint becomes a store outage at the page size an operator
 	// actually uses.
-	c.hydrateSpend(keys...)
+	c.a.hydrateSpend(c.ctx(), keys...)
 	out := make([]keyView, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, viewKey(k))
@@ -863,12 +874,40 @@ func mergeIDs(lists ...[]string) []string {
 
 // decodeOptionalBody decodes a body that may legitimately be absent — a GET, or
 // a POST whose parameters are all in the query string.
+//
+// A body that is PRESENT and is not JSON is refused, and that refusal is worth
+// the paragraph it takes.
+//
+// This function used to `return nil` for such a body: the request went on to the
+// handler as though nothing had been sent. The failure that shape produces is
+// silent and it is not hypothetical — the operator UI found it while being given
+// mutations, because a browser posts `application/x-www-form-urlencoded` and a
+// script posts JSON. `POST /key/rotate?key_id=…` with a form body of `grace=0`
+// answered **200** and rotated with the DEFAULT 24-hour grace, having discarded
+// the operator's request for an immediate cut. On the incident path of
+// OPERATIONS §3.1 that is a compromised secret left authenticating for a day, by
+// a caller who asked for it to stop now and was told 200.
+//
+// It is refused rather than parsed for two reasons. §2.3's surface is JSON and
+// growing a second request encoding would double every handler's input space.
+// And a caller who sent something is telling us it mattered: ignoring it is the
+// same class of defect as a limit that is stored and never read, which §17.1
+// calls this codebase's dominant one.
+//
+// The empty case is untouched, so a POST whose parameters are all in the query
+// string still works whatever Content-Type it declares — that is the
+// compatibility this leniency existed for, and it is kept.
 func decodeOptionalBody(w http.ResponseWriter, r *http.Request, v any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
 	}
 	if ct := r.Header.Get("Content-Type"); ct != "" && !strings.HasPrefix(ct, "application/json") {
-		return nil
+		f := newFault(http.StatusUnsupportedMediaType, CodeUnsupportedMedia, typeInvalidRequest,
+			"the administration surface takes a JSON body; %q was sent and would otherwise have "+
+				"been ignored, which is how a parameter comes to have no effect while the "+
+				"request answers 200", ct)
+		f.Param = "Content-Type"
+		return f
 	}
 	return decodeBody(w, r, v)
 }

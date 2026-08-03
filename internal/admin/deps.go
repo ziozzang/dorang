@@ -440,14 +440,31 @@ type Alias struct {
 	ModelGroup string
 }
 
-// ModelRegistry is the routing-configuration half of the store.
+// ModelCatalog is the read half of [ModelRegistry]: what model groups exist,
+// what deployments back them, and what aliases point at them.
+//
+// It is a separate interface because the two halves have different answers in
+// this codebase. Editing the `deployments` table is not yet a thing that
+// changes where a request goes — the routing table is compiled from
+// configuration — so a deployment WRITE has nowhere to land and says so. But
+// the gateway does know its own model set: it serves it on /v1/models and
+// routes on it. A process can therefore implement this and not the rest, and
+// the operator UI's models screen is served from whichever of the two is
+// present. See [Config.Routing].
+type ModelCatalog interface {
+	ListDeployments(ctx context.Context) ([]*Deployment, error)
+	ListAliases(ctx context.Context) ([]Alias, error)
+}
+
+// ModelRegistry is the routing-configuration half of the store: the read half
+// plus the mutations `/model/*` needs.
 type ModelRegistry interface {
+	ModelCatalog
+
 	CreateDeployment(ctx context.Context, d *Deployment) error
 	GetDeployment(ctx context.Context, id string) (*Deployment, error)
 	UpdateDeployment(ctx context.Context, d *Deployment) error
 	DeleteDeployment(ctx context.Context, id string) error
-	ListDeployments(ctx context.Context) ([]*Deployment, error)
-	ListAliases(ctx context.Context) ([]Alias, error)
 }
 
 // ---------------------------------------------------------------------------

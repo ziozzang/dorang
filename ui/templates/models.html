@@ -5,6 +5,19 @@
   deployments draw on. Model names are opaque strings and are never split on any character
   (DESIGN §2.1), so what is shown is what a client must ask for, byte for byte.
 </p>
+<p class="lede">
+  {{if .Compiled}}
+  These rows are the routing table this process <em>compiled</em>, from <code>models:</code> and
+  <code>aliases:</code> in its configuration — the same table <code>GET /v1/models</code> is
+  served from and the same deployment ids the ledger records. They are changed by editing the
+  configuration and reloading it (<code>SIGHUP</code>, or <code>POST /admin/config/reload</code>);
+  <code>/model/*</code> answers <span class="mono">501</span> here, because a row written to the
+  <code>deployments</code> table would route no traffic differently and a write that changes
+  nothing is worse than a refusal that says so.
+  {{else}}
+  These rows come from the deployment registry, which <code>/model/*</code> also edits.
+  {{end}}
+</p>
 
 <form class="controls" onsubmit="return false">
   <label class="field">filter

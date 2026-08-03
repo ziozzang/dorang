@@ -16,6 +16,18 @@ type Metrics struct {
 	unimplemented atomic.Uint64
 	serverErrors  atomic.Uint64
 
+	// uiMutations counts credential-lifecycle actions taken from the operator
+	// UI, and uiForgeries the unsafe requests to it that could not be proved to
+	// have come from it.
+	//
+	// The second is the one to alert on. A cookie-authenticated mutating
+	// surface is a forgery target, and the difference between "a session
+	// expired while a form was open" and "somebody is posting at this gateway
+	// from another origin" is a rate, which is a thing a counter can answer and
+	// prose cannot.
+	uiMutations atomic.Uint64
+	uiForgeries atomic.Uint64
+
 	mutations atomic.Uint64
 	// auditFailures counts mutations that were applied but could not be
 	// audited. It is separate from serverErrors because it is the one 500 that
@@ -45,8 +57,13 @@ type Metrics struct {
 
 // MetricsSnapshot is a consistent-enough read of [Metrics] for export.
 type MetricsSnapshot struct {
-	Requests      uint64
-	UIRequests    uint64
+	Requests   uint64
+	UIRequests uint64
+	// UIMutations counts lifecycle actions taken from the operator UI, and
+	// UIForgeries the unsafe requests to it that were refused for want of proof
+	// that the UI sent them.
+	UIMutations   uint64
+	UIForgeries   uint64
 	AuthFailures  uint64
 	Unimplemented uint64
 	ServerErrors  uint64
@@ -65,6 +82,8 @@ func (m *Metrics) snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
 		Requests:      m.requests.Load(),
 		UIRequests:    m.uiRequests.Load(),
+		UIMutations:   m.uiMutations.Load(),
+		UIForgeries:   m.uiForgeries.Load(),
 		AuthFailures:  m.authFailures.Load(),
 		Unimplemented: m.unimplemented.Load(),
 		ServerErrors:  m.serverErrors.Load(),

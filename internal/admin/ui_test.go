@@ -1,8 +1,13 @@
 package admin
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"html"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -86,6 +91,214 @@ func TestThreeScreensRender(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Reading the rendered page
+// ---------------------------------------------------------------------------
+//
+// The tests below parse the HTML and compare a CELL against the source of
+// truth. That is deliberate and it is the lesson of the defect they cover: the
+// keys screen answered 200, rendered every row, and printed 0 in the spend
+// column for every key while the ledger, /key/list and /global/spend/report all
+// agreed on another figure. A test that asserted the status, or that an
+// enrichment function had been called, would have passed throughout.
+
+// The keys table's columns, in the order keys.html renders them.
+const (
+	colKeyLabel = iota
+	colKeyAlias
+	colKeyID
+	colKeyUser
+	colKeyTeam
+	colKeyModels
+	colKeyTags
+	colKeySpend
+	colKeyBudget
+	colKeyState
+	colKeyExpires
+	colKeyCreated
+	numKeyCols
+)
+
+var (
+	reCell = regexp.MustCompile(`(?s)<td[^>]*>(.*?)</td>`)
+	reTag  = regexp.MustCompile(`(?s)<[^>]*>`)
+	reWS   = regexp.MustCompile(`\s+`)
+)
+
+// htmlCells returns the cells of the first table row whose rendered text
+// contains match, as plain text: tags stripped, entities decoded, whitespace
+// collapsed. It is deliberately a text extractor rather than a DOM: what is
+// being asserted is what an operator READS.
+func htmlCells(t *testing.T, body, match string) []string {
+	t.Helper()
+	for _, row := range strings.Split(body, "<tr") {
+		end := strings.Index(row, "</tr>")
+		if end < 0 {
+			continue
+		}
+		row = row[:end]
+		var cells []string
+		for _, m := range reCell.FindAllStringSubmatch(row, -1) {
+			cells = append(cells, htmlText(m[1]))
+		}
+		for _, c := range cells {
+			if c == match {
+				return cells
+			}
+		}
+	}
+	t.Fatalf("no rendered row has a cell reading %q", match)
+	return nil
+}
+
+func htmlText(s string) string {
+	return strings.TrimSpace(reWS.ReplaceAllString(html.UnescapeString(reTag.ReplaceAllString(s, " ")), " "))
+}
+
+// apiSpend reads one key's `spend` out of a /key/list response as the DIGITS it
+// published.
+//
+// json.Number rather than a float64: the whole point of Money is that an exact
+// decimal never passes through binary floating point (§8.3), so decoding to a
+// float and formatting it again would compare the screen against a third
+// answer rather than against the API's.
+func apiSpend(t *testing.T, rec *httptest.ResponseRecorder, keyID string) string {
+	t.Helper()
+	var body struct {
+		Keys []struct {
+			TokenID string      `json:"token_id"`
+			Spend   json.Number `json:"spend"`
+		} `json:"keys"`
+	}
+	dec := json.NewDecoder(strings.NewReader(rec.Body.String()))
+	dec.UseNumber()
+	if err := dec.Decode(&body); err != nil {
+		t.Fatalf("/key/list is not the expected shape: %v\n%s", err, rec.Body.String())
+	}
+	for _, k := range body.Keys {
+		if k.TokenID == keyID {
+			return k.Spend.String()
+		}
+	}
+	t.Fatalf("/key/list does not carry key %s:\n%s", keyID, rec.Body.String())
+	return ""
+}
+
+// A spend dashboard reading zero is the failure this project has now found
+// three times, and the third time it was on the screen whose whole subject is
+// spend. The column must carry the LEDGER's figure — the one /key/list reports
+// and /global/spend/report totals — and not `api_keys.spend_nano`, which no
+// request-path writer touches and which is therefore 0 on every deployment.
+func TestKeysScreenSpendColumnIsTheLedgersFigure(t *testing.T) {
+	h := newHarness(t, withSpend)
+	id, _ := h.newKey(map[string]any{"key_alias": "dogfood", "max_budget": 5})
+	other, _ := h.newKey(map[string]any{"key_alias": "probe"})
+
+	// Two priced requests against one key, one against the other. These rows
+	// are the ledger; every figure asserted below is computed from them.
+	h.store.addLog(LogRow{ID: "r1", TS: testNow.Add(-2 * time.Hour), APIKeyID: id,
+		ModelGroup: "chat", Status: 200, CostNano: 600_000_000})
+	h.store.addLog(LogRow{ID: "r2", TS: testNow.Add(-time.Hour), APIKeyID: id,
+		ModelGroup: "chat", Status: 200, CostNano: 687_300})
+	h.store.addLog(LogRow{ID: "r3", TS: testNow.Add(-time.Hour), APIKeyID: other,
+		ModelGroup: "chat", Status: 200, CostNano: 2_777_300})
+
+	// The stored column stays at zero, which is why a raw read is a zero rather
+	// than a stale number — and why nobody noticed.
+	if got := h.store.keys[id].SpendNano; got != 0 {
+		t.Fatalf("the fixture writes api_keys.spend_nano = %d; the defect needs it at 0", got)
+	}
+
+	want := formatNano(600_687_300)
+	rec := h.do(http.MethodGet, "/ui/keys", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	cells := htmlCells(t, body, id)
+	if len(cells) != numKeyCols {
+		t.Fatalf("the keys row renders %d cells, want %d: %q", len(cells), numKeyCols, cells)
+	}
+	if got := cells[colKeySpend]; got != want {
+		t.Errorf("the spend column shows %q; the ledger says %q", got, want)
+	}
+	// The budget beside it is the stored ceiling and must not have moved.
+	if got := cells[colKeyBudget]; got != "5" {
+		t.Errorf("the budget column shows %q, want %q", got, "5")
+	}
+	// The second key's own figure, so that one hydrated row cannot stand in
+	// for the page.
+	if got := htmlCells(t, body, other)[colKeySpend]; got != formatNano(2_777_300) {
+		t.Errorf("the second key's spend shows %q; the ledger says %q", got, formatNano(2_777_300))
+	}
+
+	// And the screen equals the API — read from both, compared as the digits
+	// each one publishes. The footer's claim is that this page, the API and the
+	// CLI are one answer rather than three; until a test reads two of them and
+	// compares, that sentence is a hope, and it was printed under a column that
+	// disagreed with /key/list about the same key from the same store.
+	//
+	// The comparison is on TEXT. Money renders through integer formatting on
+	// both paths (§8.3: prices never pass through binary floating point), so a
+	// float64 that survived a JSON round trip would be a third answer.
+	api := h.do(http.MethodGet, "/key/list", nil)
+	if api.Code != http.StatusOK {
+		t.Fatalf("/key/list status %d", api.Code)
+	}
+	for id, screen := range map[string]string{
+		id:    cells[colKeySpend],
+		other: htmlCells(t, body, other)[colKeySpend],
+	} {
+		if got := apiSpend(t, api, id); got != screen {
+			t.Errorf("key %s: /ui/keys shows %q and /key/list reports %q — the screen and "+
+				"the API are not one answer", id, screen, got)
+		}
+	}
+
+	// One batched lookup for the page, not one per row: a per-row query is how
+	// an operator screen becomes a store outage at the page size operators use.
+	if n := h.api.cfg.Spend.(*fakeSpend).calls.Load(); n != 2 {
+		t.Errorf("the screen and the API made %d spend lookups, want 2 (one each)", n)
+	}
+}
+
+// A reporter that cannot answer must not blank the screen: describing a
+// credential is the incident-response job, and an accounting figure is not
+// worth refusing it over.
+func TestKeysScreenSurvivesASpendReporterThatFails(t *testing.T) {
+	h := newHarness(t, withSpend)
+	h.api.cfg.Spend.(*fakeSpend).err = errors.New("counter unavailable")
+	id, _ := h.newKey(nil)
+	rec := h.do(http.MethodGet, "/ui/keys", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := htmlCells(t, rec.Body.String(), id)[colKeySpend]; got != "0" {
+		t.Errorf("spend column = %q, want the unhydrated stored value", got)
+	}
+}
+
+// §11.6's pend is a refusal. A screen that renders a pended key as "active"
+// describes a credential the gateway is turning away as one it is serving.
+func TestKeysScreenShowsAPendedKey(t *testing.T) {
+	h := newHarness(t)
+	id, _ := h.newKey(nil)
+	h.store.keys[id].PendedAt = testNow.Add(-time.Minute)
+	h.store.keys[id].PendReason = "token rate 8x baseline"
+
+	cells := htmlCells(t, h.do(http.MethodGet, "/ui/keys", nil).Body.String(), id)
+	if got := cells[colKeyState]; got != "pended" {
+		t.Errorf("state column = %q for a pended key, want %q", got, "pended")
+	}
+	// A block is an operator's decision and outranks a statistical one.
+	h.store.keys[id].Blocked = true
+	cells = htmlCells(t, h.do(http.MethodGet, "/ui/keys", nil).Body.String(), id)
+	if got := cells[colKeyState]; got != "blocked" {
+		t.Errorf("state column = %q for a blocked and pended key, want %q", got, "blocked")
+	}
+}
+
 // The keys screen must not render a secret. It cannot, because it renders the
 // same label-only type the API does — but the screen is where an operator would
 // notice a regression last, so it is checked.
@@ -162,12 +375,164 @@ func TestUsageScreenRefusesATooWideWindow(t *testing.T) {
 	}
 }
 
-func TestUIIsReadOnly(t *testing.T) {
+// The models screen is a VIEW, and it is served from what this process actually
+// routes on. A navigation item that answers 501 on every click in every
+// deployment — which is what an unset registry made of it — tells an operator
+// less than the table it was withholding.
+func TestModelsScreenIsServedFromTheRoutingTable(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		// No editable registry in this process: exactly the shipped wiring.
+		c.Routing = c.Models
+		c.Models = nil
+	})
+	if err := h.store.CreateDeployment(context.Background(), &Deployment{
+		ID: "chat|prov-a|a/model", ModelGroup: "chat", ProviderID: "prov-a",
+		UpstreamModel: "a/model", Weight: 3, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.store.aliases = []Alias{{Alias: "chat-latest", ModelGroup: "chat"}}
+
+	rec := h.do(http.MethodGet, "/ui/models", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"chat|prov-a|a/model", "a/model", "chat-latest", "compiled"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the models screen does not mention %q", want)
+		}
+	}
+	// The deployment id the screen shows is the one the ledger records, which
+	// is the whole reason an operator reads this column.
+	cells := htmlCells(t, body, "chat|prov-a|a/model")
+	if cells[0] != "chat" || cells[2] != "prov-a" || cells[3] != "a/model" {
+		t.Errorf("deployment row = %q", cells)
+	}
+
+	// And the WRITE routes still refuse, by name. Being able to see the routing
+	// table is not being able to edit it.
+	for _, p := range []string{"/model/new", "/model/update", "/model/delete"} {
+		rec := h.do(http.MethodPost, p, map[string]any{"model_name": "x", "id": "y"})
+		h.expectFault(rec, http.StatusNotImplemented, CodeDependencyOff)
+	}
+	h.expectFault(h.do(http.MethodGet, "/model/info", nil),
+		http.StatusNotImplemented, CodeDependencyOff)
+}
+
+// With neither source configured the screen says so, rather than rendering an
+// empty table that reads as "this gateway routes nothing".
+func TestModelsScreenWithNeitherSource(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.Models = nil })
+	rec := h.do(http.MethodGet, "/ui/models", nil)
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "not configured") {
+		t.Error("the screen does not say what is missing")
+	}
+}
+
+// A navigation item that cannot answer is not a disclosure that a dependency is
+// optional; it is a broken product. The nav therefore lists what this process
+// can serve THIS viewer, and the screens' own guards stay exactly as they were
+// — a link is not an authorization decision.
+func TestNavAdvertisesOnlyScreensThatAnswer(t *testing.T) {
+	t.Run("no model catalog", func(t *testing.T) {
+		h := newHarness(t, func(c *Config) { c.Models = nil })
+		body := h.do(http.MethodGet, "/ui/keys", nil).Body.String()
+		if strings.Contains(body, `href="/ui/models"`) {
+			t.Error("the nav advertises the models screen in a process that cannot serve it")
+		}
+		for _, want := range []string{`href="/ui/keys"`, `href="/ui/usage"`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the nav dropped %s, which this process serves", want)
+			}
+		}
+		// The guard is unchanged: typing the URL still gets the named refusal.
+		if got := h.do(http.MethodGet, "/ui/models", nil).Code; got != http.StatusNotImplemented {
+			t.Errorf("/ui/models = %d, want 501", got)
+		}
+	})
+
+	t.Run("team-scoped administrator", func(t *testing.T) {
+		h := newHarness(t)
+		body := h.do(http.MethodGet, "/ui/keys", nil, asToken(teamAToken)).Body.String()
+		if !strings.Contains(body, `href="/ui/keys"`) {
+			t.Error("a team administrator is not offered the keys screen, which answers for their team")
+		}
+		for _, screen := range []string{"models", "usage"} {
+			if strings.Contains(body, `href="/ui/`+screen+`"`) {
+				t.Errorf("a team administrator is offered %s, which is deployment-wide and "+
+					"can only answer them with a 403", screen)
+			}
+		}
+	})
+
+	t.Run("a refusal offers a screen that works", func(t *testing.T) {
+		h := newHarness(t)
+		body := h.do(http.MethodGet, "/ui/batches", nil).Body.String()
+		if !strings.Contains(body, `href="/ui/keys"`) {
+			t.Error("the refusal page offers no way out")
+		}
+		// Nowhere to go is said by saying nothing, rather than by sending an
+		// operator from a screen that failed to one that cannot answer either.
+		h2 := newHarness(t, func(c *Config) { c.Keys, c.Models, c.Ledger = nil, nil, nil })
+		body = h2.do(http.MethodGet, "/ui/batches", nil).Body.String()
+		if strings.Contains(body, "go to") {
+			t.Errorf("a process that serves no screen still offers one: %s", body)
+		}
+	})
+}
+
+// The footer used to assert, on every page including the ones with no figures
+// at all, that "every figure comes from the same engine the API and the CLI use,
+// so there is one answer rather than three" — while the keys screen showed a
+// spend column that disagreed with /key/list about the same key. A claim that
+// strong, citing the section that makes it, is what stops a reader from
+// cross-checking, so it now belongs to the screens that earn it.
+func TestProvenanceIsClaimedOnlyWhereThereAreFigures(t *testing.T) {
+	h := newHarness(t, withSpend)
+	h.newKey(nil)
+
+	if body := h.do(http.MethodGet, "/ui/keys", nil).Body.String(); !strings.Contains(
+		body, "spend is the §9.4 rollup /key/list reports") {
+		t.Error("the keys screen does not say where its spend column comes from")
+	}
+	if body := h.do(http.MethodGet, "/ui/usage", nil).Body.String(); !strings.Contains(
+		body, "/global/spend/report aggregates") {
+		t.Error("the usage screen does not say where its figures come from")
+	}
+
+	// A page that produced no figure claims nothing about figures.
+	body := h.do(http.MethodGet, "/ui/batches", nil).Body.String()
+	if !strings.Contains(body, "Read-only operator view") {
+		t.Fatal("the refusal page lost its footer entirely")
+	}
+	for _, claim := range []string{"one answer rather than three", "comes from", "§9.4"} {
+		if strings.Contains(body, claim) {
+			t.Errorf("a page with no figures claims %q", claim)
+		}
+	}
+}
+
+// The screens themselves are still read-only. The UI mutates now, and it does
+// so through exactly one URL — see [uiActionPath] and the tests in
+// uikeys_test.go — so a POST at a SCREEN is refused whoever sends it.
+//
+// This test used to assert that the whole UI refused every POST, which was the
+// old security model in one line. It is kept, narrowed to what is still true,
+// rather than deleted: an operator's browser posting to /ui/keys and getting a
+// mutation would be the same defect wearing a different path.
+func TestTheScreensThemselvesAreReadOnly(t *testing.T) {
 	h := newHarness(t)
 	for _, p := range []string{"/ui/keys", "/ui/models", "/ui/usage"} {
 		rec := h.do(http.MethodPost, p, map[string]any{})
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Errorf("POST %s = %d, want 405; the UI must not mutate", p, rec.Code)
+		// A header-authenticated caller cannot mutate the UI at all, so this is
+		// the forgery refusal rather than a method one. Either way: not 2xx and
+		// not a mutation.
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("POST %s = %d, want 403; a screen must not mutate", p, rec.Code)
 		}
 	}
 }
@@ -301,6 +666,161 @@ func TestLoginNextIsConfinedToTheUI(t *testing.T) {
 	}
 	if got := safeNext("/ui", "/ui/usage?start_date=2026-07-01"); got != "/ui/usage?start_date=2026-07-01" {
 		t.Errorf("safeNext discarded a legitimate destination: %q", got)
+	}
+}
+
+// signIn exchanges a credential for a session cookie, as a browser would.
+func signIn(t *testing.T, h *harness, token string) *http.Cookie {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader("key="+token))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.api.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d\n%s", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("no session cookie")
+	}
+	return cookies[0]
+}
+
+// seedKey puts a raw key row in the store, for the credentials the fake
+// authenticator already knows about.
+func seedKey(h *harness, k *Key) {
+	h.store.mu.Lock()
+	defer h.store.mu.Unlock()
+	h.store.keys[k.ID] = k
+	h.store.keyOrder = append(h.store.keyOrder, k.ID)
+}
+
+// An administrative session that outlives the credential that created it is the
+// same gap the invalidation work closed on the request path — and worse here,
+// because this is the surface the key was revoked FROM. The bound is the next
+// request, not the session TTL.
+func TestRevokingAKeyEndsItsUISession(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		revoke func(h *harness)
+	}{
+		{"blocked", func(h *harness) {
+			rec := h.do(http.MethodPost, "/key/block", map[string]any{"key_id": "key-admin"})
+			if rec.Code != http.StatusOK {
+				h.t.Fatalf("/key/block status %d: %s", rec.Code, rec.Body.String())
+			}
+		}},
+		{"deleted", func(h *harness) {
+			rec := h.do(http.MethodPost, "/key/delete", map[string]any{"keys": []string{"key-admin"}})
+			if rec.Code != http.StatusOK {
+				h.t.Fatalf("/key/delete status %d: %s", rec.Code, rec.Body.String())
+			}
+		}},
+		{"pended", func(h *harness) {
+			h.store.mu.Lock()
+			h.store.keys["key-admin"].PendedAt = testNow
+			h.store.mu.Unlock()
+		}},
+		{"expired", func(h *harness) {
+			h.store.mu.Lock()
+			h.store.keys["key-admin"].ExpiresAt = testNow.Add(-time.Minute)
+			h.store.mu.Unlock()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			seedKey(h, &Key{ID: "key-admin", KeyLabel: "dk-admin", CreatedAt: testNow})
+			c := signIn(t, h, adminToken)
+
+			get := func() int {
+				return h.do(http.MethodGet, "/ui/keys", nil, asToken(""),
+					func(r *http.Request) { r.AddCookie(c) }).Code
+			}
+			if got := get(); got != http.StatusOK {
+				t.Fatalf("the session did not authorize the screen: %d", got)
+			}
+			tc.revoke(h)
+			if got := get(); got != http.StatusSeeOther {
+				t.Fatalf("a revoked credential still authorized the screen: %d — "+
+					"the session TTL is not a revocation", got)
+			}
+			// And the session is gone from the table rather than merely refused,
+			// so a second tab does not have to discover this again.
+			if _, live := h.api.ui.lookupSession(c.Value); live {
+				t.Error("the session survived in the table")
+			}
+		})
+	}
+}
+
+// The scope a session carries was derived from the key's team. Moving the key
+// changes that derivation, and a session holding the old answer is ended rather
+// than left administering a team its credential has left.
+func TestMovingAKeysTeamEndsItsUISession(t *testing.T) {
+	h := newHarness(t)
+	seedKey(h, &Key{ID: "key-team-a", KeyLabel: "dk-team-a", TeamID: "team-a", CreatedAt: testNow})
+	c := signIn(t, h, teamAToken)
+
+	get := func() int {
+		return h.do(http.MethodGet, "/ui/keys", nil, asToken(""),
+			func(r *http.Request) { r.AddCookie(c) }).Code
+	}
+	if got := get(); got != http.StatusOK {
+		t.Fatalf("the team session did not authorize the keys screen: %d", got)
+	}
+	h.store.mu.Lock()
+	h.store.keys["key-team-a"].TeamID = "team-b"
+	h.store.mu.Unlock()
+	if got := get(); got != http.StatusSeeOther {
+		t.Errorf("a session scoped to team-a still authorized after its key moved to team-b: %d", got)
+	}
+}
+
+// The master credential has no row to check (§2.4), so it is not checked — and
+// must not be refused for having nothing to find.
+func TestMasterSessionIsNotRefusedForHavingNoKeyRow(t *testing.T) {
+	h := newHarness(t)
+	c := signIn(t, h, masterToken)
+	rec := h.do(http.MethodGet, "/ui/keys", nil, asToken(""), func(r *http.Request) { r.AddCookie(c) })
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the master credential's session was refused: %d", rec.Code)
+	}
+}
+
+// Behind a reverse proxy holding the certificate, dorang sees plaintext. The
+// cookie must still be marked Secure, or an administrative session ships in the
+// clear on the next plaintext request to the same host.
+func TestSessionCookieIsSecureBehindATerminatingProxy(t *testing.T) {
+	for _, tc := range []struct {
+		name, header, value string
+		want                bool
+	}{
+		{"plain http", "", "", false},
+		{"x-forwarded-proto", "X-Forwarded-Proto", "https", true},
+		{"x-forwarded-proto chain", "X-Forwarded-Proto", "https, http", true},
+		{"x-forwarded-proto http", "X-Forwarded-Proto", "http", false},
+		{"rfc 7239", "Forwarded", `for=192.0.2.1;proto=https`, true},
+		{"rfc 7239 quoted", "Forwarded", `proto="https";for=192.0.2.1`, true},
+		{"rfc 7239 http", "Forwarded", `for=192.0.2.1;proto=http`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			req := httptest.NewRequest(http.MethodPost, "/ui/login",
+				strings.NewReader("key="+masterToken))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if tc.header != "" {
+				req.Header.Set(tc.header, tc.value)
+			}
+			rec := httptest.NewRecorder()
+			h.api.ServeHTTP(rec, req)
+			cookies := rec.Result().Cookies()
+			if len(cookies) == 0 {
+				t.Fatalf("no cookie: %d", rec.Code)
+			}
+			if got := cookies[0].Secure; got != tc.want {
+				t.Errorf("Secure = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

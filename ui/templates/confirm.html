@@ -1,0 +1,43 @@
+{{define "content"}}
+<div class="panel confirm {{if .Danger}}danger{{end}}">
+  <h1>{{if .Danger}}⚠ {{end}}Confirm: {{.Verb}}</h1>
+
+  <p class="lede">
+    This page exists because the control you clicked sits one row away from another key's.
+    Check that the credential below is the one you meant.
+  </p>
+
+  <dl class="card">
+    <dt>label</dt><dd class="mono">{{.Key.Label}}</dd>
+    <dt>id</dt><dd class="mono">{{.Key.ID}}</dd>
+    <dt>alias</dt><dd>{{or .Key.Alias "—"}}</dd>
+    <dt>user</dt><dd class="mono">{{or .Key.User "—"}}</dd>
+    <dt>team</dt><dd class="mono">{{or .Key.Team "—"}}</dd>
+    <dt>state</dt><dd>{{.Key.State}}</dd>
+    <dt>spend</dt><dd class="mono">{{.Key.Spend}} of {{.Key.Budget}}</dd>
+    <dt>expires</dt><dd>{{.Key.Expiry}}</dd>
+    <dt>models</dt><dd class="wrap">{{if .Key.Models}}{{range .Key.Models}}<span class="tag">{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</dd>
+    <dt>tags</dt><dd class="wrap">{{range .Key.Tags}}<span class="tag">{{.}}</span>{{end}}</dd>
+  </dl>
+
+  <p class="consequence">{{.Consequence}}</p>
+
+  <form method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="{{.Action}}">
+    <input type="hidden" name="key_id" value="{{.Key.ID}}">
+    {{with .Field}}
+    <label class="field wide">{{.Label}}
+      <input type="text" name="{{.Name}}" placeholder="{{.Placeholder}}">
+      <small>{{.Help}}</small>
+    </label>
+    {{end}}
+    <div class="row">
+      <button type="submit" class="{{if $.Danger}}danger{{else}}primary{{end}}">
+        {{$.Verb}} {{$.Key.Label}}
+      </button>
+      <a class="button" href="{{$.Base}}/keys">cancel, change nothing</a>
+    </div>
+  </form>
+</div>
+{{end}}

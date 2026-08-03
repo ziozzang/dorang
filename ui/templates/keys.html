@@ -19,6 +19,10 @@
     </select>
   </label>
   <span class="field" id="filter-count">{{len .Keys}} rows</span>
+  {{if .CanCreate}}
+  <span class="field spacer"></span>
+  <a class="button primary" href="{{.Base}}/keys/new">new key</a>
+  {{end}}
 </form>
 
 <div class="panel scroll">
@@ -27,7 +31,7 @@
 <tr>
   <th>label</th><th>alias</th><th>id</th><th>user</th><th>team</th>
   <th>models</th><th>tags</th><th class="num">spend</th><th class="num">budget</th>
-  <th>state</th><th>expires</th><th>created</th>
+  <th>state</th><th>expires</th><th>created</th>{{if .CanMutate}}<th>actions</th>{{end}}
 </tr>
 </thead>
 <tbody>
@@ -42,21 +46,63 @@
   <td class="wrap">{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</td>
   <td class="num">{{money .SpendNano}}</td>
   <td class="num">{{if .MaxBudgetNano}}{{money (deref .MaxBudgetNano)}}{{else}}<span class="unavailable">none</span>{{end}}</td>
-  <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else if .Expired}}<span class="state-warn">expired</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
+  <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else if .Expired}}<span class="state-warn">expired</span>{{else if .Pended}}<span class="state-warn" title="{{.PendReason}}">pended</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
   <td>{{stamp .ExpiresAt}}</td>
   <td>{{stamp .CreatedAt}}</td>
+  {{if $.CanMutate}}
+  <td class="actions">
+    {{/* Anything that stops this credential working, or cannot be undone, is a
+         LINK to a confirmation page that names the key. The two that restore
+         service are one click, because §11.6 requires a pended key to be
+         released in one action and an interstitial is not one. */}}
+    {{if $.CanRotate}}<a href="{{$.Base}}/keys/confirm?action=rotate&amp;key_id={{.ID}}">rotate</a>
+    <a href="{{$.Base}}/keys/confirm?action=cut&amp;key_id={{.ID}}" title="End every superseded secret's grace period now">cut&nbsp;grace</a>{{end}}
+    {{if .Blocked}}
+      <form method="POST" action="{{$.Base}}{{$.ActionPath}}" class="inline">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="action" value="unblock">
+        <input type="hidden" name="key_id" value="{{.ID}}">
+        <button type="submit" class="link ok">unblock</button>
+      </form>
+    {{else}}
+      <a class="danger" href="{{$.Base}}/keys/confirm?action=block&amp;key_id={{.ID}}">block</a>
+    {{end}}
+    {{if $.CanPend}}
+      {{if .Pended}}
+        <form method="POST" action="{{$.Base}}{{$.ActionPath}}" class="inline">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="action" value="release">
+          <input type="hidden" name="key_id" value="{{.ID}}">
+          <button type="submit" class="link ok">release</button>
+        </form>
+      {{else}}
+        <a href="{{$.Base}}/keys/confirm?action=pend&amp;key_id={{.ID}}">pend</a>
+      {{end}}
+    {{end}}
+    <a class="danger" href="{{$.Base}}/keys/confirm?action=delete&amp;key_id={{.ID}}">delete</a>
+  </td>
+  {{end}}
 </tr>
 {{else}}
-<tr><td colspan="12" class="unavailable">No keys.</td></tr>
+<tr><td colspan="{{if .CanMutate}}13{{else}}12{{end}}" class="unavailable">No keys.</td></tr>
 {{end}}
 </tbody>
 </table>
 </div>
 
+{{if .CanMutate}}
 <p class="lede">
-  Creating, rotating and revoking keys is done over the API — <code>POST {{.APIBase}}/key/generate</code>
-  and friends. This screen is deliberately read-only: it authenticates with a cookie, and a
-  cookie-authenticated mutating surface is a cross-site request forgery surface. The generated
-  secret is returned exactly once, by that call, and is never recoverable afterwards.
+  Every control above calls the same administration route a script calls — <code>{{.APIBase}}/key/generate</code>,
+  <code>/key/rotate</code>, <code>/key/block</code> and the rest — with this session's operator as the actor,
+  so each one writes the audit row and publishes the invalidation (§11.2c) that the API does.
+  Editing a key's fields is still API-only: a form cannot tell &ldquo;leave this alone&rdquo; from
+  &ldquo;set this to nothing&rdquo;, and a budget cleared by an untouched box is worse than a curl command.
 </p>
+{{else}}
+<p class="lede">
+  This view is read-only: a mutation is proved by a session's own token and this page is authorized
+  by a header. Sign in for a session to create, rotate or revoke from here, or use the API —
+  <code>POST {{.APIBase}}/key/generate</code> and friends.
+</p>
+{{end}}
 {{end}}

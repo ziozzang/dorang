@@ -573,8 +573,14 @@ func (c *call) adminStatus() error {
 			"max_list_limit":  cfg.MaxListLimit,
 		},
 		"metrics": map[string]any{
-			"requests":       m.Requests,
-			"ui_requests":    m.UIRequests,
+			"requests":    m.Requests,
+			"ui_requests": m.UIRequests,
+			// The operator UI mutates now, so the two numbers that describe
+			// that are here: what it did, and what it refused for want of proof
+			// that the UI itself sent it. A rising second number is a gateway
+			// being posted at from somewhere else.
+			"ui_mutations":   m.UIMutations,
+			"ui_forgeries":   m.UIForgeries,
 			"auth_failures":  m.AuthFailures,
 			"unimplemented":  m.Unimplemented,
 			"server_errors":  m.ServerErrors,

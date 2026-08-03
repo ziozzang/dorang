@@ -31,10 +31,14 @@ const (
 	DefaultSessionCookie = "dorang_admin_ui"
 	// DefaultSessionTTL bounds a UI session.
 	//
-	// An hour, not a working day. A session holds an authorization decision
-	// rather than the credential, so revoking the underlying key is not
-	// observed until the session ends — which makes this value the revocation
-	// lag, and a revocation lag measured in working days is not a revocation.
+	// An hour, not a working day. It used to be the REVOCATION lag as well: a
+	// session held an authorization decision, nothing re-examined it, and
+	// blocking the key an operator had signed in with left their open tab
+	// administering the deployment for the rest of the hour — against the 270 ms
+	// bound §11.2c publishes for the same revocation everywhere else. It is not
+	// that any more (see [uiServer.sessionAuthorized], which re-asks the key
+	// store on every request); this is now a ceiling on an idle tab and on a
+	// stolen cookie, which is all a session lifetime should ever have been.
 	DefaultSessionTTL = time.Hour
 )
 
@@ -54,8 +58,24 @@ type Config struct {
 	Hasher    Hasher
 	Directory Directory
 	Models    ModelRegistry
-	Budgets   BudgetStore
-	Ledger    Ledger
+	// Routing is what this process actually routes on, read-only: the model
+	// groups, deployments and aliases the gateway compiled from its
+	// configuration. It is what the operator UI's models screen is served from
+	// when it is set, in preference to [Config.Models] — a stored deployment
+	// row no router reads describes what an operator WROTE, and this describes
+	// what the gateway DOES.
+	//
+	// It is separate from Models rather than a fallback inside it because the
+	// two are not the same fact and must not be able to become one by
+	// accident. `/model/new` and its siblings still answer through Models, and
+	// a deployment that a process can display is not thereby a deployment it
+	// can edit.
+	//
+	// Optional. With neither set the screen says a model registry is not
+	// configured, which is the honest answer and the one it gave before.
+	Routing ModelCatalog
+	Budgets BudgetStore
+	Ledger  Ledger
 	// Spend re-points the per-key `spend` field at the counter that has it.
 	// Optional; nil leaves the stored column, which is zero on every
 	// deployment. See [SpendReporter].
@@ -340,6 +360,11 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// headerCookie is the one header name this surface removes before
+// authenticating. It is written in net/textproto's canonical form because that
+// is how a server-parsed [http.Header] keys it.
+const headerCookie = "Cookie"
+
 // authenticate resolves the caller and enforces the entry condition §2.3 has:
 // the out-of-band master credential, or a key with an administrative role.
 //
@@ -347,8 +372,27 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // subjects they may then act on is [Scope], enforced per handler — the two are
 // separate questions and the review's finding was that only the first one was
 // being asked.
+//
+// # The cookie is removed before the authenticator sees it
+//
+// "The API never accepts the cookie" was, until the operator UI was given
+// mutations, one of two sentences that made this surface's forgery story
+// trivial. The other one is gone; this one is the whole of what is left, so it
+// is enforced here rather than assumed of an [Authenticator] this package does
+// not own. The header map handed over is a copy with `Cookie` deleted, so the
+// UI's session cookie is not merely unread on the API — it is not present, and
+// an authenticator that decided tomorrow to consult one would find nothing.
+//
+// It costs one header copy, and only on requests that carry a cookie at all: a
+// script sending a bearer token pays nothing, and a browser's own navigation to
+// an administrative path is a rate measured in operator clicks.
 func (a *API) authenticate(r *http.Request) (Principal, error) {
-	p, err := a.cfg.Auth.AuthenticateHeader(r.Context(), r.Header)
+	h := r.Header
+	if len(h[headerCookie]) > 0 {
+		h = h.Clone()
+		h.Del(headerCookie)
+	}
+	p, err := a.cfg.Auth.AuthenticateHeader(r.Context(), h)
 	if err != nil {
 		var f *fault
 		if errors.As(err, &f) {
@@ -412,6 +456,23 @@ func (a *API) models() (ModelRegistry, error) {
 		return nil, dependencyOff("model registry", "model and deployment administration")
 	}
 	return a.cfg.Models, nil
+}
+
+// modelCatalog is the READ half, for the screen that only reads.
+//
+// It prefers [Config.Routing] over [Config.Models] deliberately: where a
+// process has both, the compiled routing table is what serves traffic and the
+// stored one is what someone wrote down. compiled says which was used, because
+// "this is what you configured" and "this is what is running" are different
+// sentences and the page prints the right one.
+func (a *API) modelCatalog() (cat ModelCatalog, compiled bool) {
+	if a.cfg.Routing != nil {
+		return a.cfg.Routing, true
+	}
+	if a.cfg.Models != nil {
+		return a.cfg.Models, false
+	}
+	return nil, false
 }
 
 func (a *API) budgets() (BudgetStore, error) {

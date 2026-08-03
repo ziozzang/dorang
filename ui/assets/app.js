@@ -8,11 +8,19 @@
 //   2. a substring filter over an already-loaded table, because filtering rows
 //      the browser already has must not cost a query;
 //   3. an optional refresh timer, which reloads the current URL and therefore
-//      re-runs the same bounded, paginated query the server already validated.
+//      re-runs the same bounded, paginated query the server already validated;
+//   4. the copy button on the one-time secret page, because "select this and
+//      press ctrl-C" is the step at which an operator loses a credential that
+//      cannot be shown again.
 //
-// There is no framework, no bundler and no network fetch. The screens are
-// read-only (see internal/admin/ui.go for why: a cookie-authenticated mutating
-// surface is a CSRF surface, and this tool does not need one).
+// There is no framework, no bundler and no network fetch. Every mutation is a
+// plain HTML form POST carrying the session's token, so the screens work with
+// scripting disabled — the copy button degrades to selecting the field, which
+// is what it was standing in for.
+//
+// Nothing here is an authorization decision, and nothing here holds a secret
+// beyond the input the server rendered: the copy handler reads the field and
+// hands it to the clipboard, and does not stash it anywhere.
 
 (function () {
   "use strict";
@@ -131,6 +139,48 @@
     arm();
   }
 
+  // ---- the one-time secret ----------------------------------------------
+  //
+  // Two behaviours, both about the same 20 seconds: the field selects itself
+  // when focused, and the button copies it. If the clipboard API is
+  // unavailable — an insecure origin, or a browser that refuses — the field is
+  // selected instead and the caption says to press the copy key, because
+  // silently doing nothing is how an operator navigates away believing they
+  // have the key.
+
+  function wireSecret() {
+    var field = document.getElementById("secret-value");
+    if (!field) return;
+    field.addEventListener("focus", function () {
+      field.select();
+    });
+
+    var btn = document.getElementById("copy-secret");
+    var state = document.getElementById("copy-state");
+    if (!btn) return;
+
+    function say(msg) {
+      if (state) state.textContent = msg;
+    }
+
+    btn.addEventListener("click", function () {
+      field.focus();
+      field.select();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(field.value).then(
+          function () {
+            say("copied — now paste it into your secret manager and close this tab");
+          },
+          function () {
+            say("this browser would not let the page write to the clipboard; the field is selected, copy it yourself");
+          }
+        );
+        return;
+      }
+      say("the field is selected; copy it with your keyboard");
+    });
+  }
+
   // ---- boot -------------------------------------------------------------
 
   applyTheme(stored());
@@ -141,5 +191,6 @@
     if (b) b.addEventListener("click", cycleTheme);
     wireFilter();
     wireRefresh();
+    wireSecret();
   });
 })();

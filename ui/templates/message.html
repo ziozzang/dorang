@@ -3,6 +3,6 @@
   <h1>{{.Heading}}</h1>
   <p class="lede">{{.Body}}</p>
   {{if .Code}}<p class="lede">Code: <code>{{.Code}}</code></p>{{end}}
-  {{if .Nav}}<p><a href="{{.Base}}/keys">back to keys</a></p>{{end}}
+  {{if .Home}}<p><a href="{{.Home}}">go to {{.HomeLabel}}</a></p>{{end}}
 </div>
 {{end}}
