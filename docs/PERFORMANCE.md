@@ -150,3 +150,91 @@ These are recorded here rather than in `docs/SECURITY-REVIEW.md` because neither
 is a defect in what dorang does — one is an unexplained shape and the other is a
 missing view. Both should be closed before any claim in §2 is repeated without
 this document attached.
+
+---
+
+## 7. Rolling replacement under load, on two nodes
+
+Availability rather than speed, but the same rule applies: it is a measurement
+or it is a claim. Configured and verified 2026-08-03 on the live deployment.
+
+**Topology.** Two dorang processes, one PostgreSQL, one config file. Kong in
+front as the balancer, with active health checks on `/health` every 5s and an
+unhealthy threshold of 2. `cluster.capacity_mode: shared-pg` — dorang refuses to
+start on `local` with `cluster.enabled`, because node-local counting on N nodes
+counts every ceiling N times over.
+
+**The test.** Continuous `POST /v1/chat/completions` through Kong against a
+local model — a real 3.3-second upstream call, not a listing — at concurrency 4,
+while each node in turn is replaced with a newly built image.
+
+```
+TOTAL 208 requests, 0 failed (0.0000%)   p50=3.318s p99=3.724s max=3.725s
+seconds containing a failure: 0
+```
+
+Leadership moved each time the leader was replaced, within about a second, and
+no request observed it.
+
+**The ledger shows the replacement happening**, which is the point of §7c below:
+
+```
+node       n    first      last
+(null)   215   18:31:26   18:36:42     <- the old image
+dorang-1 120   18:35:42   18:38:02     <- replaced first
+dorang-2  59   18:36:47   18:38:02     <- replaced second
+```
+
+### 7a. `stop_grace_period` was 10s and the drain needed 45
+
+The first run passed with zero failures and proved nothing, because the drain
+never ran. `docker stop` took **10,422 ms and exited 137 — SIGKILL** — against a
+configuration asking for `pre_stop_delay: 15s` + `shutdown_grace: 30s`.
+
+Docker's default stop timeout is 10s and neither compose file set one, so every
+node was killed mid-drain. That made `shutdown_grace` **inert**: it exists so a
+20-second stream can finish, and the container was killed at 10 seconds
+regardless. The zero-failure result was luck — Kong had already stopped routing
+by then, and nothing long-running was in flight.
+
+Fixed with `stop_grace_period: 60s`. The rule is that it must exceed
+`pre_stop_delay + shutdown_grace`, and nothing in dorang can check it, because
+it lives in the orchestrator rather than in the config dorang reads.
+
+### 7b. `pre_stop_delay: 0s` is right for one node and wrong behind a balancer
+
+A balancer learns a node is unready by **polling**. Between readiness flipping
+false and the poll that notices, it is still routing there, and closing the
+listener inside that window is connection-refused at the client — the failure
+the whole drain sequence exists to prevent. The delay must exceed
+(health-check interval × unhealthy threshold): 5s × 2, so 15s.
+
+### 7c. `request_logs.node_id` existed and nothing ever wrote it
+
+The column was in the schema, `InsertRequestLogs` wrote it and `scanRequestLog`
+read it back — **52,766 rows of NULL**. On one node that is a column nobody
+misses. On two it is the first question asked when one of a pair misbehaves, and
+neither the ledger nor any response header could answer it.
+
+Fixed, and the `(null)` rows in the table above are the ones served before the
+fix rolled out — the transition is visible in the data.
+
+### 7d. A shared config file cannot name two nodes
+
+`cluster.node_id` is a literal. Written in a file both nodes read, it gives them
+the same id and the election refuses the second as a duplicate; left unset, each
+process mints a **random** id. Random is unique — all the election needs — and
+useless for "this node has been the slow one all week", because it changes at
+every restart.
+
+`cluster.node_id_env` was added, following the `key_env` / `url_env` /
+`master_key_env` convention already in the schema, and compose sets
+`DORANG_NODE_ID` per service. The variable wins over the literal: the file is
+what the fleet shares, the variable is what one node says about itself.
+
+### What this does not yet show
+
+The 3.3-second requests here are non-streaming. A drain that cuts a **stream**
+mid-flight is the case `shutdown_grace` was really written for, and it has not
+been driven under a rolling replacement. Until it is, §7a is fixed by argument
+rather than by observation.
