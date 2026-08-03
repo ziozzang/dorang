@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1110,6 +1111,13 @@ func reloadInterval(cfg *config.Config) time.Duration {
 }
 
 func nodeID(cfg *config.Config) string {
+	// The env var wins over the literal: the literal is what a shared config
+	// file can say, and the variable is what a single node can say about itself.
+	if name := cfg.Cluster.NodeIDEnv; name != "" {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
 	if cfg.Cluster.NodeID != "" {
 		return cfg.Cluster.NodeID
 	}

@@ -95,3 +95,54 @@ func ledgerRows(t *testing.T, a *App) []store.RequestLog {
 	}
 	return out
 }
+
+// A shared config file cannot name two nodes, so the id comes from the process.
+//
+// `cluster.node_id` is a literal in a file both nodes read: writing one there
+// gives them the same id, which the election refuses as a duplicate, and
+// leaving it unset mints a random id per process. Random is unique — which is
+// all the election needs — and useless for the other thing a node id is for,
+// because "this node has been the slow one all week" cannot be said about an
+// identifier that changes at every restart.
+//
+// The assertion is again the ledger row rather than the resolver's return
+// value: what matters is that the name an operator gave one container is what
+// the durable record says about the requests it served.
+func TestTheNodeIDComesFromTheEnvironmentWhenTheFileIsShared(t *testing.T) {
+	const sharedYAML = wiringYAML + `
+cluster:
+  enabled: true
+  capacity_mode: shared-pg
+  min_leasable: 4
+  node_id: written-in-the-shared-file
+  node_id_env: DORANG_TEST_NODE_ID
+`
+	t.Setenv("DORANG_TEST_NODE_ID", "dorang-2")
+	a := newWiringApp(t, sharedYAML, func(c *config.Config) {
+		c.Cluster.CapacityMode = config.CapacityModeSharedPG
+	})
+	secret := issueKey(t, a, nil)
+
+	if w := callWith(a, secret, http.MethodGet, "/v1/models", ""); w.Code != http.StatusOK {
+		t.Fatalf("/v1/models = %d: %s", w.Code, w.Body.String())
+	}
+	if err := a.Meter.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	rows := ledgerRows(t, a)
+	if len(rows) == 0 {
+		t.Fatal("the request wrote no ledger row at all")
+	}
+	for _, r := range rows {
+		switch r.NodeID {
+		case "dorang-2":
+			// what the container was told it is called
+		case "written-in-the-shared-file":
+			t.Errorf("ledger row %s carries the literal from the shared config file; "+
+				"both nodes reading that file would claim the same id", r.ID)
+		default:
+			t.Errorf("ledger row %s carries node_id %q, want %q", r.ID, r.NodeID, "dorang-2")
+		}
+	}
+}

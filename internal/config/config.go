@@ -164,8 +164,26 @@ type PostgresStorage struct {
 // Cluster configures multi-node operation (§13) and, through capacity_mode,
 // how accurate capacity accounting is across nodes (§5.6).
 type Cluster struct {
-	Enabled      bool   `yaml:"enabled"`
-	NodeID       string `yaml:"node_id,omitempty"`
+	Enabled bool   `yaml:"enabled"`
+	NodeID  string `yaml:"node_id,omitempty"`
+	// NodeIDEnv names an environment variable holding this node's id, and wins
+	// over NodeID when both are set.
+	//
+	// It exists because a cluster is TWO PROCESSES OFF ONE CONFIG FILE, and
+	// node_id is a literal: writing one in the shared file gives both nodes the
+	// same id, which is refused (cluster.ErrDuplicateNodeID), and leaving it
+	// unset mints a RANDOM id per process. Random is unique, which is what the
+	// election needs, and is useless for the other thing a node id is for —
+	// "this node has been the slow one all week" cannot be said about an
+	// identifier that changes at every restart. nodeIDMaxLen's own comment names
+	// a hostname, a pod name and a container id as the values this field is set
+	// from, and none of them can reach it through a literal in a shared file.
+	//
+	// `_env` rather than expansion in the value, because that is how every other
+	// per-deployment secret and identity in this schema is named (key_env,
+	// url_env, master_key_env), and one indirection convention is worth more
+	// than a second syntax.
+	NodeIDEnv    string `yaml:"node_id_env,omitempty"`
 	RedisURLEnv  string `yaml:"redis_url_env,omitempty"`
 	CapacityMode string `yaml:"capacity_mode,omitempty"`
 	// MinLeasable is the smallest limit the "leased" mode will divide across
