@@ -103,6 +103,19 @@ var volatilePrefixes = []string{
 	// Legitimately cumulative, and it grows by one per scrape whenever a cap
 	// is engaged — which is the behaviour, not an instability.
 	"dorang_metrics_cardinality_folds_total",
+	// The runtime's own histograms. A GC that happens BETWEEN the two
+	// collections adds a pause, and a goroutine that waits for a P adds a
+	// scheduling sample — so these move for the same reason
+	// `dorang_gc_cycles_total` above does, and the test scraping them is enough
+	// to make it happen. This test is about ORDER: "a page whose lines move is
+	// a diff nobody can read". A bucket count that advanced is not a line that
+	// moved.
+	"dorang_gc_pause_seconds",
+	"dorang_sched_latency_seconds",
+	// Threads and descriptors are properties of the process at the instant of
+	// the read, and the read itself opens a descriptor.
+	"dorang_os_threads",
+	"dorang_open_file_descriptors",
 }
 
 func stripVolatile(s string) string {
