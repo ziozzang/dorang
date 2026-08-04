@@ -870,19 +870,27 @@ The rule is: **a header the client acts on is unconditional; a header the client
 gated.** Gating `Retry-After` behind a telemetry flag means every SDK's backoff silently stops
 working, which an earlier draft did by taking the "bounded header set" rule literally.
 
-> ⚠️ **The line above listed "the `X-Ratelimit-*` set when known" until 2026-08-03. That set has
-> never been emitted.** `internal/server` renders the four names from `Result.RateLimit` and
-> nothing assigns that value, so no response dorang has sent carries one. Do not point a
-> rate-limit dashboard at them; per-key rate state is on `/metrics` (`dorang_quota_*`) and in
-> `/key/info`. Same for `X-Dorang-Quota-<Window>-Used-Pct` in the detail list below — see §11.3
-> step 3. [DESIGN.md](DESIGN.md) §10.4 and §17.1 hold the disposition.
+> ⚠️ **The `X-Ratelimit-*` set was listed here, then found never to have been emitted, and now
+> is.** For the record of what to trust: `internal/server` rendered the four names from
+> `Result.RateLimit` and nothing assigned that value, so no response before 2026-08-04 carried
+> one. They are filled now, from the chosen credential's own quota view at the moment the router
+> picks it — which means a `502` or a refused hop carries them too, since a caller learns how
+> much allowance is left most usefully when something is failing.
+>
+> They appear only where a rate limit is CONFIGURED: `models[].deployments[].limits[]` with
+> `rpm` or `tpm`. An unmetered credential gets no header rather than a limit of zero, because a
+> client reading `remaining: 0` stops.
+>
+> `X-Dorang-Quota-<Window>-Used-Pct` is filled by the same producer but stays behind
+> `X-Dorang-Detail: full`: the rate-limit set is standard HTTP a client acts on, the percentage
+> is dorang telemetry a human reads.
 
 Send `X-Dorang-Detail: full` (or set `observability.always_full_headers`) to add:
 
 `X-Dorang-Provider`, `-Credential`, `-Attempt`, `-Fallback-From`, `-Route-Reason`, `-Queue-Ms`,
 `-Ttft-Ms`, `-Latency-Ms`, `-Tokens-Input`, `-Tokens-Output`, `-Tokens-Cache-Read`,
 `-Tokens-Cache-Write`, `-Tokens-Reasoning`, `-Notional-Usd`, `-Spend-Usd`, `-Budget-Usd`,
-`-Budget-Remaining-Usd`, `-Quota-<Window>-Used-Pct` (⚠️ never emitted — see the box above),
+`-Budget-Remaining-Usd`, `-Quota-<Window>-Used-Pct` (one per configured window),
 `-Dropped-Params`, `-Native-Stop-Reason`, `-Replayable`.
 
 A counter header is **omitted at zero**, because an absent counter and a counter of zero are

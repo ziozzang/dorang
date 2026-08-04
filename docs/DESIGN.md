@@ -2283,10 +2283,10 @@ changes nothing beside a neighbour that works.
 | `x-dorang-cost-usd` | this request |
 | `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative. The ceiling comes from the authorization snapshot and is always known; the SPEND comes from the budget hold, which is hydrated by the reservation, so a request that reserves nothing (a zero-rated one) omits `-spend-usd` and `-budget-remaining-usd` rather than reporting a `0` nobody looked up. Same rule as the streamed cost header: absent claims nothing, zero claims a measurement |
-| `x-dorang-quota-*-used-pct` | credential quota windows. ⚠️ **Rendered and never emitted** — `Result.QuotaUsedPct` has no producer either; same box below |
+| `x-dorang-quota-*-used-pct` | credential quota windows, one per configured window. Filled at selection time from the chosen credential's own quota view |
 | `x-dorang-dropped-params` | what conversion removed: the knobs the target has no field for, the constructs §4.4 and §10.5 decline to send it (§10.1), and an ignored client priority hint (§10.5) |
 | `x-dorang-downgraded` | the structural constructs this request actually lost, by construct id, for a caller who consented with `x-dorang-allow-lossy` (§10.1). Absent unless a loss occurred |
-| `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form. ⚠️ **Specified, coded, and emitted by nothing — see the box below** |
+| `x-ratelimit-limit/remaining/reset-{requests,tokens}` | standard form, from the same view. Absent where no rate limit is configured — a limit of zero says the opposite of "no limit" |
 | `retry-after` | on `429`, `503` and `529`, whenever a delay is known (COMPATIBILITY §11.4) |
 
 **Header set is bounded — but standard HTTP headers are not telemetry and are never gated.**
@@ -2296,18 +2296,27 @@ listed them among the extension headers, which taken literally means a `429` car
 working. The rule is: a header the client **acts on** is unconditional; a header the client
 **reads** may be gated.
 
-> ⚠️ **"Always attached" was the wrong verb for the `x-ratelimit-*` set, and it is corrected
-> here rather than left as an aspiration in the present tense.** `internal/server`'s
-> `stampHeaders` publishes the four names from `Result.RateLimit`, and **nothing in this
-> repository sets `Result.RateLimit` outside `internal/server`'s own tests** — so no response
-> dorang has ever sent carries one of them. The gate that would emit them is reached on every
-> response and its condition has never been true, which is §17.1's "a control that is reached
-> and can never fire" in its documentary form: three documents assert the behaviour, one test
-> asserts the *renderer*, and nothing asserts that a real request produces the header.
-> COMPATIBILITY §7.8 additionally declines to mirror `x-litellm-key-rpm-limit` **on the grounds
+> ⚠️ **"Always attached" was an aspiration in the present tense for a year, and is now a
+> description. The history is kept because the shape of the error is the point.**
+> `internal/server`'s `stampHeaders` published the four names from `Result.RateLimit` and
+> nothing in this repository set `Result.RateLimit` outside that package's own tests, so no
+> response dorang sent before 2026-08-04 carried one. The gate that would emit them was reached
+> on every response and its condition was never true — §17.1's "a control that is reached and
+> can never fire" in its documentary form: three documents asserted the behaviour, one test
+> asserted the *renderer*, and nothing asserted that a real request produced the header.
+> COMPATIBILITY §7.8 additionally declined to mirror `x-litellm-key-rpm-limit` **on the grounds
 > that dorang publishes the same facts in the standard form** — a justification resting on a
-> header that does not exist. `Result.RetryAfterSeconds` is the same shape and matters less,
-> because the `Retry-After` a client actually receives is stamped from `Error` by `WriteError`
+> header that did not exist.
+>
+> The producer is `internal/app`'s `fillQuotaResult`, reading `router.Decision.Quota`, which the
+> router fills for the credential it selected. Three choices in it are load-bearing: it runs at
+> SELECTION rather than on acceptance, so a `502` still carries the allowance; the TIGHTEST rule
+> wins a header a client will pace itself against; and a credential with no rule gets NO header
+> rather than a limit of zero. `TestAConfiguredRateLimitReachesTheClient` reads them off a
+> response, because a test that asserts the renderer is what let this survive.
+>
+> `Result.RetryAfterSeconds` was the same shape and mattered less, because the `Retry-After` a
+> client actually receives is stamped from `Error` by `WriteError`
 > on the live path.
 >
 > **`Result.QuotaUsedPct` is the third, and it has a reader who acts on it.** OPERATIONS §11.3
@@ -4824,11 +4833,12 @@ generalize.**
    section's defect in the documentary form, exactly. The rule that follows is narrow and
    mechanical: **a normative sentence in COMPATIBILITY is only a contract once a named test
    fails when it stops holding.**
-3. **`internal/server.stampHeaders` renders three header families off `Result`, and all three of
-   the fields they read have no producer anywhere outside that package's own tests** —
+3. **`internal/server.stampHeaders` rendered three header families off `Result`, and all three
+   of the fields they read had no producer anywhere outside that package's own tests** —
    `Result.RateLimit`, `Result.RetryAfterSeconds`, `Result.QuotaUsedPct`. So the
-   `x-ratelimit-*` set, and `x-dorang-quota-*-used-pct`, have never been emitted by any
-   response dorang has sent. This is §8.1's clamp variant — a control reached on every response
+   `x-ratelimit-*` set, and `x-dorang-quota-*-used-pct`, had never been emitted by any
+   response dorang sent. **Closed 2026-08-04**; the producer and the three choices inside it
+   are in §10.4's box. This is §8.1's clamp variant — a control reached on every response
    whose condition can never be true — with the aggravation that **three documents describe the
    behaviour and one instructs an operator to act on it**: §10.4 listed both as attached,
    COMPATIBILITY §7.8 declined to mirror `x-litellm-key-rpm-limit` *on the grounds that dorang

@@ -1331,6 +1331,18 @@ func (q *quotaSet) Check(credential string, now time.Time) quota.Decision {
 	return q.meters.Check(credential, now)
 }
 
+// Fill implements [router.QuotaSource].
+func (q *quotaSet) Fill(credential string, now time.Time, dst *quota.View) {
+	if dst == nil {
+		return
+	}
+	if q == nil {
+		dst.N, dst.Truncated = 0, false
+		return
+	}
+	q.meters.Fill(credential, now, dst)
+}
+
 // record feeds one finished request into the credential's meter.
 func (q *quotaSet) record(credential string, now time.Time, u quota.Usage) {
 	if q == nil {

@@ -378,3 +378,70 @@ func (m *Meter) Reset(now time.Time) {
 	}
 	m.state, m.until, m.tripped = StateOK, time.Time{}, Rule{}
 }
+
+// MaxViewRules bounds [View]. Four windows times five metrics is the whole
+// expressible space and no real configuration uses it; a credential with more
+// rules than this reports its first MaxViewRules and sets [View.Truncated],
+// because a silently short answer is worse than a flagged one.
+const MaxViewRules = 12
+
+// RuleUsage is one rule's state at an instant.
+type RuleUsage struct {
+	Window  Window
+	Metric  Metric
+	Used    int64
+	Limit   int64
+	ResetAt time.Time
+	// FromProvider reports that the provider's own figure took part in Used,
+	// so this number includes usage that never went through this gateway.
+	FromProvider bool
+}
+
+// View is a credential's whole quota state, reported without allocating.
+//
+// [Decision] answers "may this serve" and therefore carries only the rule that
+// TRIPPED — on the allow path it carries nothing at all, which is why the
+// figures the enforcement point already computed were being discarded on every
+// successful request. This is the same numbers, reported rather than thrown
+// away, and it is what `x-ratelimit-*` and `x-dorang-quota-<window>-used-pct`
+// are rendered from: the headers report what enforces, not a second count kept
+// beside it that could drift.
+//
+// It is a value with a fixed array so a caller can keep one on a pooled request
+// and fill it per request without touching the heap.
+type View struct {
+	Rules     [MaxViewRules]RuleUsage
+	N         int
+	Truncated bool
+}
+
+// Fill writes m's state at now into dst, replacing whatever it held.
+//
+// A meter with no rules leaves dst empty, which is the honest report for an
+// unmetered credential: it has no limit, and a limit of zero would say the
+// opposite.
+func (m *Meter) Fill(now time.Time, dst *View) {
+	if dst == nil {
+		return
+	}
+	dst.N, dst.Truncated = 0, false
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, r := range m.rules {
+		if dst.N >= MaxViewRules {
+			dst.Truncated = true
+			return
+		}
+		used, _, fromProvider := m.effectiveUsed(r, i, now)
+		dst.Rules[dst.N] = RuleUsage{
+			Window:       r.Window,
+			Metric:       r.Metric,
+			Used:         used,
+			Limit:        r.Limit,
+			ResetAt:      r.Window.PeriodEnd(now),
+			FromProvider: fromProvider,
+		}
+		dst.N++
+	}
+}

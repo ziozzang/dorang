@@ -178,6 +178,20 @@ type Decision struct {
 	// the other half — which materializes a string — off the ordinary path.
 	ModelKnown bool
 
+	// Quota is the chosen credential's whole quota state at selection time.
+	//
+	// The router already asks [QuotaSource.Check] about every candidate and
+	// throws the figures away whenever the answer is "allow" — which is every
+	// successful request. This is the same enforcement point, reported once for
+	// the credential that won, so the `x-ratelimit-*` and
+	// `x-dorang-quota-<window>-used-pct` headers render from what enforces
+	// rather than from a second count that could drift away from it.
+	//
+	// N is zero for an unmetered credential. That is not a limit of zero, and
+	// the headers are omitted rather than published as 0 — DESIGN §17.1's rule
+	// about an absent figure and a zero one being different facts.
+	Quota quota.View
+
 	// Reservation holds the capacity axes this attempt occupies. [Router.Report]
 	// releases it; releasing it twice is safe.
 	Reservation *capacity.Reservation

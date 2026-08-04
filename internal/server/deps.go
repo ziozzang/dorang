@@ -577,6 +577,25 @@ type Result struct {
 
 // reset clears a Result for reuse. Written out rather than assigned from a zero
 // value so the quota map's capacity survives the request.
+// SetQuotaUsedPct records one window's consumption for
+// `x-dorang-quota-<window>-used-pct`.
+//
+// The map is allocated on first use and its capacity survives [Result.reset],
+// so a pooled request pays for it once per process rather than once per
+// request. A dispatcher that reports no window leaves it nil, and the header
+// family is then absent rather than a row of zeroes — an unmetered credential
+// has no percentage, and 0 would say it is idle against a limit it does not
+// have.
+func (r *Result) SetQuotaUsedPct(window string, pct int) {
+	if window == "" {
+		return
+	}
+	if r.QuotaUsedPct == nil {
+		r.QuotaUsedPct = make(map[string]int, 4)
+	}
+	r.QuotaUsedPct[window] = pct
+}
+
 func (r *Result) reset() {
 	m := r.QuotaUsedPct
 	*r = Result{}

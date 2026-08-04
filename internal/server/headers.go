@@ -364,14 +364,18 @@ var InboundRequestIDHeaders = []string{
 // standard HTTP a client acts on rather than dorang telemetry it merely reads:
 // Retry-After on the statuses [retryAfterStatus] admits, and the rate-limit set.
 //
-// ⚠️ Both read [Result], and NEITHER [Result.RetryAfterSeconds] NOR
-// [Result.RateLimit] has a producer anywhere in this repository outside this
-// package's own tests. So this is a seam for an embedder's own dispatcher, and
-// for the shipped gateway both branches are unreachable: the Retry-After a
-// client actually receives is stamped by [WriteError] off [Error], and the
-// `x-ratelimit-*` set is never stamped at all — which three documents assert it
-// always is. Tracked in DESIGN §17.1; do not read the two branches below as
-// evidence that the headers are emitted.
+// Both read [Result], and both now have a producer. `internal/app` fills
+// [Result.RateLimit] from [router.Decision.Quota] — the chosen credential's own
+// view at the enforcement point — at SELECTION time rather than on acceptance,
+// so a 502 or a refused hop still tells a client how much of its allowance is
+// left. That is when it matters most.
+//
+// It was not always so, and the shape of the defect is worth keeping: this
+// block rendered both families faithfully while nothing anywhere set either, so
+// `x-ratelimit-*` had never left this gateway even though COMPATIBILITY §7.8
+// cited it as the reason not to mirror LiteLLM's own header and an OPERATIONS
+// runbook told an operator to read it off a response. A renderer is not a
+// feature; DESIGN §17.1.
 //
 // costDeferred says that this response will be priced after its headers are on
 // the wire, which is every streamed answer: the dispatcher settles once the last

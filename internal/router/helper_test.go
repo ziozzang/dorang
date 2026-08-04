@@ -40,6 +40,25 @@ func (s stubQuota) Check(cred string, _ time.Time) quota.Decision {
 	return quota.Decision{Allow: true}
 }
 
+// Fill reports the stated decision as a one-rule view, so a test that says
+// "this credential is at 900 of 1000" gets headers describing that and not an
+// empty view that would silently omit them.
+func (s stubQuota) Fill(cred string, _ time.Time, dst *quota.View) {
+	if dst == nil {
+		return
+	}
+	dst.N, dst.Truncated = 0, false
+	d, ok := s[cred]
+	if !ok || d.Limit == 0 {
+		return
+	}
+	dst.Rules[0] = quota.RuleUsage{
+		Window: d.Rule.Window, Metric: d.Rule.Metric,
+		Used: d.Used, Limit: d.Limit, ResetAt: d.ResetAt,
+	}
+	dst.N = 1
+}
+
 // harness wires a router to real subsystems with an injected clock.
 type harness struct {
 	t        *testing.T

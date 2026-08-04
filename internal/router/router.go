@@ -26,6 +26,19 @@ type QuotaSource interface {
 	// heard of must be allowed: an unmetered credential is unlimited, not
 	// exhausted.
 	Check(credential string, now time.Time) quota.Decision
+
+	// Fill writes the credential's whole quota state into dst.
+	//
+	// [Check] answers "may this serve" and carries only the rule that TRIPPED,
+	// so on the allow path — every successful request — the figures the
+	// enforcement point computed were discarded. This reports them instead, and
+	// it is what the `x-ratelimit-*` and `x-dorang-quota-*` headers are rendered
+	// from: the number a client is told is the number that enforces, rather than
+	// a second count kept beside it that could drift.
+	//
+	// A credential the source has never heard of leaves dst empty. An unmetered
+	// credential has no limit, and a limit of zero would say the opposite.
+	Fill(credential string, now time.Time, dst *quota.View)
 }
 
 // Meters adapts a set of per-credential meters to [QuotaSource].
@@ -37,6 +50,18 @@ func (m Meters) Check(credential string, now time.Time) quota.Decision {
 		return mt.Check(now)
 	}
 	return quota.Decision{Allow: true}
+}
+
+// Fill implements QuotaSource.
+func (m Meters) Fill(credential string, now time.Time, dst *quota.View) {
+	if dst == nil {
+		return
+	}
+	if mt, ok := m[credential]; ok && mt != nil {
+		mt.Fill(now, dst)
+		return
+	}
+	dst.N, dst.Truncated = 0, false
 }
 
 // Deps are the subsystems the router composes. Every one of them is optional
@@ -1312,6 +1337,12 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 	}
 	if d.Credential == "" {
 		d.Credential = c.preferred
+	}
+	// One report for the credential that won. The per-candidate Check above
+	// answered a yes/no and discarded the numbers; this is the only place the
+	// winner is known, so it is the only place they can be kept.
+	if r.deps.Quota != nil && d.Credential != "" {
+		r.deps.Quota.Fill(d.Credential, now, &d.Quota)
 	}
 	if p.hard {
 		d.PinnedTo = p.kind

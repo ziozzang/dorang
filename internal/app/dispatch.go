@@ -337,6 +337,14 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 			}
 			return routeError(rerr)
 		}
+		// The client's remaining allowance is known HERE, at selection, and does
+		// not depend on whether the upstream then answered. It is filled before
+		// anything is attempted so that a 502, a 429 or a refused hop still
+		// carries it — a caller being told how much of its quota is left matters
+		// most when things are failing, and fillRouteResult runs only from the
+		// Accepted callback, which a connection failure never reaches.
+		fillQuotaResult(rq, dec)
+
 		// on_route (DESIGN §11.5). It sees the decision and may refuse it. It
 		// cannot ask for a different one — see luaext.RouteDecision — so a
 		// refusal is terminal.
@@ -1200,6 +1208,85 @@ func fillRouteResult(rq *server.Request, dec *router.Decision, c *call, loss *ca
 	}
 	rq.Result.DroppedParams = droppedParams(dec, c, loss)
 	rq.Result.Downgraded = downgraded(c, dec, loss)
+}
+
+// fillQuotaResult renders the chosen credential's quota state into the two
+// header families internal/server has always been able to stamp and has never
+// been given anything to stamp.
+//
+// `x-ratelimit-*` and `x-dorang-quota-<window>-used-pct` were both rendered by
+// [server.stampHeaders] off fields nothing produced, so neither had ever left
+// this gateway — while COMPATIBILITY §7.8 cited the first as the reason not to
+// mirror LiteLLM's own header, and an OPERATIONS runbook told an operator to
+// read them off a response. The figures come from [router.Decision.Quota],
+// which is the enforcement point's own view, so a client is told the number
+// that will actually refuse it.
+//
+// ABSENT, NOT ZERO, in three places, and each is a different fact:
+//   - no rule at all: the credential is unmetered. `Set` stays false and the
+//     whole `x-ratelimit-*` family is omitted, because a limit of 0 says the
+//     opposite of "no limit".
+//   - a rule on a metric that has no standard header (cost, input-only or
+//     output-only tokens): counted in the per-window percentage and left out
+//     of `x-ratelimit-*`, which has no spelling for it.
+//   - limit of zero: skipped, because a percentage of it is undefined rather
+//     than 100.
+func fillQuotaResult(rq *server.Request, dec *router.Decision) {
+	v := &dec.Quota
+	if v.N == 0 {
+		return
+	}
+	rl := &rq.Result.RateLimit
+	for i := 0; i < v.N; i++ {
+		r := &v.Rules[i]
+		if r.Limit <= 0 {
+			continue
+		}
+		remaining := r.Limit - r.Used
+		if remaining < 0 {
+			remaining = 0
+		}
+		// The per-window percentage covers every metric, because "this
+		// credential is at 90% of something" is actionable whatever the
+		// something is.
+		pct := int(r.Used * 100 / r.Limit)
+		if pct > 100 {
+			pct = 100
+		}
+		rq.Result.SetQuotaUsedPct(r.Window.String(), pct)
+
+		// Only the two metrics the standard headers can spell reach them, and
+		// the tightest rule wins: a client that obeys the number it is given
+		// must not be told the looser of two limits it is actually under.
+		switch r.Metric {
+		case quota.MetricRequests:
+			if !rl.Set || rl.LimitRequests == 0 || remaining < rl.RemainingRequests {
+				rl.LimitRequests, rl.RemainingRequests = r.Limit, remaining
+				rl.ResetRequests = quotaReset(r.ResetAt)
+			}
+			rl.Set = true
+		case quota.MetricTokensTotal:
+			if !rl.Set || rl.LimitTokens == 0 || remaining < rl.RemainingTokens {
+				rl.LimitTokens, rl.RemainingTokens = r.Limit, remaining
+				rl.ResetTokens = quotaReset(r.ResetAt)
+			}
+			rl.Set = true
+		}
+	}
+}
+
+// quotaReset renders a window boundary the way every provider spells it: whole
+// seconds from now with an `s`. An empty string for a boundary nobody stated,
+// because "0s" would tell a client to retry immediately.
+func quotaReset(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	d := time.Until(at)
+	if d < 0 {
+		d = 0
+	}
+	return strconv.FormatInt(int64(d.Seconds()+0.5), 10) + "s"
 }
 
 // downgraded is what x-dorang-downgraded carries: the structural constructs this
