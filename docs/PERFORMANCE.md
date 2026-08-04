@@ -116,9 +116,9 @@ change to it would be visible to a caller.
 
 ---
 
-## 6. Two things this measurement found that are not fixed
+## 6. What the tail turned out to be
 
-### 6a. A reproducible tail at high concurrency
+### 6a. A reproducible tail at high concurrency — and it was the client again
 
 At concurrency 64, three consecutive runs of 5,000 requests:
 
@@ -131,9 +131,10 @@ run3  p50=1.00 ms  p90=2.10 ms  p99=30.22 ms   41,817 req/s
 p90 is 2.3 ms and p99 is 30–42 ms — a 15–20× step in the last decile,
 reproducible, and throughput is *lower* than at concurrency 16. Sixteen cores
 against 64 in-flight requests is 4× oversubscription, so garbage collection or
-scheduler latency are the obvious candidates.
+scheduler latency were the obvious candidates.
 
-**Obvious, and unverified**, because of 6b.
+Both were obvious and **both are wrong**; see §6c. The instruments added in §6b
+refuted them, and the answer was the one §1 already warned about.
 
 ### 6b. The scrape could not explain a tail — corrected, then fixed
 
@@ -257,3 +258,46 @@ The 3.3-second requests here are non-streaming. A drain that cuts a **stream**
 mid-flight is the case `shutdown_grace` was really written for, and it has not
 been driven under a rolling replacement. Until it is, §7a is fixed by argument
 rather than by observation.
+
+### 6c. The diagnosis: dorang is not where the tail is
+
+With `dorang_gc_pause_seconds` and `dorang_sched_latency_seconds` in place, the
+concurrency-64 run was repeated and the histograms read as deltas across it.
+
+**Both candidates are refuted.**
+
+| | during a 6,000-request run at c=64 |
+|---|---|
+| GC pauses | **6 pauses, longest ≤ 0.131 ms** — under 1 ms of stop-the-world in total |
+| Scheduler latency | **p99 0.164 ms, p99.9 0.459 ms** |
+| GOMAXPROCS / OS threads | 16 / 22 |
+
+Neither accounts for a millisecond, let alone twenty-six.
+
+The decisive comparison is dorang's own duration histogram against what the
+client timed, over the same run:
+
+| | p50 | p99 | p99.9 |
+|---|---|---|---|
+| **server-observed** (`dorang_request_duration_seconds`) | ≤ 50 µs | **≤ 100 µs** | ≤ 500 µs |
+| client-observed (same run) | 0.89 ms | **4.53 ms** | — |
+
+The handler finishes inside 100 µs at p99. Everything else — 4.53 ms in this
+run, 26.76 ms in the one before it — happens **outside dorang**: 64 client
+goroutines and the server's own runtime contending for the same 16 cores, plus
+connection scheduling in the kernel.
+
+The clinching detail is the instability. The same configuration produced 26.76 ms
+and then 4.53 ms at the client, while the server histogram sat at ≤ 100 µs
+through both. A number that moves 6× between identical runs while the thing it
+claims to measure does not move at all is a property of the instrument.
+
+**So §6a was a measurement artifact, and it is the same artifact §1 records** —
+the client, believed because it produced a number. Once below a millisecond, a
+load generator sharing a host with the server is measuring the host.
+
+**What to take from this.** The concurrency-64 row in §2 overstates dorang's
+latency and understates nothing; the honest figure for gateway-only work at that
+concurrency is the server-side one, ≤ 100 µs at p99. The client-side column is
+kept in the table rather than corrected, because it is what an application on
+the same box would actually experience, and that is also true.
