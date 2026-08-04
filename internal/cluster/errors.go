@@ -19,8 +19,12 @@ var (
 	// is a guard that a second entry point walks around.
 	ErrLocalInCluster = errors.New(
 		"cluster: cluster.enabled with capacity_mode \"local\" refuses to start: " +
-			"every node would carry the whole limit; use \"leased\" or \"shared-pg\" " +
-			"(\"shared-redis\" is the fourth mode and needs a client this build does not ship) (DESIGN 5.6)")
+			"every node would carry the whole quota limit; use \"leased\" or \"shared-pg\" " +
+			"(\"shared-redis\" is the fourth mode and needs a client this build does not ship). " +
+			"NOTE: those modes coordinate QUOTA only. capacity.*.max_concurrency is enforced " +
+			"per node by internal/capacity in every mode, so a cluster of N nodes admits N x " +
+			"each concurrency ceiling until the broker reaches the lease table -- divide the " +
+			"ceilings by the node count, or the provider sees N-fold (DESIGN 5.6)")
 
 	// ErrNoRedisClient refuses capacity_mode "shared-redis" when no Redis
 	// client was supplied.

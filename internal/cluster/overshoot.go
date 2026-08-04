@@ -122,6 +122,30 @@ type Accuracy struct {
 	// error one level up.
 	PerLapse        int64
 	PerLapseFormula string
+	// Covers names the subsystem this figure describes, and Excludes names what
+	// it does not.
+	//
+	// The figure is about QUOTA — spend against a windowed limit, coordinated
+	// through the lease table. It says nothing about CONCURRENCY ceilings, which
+	// internal/capacity enforces, and internal/capacity holds no reference to
+	// this package: its broker is process-local by construction, so every
+	// `capacity.*.max_concurrency` is a PER-NODE ceiling in every mode,
+	// including the two that publish 0 here.
+	//
+	// Measured 2026-08-04 on an isolated two-node cluster against an upstream
+	// counting its own concurrency: a credential ceiling of 2 admitted FOUR at
+	// once, exactly two per node, reproduced twice, with `capacity_leases`
+	// holding only the leadership row.
+	//
+	// This field exists because of the paragraph above about publishing a number
+	// true only sometimes. "Max overshoot 0" printed at start-up, while the
+	// ceiling an operator actually sized their plan against overshoots by
+	// (nodes-1) times, is that failure in its most expensive form — and the
+	// qualifier was in internal/cluster's package doc, which is not where
+	// anybody reads a bound. It travels with the figure now, the same way
+	// [Accuracy.Holds] does and for the same reason.
+	Covers   string
+	Excludes string
 }
 
 // String renders the figure for a log line or a status page, condition
@@ -132,6 +156,12 @@ func (a Accuracy) String() string {
 	if a.Holds != "" {
 		s += fmt.Sprintf("; holds while %s, and each lapse adds %d (%s)",
 			a.Holds, a.PerLapse, a.PerLapseFormula)
+	}
+	if a.Covers != "" {
+		s += fmt.Sprintf("; covers %s", a.Covers)
+	}
+	if a.Excludes != "" {
+		s += fmt.Sprintf("; DOES NOT COVER %s", a.Excludes)
 	}
 	return s
 }
@@ -160,6 +190,8 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Why: "each node counts only its own traffic, so every ceiling is counted once per node. " +
 				"Exact on one node, which is the only configuration in which it is permitted",
 			HotPathCost: "none: an in-process counter",
+			Covers:      "quota: windowed spend against a limit, through the lease table",
+			Excludes:    "concurrency: capacity.*.max_concurrency is enforced per node by internal/capacity in every mode, so the cluster admits nodes x ceiling",
 		}, nil
 
 	case ModeSharedRedis:
@@ -170,6 +202,8 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Why: "the read, the ceiling test and the write are one atomic script, so two nodes " +
 				"cannot both see room for the last unit",
 			HotPathCost:     "one round trip to Redis per acquire",
+			Covers:          "quota: windowed spend against a limit, through the lease table",
+			Excludes:        "concurrency: capacity.*.max_concurrency is enforced per node by internal/capacity in every mode, so the cluster admits nodes x ceiling",
 			Holds:           holdsWhileLeasesLive,
 			PerLapse:        p.Limit,
 			PerLapseFormula: fmt.Sprintf("limit = %d", p.Limit),
@@ -183,6 +217,8 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Why: "the read-modify-write happens inside one transaction, serialized against every " +
 				"other transaction on the same key by an advisory lock",
 			HotPathCost:     "one round trip to the store per acquire, costlier than Redis",
+			Covers:          "quota: windowed spend against a limit, through the lease table",
+			Excludes:        "concurrency: capacity.*.max_concurrency is enforced per node by internal/capacity in every mode, so the cluster admits nodes x ceiling",
 			Holds:           holdsWhileLeasesLive,
 			PerLapse:        p.Limit,
 			PerLapseFormula: fmt.Sprintf("limit = %d", p.Limit),
@@ -212,6 +248,8 @@ func Publish(mode Mode, p Params) (Accuracy, error) {
 			Holds: "a holder and the leader agree on when its lease expired -- the hot path and " +
 				"the reclaim test the same expires_at, so this is clock agreement between two " +
 				"nodes and nothing more",
+			Covers:          "quota: windowed spend against a limit, through the lease table",
+			Excludes:        "concurrency: capacity.*.max_concurrency is enforced per node by internal/capacity in every mode, so the cluster admits nodes x ceiling",
 			PerLapse:        p.Block,
 			PerLapseFormula: fmt.Sprintf("block = %d", p.Block),
 		}, nil
