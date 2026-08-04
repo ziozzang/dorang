@@ -55,9 +55,14 @@ not a measuring instrument. Everything below uses the Go generator
 | 64 | **0.89 ms** | 51.87 ms | 36.30 ms | 62.48 ms | **36,314** | 1,210 |
 
 LiteLLM plateaus near 1,200 req/s from concurrency 4 onward: added concurrency
-buys latency, not throughput. dorang peaks at concurrency 16 and **loses
-throughput at 64** — see §4, which is the one result here that is not flattering
-and is not explained.
+buys latency, not throughput. dorang peaks at concurrency 16 and appears to lose
+throughput at 64.
+
+> ⚠️ **The concurrency-64 row measures the host, not dorang.** §6c establishes
+> that dorang's own handler finished those requests in **under 100 µs at p99**
+> while the client timed 36.30 ms. The client column is kept because it is what
+> an application sharing this box would experience, but it is not a statement
+> about the gateway.
 
 ## 3. Rejected credential — the path an attacker drives
 
@@ -254,10 +259,19 @@ what the fleet shares, the variable is what one node says about itself.
 
 ### What this does not yet show
 
-The 3.3-second requests here are non-streaming. A drain that cuts a **stream**
-mid-flight is the case `shutdown_grace` was really written for, and it has not
-been driven under a rolling replacement. Until it is, §7a is fixed by argument
-rather than by observation.
+> ⚠️ **This section first said the streaming drain "has not been driven" at all.
+> That was wrong**, and wrong the same way §6b was: asserted from a search that
+> used the wrong name. `internal/server/drain_sequence_test.go` has driven it all
+> along — `TestCutStreamEndsWithAnInBandError` asserts the client's last frame
+> carries `gateway_shutting_down` and that the stream is terminated with
+> `data: [DONE]`, and `TestCutStreamIsStillMetered` asserts the cut stream
+> reaches the meter with its model, its ten already-billed tokens and a request
+> id. `TestRollingRestartLosesNoRequests` covers the sequence.
+
+The narrower statement, which stands: those are **unit tests against one
+process**. What §7 measured against a live balancer used non-streaming requests,
+so the deployment-level question — does a stream survive a real rolling
+replacement, through Kong, across two containers — is answered in §7e.
 
 ### 6c. The diagnosis: dorang is not where the tail is
 
