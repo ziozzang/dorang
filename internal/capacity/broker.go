@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -299,6 +300,15 @@ func (bk *bucket) committed() int {
 // Broker admits requests against every axis that constrains them.
 // The zero value is not usable; call New.
 type Broker struct {
+	// share is how many nodes divide every configured ceiling; 1 unclustered.
+	//
+	// Atomic and not under b.mu on purpose: it is read once per needs() call on
+	// the hot path and written from the cluster heartbeat, so putting it under
+	// the broker lock would make a background tick contend with every acquire.
+	// A read that crosses a write sees the old or the new divisor and both are
+	// valid ceilings; there is no torn state to protect.
+	share atomic.Int64
+
 	// Immutable after New.
 	global      int
 	pgroups     map[string]int
@@ -578,7 +588,82 @@ func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 			out = append(out, axisNeed{key: credAxisKey(provider, c.ID), limit: c.MaxConcurrent})
 		}
 	}
+	return b.divideByShare(out)
+}
+
+// divideByShare turns each configured ceiling into THIS NODE'S share of it.
+//
+// A ceiling in the configuration is a statement about the whole deployment —
+// "this plan allows 16 in flight" — and this broker counts only its own
+// process. So with N nodes the provider saw N x every ceiling: measured on an
+// isolated two-node cluster against an upstream counting its own concurrency, a
+// credential ceiling of 2 admitted FOUR at once, exactly two per node.
+//
+// Dividing is exact in the direction that matters. Each node admits at most
+// limit/N, so the cluster admits at most N x (limit/N) <= limit: the provider
+// NEVER sees more than the operator configured. What it costs is the opposite
+// error — an idle node's share is not lent to a busy one, so a cluster can
+// refuse while capacity exists elsewhere. That is a throughput cost, and the
+// alternative is a store round trip inside the lock that serialises every
+// acquire on every axis, which is a latency cost on every request including the
+// ones that would never have contended.
+//
+// A ceiling SMALLER than the node count cannot be divided. Each node keeps 1
+// rather than 0, because 0 means that node can never serve that axis at all and
+// a cluster of zeroes serves nothing. That is the one case where the cluster
+// can exceed the configured ceiling, it is bounded by (nodes - limit), and
+// [Broker.ShareOvershoot] publishes it rather than leaving it to be discovered.
+func (b *Broker) divideByShare(out []axisNeed) []axisNeed {
+	n := int(b.share.Load())
+	if n <= 1 {
+		return out
+	}
+	for i := range out {
+		if out[i].limit <= 0 {
+			continue
+		}
+		if l := out[i].limit / n; l > 0 {
+			out[i].limit = l
+		} else {
+			out[i].limit = 1
+		}
+	}
 	return out
+}
+
+// SetShare tells the broker how many nodes divide every configured ceiling.
+//
+// It is a whole number rather than a fraction because the ceilings are, and it
+// is set from the live node registry rather than from configuration: a cluster
+// that loses a node should not keep reserving its share forever, and one that
+// gains a node must narrow BEFORE that node starts serving.
+//
+// Zero and one both mean "this process is the whole deployment", which is the
+// unclustered default and the behaviour every existing test was written
+// against.
+func (b *Broker) SetShare(nodes int) {
+	if nodes < 1 {
+		nodes = 1
+	}
+	b.share.Store(int64(nodes))
+}
+
+// Share reports the divisor in force.
+func (b *Broker) Share() int { return int(b.share.Load()) }
+
+// ShareOvershoot reports how far a cluster of this many nodes can exceed the
+// given configured ceiling, which is zero unless the ceiling is smaller than
+// the node count.
+//
+// It exists so the figure is published rather than discovered. DESIGN §5.6
+// requires every coordination mode to publish its maximum overshoot as a
+// number, and "0 except for ceilings below the node count, where it is
+// nodes - ceiling" is that number for this mechanism.
+func ShareOvershoot(limit, nodes int) int {
+	if nodes <= 1 || limit <= 0 || limit >= nodes {
+		return 0
+	}
+	return nodes - limit
 }
 
 // WaitBudget reports how long this principal may sit in a queue before
