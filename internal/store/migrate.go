@@ -89,8 +89,16 @@ func (s *Store) Migrate(ctx context.Context) (MigrateReport, error) {
 		for _, m := range migrations {
 			if have, ok := applied[m.Version]; ok {
 				if have != m.Checksum {
-					return fmt.Errorf("%w: version %d (%s): recorded %s, embedded %s",
-						ErrDirtySchema, m.Version, m.Name, have, m.Checksum)
+					// The remedy travels with the fact. An error that names a
+					// condition and no action leaves an operator inventing SQL
+					// against schema_migrations under time pressure, which is
+					// what happened the first time this fired.
+					return fmt.Errorf("%w: version %d (%s): recorded %s, embedded %s.\n"+
+						"  Run `dorangctl migrate --drift` to see what changed. If this "+
+						"database's schema already matches the current file — which only you "+
+						"can know — record it with\n"+
+						"    dorangctl migrate --rebaseline %d --expect %s",
+						ErrDirtySchema, m.Version, m.Name, have, m.Checksum, m.Version, have)
 				}
 				rep.AlreadyApplied++
 				if m.Version > rep.Version {
@@ -294,4 +302,134 @@ func firstLine(s string) string {
 		return s[:i] + " ..."
 	}
 	return s
+}
+
+// SchemaDrift is one applied migration whose file has changed since.
+type SchemaDrift struct {
+	Version int64
+	// Name is the file's current name, which may differ from the recorded one:
+	// a rename is a drift like any other, and the pair is what tells an operator
+	// which it was.
+	Name         string
+	RecordedName string
+	Recorded     string
+	Embedded     string
+	// Body is the file as it now stands, so a reviewer can decide whether the
+	// database this is running against already matches it.
+	Body string
+}
+
+// Drift reports every applied migration whose embedded file no longer matches
+// what was recorded, and changes nothing.
+//
+// It exists because [Store.Migrate] refuses to start on exactly this condition
+// and the refusal named a fact without naming an action. An operator's only
+// path was hand-written SQL against `schema_migrations`, which is a worse thing
+// to have to invent under time pressure than a command that prints the two
+// checksums.
+func (s *Store) Drift(ctx context.Context) ([]SchemaDrift, error) {
+	migrations, err := loadMigrations(s.d.migrationDir())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.query(ctx, `SELECT version, name, checksum FROM schema_migrations`)
+	if err != nil {
+		// No table yet means nothing has been applied, which is not drift.
+		return nil, nil
+	}
+	defer rows.Close()
+
+	type rec struct{ name, sum string }
+	applied := map[int64]rec{}
+	for rows.Next() {
+		var v int64
+		var n, c string
+		if err := rows.Scan(&v, &n, &c); err != nil {
+			return nil, err
+		}
+		applied[v] = rec{n, c}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var out []SchemaDrift
+	for _, m := range migrations {
+		r, ok := applied[m.Version]
+		if !ok || r.sum == m.Checksum {
+			continue
+		}
+		out = append(out, SchemaDrift{
+			Version: m.Version, Name: m.Name, RecordedName: r.name,
+			Recorded: r.sum, Embedded: m.Checksum, Body: m.Body,
+		})
+	}
+	return out, nil
+}
+
+// Rebaseline records the embedded checksum for one already-applied version,
+// asserting that this database's schema is already what the current file would
+// have produced.
+//
+// # Why it takes the checksum it expects to replace
+//
+// Re-baselining is a human judgement — only a person can know that the schema
+// in front of them matches the rewritten file — and a flag that accepted any
+// drift would be a way to make the guard stop complaining without looking. The
+// caller must name the RECORDED checksum, which it can only have got from
+// [Store.Drift]. So the command cannot be run before the report has been read,
+// and it cannot be pointed at a version whose drift is not the one that was
+// reviewed: if the file moved again in between, the expectation no longer
+// matches and the call refuses.
+//
+// # Why it cannot skip a migration
+//
+// It updates an existing row and never inserts one. A version that has not been
+// applied has no row, the update affects nothing, and this returns an error
+// naming that. Marking unapplied work as done is a different and far more
+// dangerous operation, and this is deliberately not it.
+func (s *Store) Rebaseline(ctx context.Context, version int64, expectRecorded string) error {
+	if expectRecorded == "" {
+		return fmt.Errorf("store: rebaseline version %d: the recorded checksum must be named, "+
+			"and it comes from the drift report; a rebaseline that accepts any drift is a way "+
+			"to silence the guard without reading it", version)
+	}
+	migrations, err := loadMigrations(s.d.migrationDir())
+	if err != nil {
+		return err
+	}
+	var want *migration
+	for i := range migrations {
+		if migrations[i].Version == version {
+			want = &migrations[i]
+			break
+		}
+	}
+	if want == nil {
+		return fmt.Errorf("store: rebaseline: this build has no migration %d", version)
+	}
+
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		if err := s.d.lockMigrations(ctx, tx); err != nil {
+			return fmt.Errorf("store: migration lock: %w", err)
+		}
+		res, err := s.txExec(ctx, tx,
+			`UPDATE schema_migrations SET name = ?, checksum = ? WHERE version = ? AND checksum = ?`,
+			want.Name, want.Checksum, version, expectRecorded)
+		if err != nil {
+			return fmt.Errorf("store: rebaseline version %d: %w", version, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("store: rebaseline version %d: no applied row carries checksum %s. "+
+				"Either that version was never applied to this database — in which case run the "+
+				"migration rather than rebaselining it — or its recorded checksum has changed "+
+				"since the drift report was taken; re-read it",
+				version, expectRecorded)
+		}
+		return nil
+	})
 }

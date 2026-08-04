@@ -252,11 +252,27 @@ func (e env) keyRevoke(args []string) int {
 }
 
 // runMigrate applies migrations and exits.
+//
+// `--drift` and `--rebaseline` exist because [store.Store.Migrate] refuses to
+// start when an applied migration's file has changed, and that refusal named a
+// fact without naming an action — leaving hand-written SQL against
+// `schema_migrations` as the only path, which is a bad thing to have to invent
+// while a deployment is down.
 func (e env) runMigrate(args []string) int {
 	fs := newFlagSet("migrate", e)
 	cfgPath := configPathFlag(fs)
+	drift := fs.Bool("drift", false,
+		"report applied migrations whose file has changed, and change nothing")
+	rebase := fs.Int64("rebaseline", 0,
+		"record the current file's checksum for this applied version, asserting that this "+
+			"database's schema already matches it")
+	expect := fs.String("expect", "",
+		"the recorded checksum --rebaseline expects to replace, from --drift")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *drift && *rebase != 0 {
+		return e.fail("migrate: --drift reports and --rebaseline writes; run them one at a time")
 	}
 	cfg, ok := e.loadConfigFile(*cfgPath)
 	if !ok {
@@ -270,6 +286,42 @@ func (e env) runMigrate(args []string) int {
 		return e.fail("%v", err)
 	}
 	defer st.Close()
+
+	if *drift {
+		rows, err := st.Drift(ctx)
+		if err != nil {
+			return e.fail("%v", err)
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(e.stdout, "no drift: every applied migration matches its file")
+			return 0
+		}
+		fmt.Fprintf(e.stdout, "%d applied migration(s) no longer match their file:\n\n", len(rows))
+		for _, d := range rows {
+			fmt.Fprintf(e.stdout, "  version %d\n", d.Version)
+			if d.RecordedName != d.Name {
+				fmt.Fprintf(e.stdout, "    renamed   %s -> %s\n", d.RecordedName, d.Name)
+			} else {
+				fmt.Fprintf(e.stdout, "    name      %s\n", d.Name)
+			}
+			fmt.Fprintf(e.stdout, "    recorded  %s\n    embedded  %s\n", d.Recorded, d.Embedded)
+			fmt.Fprintf(e.stdout, "    the file now says:\n")
+			for _, line := range strings.Split(strings.TrimRight(d.Body, "\n"), "\n") {
+				fmt.Fprintf(e.stdout, "      %s\n", line)
+			}
+			fmt.Fprintf(e.stdout, "\n    If this database's schema already matches that — which only "+
+				"you can know —\n    record it with:\n"+
+				"      dorangctl migrate --rebaseline %d --expect %s\n\n", d.Version, d.Recorded)
+		}
+		return 1
+	}
+	if *rebase != 0 {
+		if err := st.Rebaseline(ctx, *rebase, *expect); err != nil {
+			return e.fail("%v", err)
+		}
+		fmt.Fprintf(e.stdout, "version %d rebaselined; run `dorangctl migrate` to continue\n", *rebase)
+		return 0
+	}
 
 	before, _ := st.SchemaVersion(ctx)
 	rep, err := st.Migrate(ctx)
