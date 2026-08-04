@@ -290,4 +290,37 @@ func (a *App) refreshAccuracy(ctx context.Context) {
 		return
 	}
 	a.nodes.set(n)
+	a.shareCapacity(n)
+}
+
+// shareCapacity narrows every concurrency ceiling to this node's share of it.
+//
+// A ceiling in the configuration is a statement about the whole deployment, and
+// [capacity.Broker] counts only this process — so before this call existed, N
+// nodes admitted N x every ceiling and the provider saw N-fold. Measured on an
+// isolated two-node cluster: a credential ceiling of 2 admitted four at once.
+//
+// THE COUNT IS TAKEN FROM THE REGISTRY AND NEVER GUESSED DOWNWARD. A node whose
+// read of the registry FAILED keeps the previous, higher divisor — see the
+// caller, which returns before reaching here — because a divisor that shrinks
+// on a failed read is a node quietly reclaiming the whole ceiling at exactly
+// the moment it has lost sight of its peers. The safe direction for an
+// uncertain node is to assume MORE peers, not fewer.
+//
+// The narrowing is applied on the same heartbeat that keeps this node's own row
+// alive, so a joining node's share is in force before it has served anything:
+// the new node reads a registry that already contains itself, and every
+// existing node reads the same count on its next tick, bounded by the interval
+// that already decides whether a peer is considered live at all.
+func (a *App) shareCapacity(nodes int) {
+	if a.Broker == nil || nodes < 1 {
+		return
+	}
+	if prev := a.Broker.Share(); prev != nodes {
+		a.logf("app: cluster: %d live node(s); every capacity ceiling is now divided by %d "+
+			"(was %d). An idle node's share is not lent to a busy one; a ceiling below the "+
+			"node count keeps 1 per node and exceeds itself by nodes-ceiling (DESIGN §5.6)",
+			nodes, nodes, prev)
+	}
+	a.Broker.SetShare(nodes)
 }

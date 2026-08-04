@@ -86,6 +86,11 @@ func TestACeilingBelowTheNodeCountOvershootsAndPublishesIt(t *testing.T) {
 // the whole ceiling, and a divisor of 0 or 1 must mean exactly that — the
 // change has to be invisible to a single node.
 func TestASingleNodeKeepsTheWholeCeiling(t *testing.T) {
+	// The unset case too: a broker nobody told is the whole deployment, and
+	// must report 1 rather than the field's zero value.
+	if got := New(Config{Global: 6}).Share(); got != 1 {
+		t.Errorf("a broker with no share set reports %d, want 1", got)
+	}
 	for _, share := range []int{0, 1} {
 		b := New(Config{Global: 6})
 		b.SetShare(share)

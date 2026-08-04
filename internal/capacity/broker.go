@@ -648,8 +648,18 @@ func (b *Broker) SetShare(nodes int) {
 	b.share.Store(int64(nodes))
 }
 
-// Share reports the divisor in force.
-func (b *Broker) Share() int { return int(b.share.Load()) }
+// Share reports the divisor in force, which is 1 until one is set.
+//
+// Never 0. The field's zero value and "this process is the whole deployment"
+// are the same state, and reporting 0 would put a divisor nobody could divide
+// by into a log line — the value is read back by the cluster heartbeat to
+// decide whether the count changed.
+func (b *Broker) Share() int {
+	if n := int(b.share.Load()); n > 1 {
+		return n
+	}
+	return 1
+}
 
 // ShareOvershoot reports how far a cluster of this many nodes can exceed the
 // given configured ceiling, which is zero unless the ceiling is smaller than
