@@ -315,3 +315,83 @@ latency and understates nothing; the honest figure for gateway-only work at that
 concurrency is the server-side one, ≤ 100 µs at p99. The client-side column is
 kept in the table rather than corrected, because it is what an application on
 the same box would actually experience, and that is also true.
+
+---
+
+## 8. Scale-out on three nodes, measured
+
+`capacity.*.max_concurrency` is a statement about the whole deployment, and the
+broker counts one process, so every ceiling used to be multiplied by the node
+count. Each node now enforces `limit / nodes`. This section is what that is
+worth, measured against a fake upstream that counts its own concurrency —
+ceiling 6, 200 ms per request, an isolated cluster on its own PostgreSQL.
+
+**Overshoot was zero in every scenario.** The table is the whole result:
+
+| scenario | peak seen upstream | ceiling | overshoot |
+|---|---|---|---|
+| steady, 1 node | 6 | 6 | 0 |
+| steady, 2 nodes | 6 | 6 | 0 |
+| steady, 3 nodes | 6 | 6 | 0 |
+| node joins under saturation | 6 | 6 | 0 |
+| graceful leave under load | 6 | 6 | 0 |
+| SIGKILL under load | 6 | 6 | 0 |
+| three join/leave cycles | 6 | 6 | 0 |
+
+### 8a. Node count does not change throughput, which is the point
+
+| nodes | divisor | requests served | mean in flight upstream |
+|---|---|---|---|
+| 1 | 1 | 540 | 5.93 |
+| 2 | 2 | 540 | 5.93 |
+| 3 | 3 | 540 | 5.93 |
+
+Identical. A ceiling is a limit on what the PROVIDER sees, so scaling dorang out
+must not raise it — and with load spread evenly, dividing it costs nothing at
+all. The whole ceiling is still used.
+
+### 8b. The cost is uneven load, and it is exactly linear
+
+This is the trade the mechanism makes, and it had never been measured:
+
+| nodes carrying load (of 3) | usable ceiling |
+|---|---|
+| 1 | 2 — **33%** |
+| 2 | 4 — **67%** |
+| 3 | 6 — 100% |
+
+An idle node's share is not lent to a busy one. **A balancer that does not
+spread evenly loses plan capacity in proportion.** Round-robin is fine; sticky
+sessions, a hashed route, or one node quietly failing health checks are not.
+That is the price of not coordinating per acquire — the alternative was a store
+round trip inside the reservation lock, on every axis of every request.
+
+### 8c. A dead node's share returns in under `node_ttl`
+
+SIGKILL, no drain, under continuous load:
+
+```
+t+15s   divisor still 3   mean in flight 3.97   (4 of 6 usable)
+t+30s   divisor 2         mean in flight 5.97   (whole ceiling back)
+```
+
+`DefaultNodeTTL` is 30 s and the recovery lands inside it. The window is
+under-utilization, never overshoot: while the survivors still believe in the
+dead node they enforce a share that is too small, which is the safe direction.
+An operator who wants it shorter sets `cluster.node_ttl` against how often a
+healthy node might miss a heartbeat.
+
+### 8d. Churn does not accumulate
+
+Three join/leave cycles under continuous load: 4,915 requests, peak 6
+throughout. Mean occupancy drifts from 5.17 to 4.49 across the rounds, which is
+the transition windows adding up — a joining node narrows the others before it
+serves, and a leaving one widens them after it stops — not a leak.
+
+### What this does not show
+
+Whether three nodes serve more REQUESTS than one. Every node and every load
+generator here shares one 16-core host, so adding a process divides the host
+rather than adding to it; §6c is the same lesson. Ceilings are cluster-wide by
+construction now, and request-handling headroom needs separate hosts to
+measure.
