@@ -248,14 +248,36 @@ func EncodeRequest(req *canonical.Request, opt *EncodeOptions) (*Request, error)
 	}
 
 	if req.ResponseFormat != nil {
-		// There is no response_format here. Expressing a schema means rewriting
-		// the request into a forced tool call, which changes what the model is
-		// asked to do — DESIGN §10.1 would rather report the loss than invent
-		// one.
-		if req.ResponseFormat.Kind == canonical.FormatJSONSchema {
-			loss.Downgrade(canonical.ConstructJSONSchema, "response_format")
-		} else {
+		// TRANSLATED where the deployment says it can, REPORTED where it cannot,
+		// and the difference is whether the request would have to be rewritten.
+		//
+		// Anthropic grew a native structured output — `output_format`, a
+		// field-for-field counterpart of `response_format: {type: json_schema}`
+		// — after this branch was written. Sending it changes nothing about
+		// what the model is asked to do, so it is a translation and §10.1 has
+		// no objection.
+		//
+		// Without that capability the only way to express a schema is to
+		// synthesize a tool from it and force `tool_choice` at the tool. That is
+		// a REWRITE: the model is asked to call a function instead of to answer,
+		// the response comes back as a tool call rather than as content, and a
+		// caller reading `choices[].message.content` finds it empty. §10.1 would
+		// rather report the loss than invent one, so that path still reports.
+		switch {
+		case req.ResponseFormat.Kind != canonical.FormatJSONSchema:
 			loss.DropParam("response_format")
+		case !caps.Has(canonical.CapJSONSchema):
+			loss.Downgrade(canonical.ConstructJSONSchema, "response_format")
+		default:
+			schema, err := anthropicOutputSchema(req.ResponseFormat.Schema)
+			if err != nil {
+				// A schema this build cannot render is reported rather than
+				// sent half-formed: a filtered schema that lost a constraint is
+				// a different contract from the one the caller wrote.
+				loss.Downgrade(canonical.ConstructJSONSchema, "response_format: "+err.Error())
+				break
+			}
+			out.OutputFormat = &OutputFormat{Type: canonical.FormatJSONSchema, Schema: schema}
 		}
 	}
 

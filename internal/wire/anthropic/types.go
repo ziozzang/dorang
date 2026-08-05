@@ -491,6 +491,16 @@ type Request struct {
 	Temperature   *float64   `json:"temperature,omitempty"`
 	Thinking      *Thinking  `json:"thinking,omitempty"`
 
+	// OutputFormat is Anthropic's native structured output, the direct
+	// counterpart of OpenAI's `response_format: {type: json_schema}`.
+	//
+	// It is emitted only for a deployment that declares [canonical.CapJSONSchema].
+	// The alternative for a model without it — synthesizing a tool from the
+	// schema and forcing `tool_choice` at it — is a REWRITE of the request
+	// rather than a translation, so §10.1 reports the loss instead (see
+	// [encode]'s response-format branch).
+	OutputFormat *OutputFormat `json:"output_format,omitempty"`
+
 	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
 	Tools      []Tool      `json:"tools,omitempty"`
 
@@ -502,7 +512,18 @@ type Request struct {
 
 var requestKnown = knownKeys("model", "messages", "max_tokens", "metadata",
 	"stop_sequences", "stream", "system", "temperature", "thinking",
-	"tool_choice", "tools", "top_k", "top_p")
+	"tool_choice", "tools", "top_k", "top_p", "output_format")
+
+// OutputFormat is the native structured-output request shape.
+//
+// The schema is carried as raw JSON so member order survives the crossing: a
+// JSON Schema is a document the caller wrote, and re-marshalling a map would
+// reorder its properties. That matters here beyond aesthetics — an ordered
+// schema is part of what a prompt cache keys on.
+type OutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema,omitempty"`
+}
 
 func (r Request) MarshalJSON() ([]byte, error) {
 	type alias Request
