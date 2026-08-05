@@ -507,15 +507,6 @@ func TestGeminiRefusesOrReportsEveryConstructItCannotEncode(t *testing.T) {
 			absent:    "deliberation",
 		},
 		{
-			// Material since the capability pass: the body comes back without the
-			// member it asked for, under a 200 saying it went well.
-			name:      "logprobs",
-			path:      "/v1/chat/completions",
-			body:      chatUser + `,"logprobs":true}`,
-			construct: canonical.ConstructLogprobs,
-			absent:    "logprobs",
-		},
-		{
 			// Material because it selects a PRICE BAND. This family has no tier
 			// and no band, so the caller is billed in one they did not choose.
 			name:      "service_tier",
@@ -621,12 +612,17 @@ func TestGeminiNamesTheKnobsItCannotApply(t *testing.T) {
 	a, up, secret := lossApp(t, geminiKind, geminiAnswer)
 
 	w := chatRequest(a, secret, `{"model":"m1","messages":[{"role":"user","content":"hi"}],`+
-		`"logit_bias":{"1234":50},"frequency_penalty":0.5,"presence_penalty":0.25,"user":"u-1"}`, nil)
+		`"logit_bias":{"1234":50},"user":"u-1"}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("a droppable knob is not a refusal; status %d\n%s", w.Code, w.Body)
 	}
 	dropped := w.Header().Get(server.HeaderDroppedParams)
-	for _, name := range []string{"logit_bias", "frequency_penalty", "presence_penalty", "user"} {
+	// frequency_penalty and presence_penalty USED TO BE HERE. generationConfig
+	// names both and [geminiConfig] writes them now, so reporting them as
+	// dropped would describe a loss that no longer happens. `logprobs` left the
+	// table above for the same reason, and it mattered more: it is Material, so
+	// while the field went unwritten dorang REFUSED requests Gemini can serve.
+	for _, name := range []string{"logit_bias", "user"} {
 		if !strings.Contains(dropped, name) {
 			t.Errorf("the caller sent %s, this adapter has no field for it, and %s = %q",
 				name, server.HeaderDroppedParams, dropped)

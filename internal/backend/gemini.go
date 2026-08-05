@@ -176,13 +176,22 @@ type geminiFunctionResponse struct {
 }
 
 type geminiGenConfig struct {
-	Temperature      *float64        `json:"temperature,omitempty"`
-	TopP             *float64        `json:"topP,omitempty"`
-	TopK             *int            `json:"topK,omitempty"`
-	MaxOutputTokens  *int            `json:"maxOutputTokens,omitempty"`
-	CandidateCount   *int            `json:"candidateCount,omitempty"`
-	StopSequences    []string        `json:"stopSequences,omitempty"`
-	Seed             *int64          `json:"seed,omitempty"`
+	Temperature     *float64 `json:"temperature,omitempty"`
+	TopP            *float64 `json:"topP,omitempty"`
+	TopK            *int     `json:"topK,omitempty"`
+	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
+	CandidateCount  *int     `json:"candidateCount,omitempty"`
+	StopSequences   []string `json:"stopSequences,omitempty"`
+	Seed            *int64   `json:"seed,omitempty"`
+	// FrequencyPenalty, PresencePenalty, ResponseLogprobs and Logprobs are the
+	// three constructs this file's capability comment listed as "expressible by
+	// the protocol, not by this encoder". They are written now, so the bits are
+	// earned rather than claimed — adding the field is what earns it, in that
+	// order, and this is that order's second half.
+	FrequencyPenalty *float64        `json:"frequencyPenalty,omitempty"`
+	PresencePenalty  *float64        `json:"presencePenalty,omitempty"`
+	ResponseLogprobs *bool           `json:"responseLogprobs,omitempty"`
+	Logprobs         *int            `json:"logprobs,omitempty"`
 	ResponseMimeType string          `json:"responseMimeType,omitempty"`
 	ResponseSchema   json.RawMessage `json:"responseSchema,omitempty"`
 	ThinkingConfig   *geminiThinking `json:"thinkingConfig,omitempty"`
@@ -289,12 +298,16 @@ type geminiUsage struct {
 //
 // Expressible by the protocol, not by this encoder:
 //
-//   - CapLogprobs — generationConfig.responseLogprobs exists; nothing here
-//     writes it.
-//   - CapPenalties — generationConfig.frequencyPenalty/presencePenalty exist;
-//     nothing here writes them.
 //   - CapLogitBias, CapUser, CapMetadata, CapPriority, CapParallelToolCalls —
 //     no field, in the protocol or here.
+//
+// CapLogprobs and CapPenalties WERE in the group above and are not any more.
+// [geminiConfig] writes responseLogprobs, logprobs, frequencyPenalty and
+// presencePenalty, so the bits are earned rather than claimed — which is the
+// order this comment already required and the direction the list is meant to
+// shrink in. CapLogprobs mattered most: it is [canonical.Material], so while the
+// field was unwritten dorang REFUSED requests Gemini could serve, and told the
+// caller their model could not do it.
 //
 // CapLogprobs and CapServiceTier are [canonical.Material]: their absence changes
 // what the caller receives or is charged, so they are refused by name with the
@@ -310,6 +323,8 @@ const GeminiCapabilities = canonical.CapMultiBlockContent | // parts[]
 	canonical.CapSeed | // generationConfig.seed
 	canonical.CapTopK | // generationConfig.topK
 	canonical.CapMultipleChoices | // candidateCount
+	canonical.CapPenalties | // generationConfig.frequencyPenalty / presencePenalty
+	canonical.CapLogprobs | // generationConfig.responseLogprobs / logprobs
 	canonical.CapStopSequences // stopSequences
 
 // encodeGemini converts the neutral request.
@@ -513,6 +528,22 @@ func geminiConfig(req *canonical.Request) *geminiGenConfig {
 	if req.MaxTokens != nil {
 		c.MaxOutputTokens = req.MaxTokens
 	}
+	// generationConfig names these exactly, so they cross as themselves.
+	c.FrequencyPenalty = req.FrequencyPenalty
+	c.PresencePenalty = req.PresencePenalty
+	// The two halves of logprobs are one field each here. `responseLogprobs`
+	// turns them on; `logprobs` is HOW MANY alternatives to return, which is
+	// OpenAI's top_logprobs — so a caller who asked only for logprobs gets them
+	// on, and one who asked for a count gets the count.
+	if req.Logprobs != nil && *req.Logprobs {
+		on := true
+		c.ResponseLogprobs = &on
+	}
+	if req.TopLogprobs != nil {
+		on := true
+		c.ResponseLogprobs = &on
+		c.Logprobs = req.TopLogprobs
+	}
 	if req.N != nil && *req.N > 1 {
 		c.CandidateCount = req.N
 	}
@@ -557,7 +588,9 @@ func geminiConfig(req *canonical.Request) *geminiGenConfig {
 func (c *geminiGenConfig) empty() bool {
 	return c.Temperature == nil && c.TopP == nil && c.TopK == nil &&
 		c.MaxOutputTokens == nil && c.CandidateCount == nil && len(c.StopSequences) == 0 &&
-		c.Seed == nil && c.ResponseMimeType == "" && len(c.ResponseSchema) == 0 &&
+		c.Seed == nil && c.FrequencyPenalty == nil && c.PresencePenalty == nil &&
+		c.ResponseLogprobs == nil && c.Logprobs == nil &&
+		c.ResponseMimeType == "" && len(c.ResponseSchema) == 0 &&
 		c.ThinkingConfig == nil
 }
 
