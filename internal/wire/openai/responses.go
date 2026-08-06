@@ -899,21 +899,8 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 		out.ServiceTier = w.ServiceTier
 	}
 	if w.Usage != nil {
-		u := &canonical.Usage{
-			// Inclusive, as this family reports it (DESIGN §10.7).
-			InputTokens:  w.Usage.InputTokens,
-			OutputTokens: w.Usage.OutputTokens,
-			Reported:     canonical.UsageInput | canonical.UsageOutput,
-		}
-		if w.Usage.InputTokensDetails != nil {
-			u.CacheReadTokens = w.Usage.InputTokensDetails.CachedTokens
-			u.Report(canonical.UsageCacheRead)
-		}
-		if w.Usage.OutputTokensDetails != nil {
-			u.ReasoningTokens = w.Usage.OutputTokensDetails.ReasoningTokens
-			u.Report(canonical.UsageReasoning)
-		}
-		out.Usage = u
+		u := responsesUsage(w.Usage)
+		out.Usage = &u
 		out.UsageExtra = responsesUsageExtra(w.Usage)
 	}
 
@@ -943,6 +930,33 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 	choice.StopReason, choice.NativeStopReason = responsesStopReason(w, msg)
 	out.Choices = []canonical.Choice{choice}
 	return out, nil
+}
+
+// responsesUsage converts this family's usage block to the neutral one.
+//
+// Extracted so the buffered decoder and [ResponsesStreamDecoder] cannot drift:
+// a stream that counted cached tokens differently from the non-streaming path
+// would bill two identical requests two different amounts depending on whether
+// the caller asked for a stream, and nothing would fail.
+func responsesUsage(w *ResponsesUsage) canonical.Usage {
+	if w == nil {
+		return canonical.Usage{}
+	}
+	u := canonical.Usage{
+		// Inclusive, as this family reports it (DESIGN §10.7).
+		InputTokens:  w.InputTokens,
+		OutputTokens: w.OutputTokens,
+		Reported:     canonical.UsageInput | canonical.UsageOutput,
+	}
+	if w.InputTokensDetails != nil {
+		u.CacheReadTokens = w.InputTokensDetails.CachedTokens
+		u.Report(canonical.UsageCacheRead)
+	}
+	if w.OutputTokensDetails != nil {
+		u.ReasoningTokens = w.OutputTokensDetails.ReasoningTokens
+		u.Report(canonical.UsageReasoning)
+	}
+	return u
 }
 
 // responsesUsageExtra collects the members of a Responses usage object, and of
