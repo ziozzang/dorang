@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"errors"
+
+	"github.com/ziozzang/dorang/internal/auth"
 	"net/http"
 	"strconv"
 	"strings"
@@ -462,13 +464,34 @@ func refuseMaterialLoss(x *exchange) *server.Error {
 
 // credentialError is a credential dorang holds but cannot use.
 //
-// The credential id is named and nothing else is. The applier's own error does
-// not appear: DESIGN §11.2b requires that a refresher's message never be
-// wrapped, because it is provider code and its errors can carry the token it
-// failed to exchange.
-func credentialError(id string) *server.Error {
-	return server.NewError(http.StatusBadGateway, server.TypeAPIError,
-		"the credential selected for this request is not usable: "+id).
+// The applier's own error text never appears. DESIGN §11.2b requires that a
+// refresher's message never be wrapped, because it is provider code and its
+// errors can carry the token it failed to exchange.
+//
+// WHAT DOES APPEAR IS THE CATEGORY, and only where dorang itself determined it.
+// `unreadable`, `malformed` and `read-only` are this gateway's own sentinels
+// from internal/auth, raised before any provider is contacted and carrying no
+// provider text — so naming which one fired leaks nothing and answers the first
+// question an operator has.
+//
+// The three are different actions. Unreadable is a mount or a file mode: a
+// 0600 credential handed to a container running as another user produces it,
+// and diagnosing that from "not usable" alone cost an afternoon. Malformed is a
+// wrong `format:` or a store the vendor changed. Read-only is a source that
+// cannot be refreshed in place. Anything else stays unnamed, because anything
+// else came from the provider.
+func credentialError(id string, cause error) *server.Error {
+	msg := "the credential selected for this request is not usable: " + id
+	switch {
+	case errors.Is(cause, auth.ErrTokenStoreUnreadable):
+		msg += " — its token store cannot be read (check the path, the file mode, " +
+			"and the user the process runs as)"
+	case errors.Is(cause, auth.ErrTokenStoreMalformed):
+		msg += " — its token store is not in the shape `format:` declares"
+	case errors.Is(cause, auth.ErrTokenStoreReadOnly):
+		msg += " — its token store cannot be written, so a refresh cannot be saved"
+	}
+	return server.NewError(http.StatusBadGateway, server.TypeAPIError, msg).
 		WithCode(CodeCredentialUnavailable)
 }
 

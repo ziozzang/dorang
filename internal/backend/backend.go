@@ -509,7 +509,7 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 	}
 	if cerr := b.applyCredential(p, t.Credential, hreq.Header); cerr != nil {
 		cancel()
-		return nil, &attemptError{err: credentialError(t.Credential), credential: true}
+		return nil, &attemptError{err: credentialError(t.Credential, cerr), credential: true}
 	}
 	// What was actually put on the wire, read back from the headers rather than
 	// from the credential table: an OAuth token is applied by code this package
