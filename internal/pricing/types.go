@@ -361,6 +361,22 @@ type Request struct {
 	CacheWriteTokens int64
 	ReasoningTokens  int64
 
+	// WebSearches, ImageInputTokens and ImageOutputTokens are what SERVER-SIDE
+	// tools cost, and they are separate quantities because they are separate
+	// charges.
+	//
+	// A provider that runs a web search on the caller's behalf bills PER SEARCH,
+	// at a rate unrelated to any token; a provider that generates an image bills
+	// its tokens at a rate unrelated to chat tokens. Folding either into
+	// Requests or InputTokens would price them at the wrong rate and, worse,
+	// silently: the total would be plausible and no rule would be missing.
+	//
+	// They arrive on `tool_usage`, which is a sibling of the usage object rather
+	// than a member — the only place these are reported at all.
+	WebSearches       int64
+	ImageInputTokens  int64
+	ImageOutputTokens int64
+
 	// Requests is the number of requests for per_request rules. Zero is normalized to
 	// one, because Price prices one request.
 	Requests   int64

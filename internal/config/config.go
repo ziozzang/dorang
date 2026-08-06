@@ -1143,6 +1143,10 @@ const (
 var pricingComponents = []string{
 	"input", "output", "cached_read", "cache_read", "cache_write", "reasoning",
 	"request", "characters", "compute_seconds", "audio_seconds",
+	// Server-side tools. They are separate components because they are separate
+	// charges at unrelated rates, and folding them into `request` or `input`
+	// would price them wrongly without anything failing.
+	"web_searches", "image_input", "image_output",
 }
 
 // pricingComponentUnit maps a canonical component onto the price catalog's `unit`.
@@ -1162,6 +1166,9 @@ var pricingComponentUnit = map[string]string{
 	"characters":      "per_1k_characters",
 	"compute_seconds": "per_compute_second",
 	"audio_seconds":   "per_audio_second",
+	"web_searches":    "per_request",
+	"image_input":     "per_1m_tokens",
+	"image_output":    "per_1m_tokens",
 }
 
 // PricingUnit returns the price catalog `unit` a set of canonical component names

@@ -334,6 +334,12 @@ type Result struct {
 	// parse. Empty means application/json.
 	ContentType string
 	Usage       canonical.Usage
+	// UsageExtra is what the upstream reported that no counter names, including
+	// what SERVER-SIDE tools cost. It is carried rather than summarised because
+	// pricing charges some of it: a web search is billed per search and an
+	// image's tokens at a rate unrelated to chat tokens, and neither is
+	// reachable from any field above.
+	UsageExtra *canonical.UsageExtra
 
 	TTFT  time.Duration
 	Total time.Duration
@@ -700,6 +706,10 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 	res.Usage = usage
+	// The counts nothing names, carried to whoever prices this. A web search is
+	// billed per search and an image's tokens at a rate unrelated to chat
+	// tokens, and neither is reachable from res.Usage.
+	res.UsageExtra = x.usageExtra
 	res.Body = out
 	res.ContentType = ctype
 	res.ServedModel, res.ModelAgreement = x.served, x.agree

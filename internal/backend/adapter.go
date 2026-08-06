@@ -26,6 +26,17 @@ type exchange struct {
 	prov   *Provider
 	req    *canonical.Request
 
+	// usageExtra is what the upstream reported that no counter names, left here
+	// by the decoder for the caller to pick up.
+	//
+	// It travels on the exchange rather than through a return value for the same
+	// reason `served` and `agree` below do: the conversion path already has four
+	// results and a fifth would be a signature change at every adapter, for a
+	// value only two of them ever set. Pricing charges some of it — a web search
+	// per search, an image's tokens at a rate unrelated to chat tokens — so
+	// dropping it is a bill nobody can check.
+	usageExtra *canonical.UsageExtra
+
 	// ctype is the Content-Type of the encoded request body. An adapter that
 	// produces something other than JSON — the multipart audio and image
 	// surfaces — sets it; everything else leaves it empty and [Backend.send]

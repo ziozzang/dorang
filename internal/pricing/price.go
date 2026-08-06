@@ -552,6 +552,12 @@ func quantityOf(i int, req *Request) (int64, error) {
 		}
 	case cCharacters:
 		q = req.Characters
+	case cWebSearches:
+		q = req.WebSearches
+	case cImageInput:
+		q = req.ImageInputTokens
+	case cImageOutput:
+		q = req.ImageOutputTokens
 	case cComputeSeconds:
 		return secondsToMicros(req.Seconds)
 	case cAudioSeconds:

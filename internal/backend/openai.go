@@ -120,6 +120,10 @@ func (openaiAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 		if err != nil {
 			return nil, err
 		}
+		// The unmodelled counts ride the exchange to the Result, and from there
+		// to pricing. Some of them are charges — a server-side web search is
+		// billed per search — and none is reachable from canonical.Usage.
+		x.usageExtra = resp.UsageExtra
 		return &decoded{resp: resp}, nil
 	}
 	return decodeT1(body, x)

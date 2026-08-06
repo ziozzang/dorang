@@ -26,6 +26,14 @@ const (
 	cCharacters
 	cComputeSeconds
 	cAudioSeconds
+	// The server-side tool axes. A provider that searches the web on the
+	// caller's behalf bills PER SEARCH at a rate unrelated to any token, and one
+	// that generates an image bills its tokens at a rate unrelated to chat
+	// tokens. Folding either into `request` or `input` would price it at the
+	// wrong rate silently — the total stays plausible and no rule is missing.
+	cWebSearches
+	cImageInput
+	cImageOutput
 	numComponents
 )
 
@@ -47,6 +55,9 @@ var componentInfo = [numComponents]struct {
 	cCharacters: {"characters", "characters", UnitPerThousandCharacters, 1_000, 0},
 	// The two second axes. Their names are the whole of the convention: a rate says
 	// which quantity it prices, in the one place a catalog author cannot omit it.
+	cWebSearches:    {"web_searches", "web_searches", UnitPerRequest, 1, 0},
+	cImageInput:     {"image_input", "image_input", UnitPerMillionTokens, 1_000_000, 0},
+	cImageOutput:    {"image_output", "image_output", UnitPerMillionTokens, 1_000_000, 0},
 	cComputeSeconds: {"compute_seconds", "compute_seconds", UnitPerComputeSecond, microsPerSecond, 6},
 	cAudioSeconds:   {"audio_seconds", "audio_seconds", UnitPerAudioSecond, microsPerSecond, 6},
 }

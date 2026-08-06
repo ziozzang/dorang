@@ -602,8 +602,12 @@ type result struct {
 	err       error
 	retryable bool
 	usage     canonical.Usage
-	ttft      time.Duration
-	total     time.Duration
+	// usageExtra is what the upstream reported that no counter names. Pricing
+	// charges part of it: a server-side web search is billed per search and a
+	// generated image's tokens at a rate unrelated to chat tokens.
+	usageExtra *canonical.UsageExtra
+	ttft       time.Duration
+	total      time.Duration
 	// body is the converted non-streaming answer, held rather than written so
 	// that pricing lands on the request before the headers are stamped.
 	body []byte
@@ -772,6 +776,7 @@ func (c *call) operation() backend.Operation {
 func backendResult(br backend.Result) result {
 	res := result{
 		usage:       br.Usage,
+		usageExtra:  br.UsageExtra,
 		ttft:        br.TTFT,
 		total:       br.Total,
 		body:        br.Body,
@@ -967,17 +972,21 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	}
 	now := d.now()
 	util, refusal := observeUtilization(c, dec, res, now)
+	searches, imgIn, imgOut := toolQuantities(res.usageExtra)
 	cost, err := st.pricing.Settle(pricing.Request{
-		Provider:         dec.Provider,
-		Model:            dec.UpstreamModel,
-		Credential:       dec.Credential,
-		Deployment:       dec.Deployment,
-		InputTokens:      int64(res.usage.InputTokens),
-		OutputTokens:     int64(res.usage.OutputTokens),
-		CacheReadTokens:  int64(res.usage.CacheReadTokens),
-		CacheWriteTokens: int64(res.usage.CacheWriteTokens),
-		ReasoningTokens:  int64(res.usage.ReasoningTokens),
-		Requests:         1,
+		Provider:          dec.Provider,
+		Model:             dec.UpstreamModel,
+		Credential:        dec.Credential,
+		Deployment:        dec.Deployment,
+		InputTokens:       int64(res.usage.InputTokens),
+		OutputTokens:      int64(res.usage.OutputTokens),
+		CacheReadTokens:   int64(res.usage.CacheReadTokens),
+		CacheWriteTokens:  int64(res.usage.CacheWriteTokens),
+		WebSearches:       searches,
+		ImageInputTokens:  imgIn,
+		ImageOutputTokens: imgOut,
+		ReasoningTokens:   int64(res.usage.ReasoningTokens),
+		Requests:          1,
 		// The two second axes, and they are two on purpose (DESIGN §10.7). Seconds
 		// is how long THIS REQUEST took, which is what a GPU-second rate is quoted
 		// against. AudioSeconds is how much recorded media the vendor billed for,
@@ -1588,4 +1597,50 @@ func parseAllowLossy(v string) canonical.Capability {
 		}
 	}
 	return out
+}
+
+// toolQuantities is the priced part of the server-side tool report.
+//
+// It exists as its own function because the wiring is the thing worth pinning.
+// A test that exercised [toolCount] alone would prove the reader works and say
+// nothing about whether the dispatcher hands the numbers to pricing — which is
+// exactly the failure this whole change closes, one level up: a count that is
+// read, carried, and charged by nobody.
+func toolQuantities(extra *canonical.UsageExtra) (searches, imageIn, imageOut int64) {
+	return toolCount(extra, "web_search", "num_requests"),
+		toolCount(extra, "image_gen", "input_tokens"),
+		toolCount(extra, "image_gen", "output_tokens")
+}
+
+// toolCount reads one number out of the server-side tool report.
+//
+// The report is carried as raw JSON rather than a struct because its shape is
+// the vendor's and grows without a version bump — a struct would silently drop
+// whatever was added, and what is added here is a charge. Reading the two
+// members dorang prices, and leaving the rest intact for the ledger, keeps the
+// bill checkable without pretending to model a surface nobody has fixed.
+//
+// A member that is absent, not a number, or negative yields zero: a charge
+// dorang cannot read is not a charge it may invent.
+func toolCount(extra *canonical.UsageExtra, tool, member string) int64 {
+	if extra == nil || len(extra.ToolUsage) == 0 {
+		return 0
+	}
+	raw, ok := extra.ToolUsage[tool]
+	if !ok {
+		return 0
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return 0
+	}
+	v, ok := m[member]
+	if !ok {
+		return 0
+	}
+	var n int64
+	if err := json.Unmarshal(v, &n); err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
