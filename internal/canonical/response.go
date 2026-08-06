@@ -233,11 +233,22 @@ type UsageExtra struct {
 	// CompletionDetails is the unmodelled members of the completion-token
 	// breakdown, including accepted_prediction_tokens.
 	CompletionDetails map[string]json.RawMessage
+	// ToolUsage is what SERVER-SIDE tools cost, which is a sibling of the usage
+	// object rather than a member of it.
+	//
+	// The Responses surface reports `tool_usage` there: `web_search` carries a
+	// request count billed per request, and `image_gen` carries its own input
+	// and output token counts with a text/image breakdown, priced differently
+	// from chat tokens. None of it is reachable from the three maps above
+	// because none of it is inside `usage`, and dropping it means a bill nobody
+	// can check against a ledger.
+	ToolUsage map[string]json.RawMessage
 }
 
 // Empty reports whether nothing unmodelled was carried.
 func (u *UsageExtra) Empty() bool {
-	return u == nil || (len(u.Usage) == 0 && len(u.PromptDetails) == 0 && len(u.CompletionDetails) == 0)
+	return u == nil || (len(u.Usage) == 0 && len(u.PromptDetails) == 0 &&
+		len(u.CompletionDetails) == 0 && len(u.ToolUsage) == 0)
 }
 
 // Response is a complete non-streaming response.
@@ -339,7 +350,16 @@ type StreamEvent struct {
 	Choice int
 	Delta  Delta
 	Usage  *Usage
-	Err    *Error
+	// UsageExtra is what the upstream reported that no counter names, carried on
+	// the usage event.
+	//
+	// [Response] has had this since the buffered path was written; the streaming
+	// path had nowhere to put it, so a caller who asked for a stream lost every
+	// unmodelled count — server-side tool spend among them — and a caller who
+	// did not keep it. Two identical requests, two different ledgers, decided by
+	// whether the caller wanted the answer incrementally.
+	UsageExtra *UsageExtra
+	Err        *Error
 }
 
 // Delta is the incremental payload of an [EventDelta] or [EventStop].

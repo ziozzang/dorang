@@ -238,3 +238,75 @@ data: {"type":"response.incomplete","response":{"id":"r","status":"incomplete"}}
 		}
 	}
 }
+
+// Server-side tool spend reaches the ledger, on both paths.
+//
+// `tool_usage` is a SIBLING of `usage`, not a member, so no amount of digging in
+// the usage object finds it — and it is the only place a server-side web search
+// or image generation is priced. `web_search.num_requests` is billed per
+// request; `image_gen` carries its own token counts at a different rate from
+// chat tokens. Dropping it means a bill nobody can check against a ledger.
+//
+// The two paths are asserted together on purpose. The buffered decoder kept
+// UsageExtra and the streaming one had nowhere to put it, so a caller who asked
+// for a stream lost every unmodelled count and a caller who did not kept them:
+// two identical requests, two different ledgers, decided by whether the answer
+// was wanted incrementally.
+func TestServerSideToolSpendSurvivesBothPaths(t *testing.T) {
+	const toolUsage = `{"web_search":{"num_requests":3},"image_gen":{"output_tokens":120}}`
+
+	t.Run("stream", func(t *testing.T) {
+		sse := `data: {"type":"response.created","response":{"id":"r","model":"m"}}
+
+data: {"type":"response.completed","response":{"id":"r","status":"completed",` +
+			`"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":7}},` +
+			`"tool_usage":` + toolUsage + `}}
+
+`
+		evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var extra *canonical.UsageExtra
+		for _, e := range evs {
+			if e.Type == canonical.EventUsage {
+				extra = e.UsageExtra
+			}
+		}
+		if extra == nil {
+			t.Fatal("the usage event carries no extras; server-side tool spend left with the stream")
+		}
+		if _, ok := extra.ToolUsage["web_search"]; !ok {
+			t.Errorf("web_search spend is missing: %v", extra.ToolUsage)
+		}
+		if _, ok := extra.ToolUsage["image_gen"]; !ok {
+			t.Errorf("image_gen spend is missing: %v", extra.ToolUsage)
+		}
+		// cache_write_tokens is not a modelled counter and is a real charge.
+		if _, ok := extra.PromptDetails["cache_write_tokens"]; !ok {
+			t.Errorf("cache_write_tokens did not survive: %v", extra.PromptDetails)
+		}
+	})
+
+	t.Run("buffered", func(t *testing.T) {
+		body := `{"id":"r","object":"response","status":"completed","model":"m",` +
+			`"output":[],"usage":{"input_tokens":10,"output_tokens":5,` +
+			`"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":7}},` +
+			`"tool_usage":` + toolUsage + `}`
+		var w ResponsesResponse
+		if err := w.UnmarshalJSON([]byte(body)); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := w.Extra["tool_usage"]; !ok {
+			t.Fatal("tool_usage was dropped by the response decoder; it is not a member of " +
+				"usage, so nothing else would have caught it")
+		}
+		got := responsesUsageExtra(w.Usage, toolUsageOf(&w))
+		if got == nil || len(got.ToolUsage) == 0 {
+			t.Fatalf("buffered path reports no tool spend: %+v", got)
+		}
+		if _, ok := got.PromptDetails["cache_write_tokens"]; !ok {
+			t.Errorf("cache_write_tokens did not survive the buffered path: %v", got.PromptDetails)
+		}
+	})
+}

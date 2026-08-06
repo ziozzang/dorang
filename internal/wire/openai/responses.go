@@ -448,6 +448,49 @@ type ResponsesResponse struct {
 	User               *string             `json:"user,omitempty"`
 	Metadata           map[string]string   `json:"metadata,omitempty"`
 	ServiceTier        string              `json:"service_tier,omitempty"`
+
+	// Extra carries every member of the response object this build does not
+	// model, and `tool_usage` is why it is not optional.
+	//
+	// That object reports what the SERVER-SIDE tools cost:
+	// `web_search.num_requests` is billed per request, and `image_gen` carries
+	// its own input/output token counts with a text/image breakdown, priced
+	// differently from chat tokens. Dropping it means a bill nobody can check
+	// against a ledger — the same argument [InputTokensDetails.Extra] already
+	// makes one level down: counts on somebody's invoice, not decoration.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+var responsesResponseKnown = knownKeys("id", "object", "created_at", "status",
+	"error", "incomplete_details", "instructions", "max_output_tokens", "model",
+	"output", "parallel_tool_calls", "previous_response_id", "reasoning", "store",
+	"temperature", "text", "tool_choice", "tools", "top_p", "truncation", "usage",
+	"user", "metadata", "service_tier")
+
+func (r ResponsesResponse) MarshalJSON() ([]byte, error) {
+	type alias ResponsesResponse
+	return marshalWithExtra(alias(r), r.Extra, responsesResponseKnown)
+}
+
+// AppendJSON implements [wirejson.Appender].
+func (r ResponsesResponse) AppendJSON(dst []byte) ([]byte, error) {
+	type alias ResponsesResponse
+	return appendWithExtra(dst, alias(r), r.Extra, responsesResponseKnown)
+}
+
+func (r *ResponsesResponse) UnmarshalJSON(b []byte) error {
+	type alias ResponsesResponse
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	extra, err := splitExtraFold(b, responsesResponseKnown)
+	if err != nil {
+		return err
+	}
+	*r = ResponsesResponse(a)
+	r.Extra = extra
+	return nil
 }
 
 // IncompleteDetails says why a response stopped early.
@@ -901,7 +944,7 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 	if w.Usage != nil {
 		u := responsesUsage(w.Usage)
 		out.Usage = &u
-		out.UsageExtra = responsesUsageExtra(w.Usage)
+		out.UsageExtra = responsesUsageExtra(w.Usage, toolUsageOf(w))
 	}
 
 	msg := canonical.Message{Role: canonical.RoleAssistant}
@@ -930,6 +973,26 @@ func ResponsesResponseToCanonical(w *ResponsesResponse, opt *DecodeOptions) (*ca
 	choice.StopReason, choice.NativeStopReason = responsesStopReason(w, msg)
 	out.Choices = []canonical.Choice{choice}
 	return out, nil
+}
+
+// toolUsageOf lifts `tool_usage` out of the response's unmodelled members.
+//
+// It is a sibling of `usage` rather than a member, so no amount of digging in
+// the usage object finds it, and it is the only place a server-side web search
+// or image generation is priced.
+func toolUsageOf(w *ResponsesResponse) map[string]json.RawMessage {
+	if w == nil || w.Extra == nil {
+		return nil
+	}
+	raw, ok := w.Extra["tool_usage"]
+	if !ok {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 // responsesUsage converts this family's usage block to the neutral one.
@@ -967,11 +1030,18 @@ func responsesUsage(w *ResponsesUsage) canonical.Usage {
 // member that arrived under one spelling must be readable by an encoder for the
 // other; keeping a third pair of maps would only record which vendor's word for
 // "details" the upstream happened to use.
-func responsesUsageExtra(u *ResponsesUsage) *canonical.UsageExtra {
-	if u == nil {
+func responsesUsageExtra(u *ResponsesUsage, toolUsage map[string]json.RawMessage) *canonical.UsageExtra {
+	if u == nil && len(toolUsage) == 0 {
 		return nil
 	}
-	out := &canonical.UsageExtra{Usage: u.Extra}
+	out := &canonical.UsageExtra{ToolUsage: toolUsage}
+	if u == nil {
+		if out.Empty() {
+			return nil
+		}
+		return out
+	}
+	out.Usage = u.Extra
 	if u.InputTokensDetails != nil {
 		out.PromptDetails = u.InputTokensDetails.Extra
 	}

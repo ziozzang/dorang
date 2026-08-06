@@ -313,7 +313,16 @@ func (d *ResponsesStreamDecoder) terminal(name string, v *respStreamFrame) []can
 	if v.Response != nil && v.Response.Usage != nil {
 		u := responsesUsage(v.Response.Usage)
 		d.usage, d.haveUsed = u, true
-		out = append(out, d.stamp(canonical.StreamEvent{Type: canonical.EventUsage, Usage: &u}))
+		// The unmodelled counts travel with the counts they qualify. Without
+		// this a caller who asked for a stream lost every one of them —
+		// server-side tool spend among them — and a caller who did not kept
+		// them: two identical requests, two different ledgers, decided by
+		// whether the answer was wanted incrementally.
+		out = append(out, d.stamp(canonical.StreamEvent{
+			Type:       canonical.EventUsage,
+			Usage:      &u,
+			UsageExtra: responsesUsageExtra(v.Response.Usage, toolUsageOf(v.Response)),
+		}))
 	}
 	return out
 }
