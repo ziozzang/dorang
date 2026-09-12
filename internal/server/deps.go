@@ -408,6 +408,17 @@ type Usage struct {
 	CacheWrite int64
 	Reasoning  int64
 	Total      int64
+
+	// The server-side tool spend the upstream reported beside its token
+	// counts (`tool_usage` on the Responses surface): web searches billed
+	// per request, image tokens billed at their own rate. They are carried
+	// here so the caller sees them on the `x-dorang-*` headers exactly as it
+	// sees the token counters — the ledger and the price already had them,
+	// and a charge the caller cannot see on the answer that incurred it is
+	// a bill nobody can check.
+	WebSearches int64
+	ImageInput  int64
+	ImageOutput int64
 }
 
 // RateLimit is the standard-form rate-limit view returned to the client.

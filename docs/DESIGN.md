@@ -2279,7 +2279,8 @@ changes nothing beside a neighbour that works.
 | `x-dorang-provider`, `-credential`, `-deployment` | selected target (ids, never secrets) |
 | `x-dorang-attempt`, `-fallback-from`, `-route-reason` | routing decision |
 | `x-dorang-queue-ms`, `-ttft-ms`, `-latency-ms` | latency breakdown |
-| `x-dorang-tokens-*` | input, output, cache read/write, reasoning |
+| `x-dorang-tokens-*` | input, output, cache read/write, reasoning, image input/output (the upstream's own `tool_usage` counts, billed at their own rate) |
+| `x-dorang-tool-web-searches` | server-side web searches the upstream reported (`tool_usage.web_search.num_requests`), billed per request; beside the token counters because a charge the caller cannot see on the answer that incurred it is a bill nobody can check |
 | `x-dorang-cost-usd` | this request |
 | `x-dorang-notional-usd` | list-rate equivalent (§8.5) — an estimate, never billed |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | cumulative. The ceiling comes from the authorization snapshot and is always known; the SPEND comes from the budget hold, which is hydrated by the reservation, so a request that reserves nothing (a zero-rated one) omits `-spend-usd` and `-budget-remaining-usd` rather than reporting a `0` nobody looked up. Same rule as the streamed cost header: absent claims nothing, zero claims a measurement |

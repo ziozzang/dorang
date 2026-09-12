@@ -2,6 +2,12 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
+	"github.com/ziozzang/dorang/internal/server"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -62,6 +68,49 @@ func TestAnUnreadableToolCountIsZeroRatherThanAGuess(t *testing.T) {
 		if got, _, _ := toolQuantities(tc.extra); got != 0 {
 			t.Errorf("%s: got %d, want 0 — an unreadable charge must not become an "+
 				"invented one", tc.name, got)
+		}
+	}
+}
+
+// Server-side tool spend reaches the caller's headers.
+//
+// The counts already reached the ledger and the price; the caller is the one
+// party that could not see them, on the very answer that incurred them. The
+// assertion is on the response headers of an assembled gateway, with the
+// upstream answering a Responses document carrying `tool_usage` — and on an
+// UNPRICED deployment, because the counts are the answer's whether or not a
+// rate exists for them.
+func TestServerSideToolSpendReachesTheHeaders(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r","object":"response","status":"completed","model":"m1-upstream",` +
+			`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],` +
+			`"usage":{"input_tokens":10,"output_tokens":5},` +
+			`"tool_usage":{"web_search":{"num_requests":3},"image_gen":{"input_tokens":40,"output_tokens":120}}}`))
+	}))
+	t.Cleanup(up.Close)
+	yaml := fmt.Sprintf(spellingYAML, up.URL, "{}", "")
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	key := issueKey(t, a, nil)
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m1","messages":[{"role":"user","content":"go"}]}`))
+	r.Header.Set("Authorization", "Bearer "+key)
+	r.Header.Set(server.HeaderDetail, "full")
+	w := httptest.NewRecorder()
+	a.Server.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d\n%s", w.Code, w.Body.String())
+	}
+	for name, want := range map[string]string{
+		server.HeaderToolWebSearches:   "3",
+		server.HeaderTokensImageInput:  "40",
+		server.HeaderTokensImageOutput: "120",
+		server.HeaderTokensInput:       "10",
+	} {
+		if got := w.Header().Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
 }

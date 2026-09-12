@@ -118,6 +118,12 @@ const (
 	HeaderTokensCacheRead  = "X-Dorang-Tokens-Cache-Read"
 	HeaderTokensCacheWrite = "X-Dorang-Tokens-Cache-Write"
 	HeaderTokensReasoning  = "X-Dorang-Tokens-Reasoning"
+	// The server-side tool spend beside the token counters: a search is a
+	// per-request charge and image tokens carry their own rate, so neither is
+	// reachable from the five above.
+	HeaderTokensImageInput  = "X-Dorang-Tokens-Image-Input"
+	HeaderTokensImageOutput = "X-Dorang-Tokens-Image-Output"
+	HeaderToolWebSearches   = "X-Dorang-Tool-Web-Searches"
 	// HeaderCostUSD is this request's cost.
 	HeaderCostUSD = "X-Dorang-Cost-Usd"
 	// HeaderNotionalUSD is the list-rate equivalent (DESIGN §8.5) — an
@@ -469,6 +475,9 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	setInt(h, HeaderTokensCacheRead, u.CacheRead)
 	setInt(h, HeaderTokensCacheWrite, u.CacheWrite)
 	setInt(h, HeaderTokensReasoning, u.Reasoning)
+	setInt(h, HeaderTokensImageInput, u.ImageInput)
+	setInt(h, HeaderTokensImageOutput, u.ImageOutput)
+	setInt(h, HeaderToolWebSearches, u.WebSearches)
 
 	if r.UtilizationPriced && !costDeferred && r.UtilizationSource == utilizationObserved {
 		// Only when it was actually observed. Emitting 0.000000 on a fallback

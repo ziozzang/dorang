@@ -952,13 +952,20 @@ func (d *dispatcher) noteSubstitution(st *dispatchState, dec *router.Decision,
 func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	rq *server.Request, res result) {
 
+	// Before the pricing gate, so an unpriced deployment still tells the
+	// caller what the upstream reported: the counts are the answer's, whether
+	// or not anyone has put a rate on them.
+	searches, imgIn, imgOut := toolQuantities(res.usageExtra)
 	rq.Result.Tokens = server.Usage{
-		Input:      int64(res.usage.InputTokens),
-		Output:     int64(res.usage.OutputTokens),
-		CacheRead:  int64(res.usage.CacheReadTokens),
-		CacheWrite: int64(res.usage.CacheWriteTokens),
-		Reasoning:  int64(res.usage.ReasoningTokens),
-		Total:      int64(res.usage.TotalTokens()),
+		Input:       int64(res.usage.InputTokens),
+		Output:      int64(res.usage.OutputTokens),
+		CacheRead:   int64(res.usage.CacheReadTokens),
+		CacheWrite:  int64(res.usage.CacheWriteTokens),
+		Reasoning:   int64(res.usage.ReasoningTokens),
+		Total:       int64(res.usage.TotalTokens()),
+		WebSearches: searches,
+		ImageInput:  imgIn,
+		ImageOutput: imgOut,
 	}
 	rq.Result.TTFTNS = res.ttft.Nanoseconds()
 	rq.Result.LatencyNS = res.total.Nanoseconds()
@@ -977,7 +984,6 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	}
 	now := d.now()
 	util, refusal := observeUtilization(c, dec, res, now)
-	searches, imgIn, imgOut := toolQuantities(res.usageExtra)
 	cost, err := st.pricing.Settle(pricing.Request{
 		Provider:          dec.Provider,
 		Model:             dec.UpstreamModel,

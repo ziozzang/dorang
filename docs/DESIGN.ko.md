@@ -1401,7 +1401,8 @@ dorang은 리즈닝 budget을 맞추려고 **호출자의 `max_tokens`를 절대
 | `x-dorang-provider`, `-credential`, `-deployment` | 선택된 타깃 (id이며, 비밀값은 절대 아님) |
 | `x-dorang-attempt`, `-fallback-from`, `-route-reason` | 라우팅 결정 |
 | `x-dorang-queue-ms`, `-ttft-ms`, `-latency-ms` | 지연 분해 |
-| `x-dorang-tokens-*` | input, output, cache read/write, reasoning |
+| `x-dorang-tokens-*` | input, output, cache read/write, reasoning, image input/output(업스트림 자신의 `tool_usage` 카운트, 별도 단가로 과금) |
+| `x-dorang-tool-web-searches` | 업스트림이 보고한 서버측 웹 검색 횟수(`tool_usage.web_search.num_requests`), 건당 과금. 토큰 카운터 옆에 두는 이유: 호출자가 그 답에서 볼 수 없는 요금은 아무도 검증할 수 없는 청구서다 |
 | `x-dorang-cost-usd` | 이 요청의 비용 |
 | `x-dorang-notional-usd` | 정가 환산(§8.5) — 추정이며 절대 청구되지 않음 |
 | `x-dorang-spend-usd`, `-budget-usd`, `-budget-remaining-usd` | 누적. 상한은 인가 스냅숏에서 오므로 항상 알려져 있고, **지출**은 예약이 하이드레이트하는 예산 hold에서 온다. 따라서 아무것도 예약하지 않는 요청(요율 0짜리)은 아무도 조회하지 않은 `0`을 보고하는 대신 `-spend-usd`와 `-budget-remaining-usd`를 생략한다. 스트리밍 비용 헤더와 같은 규칙이다 — **부재는 아무것도 주장하지 않고, 0은 측정을 주장한다** |
