@@ -93,10 +93,14 @@ type Config struct {
 
 	Credentials CredentialReporter
 	Capacity    CapacityReporter
-	Health      HealthHistory
-	Catalog     Catalog
-	Pricing     Pricer
-	Reloader    Reloader
+	// Surface reports this node's live HTTP counters — what GET /metrics
+	// exposes — for the monitoring screen's real-time pulse. Optional; nil
+	// leaves that section off, the same rule the other reporters follow.
+	Surface  SurfaceReporter
+	Health   HealthHistory
+	Catalog  Catalog
+	Pricing  Pricer
+	Reloader Reloader
 
 	// MaxTimeRange caps a ledger query's width. Zero means
 	// DefaultMaxTimeRange.

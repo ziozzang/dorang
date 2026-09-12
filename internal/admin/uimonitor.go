@@ -33,11 +33,12 @@ func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v vi
 	}
 	now := s.api.now()
 	pg := monitorPage{
-		page:      s.newPage("monitoring", "Monitoring", v),
-		Window:    "5m",
-		HasLedger: s.api.cfg.Ledger != nil,
-		HasCreds:  s.api.cfg.Credentials != nil,
-		HasCap:    s.api.cfg.Capacity != nil,
+		page:       s.newPage("monitoring", "Monitoring", v),
+		Window:     "5m",
+		HasLedger:  s.api.cfg.Ledger != nil,
+		HasCreds:   s.api.cfg.Credentials != nil,
+		HasCap:     s.api.cfg.Capacity != nil,
+		HasSurface: s.api.cfg.Surface != nil,
 	}
 
 	if pg.HasLedger {
@@ -103,6 +104,19 @@ func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v vi
 			pg.CapErr = true
 		}
 	}
+	if pg.HasSurface {
+		if sf, err := s.api.cfg.Surface.Surface(r.Context()); err == nil {
+			pg.Surface = surfaceView{
+				NodeID: sf.NodeID, Requests: sf.Requests,
+				Class2xx: sf.Class2xx, Class3xx: sf.Class3xx, Class4xx: sf.Class4xx, Class5xx: sf.Class5xx,
+				InFlight: sf.InFlight, AvgLatencyMS: sf.AvgLatencyMS,
+				BytesIn: sf.BytesIn, BytesOut: sf.BytesOut,
+				Uptime: humanDuration(sf.UptimeSeconds), Ready: sf.Ready, MetricsPath: sf.MetricsPath,
+			}
+		} else {
+			pg.SurfaceErr = true
+		}
+	}
 
 	s.render(w, r, http.StatusOK, "monitoring", pg)
 }
@@ -129,6 +143,21 @@ type monitorPage struct {
 	Waiting      int
 	Reservations int
 	Axes         []capRow
+
+	HasSurface bool
+	SurfaceErr bool
+	Surface    surfaceView
+}
+
+// surfaceView is this node's live HTTP counters, the digest of GET /metrics the
+// screen shows as its real-time pulse.
+type surfaceView struct {
+	NodeID                                           string
+	Requests, Class2xx, Class3xx, Class4xx, Class5xx int64
+	InFlight, AvgLatencyMS, BytesIn, BytesOut        int64
+	Uptime                                           string
+	Ready                                            bool
+	MetricsPath                                      string
 }
 
 type recentRow struct {
@@ -191,6 +220,37 @@ func percentile(v []int64, p int) string {
 }
 
 func itoaMS(ms int64) string { return humanInt(ms) + " ms" }
+
+// humanDuration renders a whole-second count as the coarsest two units that
+// carry it: "3h 12m", "12m 04s", "45s". Uptime is the only caller and it wants
+// a glance, not a stopwatch.
+func humanDuration(sec int64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	d := sec / 86400
+	h := (sec % 86400) / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	switch {
+	case d > 0:
+		return humanInt(d) + "d " + itoa2(h) + "h"
+	case h > 0:
+		return humanInt(h) + "h " + itoa2(m) + "m"
+	case m > 0:
+		return humanInt(m) + "m " + itoa2(s) + "s"
+	default:
+		return humanInt(s) + "s"
+	}
+}
+
+// itoa2 zero-pads a 0-59 field to two digits for the trailing unit.
+func itoa2(v int64) string {
+	if v < 10 {
+		return "0" + humanInt(v)
+	}
+	return humanInt(v)
+}
 
 func shortEndpoint(e string) string {
 	switch e {

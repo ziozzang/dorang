@@ -149,7 +149,13 @@ body.app {
 .brand-name { font-weight: 650; letter-spacing: .01em; font-size: 1.02rem; }
 .brand-name small { color: var(--faint); font-weight: 500; margin-left: 6px; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
 
-nav.screens { display: flex; flex-direction: column; gap: 2px; }
+nav.screens { display: flex; flex-direction: column; gap: 14px; }
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+.nav-group-title {
+  font-size: .68rem; font-weight: 700; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--muted); opacity: .7;
+  padding: 0 12px 4px;
+}
 nav.screens a {
   display: flex;
   align-items: center;
@@ -239,6 +245,8 @@ code { font-family: var(--mono); font-size: .88em; background: var(--surface-2);
 .tile .value { font: 700 1.7rem/1.15 var(--sans); margin-top: 6px; overflow-wrap: anywhere; letter-spacing: -.02em; }
 .tile .value.mono, .tile .value:has(+ .note) { font-family: var(--sans); }
 .tile .note { color: var(--faint); font-size: .8rem; margin-top: 6px; }
+.metrics-note { color: var(--muted); font-size: .82rem; margin: 6px 0 4px; }
+.metrics-note code { font-size: .82rem; }
 .tile.paired { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-soft), var(--shadow); }
 
 /* ===========================================================================
@@ -420,7 +428,9 @@ dl.card dd.wrap { white-space: normal; }
     align-items: center; gap: 4px; padding: 10px 14px;
   }
   .brand { padding: 0 10px 0 0; }
-  nav.screens { flex-direction: row; flex-wrap: wrap; }
+  nav.screens { flex-direction: row; flex-wrap: wrap; gap: 4px; }
+  .nav-group { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .nav-group-title { display: none; }
   nav.screens a { border-left: none; border-bottom: 3px solid transparent; padding: 7px 10px; }
   nav.screens a[aria-current="page"] { border-left: none; }
   .side-foot { margin: 0 0 0 auto; padding: 0; border: none; flex-direction: row; align-items: center; }

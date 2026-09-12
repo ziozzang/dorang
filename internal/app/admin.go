@@ -226,9 +226,13 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		Routing: &adminRouting{cfg: a.Config},
 
 		Capacity: &adminCapacityReporter{b: a.Broker},
-		Catalog:  &adminCatalog{c: a.Catalog},
-		Pricing:  &adminPricer{d: a.dispatch},
-		Health:   admin.NewMemoryHealthHistory(1024, a.now()),
+		// The monitoring screen's real-time pulse: this node's live HTTP
+		// counters, the same set GET /metrics exposes. Late-bound to a.Server
+		// because the server does not exist yet — see [adminSurface].
+		Surface: &adminSurface{a: a},
+		Catalog: &adminCatalog{c: a.Catalog},
+		Pricing: &adminPricer{d: a.dispatch},
+		Health:  admin.NewMemoryHealthHistory(1024, a.now()),
 
 		Now: a.now,
 	})
@@ -1062,6 +1066,45 @@ func limitPtr(v int64) *int64 {
 // ---------------------------------------------------------------------------
 // Read-only reporting
 // ---------------------------------------------------------------------------
+
+// adminSurface reports this process's live HTTP counters — the same set GET
+// /metrics exposes — into the monitoring screen's real-time pulse.
+//
+// It reads a.Server at call time rather than at construction on purpose:
+// buildAdmin runs BEFORE the server exists, because the server is built with
+// the admin routes buildAdmin returns (app.go wires a.Admin, then a.Server). An
+// eager read would capture a nil forever; a per-call read sees the server as
+// soon as start-up has set it, and answers "not ready yet" until then.
+type adminSurface struct{ a *App }
+
+func (s *adminSurface) Surface(context.Context) (admin.Surface, error) {
+	srv := s.a.Server
+	if srv == nil {
+		// The window between buildAdmin and a.Server being set. The screen
+		// renders the section's "could not be read" line, which is the honest
+		// answer for a process that has not finished starting.
+		return admin.Surface{}, admin.ErrUnsupported
+	}
+	st := srv.Stats()
+	out := admin.Surface{
+		NodeID:        nodeID(s.a.Config()),
+		Requests:      int64(st.Requests),
+		Class2xx:      int64(st.ByClass[2]),
+		Class3xx:      int64(st.ByClass[3]),
+		Class4xx:      int64(st.ByClass[4]),
+		Class5xx:      int64(st.ByClass[5]),
+		InFlight:      st.InFlight,
+		BytesIn:       int64(st.BytesIn),
+		BytesOut:      int64(st.BytesOut),
+		UptimeSeconds: int64(st.Uptime.Seconds()),
+		Ready:         st.Ready,
+		MetricsPath:   "/metrics",
+	}
+	if st.Requests > 0 {
+		out.AvgLatencyMS = int64(st.DurationSumNS / st.Requests / 1_000_000)
+	}
+	return out, nil
+}
 
 type adminCapacityReporter struct{ b *capacity.Broker }
 

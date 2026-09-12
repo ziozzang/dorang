@@ -819,6 +819,47 @@ type CapacityReporter interface {
 	Occupancy(ctx context.Context) (CapacityOccupancy, error)
 }
 
+// SurfaceReporter reports the HTTP surface's own live counters — the ones GET
+// /metrics exposes — so the monitoring screen can show what is happening right
+// now without a Prometheus scrape and a second dashboard.
+//
+// It is per-process by nature: the numbers are THIS node's, counted since it
+// started. Behind a balancer a refresh may land on another node and show its
+// numbers instead, which is why [Surface] carries the node id — the figure is
+// only meaningful next to the node it belongs to. Fleet-wide history is what an
+// external Prometheus scraping every node's /metrics is for; this is the glance.
+type SurfaceReporter interface {
+	Surface(ctx context.Context) (Surface, error)
+}
+
+// Surface is a point-in-time read of the HTTP surface's counters, digested from
+// what GET /metrics exposes.
+type Surface struct {
+	NodeID string
+	// Requests is every request the surface finished, health probes and the
+	// metrics scrape included.
+	Requests int64
+	// Responses by status class; the four an operator reads at a glance.
+	Class2xx int64
+	Class3xx int64
+	Class4xx int64
+	Class5xx int64
+	// InFlight is requests being served right now.
+	InFlight int64
+	// AvgLatencyMS is the mean gateway duration over Requests. The ledger half
+	// of this screen carries the failure percentiles; this is the throughput
+	// mean the histogram sums to.
+	AvgLatencyMS  int64
+	BytesIn       int64
+	BytesOut      int64
+	UptimeSeconds int64
+	Ready         bool
+	// MetricsPath is where the full Prometheus exposition is served, so the
+	// screen can point an operator at the scrape endpoint for the series this
+	// digest leaves out (per-model duration, quota, cluster overshoot).
+	MetricsPath string
+}
+
 // HealthEvent is one recorded health transition or probe result.
 type HealthEvent struct {
 	TS time.Time

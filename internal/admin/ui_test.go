@@ -437,6 +437,24 @@ func TestModelsScreenWithNeitherSource(t *testing.T) {
 // optional; it is a broken product. The nav therefore lists what this process
 // can serve THIS viewer, and the screens' own guards stay exactly as they were
 // — a link is not an authorization decision.
+// The sidebar is grouped into labelled sections rather than one flat column,
+// and grouping drops no link: every screen the flat nav offered still has its
+// href, now under a section title.
+func TestNavIsGroupedIntoSections(t *testing.T) {
+	h := newHarness(t)
+	body := h.do(http.MethodGet, "/ui/keys", nil).Body.String()
+	for _, title := range []string{`nav-group-title">access`, `nav-group-title">observability`} {
+		if !strings.Contains(body, title) {
+			t.Errorf("the nav is not grouped: missing %q", title)
+		}
+	}
+	for _, href := range []string{`href="/ui/keys"`, `href="/ui/usage"`, `href="/ui/monitoring"`} {
+		if !strings.Contains(body, href) {
+			t.Errorf("grouping dropped a link: %s", href)
+		}
+	}
+}
+
 func TestNavAdvertisesOnlyScreensThatAnswer(t *testing.T) {
 	t.Run("no model catalog", func(t *testing.T) {
 		h := newHarness(t, func(c *Config) { c.Models = nil })

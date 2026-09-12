@@ -21,7 +21,11 @@
     <span class="brand-name">dorang<small>admin</small></span>
   </a>
   <nav class="screens" aria-label="Screens">
-    {{range .Screens}}<a href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}>{{.Label}}</a>
+    {{range .NavGroups}}<div class="nav-group">
+      <span class="nav-group-title">{{.Title}}</span>
+      {{range .Screens}}<a href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}>{{.Label}}</a>
+      {{end}}
+    </div>
     {{end}}
   </nav>
   <div class="side-foot">

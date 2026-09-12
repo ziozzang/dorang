@@ -228,6 +228,32 @@ func TestMonitoringScreenReadsTheLedgerLive(t *testing.T) {
 	}
 }
 
+// The monitoring screen shows this node's live pulse from the real server's own
+// counters — the digest of what GET /metrics exposes — wired through App.
+//
+// A fresh process's counters are zero, which is the honest reading and not an
+// error; what must hold is that the section renders and points an operator at
+// the scrape endpoint. Revert check: unwire Config.Surface in buildAdmin and
+// the section is gone — "Live" and the /metrics pointer both vanish and this
+// fails.
+func TestMonitoringShowsLivePulseFromTheServer(t *testing.T) {
+	a := newWiringApp(t, adminUIYAML, nil)
+	w := callWith(a, testMasterKey, http.MethodGet, "/ui/monitoring", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("/ui/monitoring = %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"Live", "/metrics"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the live pulse from the server is missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "could not be read") {
+		t.Errorf("this node's live counters could not be read — the surface reporter "+
+			"is not wired to the server:\n%s", body)
+	}
+}
+
 // Two of the six tiles on the usage screen — notional and leverage — could not
 // hold a value in any deployment: the rollup adapter hard-wired NotionalKnown
 // to false, so §8.5's whole point (a subscription's value is visible) rendered

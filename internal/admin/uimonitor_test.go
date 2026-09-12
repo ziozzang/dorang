@@ -48,6 +48,34 @@ func (l refusingLedger) Report(context.Context, ReportQuery) (Report, error) {
 	return Report{}, ErrUnsupported
 }
 
+type fakeSurface struct{ s Surface }
+
+func (f fakeSurface) Surface(context.Context) (Surface, error) { return f.s, nil }
+
+// The real-time pulse renders this node's live HTTP counters — the digest of
+// GET /metrics — including the node id it belongs to and a pointer to the
+// scrape endpoint. Without the node id the numbers are meaningless behind a
+// balancer, so it is part of what the section must show.
+func TestMonitoringShowsThisNodeLivePulse(t *testing.T) {
+	sf := fakeSurface{s: Surface{
+		NodeID: "dorang-7", Requests: 4210, Class2xx: 4000, Class4xx: 200, Class5xx: 10,
+		InFlight: 3, AvgLatencyMS: 42, UptimeSeconds: 3*3600 + 12*60, Ready: true, MetricsPath: "/metrics",
+	}}
+	h := newHarness(t, func(c *Config) { c.Surface = sf })
+	seedAdminSession(h)
+	c, _ := signInUI(t, h, adminToken)
+	rec := uiGet(h, "/ui/monitoring", c)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ui/monitoring = %d\n%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"Live", "dorang-7", "4,210", "3h 12m", "/metrics"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the live pulse is missing %q", want)
+		}
+	}
+}
+
 // The monitoring screen renders and marks a live region for auto-refresh.
 func TestMonitoringScreenRenders(t *testing.T) {
 	h := newHarness(t)

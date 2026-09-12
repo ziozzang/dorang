@@ -308,9 +308,30 @@ func humanInt(v int64) string {
 // permanent 501 does not learn that a dependency is optional — they learn the
 // product is broken.
 type navScreen struct {
+	Screen  string
 	Href    string
 	Label   string
 	Current bool
+}
+
+// navGroup is a labelled section of the sidebar. Grouping is presentation only:
+// the same screens, bucketed so the nav reads as a short list of sections
+// rather than one long column. A group with no available screen is not emitted.
+type navGroup struct {
+	Title   string
+	Screens []navScreen
+}
+
+// navSections is the order the sidebar groups appear in and which screen each
+// carries. A screen not named here still navigates (it stays in the flat list),
+// but it lands in the catch-all last group rather than being dropped.
+var navSections = []struct {
+	title   string
+	screens []string
+}{
+	{"access", []string{"keys", "users"}},
+	{"catalog", []string{"models"}},
+	{"observability", []string{"usage", "monitoring"}},
 }
 
 type page struct {
@@ -319,8 +340,13 @@ type page struct {
 	Base    string
 	APIBase string
 	// Screens is the navigation: the screens this process can serve to this
-	// viewer, in order. Empty renders no navigation at all.
+	// viewer, in order. Empty renders no navigation at all. It stays flat for
+	// the "somewhere to go" computation and for callers that read the whole
+	// list; the sidebar renders NavGroups, which is the same screens bucketed.
 	Screens []navScreen
+	// NavGroups is Screens grouped into labelled sidebar sections. Derived from
+	// Screens, so the two never disagree about which screens exist.
+	NavGroups []navGroup
 	// Home is where a message page sends someone who has nowhere else to go —
 	// the first screen that works, or empty when none does. It is deliberately
 	// not hard-wired to the keys screen: a page that failed sending an operator
@@ -452,12 +478,14 @@ type messagePage struct {
 func (s *uiServer) base() string { return s.api.cfg.UIPrefix }
 
 func (s *uiServer) newPage(screen, title string, v viewer) page {
+	screens := s.nav(screen, v)
 	pg := page{
 		Title:      title,
 		Screen:     screen,
 		Base:       s.base(),
 		APIBase:    "",
-		Screens:    s.nav(screen, v),
+		Screens:    screens,
+		NavGroups:  navGroups(screens),
 		Session:    v.signedIn && !s.api.cfg.DisableUISessions,
 		CanMutate:  v.canMutate(),
 		CSRF:       v.csrf,
@@ -496,7 +524,7 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 		{"users", "users & teams", s.api.cfg.Directory != nil && v.scope.Global},
 		{"models", "models & deployments", cat != nil && v.scope.Global},
 		{"usage", "usage & cost", s.api.cfg.Ledger != nil && v.scope.Global},
-		{"monitoring", "monitoring", (s.api.cfg.Ledger != nil || s.api.cfg.Credentials != nil || s.api.cfg.Capacity != nil) && v.scope.Global},
+		{"monitoring", "monitoring", (s.api.cfg.Ledger != nil || s.api.cfg.Credentials != nil || s.api.cfg.Capacity != nil || s.api.cfg.Surface != nil) && v.scope.Global},
 	}
 	out := make([]navScreen, 0, len(all))
 	for _, n := range all {
@@ -504,10 +532,47 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 			continue
 		}
 		out = append(out, navScreen{
+			Screen:  n.screen,
 			Href:    s.base() + "/" + n.screen,
 			Label:   n.label,
 			Current: n.screen == current,
 		})
+	}
+	return out
+}
+
+// navGroups buckets the flat nav into the sections of [navSections], in that
+// order, dropping any section that ends up empty. A screen no section names
+// falls into a trailing "more" group rather than vanishing, so adding a screen
+// and forgetting to place it degrades to "ungrouped", not "unreachable".
+func navGroups(flat []navScreen) []navGroup {
+	byScreen := make(map[string]navScreen, len(flat))
+	for _, n := range flat {
+		byScreen[n.Screen] = n
+	}
+	placed := make(map[string]bool, len(flat))
+	out := make([]navGroup, 0, len(navSections)+1)
+	for _, sec := range navSections {
+		g := navGroup{Title: sec.title}
+		for _, screen := range sec.screens {
+			if n, ok := byScreen[screen]; ok {
+				g.Screens = append(g.Screens, n)
+				placed[screen] = true
+			}
+		}
+		if len(g.Screens) > 0 {
+			out = append(out, g)
+		}
+	}
+	var rest navGroup
+	for _, n := range flat {
+		if !placed[n.Screen] {
+			rest.Screens = append(rest.Screens, n)
+		}
+	}
+	if len(rest.Screens) > 0 {
+		rest.Title = "more"
+		out = append(out, rest)
 	}
 	return out
 }

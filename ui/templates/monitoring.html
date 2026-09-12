@@ -1,12 +1,32 @@
 {{define "content"}}
 <h1>Monitoring <span class="live-dot" title="live"></span></h1>
 <p class="lede">
-  What is happening now, from the same reporters the API exposes: the ledger for the failures in
-  the last {{.Window}}, the credential reporter for health and quota, the capacity broker for
-  occupancy. The region below re-fetches on a timer — <span class="refresh-note">every 10s</span>.
+  What is happening now, from the same reporters the API exposes: this node's live HTTP counters
+  (what <code>/metrics</code> serves), the ledger for the failures in the last {{.Window}}, the
+  credential reporter for health and quota, and the capacity broker for occupancy. The region
+  below re-fetches on a timer — <span class="refresh-note">every 10s</span>.
 </p>
 
 <div data-live="10">
+
+{{if .HasSurface}}
+<h2>Live &middot; node <span class="mono">{{.Surface.NodeID}}</span></h2>
+{{if .SurfaceErr}}<div class="banner bad">This node's live counters could not be read.</div>{{else}}
+<div class="tiles">
+  <div class="tile"><div class="label">in flight</div><div class="value">{{num .Surface.InFlight}}</div><div class="note">requests being served now</div></div>
+  <div class="tile"><div class="label">requests</div><div class="value">{{num .Surface.Requests}}</div><div class="note">since start &middot; up {{.Surface.Uptime}}</div></div>
+  <div class="tile"><div class="label">avg latency</div><div class="value">{{num .Surface.AvgLatencyMS}} ms</div><div class="note">gateway, all requests</div></div>
+  <div class="tile"><div class="label">ready</div><div class="value">{{if .Surface.Ready}}<span class="state-ok">yes</span>{{else}}<span class="state-bad">no</span>{{end}}</div></div>
+</div>
+<div class="tiles">
+  <div class="tile"><div class="label">2xx</div><div class="value">{{num .Surface.Class2xx}}</div></div>
+  <div class="tile"><div class="label">3xx</div><div class="value">{{num .Surface.Class3xx}}</div></div>
+  <div class="tile"><div class="label">4xx</div><div class="value">{{num .Surface.Class4xx}}</div></div>
+  <div class="tile"><div class="label">5xx</div><div class="value">{{num .Surface.Class5xx}}</div></div>
+</div>
+<p class="metrics-note">These are this node's own counters since it started; behind the balancer a refresh may show another node.{{if .Surface.MetricsPath}} The full Prometheus exposition is at <code>{{.Surface.MetricsPath}}</code> &mdash; scrape every node for fleet-wide history.{{end}}</p>
+{{end}}
+{{end}}
 
 {{if .HasLedger}}
 <h2>Recent failures — last {{.Window}}</h2>
@@ -89,7 +109,7 @@
 {{end}}
 {{end}}
 
-{{if not (or .HasLedger .HasCreds .HasCap)}}
+{{if not (or .HasSurface .HasLedger .HasCreds .HasCap)}}
 <div class="panel"><p class="lede">This process exposes no ledger, credential reporter or capacity broker, so there is nothing live to show.</p></div>
 {{end}}
 
