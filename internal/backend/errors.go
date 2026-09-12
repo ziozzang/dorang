@@ -84,6 +84,13 @@ const (
 	// The upstream's words are where they always are: NativeType and
 	// NativeMessage.
 	CodeUpstreamStreamError = "upstream_stream_error"
+	// CodeUpstreamFailed is a 200 whose body reports the response FAILED:
+	// a Responses document with `status: "failed"` and an `error` member. The
+	// generation was attempted and did not complete, and the upstream said
+	// why; handing the document on as a successful answer with an unusual
+	// stop reason would lose the why and tell the caller the turn ended. It is
+	// the buffered twin of [CodeUpstreamStreamError] and, like it, terminal.
+	CodeUpstreamFailed = "upstream_failed"
 	// CodeUpstreamStreamTruncated is a stream that stopped without its family's
 	// end-of-stream marker: no [DONE], no message_stop, no stop reason. The
 	// generation was cut off, and the part that arrived is a prefix of an answer

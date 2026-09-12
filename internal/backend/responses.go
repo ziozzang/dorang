@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
@@ -102,15 +103,30 @@ func (responsesAdapter) encode(x *exchange) ([]byte, error) {
 // argument check, §10.5b transform and client encoder as a JSON one, which is
 // the point of returning a [decoded] rather than rendered bytes.
 func (responsesAdapter) decode(body []byte, x *exchange) (*decoded, error) {
+	// Normalised ONCE, here, so that detection and both decoders read the same
+	// bytes: a byte-order mark stripped in the detector alone left the JSON
+	// decoder refusing a document the detector had just accepted.
+	body = bytes.TrimPrefix(body, utf8BOM)
 	if eventStream(x.respType, body) {
 		return collectResponses(body, x)
 	}
-	// The same gate the chat decoder applies before reading a JSON body: a 200
-	// carrying an error envelope, `{}` or `null` is not a response of this
-	// family, and decoding it leniently yields a successful answer with no
-	// content — the shape [openai.ErrNotAResponse] exists to refuse.
+	// The chat decoder's own two-step rule. A body that is not JSON at all is
+	// a decode failure, terminal: on a forced stream it is most often a
+	// document cut off by the transport, and what was cut off was generated
+	// and billed. A body that IS JSON and is not a response of this family —
+	// an error envelope on a 200, `{}`, `null` — is [openai.ErrNotAResponse],
+	// which the shape rule offers to the fallback chain because nothing was
+	// generated.
+	if !json.Valid(body) {
+		return nil, errNotJSON
+	}
 	if !openai.IsResponsesAnswer(body) {
 		return nil, openai.ErrNotAResponse
+	}
+	// A document that reports its own failure is a failure, on this path as
+	// on the stream: the same scrubbed envelope `response.failed` produces.
+	if err := failedDocument(body, x); err != nil {
+		return nil, err
 	}
 	resp, err := openai.DecodeResponsesResponse(body, &openai.DecodeOptions{
 		Model: x.call.Model, ToolNames: x.names,
@@ -120,6 +136,39 @@ func (responsesAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 	}
 	x.usageExtra = resp.UsageExtra
 	return &decoded{resp: resp}, nil
+}
+
+// errNotJSON is a buffered body that is not a JSON document.
+var errNotJSON = errors.New("openai: the body is not JSON")
+
+// failedDocument refuses a Responses document whose status is failed or
+// cancelled, carrying the upstream's own reason scrubbed of the credential.
+func failedDocument(body []byte, x *exchange) error {
+	var probe struct {
+		Status string `json:"status"`
+		Error  *struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return nil
+	}
+	if probe.Status != openai.StatusFailed && probe.Status != openai.StatusCancelled {
+		return nil
+	}
+	e := &canonical.Error{Message: "the upstream reported the response " + probe.Status}
+	if probe.Error != nil {
+		if probe.Error.Message != "" {
+			e.Message = probe.Error.Message
+		}
+		e.Type, e.Code = probe.Error.Type, probe.Error.Code
+	}
+	out := inBandFailure(e, x.secrets).err
+	out.Message = "the upstream answered 200 and reported the response " + probe.Status
+	out.Code = CodeUpstreamFailed
+	return out
 }
 
 // eventStream reports whether a buffered body is a server-sent event stream.
@@ -141,7 +190,9 @@ func eventStream(ctype string, body []byte) bool {
 	if len(b) > 0 && b[0] == '{' {
 		return false
 	}
-	for _, field := range [...]string{"data:", "event:", "id:", "retry:"} {
+	// A comment line (`: keepalive`) is an SSE field too, and a stream that
+	// opens with one is still a stream; no JSON document begins with a colon.
+	for _, field := range [...]string{"data:", "event:", "id:", "retry:", ":"} {
 		if bytes.HasPrefix(b, []byte(field)) {
 			return true
 		}
@@ -207,7 +258,10 @@ func (s *responsesSource) terminated() bool { return false }
 //     answered 200 and produced nothing, and a sibling deployment is exactly
 //     the right next hop. This is the relay's own rule seen from the buffered
 //     side: the relay offers a truncated stream to the chain when nothing
-//     reached the client, and the start event writes nothing to the client.
+//     reached the client, and the chat sink writes nothing for the start
+//     event. (The Anthropic sink writes `message_start` for it, so a relayed
+//     stream to THAT caller is committed one event earlier — the committed-
+//     byte rule, which a buffered answer never meets.)
 //   - A `data:` payload that is not JSON is [CodeUpstreamDecode] and terminal:
 //     the bytes before it may be a real prefix, and the decoder refuses to
 //     skip a frame and hand on an answer with a hole in it.

@@ -217,4 +217,19 @@ func TestALocalContinuationIDIsNotSentUpstream(t *testing.T) {
 	if !strings.Contains(second.Body.String(), made.ID) {
 		t.Errorf("the caller's reference was not echoed on the answer:\n%s", second.Body.String())
 	}
+	// The stored row still records which exchange this one continued: the
+	// reference was removed from the UPSTREAM request, not from dorang's own
+	// record of the conversation.
+	var second2 struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(second.Body.Bytes(), &second2)
+	row, err := a.Store.GetStoredResponse(context.Background(), second2.ID, "key-"+key)
+	if err != nil {
+		t.Fatalf("the second exchange was not stored: %v", err)
+	}
+	if row.PreviousResponseID != made.ID {
+		t.Errorf("stored previous_response_id = %q, want %q: the parent reference was lost with the "+
+			"upstream field", row.PreviousResponseID, made.ID)
+	}
 }

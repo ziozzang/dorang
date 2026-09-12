@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -435,11 +436,18 @@ data: {"type":"response.incomplete","response":{"id":"r","status":"incomplete","
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
+	var stops int
 	for _, e := range evs {
-		if e.Type == canonical.EventStop && e.Delta.StopReason != canonical.StopMaxTokens {
-			t.Errorf("stop reason = %q for an incomplete response carrying a call, want %q",
-				e.Delta.StopReason, canonical.StopMaxTokens)
+		if e.Type == canonical.EventStop {
+			stops++
+			if e.Delta.StopReason != canonical.StopMaxTokens {
+				t.Errorf("stop reason = %q for an incomplete response carrying a call, want %q",
+					e.Delta.StopReason, canonical.StopMaxTokens)
+			}
 		}
+	}
+	if stops != 1 {
+		t.Errorf("%d stop events for an incomplete response, want exactly 1", stops)
 	}
 }
 
@@ -468,5 +476,79 @@ func TestAShortenedToolNameIsRestoredFromTheStream(t *testing.T) {
 	}
 	if got != long {
 		t.Errorf("tool name on the neutral stream = %q, want the caller's %d-byte name restored", got, len(long))
+	}
+}
+
+// One event cannot grow without bound.
+//
+// The scanner bounds a LINE. An upstream that sends `data:` lines forever
+// without the blank line that dispatches them would otherwise be assembled
+// into one payload until the process died — a stream, not a frame, is the
+// attacker's unit.
+func TestAnUnterminatedEventCannotGrowWithoutBound(t *testing.T) {
+	line := "data: " + strings.Repeat("x", 1024) + "\n"
+	r := io.MultiReader(strings.NewReader("data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n"),
+		&repeatReader{s: line, n: (maxResponsesFrameBytes / 1024) + 8})
+	d := NewResponsesStreamDecoder(r, &DecodeOptions{})
+	var err error
+	for {
+		_, err = d.Next()
+		if err != nil {
+			break
+		}
+	}
+	if err == io.EOF || err == nil {
+		t.Fatal("an event assembled past the frame limit was not refused")
+	}
+	if !strings.Contains(err.Error(), "frame limit") {
+		t.Errorf("err = %v, want the frame limit named", err)
+	}
+}
+
+// repeatReader yields s, n times.
+type repeatReader struct {
+	s    string
+	n    int
+	rest string
+}
+
+func (r *repeatReader) Read(p []byte) (int, error) {
+	if r.rest == "" {
+		if r.n == 0 {
+			return 0, io.EOF
+		}
+		r.n--
+		r.rest = r.s
+	}
+	n := copy(p, r.rest)
+	r.rest = r.rest[n:]
+	return n, nil
+}
+
+// An `event:` line inside an unfinished payload does not dispatch it.
+//
+// The spec permits any field order inside one event, so `data:` then
+// `event:` then `data:` is ONE event that dispatches at the blank line. The
+// missing-separator compatibility rule (an `event:` line opening the next
+// event) applies only when what is pending is already a whole document.
+func TestAnEventLineInsideAnUnfinishedPayloadDoesNotDispatch(t *testing.T) {
+	const sse = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\n" +
+		"event: response.output_text.delta\n" +
+		"data: \"output_index\":0,\"delta\":\"hello\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err != nil {
+		t.Fatalf("a spec-ordered event was split and refused: %v", err)
+	}
+	var text strings.Builder
+	for _, e := range evs {
+		for _, b := range e.Delta.Content {
+			text.WriteString(b.Text)
+		}
+	}
+	if text.String() != "hello" {
+		t.Errorf("text = %q, want the payload assembled across the event line", text.String())
 	}
 }

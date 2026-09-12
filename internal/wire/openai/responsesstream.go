@@ -109,7 +109,17 @@ type ResponsesStreamDecoder struct {
 	// started records that the first line has been read, which is the only
 	// line a byte-order mark can precede.
 	started bool
+	// overflow records that one event's data fields, assembled, exceeded
+	// [maxResponsesFrameBytes]; Next reports it as an error once the scan
+	// stops. The scanner bounds one LINE, and an upstream that never sends the
+	// blank line could otherwise grow the assembled payload without bound.
+	overflow bool
 }
+
+// errResponsesFrameTooLarge is one event whose assembled payload exceeds
+// [maxResponsesFrameBytes]: either a frame this decoder will not buffer, or a
+// stream that never dispatches and would be buffered until the process died.
+var errResponsesFrameTooLarge = errorString("openai: a Responses stream event exceeds the frame limit")
 
 // utf8BOM is the byte-order mark some proxies prepend to a body they
 // re-encoded. It is not part of any event.
@@ -151,6 +161,9 @@ func (d *ResponsesStreamDecoder) Next() ([]canonical.StreamEvent, error) {
 	for {
 		data, ok := d.nextData()
 		if !ok {
+			if d.overflow {
+				return nil, errResponsesFrameTooLarge
+			}
 			if err := d.sc.Err(); err != nil {
 				return nil, err
 			}
@@ -438,9 +451,13 @@ func (d *ResponsesStreamDecoder) nextData() ([]byte, bool) {
 			// a stream that omits the blank line between them — which the
 			// capture this decoder is tested against does, and which the
 			// spec's dispatch rule alone would read as one event with two
-			// payloads. The name on the line is not needed: the payload
-			// repeats it, and the payload wins.
-			if have && bytes.HasPrefix(line, []byte("event:")) {
+			// payloads. The spec also allows the field order the other way
+			// round, `data:` then `event:` inside ONE event, so the line
+			// dispatches only a payload that is already a whole document; an
+			// unfinished one keeps accumulating to the blank line. The name
+			// on the line is not needed: the payload repeats it, and the
+			// payload wins.
+			if have && bytes.HasPrefix(line, []byte("event:")) && json.Valid(bytes.TrimSpace(buf)) {
 				if out, ok := flush(); ok {
 					return out, true
 				}
@@ -450,6 +467,10 @@ func (d *ResponsesStreamDecoder) nextData() ([]byte, bool) {
 		payload := line[len("data:"):]
 		if len(payload) > 0 && payload[0] == ' ' {
 			payload = payload[1:]
+		}
+		if len(buf)+1+len(payload) > maxResponsesFrameBytes {
+			d.overflow = true
+			return nil, false
 		}
 		if have {
 			buf = append(buf, '\n')

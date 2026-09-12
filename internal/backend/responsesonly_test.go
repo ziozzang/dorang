@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -618,6 +619,35 @@ func TestATransportFailureUnderAForcedStreamIsReadForWhatArrived(t *testing.T) {
 		}
 	})
 
+	t.Run("a JSON document cut off", func(t *testing.T) {
+		// Not a stream, so not the collector's to classify: it takes the
+		// branch every other provider's cut-off document takes. What it must
+		// NOT become is a shape failure — "the host answered wrongly" — over
+		// a document that was merely cut short.
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+			hj := w.(http.Hijacker)
+			conn, buf, _ := hj.Hijack()
+			defer conn.Close()
+			partial := `{"id":"r","object":"response","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"already gen`
+			_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n" +
+				strconv.FormatInt(int64(len(partial)), 16) + "\r\n" + partial + "\r\n")
+			_ = buf.Flush()
+		})
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err == nil {
+			t.Fatalf("a cut-off document became an answer:\n%s", res.Body)
+		}
+		if res.Err.Code == CodeUpstreamShape {
+			t.Errorf("a cut-off document was classified as a wrong-shaped answer")
+		}
+		if res.Err.Code != CodeUpstreamBody {
+			t.Errorf("code = %q, want %q (the rule every provider's cut-off document takes)", res.Err.Code, CodeUpstreamBody)
+		}
+	})
+
 	t.Run("nothing arrived", func(t *testing.T) {
 		f := newFakeUpstream(t)
 		serveHijacked(t, f, "")
@@ -746,6 +776,13 @@ func TestARefusalSurvivesCollection(t *testing.T) {
 		t.Errorf("refusal = %q; a refusal-only answer became an empty success:\n%s",
 			out.Choices[0].Message.Refusal, res.Body)
 	}
+
+	// The stop reason is the JSON decoder's own for a refusal-only turn, and
+	// the chat encoder renders it as the one finish reason OpenAI has for a
+	// turn that did not end normally (FinishReasonOf) — not as "stop".
+	if !strings.Contains(string(res.Body), `"finish_reason":"content_filter"`) {
+		t.Errorf("a refusal-only turn reported an ordinary stop:\n%s", res.Body)
+	}
 }
 
 // A tool name over the wire limit is shortened on the way out and restored on
@@ -834,6 +871,36 @@ func TestTheBodyDecidesTheTransport(t *testing.T) {
 			t.Errorf("body:\n%s", res.Body)
 		}
 	})
+	t.Run("JSON behind a BOM", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("\xEF\xBB\xBF" + `{"id":"r","object":"response","status":"completed","model":"gpt-5.5",` +
+				`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yes"}]}]}`))
+		})
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err != nil {
+			t.Fatalf("a JSON answer behind a byte-order mark was refused: %v (retryable=%t)", res.Err, res.Retryable)
+		}
+	})
+	t.Run("stream opening with a comment, unlabelled", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(": keepalive\n\n" + codexStream))
+		})
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err != nil {
+			t.Fatalf("a stream opening with a comment line was read as JSON: %v (retryable=%t)", res.Err, res.Retryable)
+		}
+		if !strings.Contains(string(res.Body), `"content":"yes"`) {
+			t.Errorf("body:\n%s", res.Body)
+		}
+	})
 	t.Run("stream behind a BOM", func(t *testing.T) {
 		f := newFakeUpstream(t)
 		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
@@ -882,5 +949,119 @@ func TestTheResponsesSpellingOfTheCeilingIsADropAlias(t *testing.T) {
 	}
 	if loss == nil || len(loss.Dropped) == 0 {
 		t.Errorf("the removal was not reported: %+v", loss)
+	}
+}
+
+// A document that reports its own failure is a failure.
+//
+// `status: "failed"` with an `error` member is the JSON form of
+// `response.failed`, and the two paths must agree: a 200 with
+// `finish_reason: stop` over a generation that never completed loses the
+// upstream's reason and tells the caller the turn ended.
+func TestAFailedDocumentIsAFailure(t *testing.T) {
+	const secret = "sk-test-0011223344556677"
+	f := newFakeUpstream(t)
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r","object":"response","status":"failed","model":"gpt-5.5","output":[],` +
+			`"error":{"type":"server_error","code":"server_error","message":"crashed holding ` + secret + `"}}`))
+	})
+	b := testBackend(secret)
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+		chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+	if res.Err == nil {
+		t.Fatalf("a failed document became an answer:\n%s", res.Body)
+	}
+	if res.Err.Code != CodeUpstreamFailed {
+		t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamFailed)
+	}
+	if res.Retryable {
+		t.Error("a failed generation was offered to the fallback chain")
+	}
+	if strings.Contains(res.Err.NativeMessage, secret) || !strings.Contains(res.Err.NativeMessage, "crashed") {
+		t.Errorf("native message = %q: the reason must survive and the credential must not", res.Err.NativeMessage)
+	}
+}
+
+// A corrupt frame on the RELAY is an in-band error the client sees, and a
+// failure the Result records — the same classification the collector gives
+// it, so the two paths do not disagree about one stream.
+func TestACorruptFrameIsAFailureOnTheRelay(t *testing.T) {
+	f := newFakeUpstream(t)
+	serveStream(t, f, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n"+
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n"+
+		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"par\n\n"+
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n")
+	b := testBackend("sk-test")
+	c := chatCall(catalog.APIOpenAIChat)
+	c.Stream, c.Request.Stream = true, true
+	rec := httptest.NewRecorder()
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)), c, rec)
+	if res.Err == nil {
+		t.Fatal("a corrupt frame relayed as a clean stream")
+	}
+	if res.Err.Code != CodeUpstreamDecode {
+		t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamDecode)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, `"error"`) {
+		t.Errorf("the client was not told in band:\n%s", body)
+	}
+}
+
+// The ceiling is enforced before a read error is reported.
+//
+// A reader that hands back more than the limit AND an error must not have its
+// bytes served by the one caller that serves partial bytes: over the ceiling
+// is over the ceiling whether or not the read also failed.
+func TestTheSizeCeilingWinsOverAReadError(t *testing.T) {
+	r := &failAfter{data: strings.Repeat("x", 33)}
+	_, err := readUpstreamBody(r, 32)
+	if !errors.Is(err, errUpstreamTooLarge) {
+		t.Errorf("err = %v, want the size ceiling", err)
+	}
+}
+
+// failAfter yields its data and then a non-EOF error.
+type failAfter struct {
+	data string
+	done bool
+}
+
+func (f *failAfter) Read(p []byte) (int, error) {
+	if f.done {
+		return 0, errors.New("connection reset")
+	}
+	n := copy(p, f.data)
+	f.data = f.data[n:]
+	if f.data == "" {
+		f.done = true
+	}
+	return n, nil
+}
+
+// A 200 whose body is not JSON at all is a decode failure, not a wrong shape.
+//
+// The chat decoder's rule, applied here: a shape failure says "the host
+// answered with the wrong kind of document, try a sibling", and a document
+// that does not parse says nothing of the kind — on a forced stream it is
+// most often a generation cut short, which was billed. Offering it to the
+// chain buys it again.
+func TestABodyThatIsNotJSONIsADecodeFailureNotAWrongShape(t *testing.T) {
+	f := newFakeUpstream(t)
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"r","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"partial`))
+	})
+	b := testBackend("sk-test")
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+		chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+	if res.Err == nil {
+		t.Fatalf("a document that does not parse became an answer:\n%s", res.Body)
+	}
+	if res.Err.Code != CodeUpstreamDecode {
+		t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamDecode)
+	}
+	if res.Retryable {
+		t.Error("an unparseable document was offered to the fallback chain as a wrong-shaped answer")
 	}
 }
