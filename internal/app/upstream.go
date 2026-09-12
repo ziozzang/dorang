@@ -46,7 +46,14 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			Kind:    p.Kind,
 			API:     apiFor(cat, p.Kind),
 			BaseURL: base,
-			Timeout: p.Timeout.Duration(),
+			// Whether the host serves /responses alone is the catalog's claim
+			// about the kind, and it decides the adapter. Passing it is what
+			// makes the two settings below refusable on any other host.
+			ResponsesOnly: responsesOnlyFor(cat, p.Kind),
+			// A Responses-only host's contract, stated by the deployment.
+			ResponsesForceStream: p.Params.ForceStream,
+			ResponsesStoreFalse:  p.Params.StoreFalse,
+			Timeout:              p.Timeout.Duration(),
 			// providers[].retry, which is a different thing from the fallback
 			// chain of §7.6 and is documented as such on [backend.Policy].
 			Retry: backend.Policy{
@@ -81,4 +88,12 @@ func (t *upstreamTable) secret(credentialID string) string {
 		return c.secret
 	}
 	return ""
+}
+
+// responsesOnlyFor reads the catalog's declaration that a kind's host serves
+// `/responses` and nothing else. An unknown kind is not one: the default is the
+// chat address, which is the one most hosts serve.
+func responsesOnlyFor(cat *catalog.Catalog, kind string) bool {
+	kd, ok := cat.Kind(kind)
+	return ok && kd.ResponsesOnly
 }

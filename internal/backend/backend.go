@@ -782,6 +782,16 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.Usage, *server.Error) {
 	dec, err := x.prov.ad.decode(body, x)
 	if err != nil {
+		// An adapter that already knows the status and the code — a host whose
+		// answer to a buffered caller is an event stream, read back and found
+		// wanting — says so in dorang's envelope, and the envelope is passed
+		// through. Re-classifying it here would turn "the stream was cut off"
+		// into "could not read the upstream response" and lose the code the
+		// fallback decision below reads.
+		var se *server.Error
+		if errors.As(err, &se) {
+			return nil, "", canonical.Usage{}, se
+		}
 		if errors.Is(err, errNotAnObject) {
 			// A relayed answer that is not a JSON object at all. It is a
 			// different condition from "dorang could not understand this

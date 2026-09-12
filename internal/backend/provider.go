@@ -90,6 +90,16 @@ type Spec struct {
 	// every removal is reported in x-dorang-dropped-params, which is the whole
 	// difference between this and the operator editing their clients.
 	DropParams []string
+	// ResponsesOnly says the host behind Kind serves `/responses` and nothing
+	// else. It is copied from the catalog kind by whoever builds the Spec, so
+	// the adapter choice and the check on the two settings below read the
+	// catalog's declaration rather than a list of their own.
+	ResponsesOnly bool
+	// ResponsesForceStream and ResponsesStoreFalse state a Responses-only host's
+	// contract once, instead of every caller meeting it as a 400. Refused by
+	// [NewProvider] unless ResponsesOnly: nothing else reads them.
+	ResponsesForceStream bool
+	ResponsesStoreFalse  bool
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -98,10 +108,23 @@ var ErrNoBaseURL = errors.New("backend: provider has no base_url and its kind de
 // Provider is one configured upstream, resolved: everything the backend half of
 // a request needs, in a value that never changes after a reload builds it.
 type Provider struct {
-	name    string
-	kind    string
-	api     catalog.API
-	base    string
+	name string
+	kind string
+	api  catalog.API
+	base string
+	// ResponsesForceStream and ResponsesStoreFalse are the contract of a
+	// Responses-only host, stated by the deployment instead of discovered by
+	// every caller as a 400.
+	//
+	// They are exported because [responsesAdapter] reads them and this struct's
+	// other fields are not, which is deliberate: nothing else in this package
+	// needs them, and the two are provider POLICY rather than provider identity.
+	// [NewProvider] refuses them on any provider whose host is not
+	// Responses-only, because only [responsesAdapter] reads them and a setting
+	// that loads and changes nothing is the CONFIG §23.2 defect.
+	ResponsesForceStream bool
+	ResponsesStoreFalse  bool
+
 	timeout time.Duration
 	retry   Policy
 	engine  Engine
@@ -126,8 +149,11 @@ func NewProvider(s Spec) (*Provider, error) {
 	if api == "" {
 		api = catalog.APIOpenAIChat
 	}
-	ad, err := adapterFor(api, s.Kind)
+	ad, err := adapterFor(api, s.Kind, s.ResponsesOnly)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkResponsesContract(s); err != nil {
 		return nil, err
 	}
 	drop, err := resolveDropParams(api, s.DropParams)
@@ -144,7 +170,40 @@ func NewProvider(s Spec) (*Provider, error) {
 		engine:  EngineForKind(s.Kind),
 		ad:      ad,
 		drop:    drop,
+
+		ResponsesForceStream: s.ResponsesForceStream,
+		ResponsesStoreFalse:  s.ResponsesStoreFalse,
 	}, nil
+}
+
+// checkResponsesContract refuses the Responses-only settings on a host that is
+// not one.
+//
+// `force_stream` and `store_false` are read by [responsesAdapter] and by
+// nothing else. On any other provider they would load, appear in the operator's
+// file as though they took effect, and change no byte on the wire — CONFIG
+// §23.2's rule is that such a key is refused at start-up naming what it would
+// have needed. The same disposition [resolveDropParams] takes for an
+// undroppable name.
+func checkResponsesContract(s Spec) error {
+	if s.ResponsesOnly {
+		return nil
+	}
+	var set []string
+	if s.ResponsesForceStream {
+		set = append(set, "force_stream")
+	}
+	if s.ResponsesStoreFalse {
+		set = append(set, "store_false")
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	return fmt.Errorf("backend: params.%s is set, but kind %q is not a Responses-only host "+
+		"(catalog responses_only: false) and the chat adapter it uses never reads the setting — "+
+		"it would load and change nothing. Remove it, or declare the kind responses_only in "+
+		"the catalog if its host really serves /responses alone",
+		strings.Join(set, " and params."), s.Kind)
 }
 
 // requiredOutputCeiling names the wire shapes whose request is INVALID without

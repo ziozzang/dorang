@@ -503,7 +503,7 @@ func (c *Catalog) ExplainKind(name string) ([]FieldOrigin, bool) {
 	fields := []string{
 		FieldAPI, FieldBaseURL, FieldCache, FieldReasoningHint, FieldCategory,
 		FieldContextWindow, FieldMaxOutputTokens,
-		FieldSupportsTools, FieldSupportsStreaming,
+		FieldSupportsTools, FieldSupportsStreaming, FieldResponsesOnly,
 		FieldMetrics, FieldPriority, FieldVerified, FieldProbe, FieldNote,
 	}
 	out := make([]FieldOrigin, 0, len(fields))
@@ -586,6 +586,8 @@ func renderKindField(kd KindDefaults, f string) string {
 		return strconv.FormatBool(kd.SupportsTools)
 	case FieldSupportsStreaming:
 		return strconv.FormatBool(kd.SupportsStreaming)
+	case FieldResponsesOnly:
+		return strconv.FormatBool(kd.ResponsesOnly)
 	case FieldMetrics:
 		return kd.Metrics
 	case FieldPriority:

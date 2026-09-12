@@ -86,6 +86,16 @@ kinds:
 
   # OpenAI models reached through a Codex OAuth credential rather than a
   # platform API key. Same wire surface, different credential and model set.
+  #
+  # responses_only: the host serves /responses and nothing else. Measured
+  # 2026-08-06: POST .../codex/chat/completions answers 403, POST
+  # .../codex/responses answers 400 for a body problem. It also requires
+  # `stream: true` and `store: false`, each refused separately; those are
+  # stated per provider (params.force_stream / params.store_false) and are
+  # accepted only on a kind carrying this flag. It also refuses an output
+  # ceiling (400 "Unsupported parameter: max_output_tokens", measured
+  # 2026-09-12), so a provider on this kind wants params.drop: [max_tokens];
+  # the removal is reported to the caller. See docs/SURFACES.md.
   codex-responses:
     api: openai-responses
     cache: openai_cache_key
@@ -93,6 +103,7 @@ kinds:
     category: chat
     supports_tools: true
     supports_streaming: true
+    responses_only: true
     verified: 2026-07-28
 
   azure:

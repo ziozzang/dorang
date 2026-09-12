@@ -60,33 +60,60 @@ Headers are not the gate — the same call with `User-Agent: dorang/dev` and
 without `chatgpt-account-id` or `OpenAI-Beta` still answers 200. `store` and
 `stream` are the whole contract.
 
-## Why dorang cannot use `/responses` yet
+A third fact, measured 2026-09-12 through dorang: the host refuses an output
+ceiling — `POST /responses` with `max_output_tokens: 16` answers
+`400 Unsupported parameter: max_output_tokens`, buffered and streaming alike.
+That is what `providers[].params.drop` is for ("this endpoint answers 400 to
+this field"), so the codex provider carries `params: {drop: [max_tokens]}`, and
+the removal is reported to the caller as `X-Dorang-Dropped-Params: max_tokens`
+(with `X-Dorang-Detail: full`) — observed on the collected buffered path, which
+is the proof that the loss report survives collection rather than being lost on
+a side path. A caller's ceiling is therefore not honoured by this host and the
+caller is told so; nothing quieter would be honest.
 
-The adapter comment names the blocker itself, and it is not the routing:
+## How dorang reaches `/responses`
+
+The adapter comment used to name the blocker itself, and it was not the routing:
 
 > internal/wire/openai gained a Responses request/response encoder, but no
 > Responses STREAM decoder — that surface's events are a typed sequence
 > (`response.output_text.delta` and friends) with nothing in common with a chat
-> chunk. Routing the kind to /v1/responses today would trade a working streaming
-> deployment for a non-streaming one. […] switching the kind over is one line in
-> adapterFor the day a stream decoder exists.
+> chunk. […] switching the kind over is one line in adapterFor the day a stream
+> decoder exists.
 
-So the decoder is the work and the routing is its consequence. For codex it is
-not optional in either direction: that host **requires** `stream: true`, so
-without a stream decoder there is no way to reach it at all.
+The decoder exists now (`internal/wire/openai/responsesstream.go`, tested
+against a verbatim capture of this host), and the routing followed:
 
-## The order this has to be done in
+- The catalog kind carries `responses_only: true` (`codex-responses`). That one
+  declaration selects `responsesAdapter` in the backend AND gates the two
+  provider settings below at start-up, so there is no second list to disagree
+  with it. A kind declaring the flag next to any api but `openai-responses` is a
+  catalog lint error.
+- `providers[].params.force_stream` / `store_false` state the host's contract
+  once. They are refused on any kind that is not `responses_only`, because only
+  this adapter reads them.
+- A non-streaming caller still receives one buffered answer. The stream is read
+  back and collected into the neutral form INSIDE the adapter's decode, which is
+  what makes the answer pass through the same served-model note, tool-argument
+  check, §10.5b transform and client encoder as every JSON answer — an Anthropic
+  Messages caller gets a message, a `/v1/responses` caller gets a response. A
+  stream that stops before its terminal event is `upstream_stream_truncated`; an
+  error event is `upstream_stream_error` with the credential scrubbed exactly as
+  the relay scrubs it; neither is offered to the fallback chain, because the
+  host bills the generation it began.
+- Measured end to end against the live surface, buffered and streaming, from a
+  distroless container holding the operator's `~/.codex/auth.json`.
 
-1. **A Responses stream decoder** — the typed event sequence into the canonical
-   stream, including tool calls, reasoning blocks and the terminal usage.
-2. **Per-kind routing** — hosts that serve both keep the chat route, hosts that
-   serve only `/responses` get it. One line each, once (1) exists.
-3. **A way for a deployment to state `store: false` and `stream: true`** — codex
-   refuses without them and there is no configuration field today.
-4. **A credential error that names its cause.** Mounting the operator's
-   `~/.codex/auth.json` (0600, uid 1000) into a distroless image running as
-   `nonroot` produced `credential_unavailable` and nothing else. Unreadable,
-   expired and malformed are three different operator actions and they currently
-   share one message.
+## The order this was done in
 
-Items 2 and 3 are small and blocked on 1. Item 4 is independent.
+1. **A Responses stream decoder** — done. The typed event sequence into the
+   canonical stream, including tool calls, reasoning blocks and the terminal
+   usage with `tool_usage` (server-side web search and image spend, priced).
+2. **Per-kind routing** — done, by the catalog's `responses_only` flag rather
+   than a kind-name table, so an operator's own Responses-only host under any
+   kind gets the same adapter by declaring it.
+3. **A way for a deployment to state `store: false` and `stream: true`** — done,
+   `params.force_stream` / `params.store_false`, refused where inert.
+4. **A credential error that names its cause** — done. Unreadable, malformed and
+   read-only are three categories from `internal/auth`'s own sentinels, never
+   from provider text.

@@ -482,6 +482,17 @@ type Params struct {
 	MaxTokensField string         `yaml:"max_tokens_field,omitempty"`
 	Set            map[string]any `yaml:"set,omitempty"`
 	Default        map[string]any `yaml:"default,omitempty"`
+	// ForceStream and StoreFalse state the contract of a host that refuses
+	// anything else, so a deployment says it once instead of every caller
+	// meeting it as a 400.
+	//
+	// The ChatGPT Codex surface requires both — `stream: true` and
+	// `store: false`, each refused separately — and it is the only host in this
+	// build's catalog that does. Forcing the stream does not change what the
+	// CALLER gets: dorang's relay reads it back, so a non-streaming caller still
+	// receives one buffered answer.
+	ForceStream bool `yaml:"force_stream,omitempty"`
+	StoreFalse  bool `yaml:"store_false,omitempty"`
 }
 
 // Output-ceiling spellings for `max_tokens_field`.

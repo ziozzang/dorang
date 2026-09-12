@@ -254,9 +254,21 @@ type adapter interface {
 // credential in a spelling the host does not accept. Refusing by name is worse
 // for nobody and better for the operator, who gets a sentence naming what is
 // missing instead of a vendor 404.
-func adapterFor(api catalog.API, kind string) (adapter, error) {
+// adapterFor picks the adapter for a wire shape.
+//
+// responsesOnly is the one input that is about the HOST rather than the shape:
+// `openai-responses` is served by hosts that offer both routes and by hosts
+// that offer one, and [openaiAdapter]'s chat address is right for the first
+// and a 403 for the second. It arrives from the catalog kind
+// ([catalog.KindDefaults.ResponsesOnly]) rather than from a table here, so the
+// start-up check that refuses Responses-only settings on any other host reads
+// the same declaration this does.
+func adapterFor(api catalog.API, kind string, responsesOnly bool) (adapter, error) {
 	if u, ok := unsupportedKinds[kind]; ok {
 		return u, nil
+	}
+	if responsesOnly {
+		return responsesAdapter{}, nil
 	}
 	switch api {
 	case catalog.APIOpenAIChat, catalog.APIOpenAIResponses:

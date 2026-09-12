@@ -100,17 +100,20 @@ func (p *Provider) Endpoint(op Operation, model string, stream bool) (string, er
 const (
 	pathChatCompletions = "/chat/completions"
 	pathCompletions     = "/completions"
-	pathEmbeddings      = "/embeddings"
-	pathRerank          = "/rerank"
-	pathMessages        = "/messages"
-	pathCountTokens     = "/messages/count_tokens"
-	pathModerations     = "/moderations"
-	pathSpeech          = "/audio/speech"
-	pathTranscriptions  = "/audio/transcriptions"
-	pathTranslations    = "/audio/translations"
-	pathImageGenerate   = "/images/generations"
-	pathImageEdit       = "/images/edits"
-	pathImageVariation  = "/images/variations"
+	// pathResponses is addressed without a version segment: a Responses-only
+	// host publishes its base with the version already in it.
+	pathResponses      = "/responses"
+	pathEmbeddings     = "/embeddings"
+	pathRerank         = "/rerank"
+	pathMessages       = "/messages"
+	pathCountTokens    = "/messages/count_tokens"
+	pathModerations    = "/moderations"
+	pathSpeech         = "/audio/speech"
+	pathTranscriptions = "/audio/transcriptions"
+	pathTranslations   = "/audio/translations"
+	pathImageGenerate  = "/images/generations"
+	pathImageEdit      = "/images/edits"
+	pathImageVariation = "/images/variations"
 )
 
 // joinVersioned joins a suffix onto a base URL, supplying the family's default

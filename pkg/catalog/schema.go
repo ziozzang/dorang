@@ -139,6 +139,7 @@ type kindDoc struct {
 	MaxOutputTokens   field[int]    `yaml:"max_output_tokens"`
 	SupportsTools     field[bool]   `yaml:"supports_tools"`
 	SupportsStreaming field[bool]   `yaml:"supports_streaming"`
+	ResponsesOnly     field[bool]   `yaml:"responses_only"`
 	Metrics           field[string] `yaml:"metrics"`
 	Priority          field[string] `yaml:"priority"`
 	Verified          field[string] `yaml:"verified"`
@@ -396,6 +397,7 @@ func mergeKind(dst, src *kindDoc, from fieldSource) {
 	mergeField(&dst.MaxOutputTokens, src.MaxOutputTokens, from)
 	mergeField(&dst.SupportsTools, src.SupportsTools, from)
 	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
+	mergeField(&dst.ResponsesOnly, src.ResponsesOnly, from)
 	mergeField(&dst.Metrics, src.Metrics, from)
 	mergeField(&dst.Priority, src.Priority, from)
 	mergeField(&dst.Verified, src.Verified, from)
@@ -669,6 +671,7 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		FieldMaxOutputTokens:   in.MaxOutputTokens.origin,
 		FieldSupportsTools:     in.SupportsTools.origin,
 		FieldSupportsStreaming: in.SupportsStreaming.origin,
+		FieldResponsesOnly:     in.ResponsesOnly.origin,
 		FieldMetrics:           in.Metrics.origin,
 		FieldPriority:          in.Priority.origin,
 		FieldVerified:          in.Verified.origin,
@@ -686,6 +689,7 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		MaxOutputTokens:   in.MaxOutputTokens.get(),
 		SupportsTools:     in.SupportsTools.get(),
 		SupportsStreaming: in.SupportsStreaming.get(),
+		ResponsesOnly:     in.ResponsesOnly.get(),
 		Metrics:           in.Metrics.get(),
 		Priority:          in.Priority.get(),
 		Verified:          in.Verified.get(),

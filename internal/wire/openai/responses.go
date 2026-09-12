@@ -1123,6 +1123,15 @@ func EncodeResponsesRequest(req *canonical.Request, opt *EncodeOptions) (*Respon
 	if opt != nil && opt.Model != "" {
 		out.Model = opt.Model
 	}
+	// A host that refuses anything else. Applied after the caller's own values
+	// so a deployment's contract wins over a request that cannot be served.
+	if opt != nil && opt.ForceStream {
+		out.Stream = true
+	}
+	if opt != nil && opt.StoreFalse {
+		no := false
+		out.Store = &no
+	}
 	if len(req.System) > 0 {
 		s, exact := req.System.Plain()
 		if !exact {
@@ -1313,16 +1322,21 @@ type ResponsesOptions struct {
 	Created int64
 	Model   string
 
-	Instructions       *string
-	MaxOutputTokens    *int
-	Temperature        *float64
-	TopP               *float64
-	Tools              []ResponsesTool
-	ToolChoice         json.RawMessage
-	ParallelToolCalls  *bool
-	Text               *ResponsesText
-	Reasoning          *ResponsesReasoning
-	Store              *bool
+	Instructions      *string
+	MaxOutputTokens   *int
+	Temperature       *float64
+	TopP              *float64
+	Tools             []ResponsesTool
+	ToolChoice        json.RawMessage
+	ParallelToolCalls *bool
+	Text              *ResponsesText
+	Reasoning         *ResponsesReasoning
+	Store             *bool
+	// ForceStream sends `stream: true` regardless of what the caller asked for,
+	// for a host that refuses anything else. dorang's own relay reads the stream
+	// back, so a non-streaming caller still receives one buffered answer: the
+	// choice of shape is the caller's and the transport is not.
+	ForceStream        bool
 	PreviousResponseID string
 	Truncation         string
 	Metadata           map[string]string

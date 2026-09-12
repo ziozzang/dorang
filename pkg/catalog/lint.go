@@ -75,6 +75,20 @@ func (c *Catalog) Validate() []Problem {
 					kd.ContextWindow),
 			})
 		}
+		if kd.ResponsesOnly && kd.API != APIOpenAIResponses {
+			// A host that serves only /responses speaks the Responses shape by
+			// definition. Declaring the flag next to any other api is not a
+			// warning about taste: the adapter it selects encodes Responses
+			// requests, so every call on this kind would carry the wrong body.
+			ps = append(ps, Problem{
+				Severity: SeverityError,
+				Source:   org[FieldResponsesOnly].source,
+				Kind:     name,
+				Field:    FieldResponsesOnly,
+				Message: fmt.Sprintf("responses_only with api %q; a host that serves only /responses speaks %s, and the adapter this flag selects encodes that shape",
+					kd.API, APIOpenAIResponses),
+			})
+		}
 		if !isChatLike(kd.Category) && (kd.SupportsTools || kd.SupportsStreaming) {
 			ps = append(ps, Problem{
 				Severity: SeverityWarning,

@@ -53,6 +53,18 @@ type EncodeOptions struct {
 	MaxTokensField string
 
 	Warn WarnFunc
+	// ForceStream and StoreFalse are for a host that refuses anything else.
+	//
+	// The ChatGPT Codex surface requires `stream: true` AND `store: false`, each
+	// refused separately with its own 400, and they are the contract rather than
+	// options an operator forgot. Applied here so a deployment states them once
+	// instead of every caller discovering the refusal.
+	//
+	// Forcing the stream does not change what the CALLER gets: dorang's relay
+	// reads it back, so a non-streaming caller still receives one buffered
+	// answer. The shape is the caller's choice and the transport is not.
+	ForceStream bool
+	StoreFalse  bool
 }
 
 // Output-ceiling spellings for EncodeOptions.MaxTokensField.

@@ -418,6 +418,23 @@ type KindDefaults struct {
 	SupportsTools     bool
 	SupportsStreaming bool
 
+	// ResponsesOnly records that the HOST behind this kind serves `/responses`
+	// and no other route, so a chat-completions address answers 403 or 404
+	// rather than a completion.
+	//
+	// It is a fact about the host, not about the wire shape: `api:
+	// openai-responses` says what the request looks like, and most hosts
+	// declaring it serve `/chat/completions` too. It lives on the kind so that
+	// the adapter choice and the start-up validation of the provider settings
+	// that only mean something on such a host read ONE declaration — a table
+	// in the backend and a check in app that each had their own list would be
+	// two lists, and two lists disagree.
+	//
+	// Measured 2026-08-06 against the ChatGPT Codex surface: `POST
+	// /backend-api/codex/chat/completions` answers 403 and `POST
+	// /backend-api/codex/responses` answers 400 for a body problem.
+	ResponsesOnly bool
+
 	// Metrics and Priority record kind-specific integrations (DESIGN §4.3,
 	// e.g. vllm exposes Prometheus metrics and native request priority).
 	Metrics  string
@@ -472,6 +489,7 @@ const (
 	FieldMaxOutputTokens   = "max_output_tokens"
 	FieldSupportsTools     = "supports_tools"
 	FieldSupportsStreaming = "supports_streaming"
+	FieldResponsesOnly     = "responses_only"
 	FieldMetrics           = "metrics"
 	FieldPriority          = "priority"
 	FieldReasoning         = "reasoning"
