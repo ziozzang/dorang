@@ -121,3 +121,41 @@ against a verbatim capture of this host), and the routing followed:
 4. **A credential error that names its cause** — done. Unreadable, malformed and
    read-only are three categories from `internal/auth`'s own sentinels, never
    from provider text.
+
+## 2026-09-12: the listings re-fetched, the new names asked
+
+Every plan's model listing was fetched again (no generation cost) and every
+name new to the catalog was asked once with `max_tokens: 1`. What that found
+that a listing alone could not:
+
+- **Ollama Cloud** lists 20; four are new (deepseek-v4.1-flash,
+  deepseek-v4-pro:0813, glm-5.3, glm-5.3-flash) and answer as themselves. The
+  bare `deepseek-v4-pro`/`deepseek-v4-flash` names left the listing — it
+  carries dated tags now — but `/api/show` still resolves them.
+- **z.ai coding plan** lists 10; glm-5.3 and glm-5.3-flash new, verified.
+- **qwen token plan** lists 12. `qwen3.8-max-preview` is gone from the listing
+  and the endpoint now serves `qwen3.8-max` for the name (200, body `model`
+  field) — the second substitution this file has recorded, and the deployment
+  was removed for the same reason glm-5.1's was. `qwen3.8-flash` and
+  `deepseek-v4-flash-0731` new, verified. The listing also carries two audio
+  and two image names; **none is reachable through this host**: on
+  compatible-mode `/audio/speech`, `/audio/transcriptions`, `/embeddings` and
+  `/images/generations` all answer 404, the DashScope-native routes refuse
+  (`url error`, `current user api does not support asynchronous calls`,
+  `Model not exist`), a chat call to the TTS name is a 500, and the plan's key
+  is `Incorrect API key` on both standard DashScope hosts. So there is no
+  STT/TTS/embedding to deploy from this plan; a listing names what a route
+  accepts, not what serves. The plan lists no embedding model at all.
+- **codex**: `GET /backend-api/codex/models` lists two names for this plan —
+  gpt-5.3-codex-spark (ctx 128000, added) and a hidden codex-auto-review — and
+  NOT the four catalogued gpt-5.5 / gpt-5.6-* names, which answer regardless.
+  gpt-5.6, gpt-5.7, gpt-5.5-codex, gpt-5.6-codex and gpt-5.7-codex are refused
+  with "not supported when using Codex with a ChatGPT account".
+- **OpenRouter** lists its embedding models at `/api/v1/embeddings/models`,
+  not `/api/v1/models`; both deployed embedding names are on it.
+
+The live fleet was rolled to this build the same day (06ecaff → e75da45, two
+nodes one at a time, 0 Kong health transitions to UNHEALTHY, migrations
+already at 8), and the configuration gained glm-5.3, glm-5.3-flash,
+deepseek-v4.1-flash, kimi-k3 and qwen3.8-flash — each exercised once through
+Kong afterwards.
