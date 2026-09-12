@@ -247,7 +247,7 @@ func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 	// The nav element carries attributes (aria-label) since the app-shell
 	// layout, so the open tag is matched up to its own '>' rather than assumed
 	// to be bare.
-	nav := regexp.MustCompile(`<nav class="screens"[^>]*>(?s)(.*?)</nav>`)
+	nav := regexp.MustCompile(`<nav[^>]*>(?s)(.*?)</nav>`)
 	href := regexp.MustCompile(`href="([^"]+)"`)
 
 	seen := map[string]bool{}

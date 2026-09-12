@@ -29,37 +29,44 @@
 <h2>Users</h2>
 
 {{if .CanMutate}}
-<form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
-  <input type="hidden" name="csrf" value="{{.CSRF}}">
-  <input type="hidden" name="action" value="create_user">
-  <input type="hidden" name="return" value="{{.Base}}/users">
-  <div class="grid">
-    <label class="field">email <small>required — the user's identity</small>
+<div class="panel user-panel">
+  <h2>Register a user</h2>
+  <p class="field-help">Creates an account through <code>{{.APIBase}}/user/new</code> with this session's operator as the actor. Only the email is required; every ceiling is optional and empty means &ldquo;no limit&rdquo;.</p>
+  <form class="form-grid" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="create_user">
+    <input type="hidden" name="return" value="{{.Base}}/users">
+    <div class="field">
+      <label>email <span class="field-help-inline">required — the user's identity</span></label>
       <input type="text" name="user_email" placeholder="alex@example.com" required>
-    </label>
-    <label class="field">name
+    </div>
+    <div class="field">
+      <label>name</label>
       <input type="text" name="user_name" placeholder="Alex Kim">
-    </label>
-    <label class="field">role
-      <select name="user_role">
-        {{range .Roles}}<option value="{{.}}">{{.}}</option>{{end}}
-      </select>
-    </label>
-    <label class="field">budget <small>decimal dollars; empty is no ceiling</small>
+    </div>
+    <div class="field">
+      <label>role</label>
+      <select name="user_role">{{range .Roles}}<option value="{{.}}">{{.}}</option>{{end}}</select>
+    </div>
+    <div class="field">
+      <label>budget <span class="field-help-inline">decimal dollars; empty is no ceiling</span></label>
       <input type="text" name="max_budget" inputmode="decimal" placeholder="250">
-    </label>
-    <label class="field">budget period
+    </div>
+    <div class="field">
+      <label>budget period</label>
       <input type="text" name="budget_duration" placeholder="monthly">
-    </label>
-    <label class="field">rpm limit
+    </div>
+    <div class="field">
+      <label>rpm limit</label>
       <input type="text" name="rpm_limit" inputmode="numeric" placeholder="600">
-    </label>
-    <label class="field">tpm limit
+    </div>
+    <div class="field">
+      <label>tpm limit</label>
       <input type="text" name="tpm_limit" inputmode="numeric" placeholder="120000">
-    </label>
-  </div>
-  <div class="row"><button type="submit" class="primary">create user</button></div>
-</form>
+    </div>
+    <div class="button-row span-2"><button type="submit" class="button button-primary">create user</button></div>
+  </form>
+</div>
 {{end}}
 
 <div class="scroll">

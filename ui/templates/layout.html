@@ -4,65 +4,79 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="same-origin">
+<meta name="color-scheme" content="light dark">
 <title>{{.Title}} — dorang</title>
 <link rel="stylesheet" href="{{.Base}}/assets/style.css">
 <!-- Loaded without defer on purpose: it stamps the stored theme on <html>
      before the first paint, so an operator on the dark theme does not get a
-     white flash on every navigation. Everything else it does waits for
+     white flash on every navigation. Everything else waits for
      DOMContentLoaded. -->
 <script src="{{.Base}}/assets/app.js"></script>
 </head>
 {{if .Screens}}
-<body class="app">
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="app-shell">
 
-<aside class="side">
-  <a class="brand" href="{{.Base}}/">
-    <span class="brand-mark">d</span>
-    <span class="brand-name">dorang<small>admin</small></span>
-  </a>
-  <nav class="screens" aria-label="Screens">
-    {{range .NavGroups}}<div class="nav-group">
-      <span class="nav-group-title">{{.Title}}</span>
-      {{range .Screens}}<a href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}>{{.Label}}</a>
-      {{end}}
+  <header class="topbar">
+    <a class="brand" href="{{.Base}}/">
+      <span class="brand-mark" aria-hidden="true">d</span>
+      <span><strong>DORANG</strong><small>GATEWAY CONTROL</small></span>
+    </a>
+    <div class="workspace-crumb">
+      <span class="workspace-avatar" aria-hidden="true">d</span>
+      <span>Gateway</span><span class="crumb-slash">/</span><strong>admin</strong>
     </div>
-    {{end}}
-  </nav>
-  <div class="side-foot">
-    {{if .Actor}}<span class="who" title="signed in as">{{.Actor}}</span>{{end}}
-    <div class="side-actions">
-      <button type="button" id="theme-toggle" title="toggle theme" aria-label="toggle theme"></button>
-      {{if .Session}}<form method="POST" action="{{.Base}}/logout"><button type="submit" class="ghost">sign out</button></form>{{end}}
+    <div class="top-status">
+      {{if .Actor}}<span class="signed-in-user" title="signed in as">{{.Actor}}</span>{{end}}
+      <button type="button" id="theme-toggle" class="theme-toggle" title="toggle theme" aria-label="toggle theme">◐</button>
+      {{if .Session}}<form method="POST" action="{{.Base}}/logout"><button type="submit" class="button button-quiet">sign out</button></form>{{end}}
     </div>
-  </div>
-</aside>
+  </header>
 
-<div class="content">
-  <main>
-  {{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
-  {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
-  {{template "content" .}}
+  <aside class="sidebar" aria-label="Primary navigation">
+    <nav>
+      {{range .NavGroups}}<p class="nav-group-label">{{.Title}}</p>
+      {{range .Screens}}<a class="nav-link{{if .Current}} is-active{{end}}" href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}><span aria-hidden="true">{{.Icon}}</span><bdi>{{.Label}}</bdi></a>
+      {{end}}{{end}}
+    </nav>
+    <div class="sidebar-foot">
+      <span class="sidebar-system"><span class="small-dot"></span>dorang control plane</span>
+    </div>
+  </aside>
+
+  <main id="main" tabindex="-1">
+    {{if .Problem}}<div class="alert" role="alert">{{.Problem}}</div>{{end}}
+    {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+    {{template "content" .}}
+    <footer class="foot">
+      Read-only operator view. Rendered {{rfc3339 .Generated}}.
+      {{if .Provenance}}{{.Provenance}}{{end}}
+    </footer>
   </main>
-  <footer class="foot">
-    Read-only operator view. Rendered {{rfc3339 .Generated}}.
-    {{if .Provenance}}{{.Provenance}}{{end}}
-  </footer>
-</div>
 
+</div>
 </body>
 {{else}}
-<body class="plain">
-<header class="plain-top">
-  <span class="brand"><span class="brand-mark">d</span><span class="brand-name">dorang<small>admin</small></span></span>
+<body class="login-body">
+<header class="topbar">
+  <a class="brand" href="{{.Base}}/">
+    <span class="brand-mark" aria-hidden="true">d</span>
+    <span><strong>DORANG</strong><small>GATEWAY CONTROL</small></span>
+  </a>
   <span class="spacer"></span>
-  <button type="button" id="theme-toggle" title="toggle theme" aria-label="toggle theme"></button>
+  <div class="top-status">
+    <button type="button" id="theme-toggle" class="theme-toggle" title="toggle theme" aria-label="toggle theme">◐</button>
+  </div>
 </header>
-<main>
-{{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
-{{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
-{{template "content" .}}
+<main id="main" class="login-main">
+  <div class="login-card panel">
+    {{if .Problem}}<div class="alert" role="alert">{{.Problem}}</div>{{end}}
+    {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+    {{template "content" .}}
+  </div>
+  <footer class="foot">Rendered {{rfc3339 .Generated}}.{{if .Provenance}} {{.Provenance}}{{end}}</footer>
 </main>
-<footer class="foot">Rendered {{rfc3339 .Generated}}.{{if .Provenance}} {{.Provenance}}{{end}}</footer>
 </body>
 {{end}}
 </html>

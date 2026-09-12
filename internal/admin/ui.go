@@ -313,7 +313,18 @@ type navScreen struct {
 	Screen  string
 	Href    string
 	Label   string
+	Icon    string
 	Current bool
+}
+
+// navIcons is the sidebar glyph per screen. A screen without one falls back to
+// its initial, so a new screen is never iconless.
+var navIcons = map[string]string{
+	"keys":       "⚷",
+	"users":      "◫",
+	"models":     "▤",
+	"usage":      "▦",
+	"monitoring": "◉",
 }
 
 // navGroup is a labelled section of the sidebar. Grouping is presentation only:
@@ -537,10 +548,15 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 		if !n.available {
 			continue
 		}
+		icon := navIcons[n.screen]
+		if icon == "" && n.screen != "" {
+			icon = strings.ToUpper(n.screen[:1])
+		}
 		out = append(out, navScreen{
 			Screen:  n.screen,
 			Href:    s.base() + "/" + n.screen,
 			Label:   n.label,
+			Icon:    icon,
 			Current: n.screen == current,
 		})
 	}

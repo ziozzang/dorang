@@ -468,7 +468,7 @@ func TestModelsScreenWithNeitherSource(t *testing.T) {
 func TestNavIsGroupedIntoSections(t *testing.T) {
 	h := newHarness(t)
 	body := h.do(http.MethodGet, "/ui/keys", nil).Body.String()
-	for _, title := range []string{`nav-group-title">access`, `nav-group-title">observability`} {
+	for _, title := range []string{`nav-group-label">access`, `nav-group-label">observability`} {
 		if !strings.Contains(body, title) {
 			t.Errorf("the nav is not grouped: missing %q", title)
 		}
