@@ -1,0 +1,203 @@
+{{define "content"}}
+<h1>Users &amp; teams</h1>
+<p class="lede">
+  The directory the request path enforces: a user's or team's block flag, budget, rate limits and
+  model allow-list all apply on top of a key's. Every change here goes through the same
+  <code>{{.APIBase}}/user/*</code> and <code>{{.APIBase}}/team/*</code> routes a script would call,
+  with this session's operator as the actor and the same audit row. An empty box means
+  &ldquo;not set&rdquo;, never &ldquo;set to empty&rdquo;.
+</p>
+
+{{if .Confirm}}
+<div class="panel confirm danger">
+  <h1>⚠ Delete this {{.Confirm.Kind}}?</h1>
+  <p class="lede">This removes <strong>{{.Confirm.Label}}</strong> (<code>{{.Confirm.ID}}</code>).
+    Keys that named it keep working but lose its {{.Confirm.Kind}}-scoped budget and limits.</p>
+  <form method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="{{.Confirm.Action}}">
+    <input type="hidden" name="{{.Confirm.Field}}" value="{{.Confirm.ID}}">
+    <input type="hidden" name="return" value="{{.Base}}/users">
+    <div class="row">
+      <button type="submit" class="danger">delete {{.Confirm.Kind}} {{.Confirm.Label}}</button>
+      <a class="button" href="{{.Base}}/users">cancel, change nothing</a>
+    </div>
+  </form>
+</div>
+{{end}}
+
+<h2>Users</h2>
+
+{{if .CanMutate}}
+<form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="action" value="create_user">
+  <input type="hidden" name="return" value="{{.Base}}/users">
+  <div class="grid">
+    <label class="field">email <small>required — the user's identity</small>
+      <input type="text" name="user_email" placeholder="alex@example.com" required>
+    </label>
+    <label class="field">name
+      <input type="text" name="user_name" placeholder="Alex Kim">
+    </label>
+    <label class="field">role
+      <select name="user_role">
+        {{range .Roles}}<option value="{{.}}">{{.}}</option>{{end}}
+      </select>
+    </label>
+    <label class="field">budget <small>decimal dollars; empty is no ceiling</small>
+      <input type="text" name="max_budget" inputmode="decimal" placeholder="250">
+    </label>
+    <label class="field">budget period
+      <input type="text" name="budget_duration" placeholder="monthly">
+    </label>
+    <label class="field">rpm limit
+      <input type="text" name="rpm_limit" inputmode="numeric" placeholder="600">
+    </label>
+    <label class="field">tpm limit
+      <input type="text" name="tpm_limit" inputmode="numeric" placeholder="120000">
+    </label>
+  </div>
+  <div class="row"><button type="submit" class="primary">create user</button></div>
+</form>
+{{end}}
+
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>email</th><th>name</th><th>role</th><th>state</th>
+    <th>budget</th><th class="num">spend</th><th class="num">rpm</th><th class="num">tpm</th>
+    <th>models</th>{{if .CanMutate}}<th>actions</th>{{end}}
+  </tr></thead>
+  <tbody>
+  {{range .Users}}
+    <tr>
+      <td class="mono">{{.Email}}</td>
+      <td>{{or .Name "—"}}</td>
+      <td>{{.Role}}</td>
+      <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
+      <td>{{.Budget}}</td>
+      <td class="num">{{.Spend}}</td>
+      <td class="num">{{.RPM}}</td>
+      <td class="num">{{.TPM}}</td>
+      <td class="wrap">{{if .Models}}{{.Models}}{{else}}<span class="unavailable">all</span>{{end}}</td>
+      {{if $.CanMutate}}
+      <td class="actions">
+        {{if .Blocked}}
+          <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="unblock_user"><input type="hidden" name="user_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link ok">unblock</button></form>
+        {{else}}
+          <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="block_user"><input type="hidden" name="user_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link">block</button></form>
+        {{end}}
+        <a class="danger" href="{{$.Base}}/users?del_user={{.ID}}">delete</a>
+      </td>
+      {{end}}
+    </tr>
+  {{else}}
+    <tr><td colspan="{{if .CanMutate}}10{{else}}9{{end}}"><span class="unavailable">no users</span></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+<h2>Teams</h2>
+
+{{if .CanMutate}}
+<form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="action" value="create_team">
+  <input type="hidden" name="return" value="{{.Base}}/users">
+  <div class="grid">
+    <label class="field">name <small>required</small>
+      <input type="text" name="team_name" placeholder="Search" required>
+    </label>
+    <label class="field">alias
+      <input type="text" name="team_alias" placeholder="search-team">
+    </label>
+    <label class="field">organization id
+      <input type="text" name="organization_id" placeholder="org_1">
+    </label>
+    <label class="field">budget <small>decimal dollars</small>
+      <input type="text" name="max_budget" inputmode="decimal" placeholder="1000">
+    </label>
+    <label class="field">budget period
+      <input type="text" name="budget_duration" placeholder="monthly">
+    </label>
+    <label class="field">rpm limit
+      <input type="text" name="rpm_limit" inputmode="numeric" placeholder="6000">
+    </label>
+    <label class="field">tpm limit
+      <input type="text" name="tpm_limit" inputmode="numeric" placeholder="1000000">
+    </label>
+  </div>
+  <div class="row"><button type="submit" class="primary">create team</button></div>
+</form>
+{{end}}
+
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>name</th><th>alias</th><th>org</th><th>state</th>
+    <th>budget</th><th class="num">spend</th><th class="num">rpm</th><th class="num">tpm</th>
+    <th class="num">members</th>{{if .CanMutate}}<th>actions</th>{{end}}
+  </tr></thead>
+  <tbody>
+  {{range .Teams}}
+    <tr>
+      <td>{{.Name}}</td>
+      <td class="mono">{{or .Alias "—"}}</td>
+      <td class="mono">{{or .Org "—"}}</td>
+      <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
+      <td>{{.Budget}}</td>
+      <td class="num">{{.Spend}}</td>
+      <td class="num">{{.RPM}}</td>
+      <td class="num">{{.TPM}}</td>
+      <td class="num">{{.Members}}</td>
+      {{if $.CanMutate}}
+      <td class="actions">
+        {{if .Blocked}}
+          <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="unblock_team"><input type="hidden" name="team_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link ok">unblock</button></form>
+        {{else}}
+          <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="block_team"><input type="hidden" name="team_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link">block</button></form>
+        {{end}}
+        <a class="danger" href="{{$.Base}}/users?del_team={{.ID}}">delete</a>
+      </td>
+      {{end}}
+    </tr>
+  {{else}}
+    <tr><td colspan="{{if .CanMutate}}10{{else}}9{{end}}"><span class="unavailable">no teams</span></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+
+{{if .CanMutate}}
+<h2>Team membership</h2>
+<div class="grid">
+  <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="add_member">
+    <input type="hidden" name="return" value="{{.Base}}/users">
+    <strong>Add a member</strong>
+    <label class="field">team
+      <select name="team_id">{{range .Teams}}<option value="{{.ID}}">{{.Name}} ({{.ID}})</option>{{end}}</select>
+    </label>
+    <label class="field">user id <input type="text" name="user_id" placeholder="u_42"></label>
+    <label class="field">role
+      <select name="role"><option value="member">member</option><option value="admin">admin</option></select>
+    </label>
+    <div class="row"><button type="submit" class="primary">add member</button></div>
+  </form>
+  <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="action" value="remove_member">
+    <input type="hidden" name="return" value="{{.Base}}/users">
+    <strong>Remove a member</strong>
+    <label class="field">team
+      <select name="team_id">{{range .Teams}}<option value="{{.ID}}">{{.Name}} ({{.ID}})</option>{{end}}</select>
+    </label>
+    <label class="field">user id <input type="text" name="user_id" placeholder="u_42"></label>
+    <div class="row"><button type="submit" class="danger">remove member</button></div>
+  </form>
+</div>
+{{end}}
+{{end}}

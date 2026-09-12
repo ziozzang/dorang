@@ -493,6 +493,7 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 		available     bool
 	}{
 		{"keys", "keys", s.api.cfg.Keys != nil},
+		{"users", "users & teams", s.api.cfg.Directory != nil && v.scope.Global},
 		{"models", "models & deployments", cat != nil && v.scope.Global},
 		{"usage", "usage & cost", s.api.cfg.Ledger != nil && v.scope.Global},
 	}
@@ -688,6 +689,8 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 		s.renderMessage(w, r, http.StatusMethodNotAllowed, v, "Not a screen",
 			"That URL performs an action and is reached by submitting a form on the keys screen.",
 			CodeMethodNotAllowed)
+	case "/users":
+		s.screenUsers(w, r, v)
 	case "/models":
 		s.screenModels(w, r, v)
 	case "/usage":

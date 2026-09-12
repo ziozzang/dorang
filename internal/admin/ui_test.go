@@ -477,7 +477,7 @@ func TestNavAdvertisesOnlyScreensThatAnswer(t *testing.T) {
 		}
 		// Nowhere to go is said by saying nothing, rather than by sending an
 		// operator from a screen that failed to one that cannot answer either.
-		h2 := newHarness(t, func(c *Config) { c.Keys, c.Models, c.Ledger = nil, nil, nil })
+		h2 := newHarness(t, func(c *Config) { c.Keys, c.Models, c.Ledger, c.Directory = nil, nil, nil, nil })
 		body = h2.do(http.MethodGet, "/ui/batches", nil).Body.String()
 		if strings.Contains(body, "go to") {
 			t.Errorf("a process that serves no screen still offers one: %s", body)

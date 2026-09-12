@@ -486,7 +486,11 @@ func (s *uiServer) act(w http.ResponseWriter, r *http.Request, v viewer) {
 		msg = "Key " + r.PostFormValue("key_id") + " is " + a.past + "."
 	}
 	s.setFlash(v.session, msg)
-	http.Redirect(w, r, s.base()+"/keys", http.StatusSeeOther)
+	// The screen to return to. Key forms send none and default to /keys
+	// (safeNext's own default); the users screen sends its own path. safeNext
+	// admits only a path under this UI's mount, so a crafted return cannot
+	// bounce the operator off-site.
+	http.Redirect(w, r, safeNext(s.base(), r.PostFormValue("return")), http.StatusSeeOther)
 }
 
 // renderActionError shows a refusal from the administration surface.
