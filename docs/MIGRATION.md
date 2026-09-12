@@ -524,7 +524,11 @@ whose user row is absent is reported and not carried (`--members` is on by defau
 already present is left untouched, so carry the members on the first run. Both verbs read the
 same columns the key importer does where the meaning is the same — `max_budget`, `spend`,
 `budget_duration`, `budget_reset_at`, `tpm_limit`, `rpm_limit`, `models` (with §3.6's idioms and
-`--on-untranslatable`), `metadata`, the timestamps — and the report names every column that is
+`--on-untranslatable`, with one difference the level makes: `no-default-models` is the incumbent's
+default for every user and team it creates and at that level means "this level grants nothing, the
+key decides" — which is what an empty dorang list says there, since key, user and team must each
+allow — so it is removed, reported as cleared, and the row imports; on a key it stays refused),
+`metadata`, the timestamps — and the report names every column that is
 not carried with the reason: `password` and `sso_user_id` are credential material dorang has no
 use for; `soft_budget`, `model_max_budget` and `model_spend` are per key or per ledger in dorang;
 a user's `teams` list is carried from the team side. A user without an email is skipped, because

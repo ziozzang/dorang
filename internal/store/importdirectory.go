@@ -359,7 +359,7 @@ func (s *Store) importTeamRow(ctx context.Context, rec map[string]any, now time.
 		}
 		t.SpendNano = nano
 	}
-	models, ok := translateModels(id, asList(rec["models"]), opts.OnUntranslatable, rep)
+	models, ok := translateModels(id, asList(rec["models"]), opts.OnUntranslatable, rep, "team")
 	if !ok {
 		return nil
 	}
@@ -486,7 +486,7 @@ func (s *Store) importUserRow(ctx context.Context, rec map[string]any, now time.
 		}
 		u.SpendNano = nano
 	}
-	models, ok := translateModels(id, asList(rec["models"]), opts.OnUntranslatable, rep)
+	models, ok := translateModels(id, asList(rec["models"]), opts.OnUntranslatable, rep, "user")
 	if !ok {
 		return nil
 	}

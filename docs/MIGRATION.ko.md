@@ -440,7 +440,10 @@ dorangctl import teams --from postgres://user:pass@host/litellm --commit   # 그
 보고만 하고 만들지 않는다(`--members` 기본 켜짐). 이미 있는 팀은 건드리지 않으므로 멤버는 첫 실행에서
 가져와야 한다. 두 동사 모두 의미가 같은 열은 키 임포터와 같은 방식으로 읽고(`max_budget`, `spend`,
 `budget_duration`, `budget_reset_at`, `tpm_limit`, `rpm_limit`, `models`(§3.6의 관용구와
-`--on-untranslatable`), `metadata`, 타임스탬프), 가져오지 않는 열은 이유와 함께 보고한다: `password`와
+`--on-untranslatable`. 단 수준에 따른 차이 하나: `no-default-models`는 기존 프록시가 모든 유저·팀에
+기본으로 넣는 값이고 그 수준에서는 "이 수준은 아무것도 부여하지 않는다, 키가 결정한다"는 뜻이다 — dorang은
+키·유저·팀 각각이 허용해야 하므로 그 수준의 빈 목록이 정확히 같은 말이다 — 그래서 제거하고 cleared로
+보고하며 행은 임포트된다. 키에서는 여전히 거부), `metadata`, 타임스탬프), 가져오지 않는 열은 이유와 함께 보고한다: `password`와
 `sso_user_id`는 dorang이 쓸 데 없는 자격증명 재료, `soft_budget`·`model_max_budget`·`model_spend`는 dorang에서
 키별 또는 원장의 사실, 유저의 `teams` 목록은 팀 쪽에서 가져온다. 이메일 없는 유저는 건너뛴다(dorang은
 이메일을 요구). `--synthetic-email-domain example.invalid`를 주면 `<user_id>@example.invalid`로 만든다.

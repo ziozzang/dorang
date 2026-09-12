@@ -373,7 +373,17 @@ type untranslator interface {
 // because the idiom is one idiom: a sentinel that means "everything" cannot be
 // kept beside literals without narrowing, and one that means "nothing" has no
 // dorang spelling at all.
-func translateModels(lookup string, models []string, policy UntranslatablePolicy, rep untranslator) ([]string, bool) {
+//
+// subject says whose list this is, because the deny sentinel means two
+// different things by level. On a KEY, `no-default-models` is the key reaching
+// nothing, and dorang's empty list means the opposite — refused. On a USER or
+// TEAM it is "this level grants nothing; the key's own list decides", which is
+// the incumbent's default for every user it creates; dorang consults the key,
+// its user and its team and each must allow, so an EMPTY list at the user or
+// team level is exactly "this level does not restrict" — the same statement.
+// It is removed, kept beside nothing, and reported as cleared rather than
+// silently, under both policies.
+func translateModels(lookup string, models []string, policy UntranslatablePolicy, rep untranslator, subject string) ([]string, bool) {
 	var widening, denying []string
 	for _, m := range models {
 		lc := strings.ToLower(strings.TrimSpace(m))
@@ -384,6 +394,29 @@ func translateModels(lookup string, models []string, policy UntranslatablePolicy
 			widening = append(widening, lc)
 		} else {
 			denying = append(denying, lc)
+		}
+	}
+	if subject != "key" && len(denying) > 0 {
+		kept := models[:0:0]
+		for _, m := range models {
+			if _, deny := litellmModelSentinels[strings.ToLower(strings.TrimSpace(m))]; deny &&
+				!litellmWideningModelSentinels[strings.ToLower(strings.TrimSpace(m))] {
+				continue
+			}
+			kept = append(kept, m)
+		}
+		for _, s := range denying {
+			if !rep.untranslated(lookup, "models", s, actionCleared,
+				"the incumbent reads this as "+litellmModelSentinels[s]+" at the "+subject+
+					" level, which is its default for every "+subject+" it creates; dorang consults the key, "+
+					"its user and its team and each must allow, so an empty "+subject+"-level list says the "+
+					"same thing — the key's own allow-list decides") {
+				return nil, false
+			}
+		}
+		models, denying = kept, nil
+		if len(models) == 0 {
+			models = nil
 		}
 	}
 	for _, s := range denying {
@@ -418,7 +451,7 @@ func translateModels(lookup string, models []string, policy UntranslatablePolicy
 }
 
 func translateAllowLists(k *APIKey, policy UntranslatablePolicy, rep *ImportReport) bool {
-	models, ok := translateModels(k.Lookup, k.Models, policy, rep)
+	models, ok := translateModels(k.Lookup, k.Models, policy, rep, "key")
 	if !ok {
 		return false
 	}

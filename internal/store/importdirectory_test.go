@@ -172,11 +172,20 @@ func TestImportTeamsIsReportFirstAndIdempotent(t *testing.T) {
 	})
 }
 
-// The model-list idioms are the key importer's, applied to a team.
+// The model-list idioms are the key importer's, applied to a team — with the
+// one difference the level makes.
+//
+// A widening sentinel is refused or cleared by policy, as on a key. The deny
+// sentinel is the incumbent's DEFAULT for every user and team it creates, and
+// at that level it means "this level grants nothing; the key decides" — which
+// is what an empty dorang list says at that level, since key, user and team
+// must each allow. So it imports, with the sentinel removed and reported, and
+// the literal names beside it kept.
 func TestImportTeamsAppliesTheAllowListIdioms(t *testing.T) {
 	src := newDirectorySource(t, []teamRow{
 		{id: "wide", alias: "wide", models: `["all-proxy-models","gpt-4o"]`},
 		{id: "none", alias: "none", models: `["no-default-models"]`},
+		{id: "some", alias: "some", models: `["no-default-models","gpt-4o"]`},
 	}, nil)
 	eachBackend(t, func(t *testing.T, s *Store) {
 		ctx := context.Background()
@@ -184,14 +193,34 @@ func TestImportTeamsAppliesTheAllowListIdioms(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rep.Imported != 0 || rep.Skipped != 2 {
+		if rep.Imported != 2 || rep.Skipped != 1 {
 			t.Errorf("skip policy: %+v\n%s", rep, rep.Summary())
+		}
+		none, err := s.GetTeam(ctx, "none")
+		if err != nil || len(none.Models) != 0 {
+			t.Errorf("a team-level deny sentinel did not become an unrestricting empty list: %+v %v", none, err)
+		}
+		some, err := s.GetTeam(ctx, "some")
+		if err != nil || strings.Join(some.Models, ",") != "gpt-4o" {
+			t.Errorf("the literal beside the sentinel was not kept: %+v %v", some, err)
+		}
+		var reported bool
+		for _, u := range rep.Untranslated {
+			if u.Lookup == "none" && u.Value == "no-default-models" && u.Action == actionCleared {
+				reported = true
+			}
+		}
+		if !reported {
+			t.Errorf("the removed sentinel was not reported:\n%s", rep.Summary())
+		}
+		if _, err := s.GetTeam(ctx, "wide"); !errors.Is(err, ErrNotFound) {
+			t.Error("a widening sentinel was imported under the skip policy")
 		}
 		rep, err = s.ImportTeams(ctx, src, DirectoryImportOptions{OnUntranslatable: UntranslatableClear})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rep.Imported != 1 || rep.Skipped != 1 {
+		if rep.Imported != 1 || rep.AlreadyPresent != 2 {
 			t.Errorf("clear policy: %+v\n%s", rep, rep.Summary())
 		}
 		got, err := s.GetTeam(ctx, "wide")
@@ -200,9 +229,6 @@ func TestImportTeamsAppliesTheAllowListIdioms(t *testing.T) {
 		}
 		if len(got.Models) != 0 {
 			t.Errorf("a cleared allow-list kept entries: %v", got.Models)
-		}
-		if _, err := s.GetTeam(ctx, "none"); !errors.Is(err, ErrNotFound) {
-			t.Error("a deny-everything sentinel was imported under either policy")
 		}
 	})
 }
