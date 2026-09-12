@@ -57,6 +57,31 @@ func TestEmbeddedAssetsAreSelfContained(t *testing.T) {
 	}
 }
 
+// Assets revalidate instead of caching blind: each carries an ETag and a
+// conditional request matching it gets a 304. This is what makes a redeploy's
+// new stylesheet show at once rather than after the old cache window — the
+// defect that made a deploy look like it had not taken.
+func TestAssetsRevalidateWithAnETag(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do(http.MethodGet, "/ui/assets/style.css", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("style.css: status %d", rec.Code)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("style.css carries no ETag, so a browser cannot tell a redeploy from a repeat")
+	}
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-cache") {
+		t.Errorf("Cache-Control = %q; without revalidation a deploy is invisible for the cache window", cc)
+	}
+	// A conditional request with the current ETag is answered 304 (cheap), not
+	// a full body.
+	rec2 := h.do(http.MethodGet, "/ui/assets/style.css", nil, header("If-None-Match", etag))
+	if rec2.Code != http.StatusNotModified {
+		t.Errorf("If-None-Match with the current ETag = %d, want 304", rec2.Code)
+	}
+}
+
 func TestThreeScreensRender(t *testing.T) {
 	h := newHarness(t, withReporters)
 	seedLedger(h)

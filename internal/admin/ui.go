@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html/template"
@@ -817,7 +819,16 @@ func (s *uiServer) serveAsset(w http.ResponseWriter, r *http.Request, name strin
 	}
 	// Embedded assets change only with the binary, so they may be cached; the
 	// header set by securityHeaders is for pages, not for these.
-	w.Header().Set("Cache-Control", "public, max-age=300")
+	// Content-addressed revalidation instead of a blind 5-minute cache. The
+	// asset is embedded in the binary, so its bytes change only on a deploy;
+	// the ETag is their hash, and "no-cache" tells the browser to revalidate
+	// every load. Unchanged, that is a cheap 304; after a deploy the hash
+	// differs and the browser fetches the new bytes at once, rather than
+	// showing the old stylesheet for up to five minutes and looking like the
+	// deploy did not take.
+	sum := sha256.Sum256(body)
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:16])+`"`)
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(body))
 }
 
