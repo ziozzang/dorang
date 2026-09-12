@@ -87,8 +87,12 @@
   function label(v) {
     var b = document.getElementById("theme-toggle");
     if (!b) return;
-    b.textContent = v === null ? "theme: auto" : "theme: " + v;
-    b.setAttribute("aria-label", "Colour theme: " + (v === null ? "follow system" : v));
+    // The button is icon-only (the glyph is a CSS ::before that tracks
+    // data-theme), so the label is carried by title/aria-label rather than
+    // textContent — writing text here would sit beside the icon.
+    var t = "Colour theme: " + (v === null ? "follow system" : v) + " (click to change)";
+    b.setAttribute("aria-label", t);
+    b.setAttribute("title", t);
   }
 
   // ---- table filter -----------------------------------------------------

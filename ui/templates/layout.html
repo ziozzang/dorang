@@ -12,41 +12,53 @@
      DOMContentLoaded. -->
 <script src="{{.Base}}/assets/app.js"></script>
 </head>
-<body>
+{{if .Screens}}
+<body class="app">
 
-<header class="top">
-  <span class="brand">dorang<small>admin</small></span>
-  {{if .Screens}}
-  <nav class="screens">
+<aside class="side">
+  <a class="brand" href="{{.Base}}/">
+    <span class="brand-mark">d</span>
+    <span class="brand-name">dorang<small>admin</small></span>
+  </a>
+  <nav class="screens" aria-label="Screens">
     {{range .Screens}}<a href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}>{{.Label}}</a>
     {{end}}
   </nav>
-  {{end}}
-  <span class="spacer"></span>
-  {{if .Actor}}<span class="tag">{{.Actor}}</span>{{end}}
-  <button type="button" id="theme-toggle">theme</button>
-  {{if .Session}}
-  <form method="POST" action="{{.Base}}/logout"><button type="submit">sign out</button></form>
-  {{end}}
-</header>
+  <div class="side-foot">
+    {{if .Actor}}<span class="who" title="signed in as">{{.Actor}}</span>{{end}}
+    <div class="side-actions">
+      <button type="button" id="theme-toggle" title="toggle theme" aria-label="toggle theme"></button>
+      {{if .Session}}<form method="POST" action="{{.Base}}/logout"><button type="submit" class="ghost">sign out</button></form>{{end}}
+    </div>
+  </div>
+</aside>
 
-<main>
-{{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
-{{if .Notice}}<div class="banner">{{.Notice}}</div>{{end}}
-{{template "content" .}}
-</main>
-
-<!-- The provenance line is supplied by the SCREEN, and screens that show no
-     figures supply none. It used to live here, unconditionally: "every figure
-     comes from the same engine the API and the CLI use, so there is one answer
-     rather than three" — printed under a page that had produced no figure at
-     all, and under a spend column that disagreed with /key/list about the same
-     key from the same store. A claim that strong, citing the section that makes
-     it, is what stops a reader from cross-checking. -->
-<footer class="foot">
-  Read-only operator view. Rendered {{rfc3339 .Generated}}.
-  {{if .Provenance}}{{.Provenance}}{{end}}
-</footer>
+<div class="content">
+  <main>
+  {{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
+  {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+  {{template "content" .}}
+  </main>
+  <footer class="foot">
+    Read-only operator view. Rendered {{rfc3339 .Generated}}.
+    {{if .Provenance}}{{.Provenance}}{{end}}
+  </footer>
+</div>
 
 </body>
+{{else}}
+<body class="plain">
+<header class="plain-top">
+  <span class="brand"><span class="brand-mark">d</span><span class="brand-name">dorang<small>admin</small></span></span>
+  <span class="spacer"></span>
+  <button type="button" id="theme-toggle" title="toggle theme" aria-label="toggle theme"></button>
+</header>
+<main>
+{{if .Problem}}<div class="banner bad" role="alert">{{.Problem}}</div>{{end}}
+{{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+{{template "content" .}}
+</main>
+<footer class="foot">Rendered {{rfc3339 .Generated}}.{{if .Provenance}} {{.Provenance}}{{end}}</footer>
+</body>
+{{end}}
 </html>
