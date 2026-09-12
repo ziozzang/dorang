@@ -22,17 +22,28 @@ answer that matters most — it distinguishes *absent* from *reachable and picky
 **z.ai coding plan** serves chat and nothing else, so dorang's current routing is
 already correct for it. Nothing to do.
 
-**Ollama Cloud serves all three** and dorang uses one. A caller's Anthropic
-`/v1/messages` request is converted to chat before it goes out, and every
-construct §10.1 reports as lost on that crossing — `thinking` blocks, multi-block
-tool results, per-block cache breakpoints — is lost against a host that would
-have accepted it natively.
+**Ollama Cloud serves all three, and since 2026-09-12 dorang uses all three.**
+The kind declares `surfaces: [chat, messages, responses]` in the catalog, and a
+caller on `/v1/messages` or `/v1/responses` reaches the host on that route in its
+own family's shape — no conversion, so no conversion loss: the `thinking` blocks,
+multi-block tool results and per-block cache breakpoints that the chat crossing
+reported as lost now arrive as sent. Two things were measured before this could
+be done, and both are in the code's comments: the host takes the same
+`Authorization: Bearer` on `/v1/messages` as on chat (`x-api-key`, the Anthropic
+family's own spelling, answers 401), and `/v1/responses` lives under the
+versioned base, unlike the Responses-only host's bare one. A chat caller still
+takes the chat route; a kind declaring nothing behaves exactly as before. The
+choice is made per exchange (`Provider.pick`), the §10.1 gate and the encoder
+read the surface's own capability set, and the credential is the host's.
 
 **qwen token plan serves `/responses` and not `/messages`**, which is the
 opposite of what was assumed. The live configuration's own comment records why
 it uses `openai-chat`: the Responses surface "flaked once in nine calls with an
 upstream 500". That is a reason to prefer chat, and it is not the same as the
-surface being absent — the note should say *unstable*, not *unavailable*.
+surface being absent — the note says *unstable*, not *unavailable*, and the kind
+deliberately declares no native `responses` surface: a `/v1/responses` caller is
+converted to chat there, which is the stable route. An operator who has measured
+otherwise declares `surfaces: [chat, responses]` on the kind in a catalog overlay.
 
 **codex serves `/responses` and only `/responses`.** dorang sends it to
 `/v1/chat/completions` and gets a 403. The reason is in

@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -95,6 +96,10 @@ type Spec struct {
 	// the adapter choice and the check on the two settings below read the
 	// catalog's declaration rather than a list of their own.
 	ResponsesOnly bool
+	// Surfaces are the chat-shaped routes the host serves natively beyond its
+	// primary one ([catalog.KindDefaults.Surfaces]): a caller speaking one of
+	// them is sent there in its own family's shape.
+	Surfaces []string
 	// ResponsesForceStream and ResponsesStoreFalse state a Responses-only host's
 	// contract once, instead of every caller meeting it as a 400. Refused by
 	// [NewProvider] unless ResponsesOnly: nothing else reads them.
@@ -129,7 +134,10 @@ type Provider struct {
 	retry   Policy
 	engine  Engine
 	ad      adapter
-	drop    []string
+	// native holds one adapter per surface the host serves natively beyond the
+	// primary, keyed by the caller family it serves. [Provider.pick] reads it.
+	native map[catalog.API]adapter
+	drop   []string
 }
 
 // NewProvider resolves a spec.
@@ -156,6 +164,10 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err := checkResponsesContract(s); err != nil {
 		return nil, err
 	}
+	native, err := nativeAdapters(api, ad, s.Surfaces)
+	if err != nil {
+		return nil, err
+	}
 	drop, err := resolveDropParams(api, s.DropParams)
 	if err != nil {
 		return nil, err
@@ -169,11 +181,84 @@ func NewProvider(s Spec) (*Provider, error) {
 		retry:   s.Retry.withDefaults(),
 		engine:  EngineForKind(s.Kind),
 		ad:      ad,
+		native:  native,
 		drop:    drop,
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,
 	}, nil
+}
+
+// nativeAdapters builds the per-surface adapters a host's declared surfaces
+// call for.
+//
+// A surface is served in ITS family's shape but with THIS host's credential:
+// Ollama Cloud's /v1/messages takes `Authorization: Bearer`, the same as its
+// chat route, and answers 401 to the x-api-key the Anthropic family spells.
+// So the messages adapter here is the Anthropic encoder and decoder wrapped
+// around the primary adapter's credential. The Responses surface on a host
+// that serves both routes is addressed under the versioned base, unlike the
+// Responses-only host, which serves it at the bare base.
+func nativeAdapters(api catalog.API, primary adapter, surfaces []string) (map[catalog.API]adapter, error) {
+	var out map[catalog.API]adapter
+	add := func(k catalog.API, a adapter) {
+		if out == nil {
+			out = map[catalog.API]adapter{}
+		}
+		out[k] = a
+	}
+	for _, s := range surfaces {
+		switch s {
+		case catalog.SurfaceChat:
+			if api != catalog.APIOpenAIChat && api != catalog.APIOpenAIResponses {
+				return nil, fmt.Errorf("backend: surface %q is not served natively from a %s host in this build", s, api)
+			}
+		case catalog.SurfaceMessages:
+			if api == catalog.APIAnthropicMessages {
+				continue // the primary surface
+			}
+			add(catalog.APIAnthropicMessages, nativeMessagesAdapter{primary: primary})
+		case catalog.SurfaceResponses:
+			if api != catalog.APIOpenAIChat && api != catalog.APIOpenAIResponses {
+				return nil, fmt.Errorf("backend: surface %q is not served natively from a %s host in this build", s, api)
+			}
+			add(catalog.APIOpenAIResponses, responsesAdapter{versioned: true})
+		default:
+			return nil, fmt.Errorf("backend: surface %q is not one of chat, messages, responses", s)
+		}
+	}
+	return out, nil
+}
+
+// pick chooses the adapter for one call: the native adapter for the caller's
+// own surface when the host serves it, the primary otherwise. The API it
+// returns is the family the request is encoded against, which is what the
+// §10.1 gate and the encoder read their capability set from.
+func (p *Provider) pick(c *Call) (adapter, catalog.API) {
+	if c != nil && p.native != nil {
+		switch {
+		case c.Op == OpResponses:
+			if a, ok := p.native[catalog.APIOpenAIResponses]; ok {
+				return a, catalog.APIOpenAIResponses
+			}
+		case c.Op == OpChat && c.ClientAPI == catalog.APIAnthropicMessages:
+			if a, ok := p.native[catalog.APIAnthropicMessages]; ok {
+				return a, catalog.APIAnthropicMessages
+			}
+		}
+	}
+	return p.ad, p.api
+}
+
+// nativeMessagesAdapter is the Anthropic surface on a host whose credential
+// is spelled some other way.
+type nativeMessagesAdapter struct {
+	anthropicAdapter
+	primary adapter
+}
+
+func (a nativeMessagesAdapter) credential(secret string, h http.Header) {
+	a.primary.credential(secret, h)
 }
 
 // checkResponsesContract refuses the Responses-only settings on a host that is

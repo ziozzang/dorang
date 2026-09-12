@@ -58,7 +58,12 @@ func (p *Provider) ApplyCredential(secret string, oauth Applier, h http.Header) 
 	// Family headers that are not the credential itself go on regardless of how
 	// the credential is spelled: anthropic-version is mandatory on that surface
 	// whether the key is static or an OAuth token.
-	p.ad.headers(h)
+	return applyWith(p.ad, secret, oauth, h)
+}
+
+// applyWith is [Provider.ApplyCredential] for the adapter one exchange chose.
+func applyWith(ad adapter, secret string, oauth Applier, h http.Header) error {
+	ad.headers(h)
 
 	if oauth != nil {
 		if err := oauth.Apply(h); err != nil {
@@ -69,7 +74,7 @@ func (p *Provider) ApplyCredential(secret string, oauth Applier, h http.Header) 
 	if secret == "" {
 		return nil
 	}
-	p.ad.credential(secret, h)
+	ad.credential(secret, h)
 	return nil
 }
 

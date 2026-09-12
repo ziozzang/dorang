@@ -48,14 +48,21 @@ import (
 // They are not options an operator forgot; they are the contract. [Provider]
 // carries them so a deployment states them once rather than every caller
 // discovering the 400 for themselves, and the encoder applies them below.
-type responsesAdapter struct{}
+type responsesAdapter struct {
+	// versioned addresses the route under the versioned base, which is where
+	// a host that serves BOTH routes keeps it (ollama.com/v1/responses). The
+	// Responses-only host is the other case: no `/v1`, the route at the bare
+	// base the operator configured — chatgpt.com/backend-api/codex/responses —
+	// and joining a version segment would produce a path it does not serve.
+	versioned bool
+}
 
-func (responsesAdapter) endpoint(p *Provider, op Operation, _ string, _ bool) (string, error) {
+func (a responsesAdapter) endpoint(p *Provider, op Operation, _ string, _ bool) (string, error) {
 	switch op {
 	case OpChat, OpResponses:
-		// No `/v1`. This surface is addressed at the base the operator
-		// configured — chatgpt.com/backend-api/codex/responses — and joining a
-		// version segment would produce a path the host does not serve.
+		if a.versioned {
+			return joinVersioned(p.base, "/v1", pathResponses), nil
+		}
 		return join(p.base, pathResponses), nil
 	case OpEmbeddings, OpRerank, OpCompletions, OpModerations:
 		return "", unsupportedProvider{
@@ -266,7 +273,7 @@ func (s *responsesSource) terminated() bool { return false }
 //     the bytes before it may be a real prefix, and the decoder refuses to
 //     skip a frame and hand on an answer with a hole in it.
 func collectResponses(body []byte, x *exchange) (*decoded, error) {
-	src, err := x.prov.ad.source(bytes.NewReader(body), x)
+	src, err := x.ad.source(bytes.NewReader(body), x)
 	if err != nil {
 		return nil, server.NewError(http.StatusBadGateway, server.TypeAPIError,
 			"the upstream stream could not be read").WithCode(CodeUpstreamShape)

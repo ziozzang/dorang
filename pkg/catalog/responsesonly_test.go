@@ -59,3 +59,34 @@ kinds:
 			"flag selects would encode a shape the api field contradicts")
 	}
 }
+
+// Ollama Cloud declares the three surfaces it was measured to serve, and the
+// declaration is validated: an unknown surface name and a surface beside
+// `responses` on a responses_only kind are both refused at load.
+func TestSurfacesAreDeclaredAndValidated(t *testing.T) {
+	c := loadWith(t, "version: 1\n")
+	kd, _ := c.Kind("ollama-cloud")
+	if strings.Join(kd.Surfaces, ",") != "chat,messages,responses" {
+		t.Errorf("ollama-cloud surfaces = %v, want the three measured routes", kd.Surfaces)
+	}
+	if kd, _ := c.Kind("codex-responses"); len(kd.Surfaces) != 0 {
+		t.Errorf("codex-responses declares surfaces %v; it serves one route and says so with responses_only", kd.Surfaces)
+	}
+	mustLoadFail(t, `
+version: 1
+kinds:
+  odd:
+    api: openai-chat
+    category: chat
+    surfaces: [chat, completions]
+`, "completions")
+	mustLoadFail(t, `
+version: 1
+kinds:
+  odd:
+    api: openai-responses
+    category: chat
+    responses_only: true
+    surfaces: [messages]
+`, "responses_only")
+}

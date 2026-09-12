@@ -435,6 +435,16 @@ type KindDefaults struct {
 	// /backend-api/codex/responses` answers 400 for a body problem.
 	ResponsesOnly bool
 
+	// Surfaces names the chat-shaped routes the HOST serves natively beyond
+	// the one `API` implies: any of "chat", "messages", "responses". A caller
+	// speaking one of them is sent to that route in its own family's shape,
+	// with no conversion and therefore no conversion loss, instead of being
+	// translated to the kind's primary surface (docs/SURFACES.md). A surface
+	// equal to the primary is redundant and ignored; a name outside the three
+	// is refused at load. Measured, like ResponsesOnly: Ollama Cloud serves all
+	// three and takes the same bearer credential on each.
+	Surfaces []string
+
 	// Metrics and Priority record kind-specific integrations (DESIGN §4.3,
 	// e.g. vllm exposes Prometheus metrics and native request priority).
 	Metrics  string
@@ -490,6 +500,7 @@ const (
 	FieldSupportsTools     = "supports_tools"
 	FieldSupportsStreaming = "supports_streaming"
 	FieldResponsesOnly     = "responses_only"
+	FieldSurfaces          = "surfaces"
 	FieldMetrics           = "metrics"
 	FieldPriority          = "priority"
 	FieldReasoning         = "reasoning"
@@ -697,3 +708,10 @@ type ModelInfo struct {
 
 	Note string
 }
+
+// The chat-shaped surfaces a kind may declare in `surfaces`.
+const (
+	SurfaceChat      = "chat"
+	SurfaceMessages  = "messages"
+	SurfaceResponses = "responses"
+)

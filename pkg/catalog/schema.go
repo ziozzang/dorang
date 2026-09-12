@@ -129,22 +129,23 @@ type fileDoc struct {
 }
 
 type kindDoc struct {
-	Merge             *string       `yaml:"merge"`
-	API               field[string] `yaml:"api"`
-	BaseURL           field[string] `yaml:"base_url"`
-	Cache             field[string] `yaml:"cache"`
-	Reasoning         field[string] `yaml:"reasoning"`
-	Category          field[string] `yaml:"category"`
-	ContextWindow     field[int]    `yaml:"context_window"`
-	MaxOutputTokens   field[int]    `yaml:"max_output_tokens"`
-	SupportsTools     field[bool]   `yaml:"supports_tools"`
-	SupportsStreaming field[bool]   `yaml:"supports_streaming"`
-	ResponsesOnly     field[bool]   `yaml:"responses_only"`
-	Metrics           field[string] `yaml:"metrics"`
-	Priority          field[string] `yaml:"priority"`
-	Verified          field[string] `yaml:"verified"`
-	Probe             *probeDoc     `yaml:"probe"`
-	Note              field[string] `yaml:"note"`
+	Merge             *string         `yaml:"merge"`
+	API               field[string]   `yaml:"api"`
+	BaseURL           field[string]   `yaml:"base_url"`
+	Cache             field[string]   `yaml:"cache"`
+	Reasoning         field[string]   `yaml:"reasoning"`
+	Category          field[string]   `yaml:"category"`
+	ContextWindow     field[int]      `yaml:"context_window"`
+	MaxOutputTokens   field[int]      `yaml:"max_output_tokens"`
+	SupportsTools     field[bool]     `yaml:"supports_tools"`
+	SupportsStreaming field[bool]     `yaml:"supports_streaming"`
+	ResponsesOnly     field[bool]     `yaml:"responses_only"`
+	Surfaces          field[[]string] `yaml:"surfaces"`
+	Metrics           field[string]   `yaml:"metrics"`
+	Priority          field[string]   `yaml:"priority"`
+	Verified          field[string]   `yaml:"verified"`
+	Probe             *probeDoc       `yaml:"probe"`
+	Note              field[string]   `yaml:"note"`
 
 	// Provenance for the block that merges whole rather than field-wise.
 	probeFrom fieldSource
@@ -398,6 +399,7 @@ func mergeKind(dst, src *kindDoc, from fieldSource) {
 	mergeField(&dst.SupportsTools, src.SupportsTools, from)
 	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
 	mergeField(&dst.ResponsesOnly, src.ResponsesOnly, from)
+	mergeField(&dst.Surfaces, src.Surfaces, from)
 	mergeField(&dst.Metrics, src.Metrics, from)
 	mergeField(&dst.Priority, src.Priority, from)
 	mergeField(&dst.Verified, src.Verified, from)
@@ -657,6 +659,22 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 	if v := in.MaxOutputTokens.get(); v < 0 {
 		errs = append(errs, fmt.Errorf("kinds[%q]: max_output_tokens is negative", name))
 	}
+	var surfaces []string
+	for _, s := range in.Surfaces.get() {
+		switch s {
+		case SurfaceChat, SurfaceMessages, SurfaceResponses:
+			surfaces = append(surfaces, s)
+		default:
+			errs = append(errs, fmt.Errorf("kinds[%q]: surfaces: %q is not one of chat, messages, responses", name, s))
+		}
+	}
+	if in.ResponsesOnly.get() {
+		for _, s := range surfaces {
+			if s != SurfaceResponses {
+				errs = append(errs, fmt.Errorf("kinds[%q]: surfaces: %q on a responses_only kind, whose host serves /responses alone", name, s))
+			}
+		}
+	}
 
 	if len(errs) > 0 {
 		return KindDefaults{}, nil, errors.Join(errs...)
@@ -672,6 +690,7 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		FieldSupportsTools:     in.SupportsTools.origin,
 		FieldSupportsStreaming: in.SupportsStreaming.origin,
 		FieldResponsesOnly:     in.ResponsesOnly.origin,
+		FieldSurfaces:          in.Surfaces.origin,
 		FieldMetrics:           in.Metrics.origin,
 		FieldPriority:          in.Priority.origin,
 		FieldVerified:          in.Verified.origin,
@@ -690,6 +709,7 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		SupportsTools:     in.SupportsTools.get(),
 		SupportsStreaming: in.SupportsStreaming.get(),
 		ResponsesOnly:     in.ResponsesOnly.get(),
+		Surfaces:          surfaces,
 		Metrics:           in.Metrics.get(),
 		Priority:          in.Priority.get(),
 		Verified:          in.Verified.get(),

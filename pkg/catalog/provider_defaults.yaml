@@ -325,7 +325,13 @@ kinds:
   # The hosted endpoint at https://ollama.com/v1. Distinct from `ollama`: it
   # takes a credential, hosts a fixed model set, and has no keep-alive knob to
   # hold a model resident, so no prompt-cache scheme applies.
+  # surfaces: measured 2026-08-06 and again 2026-09-12 — the host serves
+  # /v1/chat/completions, /v1/messages and /v1/responses, and takes the same
+  # `Authorization: Bearer` on each (x-api-key on /v1/messages answers 401). A
+  # caller on /v1/messages or /v1/responses therefore reaches it in its own
+  # shape, with nothing translated and nothing reported lost.
   ollama-cloud:
+    surfaces: [chat, messages, responses]
     api: openai-chat
     base_url: https://ollama.com/v1
     # hermes plugins/model-providers/ollama-cloud/__init__.py:81-87 names this

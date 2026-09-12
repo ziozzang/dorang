@@ -156,7 +156,7 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 		return u, fw.n, watch.failure(x.secrets)
 	}
 
-	src, err := x.prov.ad.source(resp.Body, x)
+	src, err := x.ad.source(resp.Body, x)
 	if err != nil {
 		return canonical.Usage{}, fw.n, err
 	}

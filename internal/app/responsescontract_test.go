@@ -233,3 +233,53 @@ func TestALocalContinuationIDIsNotSentUpstream(t *testing.T) {
 			"upstream field", row.PreviousResponseID, made.ID)
 	}
 }
+
+// The catalog's `surfaces` reaches the adapter from an operator's file.
+//
+// An assembled gateway with a provider of kind ollama-cloud — which the
+// catalog declares serves /v1/messages natively — sends an Anthropic caller's
+// request to that route. Without the copy from catalog to Spec the host sees
+// the chat route, and every backend test above passes regardless.
+func TestTheCatalogSurfacesReachTheAdapterFromTheFile(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/messages" {
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"native"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"converted"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`))
+	}))
+	t.Cleanup(up.Close)
+	yaml := `
+version: 1
+providers:
+  - {name: p1, kind: ollama-cloud, base_url: "` + up.URL + `"}
+credentials:
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: p1, upstream_model: gpt-oss:20b, credentials: [c1]}
+`
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	key := issueKey(t, a, nil)
+	w := callWith(a, key, http.MethodPost, "/v1/messages",
+		`{"model":"m1","max_tokens":16,"messages":[{"role":"user","content":"go"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d\n%s", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 1 || paths[0] != "/v1/messages" {
+		t.Errorf("host saw %v; the catalog's surfaces did not reach the adapter", paths)
+	}
+	if !strings.Contains(w.Body.String(), `"native"`) {
+		t.Errorf("body:\n%s", w.Body.String())
+	}
+}

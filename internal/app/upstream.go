@@ -50,6 +50,9 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			// about the kind, and it decides the adapter. Passing it is what
 			// makes the two settings below refusable on any other host.
 			ResponsesOnly: responsesOnlyFor(cat, p.Kind),
+			// The routes the host serves natively beyond its primary one, also
+			// the catalog's claim about the kind.
+			Surfaces: surfacesFor(cat, p.Kind),
 			// A Responses-only host's contract, stated by the deployment.
 			ResponsesForceStream: p.Params.ForceStream,
 			ResponsesStoreFalse:  p.Params.StoreFalse,
@@ -96,4 +99,13 @@ func (t *upstreamTable) secret(credentialID string) string {
 func responsesOnlyFor(cat *catalog.Catalog, kind string) bool {
 	kd, ok := cat.Kind(kind)
 	return ok && kd.ResponsesOnly
+}
+
+// surfacesFor reads the catalog's declaration of the chat-shaped routes a
+// kind's host serves natively beyond its primary one.
+func surfacesFor(cat *catalog.Catalog, kind string) []string {
+	if kd, ok := cat.Kind(kind); ok {
+		return kd.Surfaces
+	}
+	return nil
 }

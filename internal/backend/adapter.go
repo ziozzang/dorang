@@ -97,6 +97,11 @@ type exchange struct {
 	// "exactly once" is a property of this struct rather than of the reader of
 	// two call sites in [Backend.finish].
 	accepted bool
+	// ad is the adapter this exchange speaks through and api the family it
+	// is encoded against — the provider's primary pair, or the native pair
+	// for the caller's own surface when the host serves it ([Provider.pick]).
+	ad  adapter
+	api catalog.API
 }
 
 // accept hands the loss report to [Call.Accepted], once.
@@ -183,6 +188,13 @@ func (x *exchange) toolNames() *openai.ToolNames {
 // answering the question separately is exactly how a request gets refused
 // against one capability set and encoded against another.
 func (x *exchange) capabilities() canonical.Capability {
+	if x.api != "" && x.api != x.prov.api {
+		// A native surface is that family's shape on this host, so it is
+		// that family's capability set: a deployment's declared set describes
+		// the primary route and would report a construct the Anthropic route
+		// takes natively as lost on the chat route it never went to.
+		return CapabilitiesForAPI(x.api)
+	}
 	if x.target.Capabilities != 0 {
 		return x.target.Capabilities
 	}

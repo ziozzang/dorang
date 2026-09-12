@@ -407,13 +407,14 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 	}
 	p := t.Provider
 
-	endpoint, err := p.Endpoint(c.Op, t.UpstreamModel, c.Stream)
+	ad, api := p.pick(c)
+	endpoint, err := ad.endpoint(p, c.Op, t.UpstreamModel, c.Stream)
 	if err != nil {
 		res.Err = operationError(err)
 		return res
 	}
 
-	x := &exchange{call: c, target: &t, prov: p, attempt: 1}
+	x := &exchange{call: c, target: &t, prov: p, attempt: 1, ad: ad, api: api}
 	if c.Op.ChatShaped() {
 		// Allocated before the encoder runs, per exchange rather than per call: a
 		// fail-back hop lands on a different deployment and loses different things,
@@ -427,7 +428,7 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 		}
 	}
 
-	payload, err := p.ad.encode(x)
+	payload, err := x.ad.encode(x)
 	if err != nil {
 		res.Err = encodeError(err)
 		return res
@@ -520,7 +521,7 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 	if p.engine == EngineVLLM {
 		hreq.Header.Set(loadsignal.RequestHeader, loadsignal.RequestFormat)
 	}
-	if cerr := b.applyCredential(p, t.Credential, hreq.Header); cerr != nil {
+	if cerr := b.applyCredential(x, t.Credential, hreq.Header); cerr != nil {
 		cancel()
 		return nil, &attemptError{err: credentialError(t.Credential, cerr), credential: true}
 	}
@@ -553,7 +554,7 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 func noCancel() {}
 
 // applyCredential resolves and applies the provider credential.
-func (b *Backend) applyCredential(p *Provider, id string, h http.Header) error {
+func (b *Backend) applyCredential(x *exchange, id string, h http.Header) error {
 	var (
 		secret string
 		oauth  Applier
@@ -561,10 +562,10 @@ func (b *Backend) applyCredential(p *Provider, id string, h http.Header) error {
 	if b.creds != nil && id != "" {
 		secret, oauth = b.creds.Credential(id)
 	} else {
-		p.ad.headers(h)
+		x.ad.headers(h)
 		return nil
 	}
-	return p.ApplyCredential(secret, oauth, h)
+	return applyWith(x.ad, secret, oauth, h)
 }
 
 // finish handles a response that arrived: the status classes, then the body.
@@ -833,7 +834,7 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 // the name is not the only place the two differ once a deployment's upstream
 // model id is not the client's.
 func (b *Backend) convert(body []byte, x *exchange) ([]byte, string, canonical.Usage, *server.Error) {
-	dec, err := x.prov.ad.decode(body, x)
+	dec, err := x.ad.decode(body, x)
 	if err != nil {
 		// An adapter that already knows the status and the code — a host whose
 		// answer to a buffered caller is an event stream, read back and found
