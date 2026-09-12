@@ -759,6 +759,10 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 			CodeMethodNotAllowed)
 	case "/users":
 		s.screenUsers(w, r, v)
+	case "/users/edit_user":
+		s.screenEditUser(w, r, v)
+	case "/users/edit_team":
+		s.screenEditTeam(w, r, v)
 	case "/models":
 		s.screenModels(w, r, v)
 	case "/usage":

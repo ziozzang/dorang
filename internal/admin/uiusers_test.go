@@ -98,6 +98,62 @@ func TestUsersScreenCreateBlockDelete(t *testing.T) {
 	}
 }
 
+// The user edit form is prefilled and writes through /user/update under the
+// same end-state semantics as the key edit form: a kept field keeps its value,
+// an emptied clearable field is reset. Revert check: stop the form clearing an
+// emptied budget and the budget assertion fails.
+func TestEditUserFromTheUISetsAndClearsFields(t *testing.T) {
+	h := newHarness(t)
+	seedAdminSession(h)
+	c, token := signInUI(t, h, adminToken)
+
+	rec := uiPost(h, "/ui"+uiActionPath, url.Values{
+		"csrf": {token}, "action": {"create_user"}, "return": {"/ui/users"},
+		"user_email": {"edit@example.com"}, "user_name": {"Editable"}, "user_role": {"internal_user"},
+		"max_budget": {"250"}, "rpm_limit": {"600"},
+	}, c)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("create_user = %d\n%s", rec.Code, rec.Body.String())
+	}
+	users, _ := h.store.ListUsers(t.Context(), ListOptions{Limit: 100})
+	var uid string
+	for _, u := range users {
+		if u.Email == "edit@example.com" {
+			uid = u.ID
+		}
+	}
+	if uid == "" {
+		t.Fatal("created user not found")
+	}
+
+	page := uiGet(h, "/ui/users/edit_user?user_id="+uid, c)
+	if page.Code != http.StatusOK {
+		t.Fatalf("GET edit_user = %d\n%s", page.Code, page.Body.String())
+	}
+	for _, want := range []string{`value="edit@example.com"`, `value="250.00"`, `value="600"`} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Errorf("edit form not prefilled with %q", want)
+		}
+	}
+
+	// Raise rpm, keep email/role, empty the budget (clears it).
+	rec = uiPost(h, "/ui"+uiActionPath, url.Values{
+		"csrf": {token}, "action": {"update_user"}, "user_id": {uid}, "return": {"/ui/users"},
+		"user_email": {"edit@example.com"}, "user_role": {"internal_user"},
+		"rpm_limit": {"900"}, "max_budget": {""},
+	}, c)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("update_user = %d\n%s", rec.Code, rec.Body.String())
+	}
+	u, _ := h.store.GetUser(t.Context(), uid)
+	if u == nil || u.RPMLimit == nil || *u.RPMLimit != 900 {
+		t.Errorf("rpm not updated to 900: %+v", u)
+	}
+	if u != nil && u.MaxBudgetNano != nil {
+		t.Errorf("emptied budget box did not clear the budget: %d", *u.MaxBudgetNano)
+	}
+}
+
 // The screen is refused where no directory is configured, rather than 500ing.
 func TestUsersScreenNeedsDirectory(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.Directory = nil })

@@ -318,6 +318,110 @@ func init() {
 		},
 		notice: func(f url.Values, _ map[string]any) string { return "Member " + f.Get("user_id") + " removed." },
 	})
+
+	add("update_user", uiAction{
+		api: "/user/update", verb: "save changes to a user", past: "updated", needs: directoryPresent,
+		body: editUserBody,
+		notice: func(f url.Values, _ map[string]any) string {
+			return "User " + f.Get("user_id") + " updated. Fields left empty are now unset."
+		},
+	})
+	add("update_team", uiAction{
+		api: "/team/update", verb: "save changes to a team", past: "updated", needs: directoryPresent,
+		body: editTeamBody,
+		notice: func(f url.Values, _ map[string]any) string {
+			return "Team " + f.Get("team_id") + " updated. Fields left empty are now unset."
+		},
+	})
+}
+
+// editUserBody and editTeamBody map a prefilled edit form to /user/update and
+// /team/update under the same end-state semantics as the key edit form: a box
+// left as it is re-sends its value, a clearable box emptied resets that field
+// through the update route's `clear` list. Identity fields (email, name, role,
+// team name) are set-only — they have no clear token and an emptied box leaves
+// them unchanged rather than blanks an identity. `blocked` is not here; block
+// and unblock are their own one-click controls.
+func editUserBody(f url.Values) (any, error) {
+	id := strings.TrimSpace(f.Get("user_id"))
+	if id == "" {
+		return nil, badRequest("no user was named")
+	}
+	b := map[string]any{"user_id": id}
+	putStr(b, "user_email", f, "user_email")
+	putStr(b, "user_name", f, "user_name")
+	putStr(b, "user_role", f, "user_role")
+	clear := setOrClearCommon(b, f)
+	if len(clear) > 0 {
+		b["clear"] = clear
+	}
+	return b, nil
+}
+
+func editTeamBody(f url.Values) (any, error) {
+	id := strings.TrimSpace(f.Get("team_id"))
+	if id == "" {
+		return nil, badRequest("no team was named")
+	}
+	b := map[string]any{"team_id": id}
+	putStr(b, "team_name", f, "team_name")
+	var clear []string
+	for _, n := range []string{"team_alias", "organization_id"} {
+		if v := strings.TrimSpace(f.Get(n)); v != "" {
+			b[n] = v
+		} else {
+			clear = append(clear, n)
+		}
+	}
+	clear = append(clear, setOrClearCommon(b, f)...)
+	if v := strings.TrimSpace(f.Get("max_parallel_requests")); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || i < 0 {
+			return nil, badRequest("max_parallel_requests must be a whole number")
+		}
+		b["max_parallel_requests"] = i
+	} else {
+		clear = append(clear, "max_parallel_requests")
+	}
+	if len(clear) > 0 {
+		b["clear"] = clear
+	}
+	return b, nil
+}
+
+// setOrClearCommon applies the budget/limit/models fields shared by the user
+// and team edit forms: present sets, empty clears. It returns the clear tokens
+// the caller folds into its own list.
+func setOrClearCommon(b map[string]any, f url.Values) []string {
+	var clear []string
+	if v := strings.TrimSpace(f.Get("budget_duration")); v != "" {
+		b["budget_duration"] = v
+	} else {
+		clear = append(clear, "budget_duration")
+	}
+	if v := strings.TrimSpace(f.Get("max_budget")); v != "" {
+		if _, err := parseNano(v); err == nil {
+			b["max_budget"] = v
+		}
+	} else {
+		clear = append(clear, "max_budget")
+	}
+	for _, n := range []string{"rpm_limit", "tpm_limit"} {
+		v := strings.TrimSpace(f.Get(n))
+		if v == "" {
+			clear = append(clear, n)
+			continue
+		}
+		if i, err := strconv.ParseInt(v, 10, 64); err == nil && i >= 0 {
+			b[n] = i
+		}
+	}
+	if list := splitList(f.Get("models")); len(list) > 0 {
+		b["models"] = list
+	} else {
+		clear = append(clear, "models")
+	}
+	return clear
 }
 
 func stringField(m map[string]any, k string) string {
@@ -336,4 +440,116 @@ func stringField(m map[string]any, k string) string {
 		}
 	}
 	return ""
+}
+
+// editUserPage / editTeamPage prefill the directory edit forms. Every field is
+// a string ready to be an input value; the form is the object's desired state,
+// like the key edit form. See [editUserBody] and [editTeamBody].
+type editUserPage struct {
+	page
+	ID, Email, Name, Role string
+	Roles                 []string
+	Budget, BudgetPeriod  string
+	RPM, TPM              string
+	Models                string
+	Blocked               bool
+}
+
+type editTeamPage struct {
+	page
+	ID, Name, Alias, Org  string
+	Budget, BudgetPeriod  string
+	RPM, TPM, MaxParallel string
+	Models                string
+	Blocked               bool
+}
+
+// screenEditUser renders the prefilled edit form for one user, loaded through
+// the same Directory the API reads, gated on the same global scope the users
+// screen is. The save goes through the `update_user` action and /user/update.
+func (s *uiServer) screenEditUser(w http.ResponseWriter, r *http.Request, v viewer) {
+	dir := s.api.cfg.Directory
+	if dir == nil {
+		s.renderMessage(w, r, http.StatusNotImplemented, v, "Edit user",
+			"A directory is not configured in this process.", CodeDependencyOff)
+		return
+	}
+	if !v.scope.Global {
+		s.renderMessage(w, r, http.StatusForbidden, v, "Edit user",
+			"Users are administered for the whole deployment; this session is team-scoped.", CodeForbidden)
+		return
+	}
+	if !v.canMutate() {
+		s.refuseReadOnly(w, r, v, "edit a user")
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if id == "" {
+		s.renderMessage(w, r, http.StatusBadRequest, v, "Edit user", "No user was named.", CodeInvalidRequest)
+		return
+	}
+	u, err := dir.GetUser(r.Context(), id)
+	if err != nil {
+		s.renderError(w, r, v, "Edit user", err)
+		return
+	}
+	pg := editUserPage{
+		page:         s.newPage("users", "Edit user", v),
+		ID:           u.ID,
+		Email:        u.Email,
+		Name:         u.Name,
+		Role:         u.Role,
+		Roles:        []string{"internal_user", "proxy_admin", "proxy_admin_viewer", "internal_user_viewer"},
+		Budget:       nanoDollars(u.MaxBudgetNano),
+		BudgetPeriod: u.BudgetPeriod,
+		RPM:          intStr(u.RPMLimit),
+		TPM:          intStr(u.TPMLimit),
+		Models:       strings.Join(u.Models, ", "),
+		Blocked:      u.Blocked,
+	}
+	s.render(w, r, http.StatusOK, "edituser", pg)
+}
+
+// screenEditTeam renders the prefilled edit form for one team.
+func (s *uiServer) screenEditTeam(w http.ResponseWriter, r *http.Request, v viewer) {
+	dir := s.api.cfg.Directory
+	if dir == nil {
+		s.renderMessage(w, r, http.StatusNotImplemented, v, "Edit team",
+			"A directory is not configured in this process.", CodeDependencyOff)
+		return
+	}
+	if !v.scope.Global {
+		s.renderMessage(w, r, http.StatusForbidden, v, "Edit team",
+			"Teams are administered for the whole deployment; this session is team-scoped.", CodeForbidden)
+		return
+	}
+	if !v.canMutate() {
+		s.refuseReadOnly(w, r, v, "edit a team")
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("team_id"))
+	if id == "" {
+		s.renderMessage(w, r, http.StatusBadRequest, v, "Edit team", "No team was named.", CodeInvalidRequest)
+		return
+	}
+	t, err := dir.GetTeam(r.Context(), id)
+	if err != nil {
+		s.renderError(w, r, v, "Edit team", err)
+		return
+	}
+	pg := editTeamPage{
+		page:         s.newPage("users", "Edit team", v),
+		ID:           t.ID,
+		Name:         t.Name,
+		Alias:        t.Alias,
+		Org:          t.OrganizationID,
+		Budget:       nanoDollars(t.MaxBudgetNano),
+		BudgetPeriod: t.BudgetPeriod,
+		RPM:          intStr(t.RPMLimit),
+		TPM:          intStr(t.TPMLimit),
+		MaxParallel:  intStr(t.MaxParallel),
+		Models:       strings.Join(t.Models, ", "),
+		Blocked:      t.Blocked,
+	}
+	s.render(w, r, http.StatusOK, "editteam", pg)
 }

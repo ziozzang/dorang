@@ -1,0 +1,66 @@
+{{define "content"}}
+<h1>Edit user</h1>
+<p class="lede">
+  This edits a user through <code>POST {{.APIBase}}/user/update</code> — the same route a script
+  calls, with this session's operator as the actor and the same audit row. The form is
+  <strong>the user's desired state</strong>: a box left as it is keeps its value, and a clearable
+  box you <strong>empty is reset</strong> to &ldquo;none&rdquo;. Email, name and role are kept
+  unless you change them. Blocking is a separate control on the users screen.
+</p>
+
+<form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="action" value="update_user">
+  <input type="hidden" name="user_id" value="{{.ID}}">
+  <input type="hidden" name="return" value="{{.Base}}/users">
+
+  <div class="grid">
+    <label class="field">id
+      <input type="text" value="{{.ID}}" readonly>
+      <small class="mono">{{if .Blocked}}blocked{{else}}active{{end}}</small>
+    </label>
+    <label class="field">email
+      <input type="text" name="user_email" value="{{.Email}}" placeholder="alex@example.com">
+      <small>The user's identity.</small>
+    </label>
+    <label class="field">name
+      <input type="text" name="user_name" value="{{.Name}}" placeholder="Alex Kim">
+    </label>
+    <label class="field">role
+      <select name="user_role">
+        {{$r := .Role}}{{range .Roles}}<option value="{{.}}" {{if eq . $r}}selected{{end}}>{{.}}</option>{{end}}
+      </select>
+    </label>
+  </div>
+
+  <div class="grid">
+    <label class="field">budget
+      <input type="text" name="max_budget" value="{{.Budget}}" inputmode="decimal" placeholder="250">
+      <small>Spend ceiling, an exact decimal. Empty is no ceiling.</small>
+    </label>
+    <label class="field">budget period
+      <input type="text" name="budget_duration" value="{{.BudgetPeriod}}" placeholder="monthly">
+    </label>
+    <label class="field">rpm limit
+      <input type="text" name="rpm_limit" value="{{.RPM}}" inputmode="numeric" placeholder="600">
+      <small>Empty is no limit.</small>
+    </label>
+    <label class="field">tpm limit
+      <input type="text" name="tpm_limit" value="{{.TPM}}" inputmode="numeric" placeholder="120000">
+      <small>Empty is no limit.</small>
+    </label>
+  </div>
+
+  <div class="grid">
+    <label class="field">models
+      <input type="text" name="models" value="{{.Models}}" placeholder="model-large, model-small">
+      <small>Comma separated allow-list. Empty allows all.</small>
+    </label>
+  </div>
+
+  <div class="row">
+    <button type="submit" class="primary">save changes</button>
+    <a class="button" href="{{.Base}}/users">cancel</a>
+  </div>
+</form>
+{{end}}

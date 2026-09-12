@@ -83,6 +83,7 @@
       <td class="wrap">{{if .Models}}{{.Models}}{{else}}<span class="unavailable">all</span>{{end}}</td>
       {{if $.CanMutate}}
       <td class="actions">
+        <a href="{{$.Base}}/users/edit_user?user_id={{.ID}}">edit</a>
         {{if .Blocked}}
           <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="unblock_user"><input type="hidden" name="user_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link ok">unblock</button></form>
         {{else}}
@@ -154,6 +155,7 @@
       <td class="num">{{.Members}}</td>
       {{if $.CanMutate}}
       <td class="actions">
+        <a href="{{$.Base}}/users/edit_team?team_id={{.ID}}">edit</a>
         {{if .Blocked}}
           <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="unblock_team"><input type="hidden" name="team_id" value="{{.ID}}"><input type="hidden" name="return" value="{{$.Base}}/users"><button type="submit" class="link ok">unblock</button></form>
         {{else}}
