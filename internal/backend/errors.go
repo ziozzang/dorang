@@ -209,7 +209,13 @@ func normalizedFailure(frame []byte, secrets []string) *relayFailure {
 // credentialHeaders are the headers this package puts key material into. They
 // are the whole list, per adapter: bearer for the OpenAI-shaped families and the
 // two non-chat vendors, x-api-key for messages, x-goog-api-key for Gemini.
-var credentialHeaders = [...]string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"}
+var credentialHeaders = [...]string{
+	"Authorization",        // bearer (openai-shaped families, cohere, jina) and the Azure Entra path
+	"X-Api-Key",            // anthropic-messages
+	"X-Goog-Api-Key",       // gemini and vertex
+	"Api-Key",              // azure-openai's static key
+	"X-Amz-Security-Token", // bedrock's SigV4 session token
+}
 
 // redacted replaces a credential in text that is about to leave dorang. It is
 // internal/redact's constant rather than a second spelling of it: two

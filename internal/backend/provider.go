@@ -114,6 +114,14 @@ type Spec struct {
 	// refused elsewhere; the location also names the default host.
 	VertexProject  string
 	VertexLocation string
+	// BedrockRegion, BedrockAccessKeyID and BedrockSessionToken are the SigV4
+	// signing inputs (`params.region`, `params.access_key_id`,
+	// `params.session_token`). Required on the bedrock kind (the region may
+	// come from base_url), refused elsewhere. The secret access key is the
+	// credential, not a Spec field.
+	BedrockRegion       string
+	BedrockAccessKeyID  string
+	BedrockSessionToken string
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -151,7 +159,18 @@ type Provider struct {
 	azureAPIVersion string
 	// vertexProject and vertexLocation: see [Spec.VertexProject].
 	vertexProject, vertexLocation string
+	// bedrock*: see [Spec.BedrockRegion].
+	bedrockRegion, bedrockAccessKeyID, bedrockSessionToken string
 }
+
+// errBedrockNeedsAccessKey and errBedrockNeedsRegion are a bedrock provider
+// whose request cannot be signed.
+var (
+	errBedrockNeedsAccessKey = errors.New("backend: a bedrock provider needs params.access_key_id; " +
+		"SigV4 names the access key in the credential scope and there is no default")
+	errBedrockNeedsRegion = errors.New("backend: a bedrock provider needs params.region or a " +
+		"bedrock-runtime.{region}.amazonaws.com base_url; SigV4 signs per region and there is no default")
+)
 
 // errVertexNeedsProject is a vertex provider whose route cannot be built.
 var errVertexNeedsProject = errors.New("backend: a vertex provider needs params.project and params.location; " +
@@ -168,6 +187,9 @@ func NewProvider(s Spec) (*Provider, error) {
 		// The location names the host on Vertex; an operator who states the
 		// location has stated the host.
 		base = vertexHost(s.VertexLocation)
+	}
+	if base == "" && s.API == catalog.APIBedrock && s.BedrockRegion != "" {
+		base = "https://bedrock-runtime." + s.BedrockRegion + ".amazonaws.com"
 	}
 	if base == "" {
 		return nil, ErrNoBaseURL
@@ -196,6 +218,9 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err := checkVertexParams(s, api); err != nil {
 		return nil, err
 	}
+	if err := checkBedrockParams(s, api); err != nil {
+		return nil, err
+	}
 	drop, err := resolveDropParams(api, s.DropParams)
 	if err != nil {
 		return nil, err
@@ -215,6 +240,10 @@ func NewProvider(s Spec) (*Provider, error) {
 		azureAPIVersion: s.AzureAPIVersion,
 		vertexProject:   s.VertexProject,
 		vertexLocation:  s.VertexLocation,
+
+		bedrockRegion:       s.BedrockRegion,
+		bedrockAccessKeyID:  s.BedrockAccessKeyID,
+		bedrockSessionToken: s.BedrockSessionToken, // pragma: allowlist secret -- field name, not a secret
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,

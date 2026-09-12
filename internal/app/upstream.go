@@ -61,7 +61,11 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			// Vertex AI's route scope.
 			VertexProject:  p.Params.Project,
 			VertexLocation: p.Params.Location,
-			Timeout:        p.Timeout.Duration(),
+			// Amazon Bedrock's SigV4 signing inputs.
+			BedrockRegion:       p.Params.Region,
+			BedrockAccessKeyID:  p.Params.AccessKeyID,
+			BedrockSessionToken: bedrockSessionToken(p), // pragma: allowlist secret -- field name, not a secret
+			Timeout:             p.Timeout.Duration(),
 			// providers[].retry, which is a different thing from the fallback
 			// chain of §7.6 and is documented as such on [backend.Policy].
 			Retry: backend.Policy{
@@ -113,4 +117,11 @@ func surfacesFor(cat *catalog.Catalog, kind string) []string {
 		return kd.Surfaces
 	}
 	return nil
+}
+
+// bedrockSessionToken reads params.session_token, which is a SecretRef so it
+// can come from an env var rather than the file.
+func bedrockSessionToken(p *config.Provider) string {
+	v, _ := p.Params.SessionToken.Value()
+	return v
 }

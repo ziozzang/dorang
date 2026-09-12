@@ -501,6 +501,12 @@ type Params struct {
 	// kind, refused on any other.
 	Project  string `yaml:"project,omitempty"`
 	Location string `yaml:"location,omitempty"`
+	// Region, AccessKeyID and SessionToken are Amazon Bedrock's SigV4 signing
+	// inputs. Required on the bedrock kind (region may come from base_url),
+	// refused on any other. The secret access key is the credential.
+	Region       string    `yaml:"region,omitempty"`
+	AccessKeyID  string    `yaml:"access_key_id,omitempty"`
+	SessionToken SecretRef `yaml:"session_token,omitempty"`
 }
 
 // Output-ceiling spellings for `max_tokens_field`.

@@ -521,7 +521,22 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 	if p.engine == EngineVLLM {
 		hreq.Header.Set(loadsignal.RequestHeader, loadsignal.RequestFormat)
 	}
-	if cerr := b.applyCredential(x, t.Credential, hreq.Header); cerr != nil {
+	if sg, ok := x.ad.(requestSigner); ok {
+		// A signed surface (Bedrock): the credential is a signature over the
+		// whole request, so it is applied here where the body and headers
+		// exist rather than through applyCredential's header path. The secret
+		// is the signing key; a missing or unusable one is the same
+		// credential failure any other adapter would raise.
+		secret, oauth := b.credential(t.Credential)
+		if oauth != nil {
+			cancel()
+			return nil, &attemptError{err: credentialError(t.Credential, errCredentialUnavailable), credential: true}
+		}
+		if err := sg.signRequest(hreq, payload, secret, p, b.now()); err != nil {
+			cancel()
+			return nil, &attemptError{err: credentialError(t.Credential, err), credential: true}
+		}
+	} else if cerr := b.applyCredential(x, t.Credential, hreq.Header); cerr != nil {
 		cancel()
 		return nil, &attemptError{err: credentialError(t.Credential, cerr), credential: true}
 	}
@@ -552,6 +567,22 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 
 // noCancel is the cancel function of an attempt with no deadline of its own.
 func noCancel() {}
+
+// requestSigner is an adapter that authenticates by signing the whole built
+// request rather than by setting a credential header ([bedrockAdapter], AWS
+// SigV4). [Backend.send] calls it in place of applyCredential.
+type requestSigner interface {
+	signRequest(req *http.Request, payload []byte, secret string, p *Provider, now time.Time) error
+}
+
+// credential resolves a credential id to its secret and OAuth applier, or
+// empty when there is no credential table or no id.
+func (b *Backend) credential(id string) (string, Applier) {
+	if b.creds == nil || id == "" {
+		return "", nil
+	}
+	return b.creds.Credential(id)
+}
 
 // applyCredential resolves and applies the provider credential.
 func (b *Backend) applyCredential(x *exchange, id string, h http.Header) error {

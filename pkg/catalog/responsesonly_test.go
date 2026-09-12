@@ -112,3 +112,11 @@ func TestTheVertexKindSpeaksTheVertexShape(t *testing.T) {
 		t.Errorf("anthropic-vertex api = %q ok=%t", kd.API, ok)
 	}
 }
+
+// The bedrock kind speaks the Converse (SigV4) shape.
+func TestTheBedrockKindSpeaksConverse(t *testing.T) {
+	c := loadWith(t, "version: 1\n")
+	if kd, ok := c.Kind("bedrock"); !ok || kd.API != APIBedrock {
+		t.Errorf("bedrock api = %q ok=%t, want %q", kd.API, ok, APIBedrock)
+	}
+}

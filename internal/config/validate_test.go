@@ -1355,3 +1355,29 @@ func TestPreStopDelayRefusesNegative(t *testing.T) {
 		t.Error("validateServer accepted a negative pre_stop_delay")
 	}
 }
+
+// A session token as a SecretRef resolves from the environment, so the AWS
+// short-lived credential is never written into the file.
+func TestBedrockSessionTokenIsASecretRef(t *testing.T) {
+	t.Setenv("DORANG_TEST_BEDROCK_SESSION", "sess-from-env")
+	cfg, err := LoadBytes([]byte(`
+version: 1
+providers:
+  - name: br
+    kind: bedrock
+    params: {region: us-east-1, access_key_id: AKID, session_token: {key_env: DORANG_TEST_BEDROCK_SESSION}}
+credentials:
+  - {id: c1, provider: br, key_env: DORANG_TEST_BEDROCK_SESSION}
+models:
+  - name: m1
+    deployments:
+      - {provider: br, upstream_model: anthropic.claude, credentials: [c1]}
+`))
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	v, ok := cfg.Providers[0].Params.SessionToken.Value()
+	if !ok || v != "sess-from-env" {
+		t.Errorf("session token = %q ok=%t, want it resolved from the env", v, ok)
+	}
+}

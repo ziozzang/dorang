@@ -170,3 +170,25 @@ nodes one at a time, 0 Kong health transitions to UNHEALTHY, migrations
 already at 8), and the configuration gained glm-5.3, glm-5.3-flash,
 deepseek-v4.1-flash, kimi-k3 and qwen3.8-flash — each exercised once through
 Kong afterwards.
+
+## 2026-09-12: the cloud kinds that were refused now have adapters
+
+Three kinds this build refused outright ("no adapter in this build") are served
+now, each needing only what its refusal named:
+
+- **azure** (`azure-openai`): the OpenAI body on an Azure resource — the unified
+  `/openai/v1` route by default, the legacy per-deployment path with
+  `params.api_version`, and the `api-key` header.
+- **vertex**: the Gemini body under a project- and location-scoped route
+  (`params.project`, `params.location`), with a Google OAuth bearer — a
+  service-account key file minted through `format: gcp-service-account`.
+- **bedrock**: the Converse API (`internal/wire/bedrock`, one request shape
+  across model families, plus its binary event stream), signed with SigV4
+  (`params.region`, `params.access_key_id`, the secret access key as the
+  credential). The signer is pinned to AWS's published `get-vanilla` vector.
+
+None is measured against a live account — the operator has none of the three —
+and each says so in the catalog and is pinned against a fake at every layer.
+Claude on Vertex (`anthropic-vertex`) stays refused: it is a different route
+(rawPredict, `anthropic_version` in the body, no model field) than Gemini on
+Vertex, and its refusal names why.

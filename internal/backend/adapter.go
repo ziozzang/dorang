@@ -9,6 +9,7 @@ import (
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
+	"github.com/ziozzang/dorang/internal/wire/bedrock"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/internal/wire/rerank"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -294,6 +295,8 @@ func adapterFor(api catalog.API, kind string, responsesOnly bool) (adapter, erro
 		return geminiAdapter{}, nil
 	case catalog.APIVertex:
 		return vertexAdapter{}, nil
+	case catalog.APIBedrock:
+		return bedrockAdapter{}, nil
 	case catalog.APICohere:
 		return cohereAdapter{}, nil
 	case catalog.APIJina:
@@ -358,6 +361,8 @@ func CapabilitiesForAPI(api catalog.API) canonical.Capability {
 		return anthropic.DefaultCapabilities
 	case catalog.APIGemini, catalog.APIVertex:
 		return GeminiCapabilities
+	case catalog.APIBedrock:
+		return bedrock.DefaultCapabilities
 	}
 	return openai.DefaultCapabilities
 }

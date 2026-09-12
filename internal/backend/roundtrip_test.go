@@ -472,11 +472,11 @@ func TestCohereRefusesChatAndEmbeddings(t *testing.T) {
 // name rather than dispatched at a URL that does not exist.
 func TestUnsupportedKinds(t *testing.T) {
 	f := newFakeUpstream(t)
-	// azure and vertex left this table on 2026-09-12: each has an adapter now
-	// (azure_test.go, vertex_test.go). Claude on Vertex joined it, with the
-	// reason its refusal names.
+	// azure, vertex and bedrock left this table as each gained an adapter
+	// (azure_test.go, vertex_test.go, bedrock_test.go). anthropic-vertex —
+	// Claude on Vertex, a different route — remains, with the reason its
+	// refusal names.
 	for kind, code := range map[string]string{
-		"bedrock":          "bedrock_unsupported",
 		"anthropic-vertex": "anthropic_vertex_unsupported",
 	} {
 		p, err := NewProvider(Spec{Name: kind, Kind: kind, API: catalog.APIOpenAIChat, BaseURL: f.srv.URL})

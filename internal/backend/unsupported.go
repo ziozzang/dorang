@@ -45,12 +45,6 @@ type unsupportedProvider struct {
 func (u unsupportedProvider) Error() string { return u.reason }
 
 var unsupportedKinds = map[string]unsupportedAdapter{
-	"bedrock": {
-		code: "bedrock_unsupported",
-		reason: "the bedrock kind has no adapter in this build: it needs SigV4 request signing and the Converse " +
-			"request shape, neither of which dorang implements. Front Bedrock with a gateway that speaks " +
-			"anthropic-messages or openai-chat, and point a provider at that.",
-	},
 	"anthropic-vertex": {
 		code: "anthropic_vertex_unsupported",
 		reason: "the anthropic-vertex kind has no adapter in this build: Claude on Vertex is addressed at a " +

@@ -24,14 +24,16 @@ const (
 	// APIVertex is the Gemini wire shape on Vertex AI: the same body, under a
 	// project- and location-scoped path, with a Google OAuth bearer.
 	APIVertex API = "vertex"
-	APICohere API = "cohere"
-	APIJina   API = "jina"
-	APIEcho   API = "echo"
+	// APIBedrock is Amazon Bedrock's Converse API, signed with SigV4.
+	APIBedrock API = "bedrock"
+	APICohere  API = "cohere"
+	APIJina    API = "jina"
+	APIEcho    API = "echo"
 )
 
 var validAPIs = map[API]bool{
 	APIOpenAIChat: true, APIOpenAIResponses: true, APIAzureOpenAI: true, APIAnthropicMessages: true,
-	APIGemini: true, APIVertex: true, APICohere: true, APIJina: true, APIEcho: true,
+	APIGemini: true, APIVertex: true, APIBedrock: true, APICohere: true, APIJina: true, APIEcho: true,
 }
 
 // CacheScheme names how prompt caching is expressed on the wire for a kind.

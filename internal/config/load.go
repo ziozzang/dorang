@@ -96,6 +96,14 @@ func (c *Config) resolveSecrets(col *collector) {
 				fmt.Sprintf("credentials[%d].oauth.refresh", i), col)
 		}
 	}
+	// A Bedrock session token is a short-lived AWS credential, so it is a
+	// reference like every other secret rather than a literal in the file.
+	for i := range c.Providers {
+		if c.Providers[i].Params.SessionToken.sources() == 1 {
+			c.Providers[i].Params.SessionToken.resolve(env,
+				fmt.Sprintf("providers[%d].params.session_token", i), col)
+		}
+	}
 	for _, name := range sortedKeys(c.KeyRotation.Providers) {
 		kp := c.KeyRotation.Providers[name]
 		for i := range kp.Keys {

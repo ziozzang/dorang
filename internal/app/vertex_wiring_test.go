@@ -97,3 +97,50 @@ models:
 		t.Errorf("token minted %d times, want 1", minted)
 	}
 }
+
+// A Bedrock provider from an operator's file signs its request with the
+// access key id the file names.
+//
+// The backend tests build the Spec directly; this proves the copy from
+// params.access_key_id / params.region / key into it (upstream.go). The fake
+// host records the Authorization header, which carries the access key id in
+// its Credential scope.
+func TestBedrockFromTheFileSignsWithTheConfiguredKey(t *testing.T) {
+	t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
+	var mu sync.Mutex
+	var seenAuth, seenPath string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		mu.Lock()
+		seenAuth, seenPath = r.Header.Get("Authorization"), r.URL.Path
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"output":{"message":{"role":"assistant","content":[{"text":"ok"}]}},"stopReason":"end_turn","usage":{"inputTokens":3,"outputTokens":1,"totalTokens":4}}`))
+	}))
+	t.Cleanup(up.Close)
+	yaml := `
+version: 1
+providers:
+  - {name: br, kind: bedrock, base_url: "` + up.URL + `", params: {region: us-east-1, access_key_id: AKIDFROMFILE}}
+credentials:
+  - {id: c1, provider: br, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: br, upstream_model: anthropic.claude, credentials: [c1]}
+`
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	k := issueKey(t, a, nil)
+	w := callWith(a, k, http.MethodPost, "/v1/chat/completions", `{"model":"m1","messages":[{"role":"user","content":"go"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d\n%s", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(seenAuth, "Credential=AKIDFROMFILE/") || !strings.Contains(seenAuth, "/us-east-1/bedrock/aws4_request") {
+		t.Errorf("Authorization = %q; the access key id from the file did not reach the signer", seenAuth)
+	}
+	if seenPath != "/model/anthropic.claude/converse" {
+		t.Errorf("host saw %q", seenPath)
+	}
+}

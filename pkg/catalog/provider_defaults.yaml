@@ -153,24 +153,22 @@ kinds:
     supports_streaming: true
 
   bedrock:
-    api: anthropic-messages
+    api: bedrock
     cache: anthropic_cache_control
     category: chat
     supports_tools: true
     supports_streaming: true
     note: >-
-      §4.3 elides bedrock's defaults. It fronts several model families, so this
-      is a starting point a deployment is expected to override. Both mined
-      sources disagree with the wire shape recorded here: openclaw declares
-      api "bedrock-converse-stream" (extensions/amazon-bedrock/discovery.ts:695)
-      and hermes api_mode "bedrock_converse"
-      (plugins/model-providers/bedrock/__init__.py:21-28). dorang has no
-      Converse adapter, and naming an API that no adapter implements would be
-      a worse lie than this one. No models are listed: openclaw's
-      KNOWN_CONTEXT_WINDOWS (discovery.ts:68-139) and hermes'
-      BEDROCK_CONTEXT_LENGTHS (agent/bedrock_adapter.py:1351-1391) are both
-      hand-maintained tables their own authors label as stale-prone fallbacks
-      (bedrock_adapter.py:1509-1514).
+      §4.3 elides bedrock's defaults. It fronts several model families through
+      one Converse request shape, so this is a starting point a deployment is
+      expected to override; no models are listed. dorang speaks Converse (the
+      neutral form both mined sources named — openclaw's "bedrock-converse-
+      stream", hermes' "bedrock_converse"). SigV4 signing: params.region and
+      params.access_key_id are required (region may instead come from base_url,
+      bedrock-runtime.{region}.amazonaws.com), the secret access key is the
+      credential, and params.session_token is optional. base_url defaults to
+      the regional runtime host. Not measured against a live account; the
+      signer is pinned to AWS's published test vector.
 
   # ---- Google-shaped -------------------------------------------------------
 
