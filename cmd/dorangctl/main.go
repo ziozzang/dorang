@@ -93,6 +93,10 @@ commands:
   import config <file>         convert a foreign proxy configuration, with warnings
   import keys --from <dsn>     migrate caller credentials from an incumbent proxy's
                                database. Reads and reports by default; --commit writes
+  import users --from <dsn>    migrate users from the incumbent's LiteLLM_UserTable;
+                               reads and reports by default, --commit writes
+  import teams --from <dsn>    migrate teams, with their members (--members, default
+                               on; import users first). Same report-first rule
   key create                   issue an api key and print it once
   key list                     list issued keys
   key revoke <id>              block a key

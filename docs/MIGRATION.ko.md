@@ -112,7 +112,7 @@ importer는 평문 키를 필요로 하지도 받지도 않는다 — 호출자�
 > 컬럼이었다 — 게이트웨이의 인가 봉투는 키만 담고 있었다 — 그래서 이 절이 예전에 안내하던 `INSERT`로 이미
 > 데이터베이스에 넣어 둔 값은 **아무것에도** 적용되지 않았다. 지연 없이, 모든 노드에서.
 >
-> `dorangctl import keys`는 `users`·`teams` 행을 만들지 않으므로 평범한 임포트만으로는 심어질 수 없다.
+> `dorangctl import keys`는 `users`·`teams` 행을 만들지 않는다 — `dorangctl import users`·`dorangctl import teams`(§3.5)가 기존 프록시의 테이블에서 만든다 — 그러므로 평범한 키 임포트만으로는 심어질 수 없다.
 > 손으로 쓴 행이나 자체 마이그레이션 스크립트가 넣은 행은 가능하다. 그런 것이 있다면 컷오버 **전에**
 > `users.blocked`, `teams.blocked`, 두 테이블의 `max_budget_nano`를 읽어 볼 것. 무해했던 행이 이제
 > 살아 있고, 처음 알아차리는 지점은 테넌트가 거부되는 순간이다. 임포터 자신의 경고 — *"임포트된 키가 존재
@@ -425,6 +425,32 @@ auth:
 dorangctl import keys --from postgres://user:pass@host/litellm          # 읽고 보고만
 dorangctl import keys --from postgres://user:pass@host/litellm --commit # 실제로 쓴다
 ```
+
+**키가 가리키는 행들.** 키는 `team_id`·`user_id`를 들고 오고, 팀의 예산 상한·요청 제한·모델 허용 목록·차단
+플래그는 요청 경로에서 실제로 적용된다 — 팀을 만들지 않은 채 키만 임포트하면 팀 단위 제한이 전부 조용히
+빠진 채로 돈다(§3.3이 경계하는 바로 그 실패). 두 동사가 그 행들을 기존 프록시의 테이블에서 만든다.
+보고가 기본이고 `--commit`으로만 쓰는 규칙은 같다:
+
+```
+dorangctl import users --from postgres://user:pass@host/litellm --commit
+dorangctl import teams --from postgres://user:pass@host/litellm --commit   # 그 다음 keys
+```
+
+**users → teams → keys 순서.** 팀의 `members_with_roles`는 유저를 가리키며, 유저 행이 없는 멤버는
+보고만 하고 만들지 않는다(`--members` 기본 켜짐). 이미 있는 팀은 건드리지 않으므로 멤버는 첫 실행에서
+가져와야 한다. 두 동사 모두 의미가 같은 열은 키 임포터와 같은 방식으로 읽고(`max_budget`, `spend`,
+`budget_duration`, `budget_reset_at`, `tpm_limit`, `rpm_limit`, `models`(§3.6의 관용구와
+`--on-untranslatable`), `metadata`, 타임스탬프), 가져오지 않는 열은 이유와 함께 보고한다: `password`와
+`sso_user_id`는 dorang이 쓸 데 없는 자격증명 재료, `soft_budget`·`model_max_budget`·`model_spend`는 dorang에서
+키별 또는 원장의 사실, 유저의 `teams` 목록은 팀 쪽에서 가져온다. 이메일 없는 유저는 건너뛴다(dorang은
+이메일을 요구). `--synthetic-email-domain example.invalid`를 주면 `<user_id>@example.invalid`로 만든다.
+
+| 플래그 (teams / users) | |
+|---|---|
+| `--from`, `--from-driver`, `--commit`, `--limit`, `--on-untranslatable` | keys와 같음 |
+| `--table` | 소스 테이블, 기본 `LiteLLM_TeamTable` / `LiteLLM_UserTable` |
+| `--members` | teams: `members_with_roles`를 팀 멤버십으로 가져온다(기본 켜짐) |
+| `--synthetic-email-domain` | users: 소스에 이메일이 없는 유저에게 줄 도메인. 미지정이면 그런 유저는 보고하고 건너뜀 |
 
 **기본은 보고이고, `--commit` 이 있어야만 쓴다.** 신중함 자체를 위한 것이 아니라 리포트가 산출물이기
 때문이다. 마이그레이션되지 않은 모든 행과 그 이유, 옮기지 않은 모든 원본 컬럼과 그 이유, 그리고 이미 만료된

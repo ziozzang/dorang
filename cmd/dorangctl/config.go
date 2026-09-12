@@ -106,15 +106,19 @@ func (e env) configLint(args []string) int {
 // operator who conflates them grants access by accident, which is why the
 // mismatch below is a usage error rather than a default.
 func (e env) runImport(args []string) int {
+	const usage = "usage: dorangctl import config <file> | import keys --from <dsn> | import users --from <dsn> | import teams --from <dsn>"
 	if len(args) == 0 {
-		fmt.Fprintln(e.stderr, "usage: dorangctl import config <file> | import keys --from <dsn>")
+		fmt.Fprintln(e.stderr, usage)
 		return 2
 	}
-	if args[0] == "keys" {
+	switch args[0] {
+	case "keys":
 		return e.importKeys(args[1:])
+	case "teams", "users":
+		return e.importDirectory(args[0], args[1:])
 	}
 	if len(args) < 2 || args[0] != "config" {
-		fmt.Fprintln(e.stderr, "usage: dorangctl import config <file> | import keys --from <dsn>")
+		fmt.Fprintln(e.stderr, usage)
 		return 2
 	}
 	path := args[1]

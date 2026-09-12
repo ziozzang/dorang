@@ -130,8 +130,9 @@ So, for a cutover:
 > carried only the key — so any of them you had already put in the database, by the `INSERT`s this
 > section used to send you to, applied to **nothing**, at any latency, on any node.
 >
-> `dorangctl import keys` does not create `users` or `teams` rows, so a plain import cannot have
-> planted them; hand-written rows and rows loaded by your own migration script can. If you have
+> `dorangctl import keys` does not create `users` or `teams` rows; `dorangctl import users` and
+> `dorangctl import teams` do (§3.5), from the incumbent's own tables, and a plain key import
+> cannot have planted them. Hand-written rows and rows loaded by your own migration script can. If you have
 > any, read `users.blocked`, `teams.blocked` and `max_budget_nano` on both tables **before** you
 > cut over. Rows that were inert are now live, and the first place you would notice is a tenant
 > being refused. The importer's own warning — *"imported keys reference teams that are not
@@ -506,6 +507,36 @@ to "is this worth importing at all".
 
 Re-running is safe: a key already present is left untouched and counted, so a re-import cannot
 undo a revocation you made in between.
+
+**The rows a key refers to.** A key carries its `team_id` and `user_id`, and the team's budget
+ceiling, rate limit, model allow-list and blocked flag are enforced on the request path — so a
+fleet of imported keys whose teams were never created runs with every team-scoped limit silently
+absent, which is the failure §3.3 is written against. Two more verbs create those rows from the
+incumbent's own tables, with the same report-first, write-on-`--commit` rule:
+
+```
+dorangctl import users --from postgres://user:pass@host/litellm --commit
+dorangctl import teams --from postgres://user:pass@host/litellm --commit   # then keys
+```
+
+**Users first, then teams, then keys.** A team's `members_with_roles` names users, and a member
+whose user row is absent is reported and not carried (`--members` is on by default); a team
+already present is left untouched, so carry the members on the first run. Both verbs read the
+same columns the key importer does where the meaning is the same — `max_budget`, `spend`,
+`budget_duration`, `budget_reset_at`, `tpm_limit`, `rpm_limit`, `models` (with §3.6's idioms and
+`--on-untranslatable`), `metadata`, the timestamps — and the report names every column that is
+not carried with the reason: `password` and `sso_user_id` are credential material dorang has no
+use for; `soft_budget`, `model_max_budget` and `model_spend` are per key or per ledger in dorang;
+a user's `teams` list is carried from the team side. A user without an email is skipped, because
+dorang requires one; `--synthetic-email-domain example.invalid` gives such a user
+`<user_id>@example.invalid` instead.
+
+| Flag (teams / users) | |
+|---|---|
+| `--from`, `--from-driver`, `--commit`, `--limit`, `--on-untranslatable` | as for keys |
+| `--table` | source table, default `LiteLLM_TeamTable` / `LiteLLM_UserTable` |
+| `--members` | teams: carry `members_with_roles` into team membership (default on) |
+| `--synthetic-email-domain` | users: the domain for a user the source left without an email; unset skips such users, reported |
 
 ### 3.6 The three idioms that do not mean the same thing on the other side
 

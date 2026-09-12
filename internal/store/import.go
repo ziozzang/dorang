@@ -361,10 +361,21 @@ func isRouteGroup(entry string) bool {
 // translateAllowLists reconciles the incumbent's allow-list idioms with
 // dorang's, on the key that has already been built. It reports false when the
 // key must not be imported.
-func translateAllowLists(k *APIKey, policy UntranslatablePolicy, rep *ImportReport) bool {
-	// models
+// untranslator is the report half both importers share for an allow-list
+// idiom dorang cannot express.
+type untranslator interface {
+	untranslated(lookup, column, value, action, detail string) bool
+}
+
+// translateModels reconciles the incumbent's model allow-list idioms with
+// dorang's (MIGRATION §3.6). It returns the list to store and false when the
+// row must not be imported. It is one function for keys, teams and users
+// because the idiom is one idiom: a sentinel that means "everything" cannot be
+// kept beside literals without narrowing, and one that means "nothing" has no
+// dorang spelling at all.
+func translateModels(lookup string, models []string, policy UntranslatablePolicy, rep untranslator) ([]string, bool) {
 	var widening, denying []string
-	for _, m := range k.Models {
+	for _, m := range models {
 		lc := strings.ToLower(strings.TrimSpace(m))
 		if _, isSentinel := litellmModelSentinels[lc]; !isSentinel {
 			continue
@@ -379,30 +390,39 @@ func translateAllowLists(k *APIKey, policy UntranslatablePolicy, rep *ImportRepo
 		// Not clearable in either policy: it exists to deny, an empty
 		// dorang list allows everything, and dorang has no spelling for
 		// "nothing" that an administrator would not mistake for a typo.
-		if !rep.untranslated(k.Lookup, "models", s, actionRefused,
+		if !rep.untranslated(lookup, "models", s, actionRefused,
 			"the incumbent reads this as "+litellmModelSentinels[s]+
 				"; dorang's empty model allow-list means the opposite, and it has no "+
-				"spelling for a key that may reach no model. Block the key instead") {
-			return false
+				"spelling for a subject that may reach no model. Block the subject instead") {
+			return nil, false
 		}
 	}
 	for _, s := range widening {
 		detail := "the incumbent reads this as " + litellmModelSentinels[s] +
-			"; dorang reads it as the literal name of a model, so the key would be refused " +
-			"every model. Clear the key's model allow-list to defer to its team, or list the " +
+			"; dorang reads it as the literal name of a model, so the subject would be refused " +
+			"every model. Clear the model allow-list to defer to its team, or list the " +
 			"models by name"
 		if policy != UntranslatableClear {
-			if !rep.untranslated(k.Lookup, "models", s, actionRefused, detail) {
-				return false
+			if !rep.untranslated(lookup, "models", s, actionRefused, detail) {
+				return nil, false
 			}
 			continue
 		}
-		if !rep.untranslated(k.Lookup, "models", s, actionCleared, detail+
-			" (cleared: the key is unrestricted at key level and its team's limits still apply)") {
-			return false
+		if !rep.untranslated(lookup, "models", s, actionCleared, detail+
+			" (cleared: unrestricted at this level; the enclosing subject's limits still apply)") {
+			return nil, false
 		}
-		k.Models = nil
+		models = nil
 	}
+	return models, true
+}
+
+func translateAllowLists(k *APIKey, policy UntranslatablePolicy, rep *ImportReport) bool {
+	models, ok := translateModels(k.Lookup, k.Models, policy, rep)
+	if !ok {
+		return false
+	}
+	k.Models = models
 
 	// allowed_routes
 	for _, r := range k.AllowedRoutes {
