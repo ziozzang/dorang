@@ -957,7 +957,7 @@ func (f fakeReloader) Reload(context.Context) (ReloadResult, error) { return f.r
 // has no config file to write.
 type fakeConfigWriter struct{}
 
-func (fakeConfigWriter) SetDeploymentEnabled(context.Context, string, string, string, bool) error {
+func (fakeConfigWriter) SetDeploymentEnabled(context.Context, string, string, string, int, bool) error {
 	return nil
 }
 

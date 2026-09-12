@@ -987,16 +987,23 @@ func (r *adminRouting) ListDeployments(context.Context) ([]*admin.Deployment, er
 		return nil, nil
 	}
 	ids := deploymentIDs(cfg)
+	// Occurrence mirrors deploymentIDs' #n disambiguation, so the number the
+	// enable/disable control sends back names the same deployment the id does.
+	seen := make(map[string]int)
 	out := make([]*admin.Deployment, 0, len(cfg.Models))
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		for j := range m.Deployments {
 			d := &m.Deployments[j]
+			base := m.Name + "|" + d.Provider + "|" + d.UpstreamModel
+			occurrence := seen[base]
+			seen[base]++
 			dep := &admin.Deployment{
 				ID:            ids[i][j],
 				ModelGroup:    m.Name,
 				ProviderID:    d.Provider,
 				UpstreamModel: d.UpstreamModel,
+				Occurrence:    occurrence,
 				CredentialIDs: append([]string(nil), d.Credentials...),
 				// Zero weight is one to the router, so it is one here. A column
 				// reading 0 beside a deployment that takes its full share of
@@ -1144,7 +1151,7 @@ func (r *adminReloader) Reload(context.Context) (admin.ReloadResult, error) {
 // mount — see [writeConfigInPlace].
 type adminConfigWriter struct{ a *App }
 
-func (w *adminConfigWriter) SetDeploymentEnabled(_ context.Context, group, provider, upstream string, enabled bool) error {
+func (w *adminConfigWriter) SetDeploymentEnabled(_ context.Context, group, provider, upstream string, occurrence int, enabled bool) error {
 	path := w.a.configPath
 	if path == "" || w.a.reloadNow == nil {
 		return admin.ErrUnsupported
@@ -1162,7 +1169,7 @@ func (w *adminConfigWriter) SetDeploymentEnabled(_ context.Context, group, provi
 	// inside the transaction, before any byte is written: a file that would not
 	// load is never written, or the next start-up could not come up.
 	err := config.EditLocked(path, func(cur []byte) ([]byte, error) {
-		next, err := config.SetDeploymentEnabled(cur, group, provider, upstream, enabled)
+		next, err := config.SetDeploymentEnabled(cur, group, provider, upstream, occurrence, enabled)
 		if err != nil {
 			return nil, err
 		}

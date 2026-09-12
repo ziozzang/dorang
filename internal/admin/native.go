@@ -549,6 +549,7 @@ func (c *call) modelDeploymentSetEnabled() error {
 		ModelGroup    string `json:"model_group"`
 		Provider      string `json:"provider"`
 		UpstreamModel string `json:"upstream_model"`
+		Occurrence    int    `json:"occurrence"`
 		Enabled       *bool  `json:"enabled"`
 	}
 	if err := decodeBody(c.w, c.r, &body); err != nil {
@@ -561,7 +562,7 @@ func (c *call) modelDeploymentSetEnabled() error {
 		return badRequest("enabled is required, true or false")
 	}
 	if err := c.a.cfg.ConfigWriter.SetDeploymentEnabled(c.ctx(),
-		body.ModelGroup, body.Provider, body.UpstreamModel, *body.Enabled); err != nil {
+		body.ModelGroup, body.Provider, body.UpstreamModel, body.Occurrence, *body.Enabled); err != nil {
 		return err
 	}
 	id := body.ModelGroup + "|" + body.Provider + "|" + body.UpstreamModel

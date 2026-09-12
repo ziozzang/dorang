@@ -416,6 +416,11 @@ type Deployment struct {
 	// splits it on any character (§2.1).
 	UpstreamModel string
 	CredentialIDs []string
+	// Occurrence disambiguates duplicate (group, provider, upstream) triples
+	// within a model: 0 for the first, matching the deployment id's #n suffix
+	// (which starts at #1 for the second). A control that edits a deployment
+	// needs it to name which of the duplicates it means.
+	Occurrence int
 
 	Weight   int
 	Priority int
@@ -1059,7 +1064,8 @@ type Reloader interface {
 // change is refused. Optional; nil leaves the model controls read-only.
 type ConfigWriter interface {
 	// SetDeploymentEnabled takes the (group, provider, upstream) deployment in
-	// or out of routing. It is idempotent and applies as soon as the re-read
-	// completes on this node.
-	SetDeploymentEnabled(ctx context.Context, group, provider, upstream string, enabled bool) error
+	// or out of routing. occurrence selects among duplicate triples in the
+	// model (0-based, matching the deployment id's #n disambiguation). It is
+	// idempotent and applies as soon as the re-read completes on this node.
+	SetDeploymentEnabled(ctx context.Context, group, provider, upstream string, occurrence int, enabled bool) error
 }

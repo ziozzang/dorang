@@ -27,7 +27,7 @@ models:
 // operator's comments and the other entries — the whole reason for editing the
 // node tree rather than re-serializing a decoded Config.
 func TestSetDeploymentEnabledIsSurgical(t *testing.T) {
-	out, err := SetDeploymentEnabled([]byte(editSample), "chat", "p1", "vendor/chat-mini", false)
+	out, err := SetDeploymentEnabled([]byte(editSample), "chat", "p1", "vendor/chat-mini", 0, false)
 	if err != nil {
 		t.Fatalf("SetDeploymentEnabled: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestSetDeploymentEnabledIsSurgical(t *testing.T) {
 	}
 
 	// Re-enabling flips it back.
-	out2, err := SetDeploymentEnabled(out, "chat", "p1", "vendor/chat-mini", true)
+	out2, err := SetDeploymentEnabled(out, "chat", "p1", "vendor/chat-mini", 0, true)
 	if err != nil {
 		t.Fatalf("re-enable: %v", err)
 	}
@@ -85,16 +85,42 @@ func TestSetDeploymentEnabledIsSurgical(t *testing.T) {
 	}
 }
 
-func TestSetDeploymentEnabledRefusesUnknownAndAmbiguous(t *testing.T) {
-	if _, err := SetDeploymentEnabled([]byte(editSample), "chat", "p1", "nope", false); err == nil {
+func TestSetDeploymentEnabledSelectsByOccurrence(t *testing.T) {
+	if _, err := SetDeploymentEnabled([]byte(editSample), "chat", "p1", "nope", 0, false); err == nil {
 		t.Error("an unknown deployment was accepted")
 	}
+	// A model with the same triple twice — the same provider and upstream behind
+	// different credentials, which the router disambiguates with #n. occurrence
+	// selects which one; an occurrence past the last is refused.
 	dup := editSample + `  - name: dup
     deployments:
       - {provider: p1, upstream_model: same}
       - {provider: p1, upstream_model: same}
 `
-	if _, err := SetDeploymentEnabled([]byte(dup), "dup", "p1", "same", false); err == nil {
-		t.Error("an ambiguous deployment triple was accepted rather than refused")
+	out, err := SetDeploymentEnabled([]byte(dup), "dup", "p1", "same", 1, false)
+	if err != nil {
+		t.Fatalf("occurrence 1 was refused: %v", err)
+	}
+	cfg, err := LoadBytes(out)
+	if err != nil {
+		t.Fatalf("edited dup config does not load: %v", err)
+	}
+	for _, m := range cfg.Models {
+		if m.Name != "dup" {
+			continue
+		}
+		if len(m.Deployments) != 2 {
+			t.Fatalf("dup shape changed: %d deployments", len(m.Deployments))
+		}
+		// Only the SECOND occurrence is disabled.
+		if m.Deployments[0].Enabled != nil {
+			t.Errorf("occurrence 0 was touched: %v", m.Deployments[0].Enabled)
+		}
+		if m.Deployments[1].Enabled == nil || *m.Deployments[1].Enabled {
+			t.Errorf("occurrence 1 was not disabled: %v", m.Deployments[1].Enabled)
+		}
+	}
+	if _, err := SetDeploymentEnabled([]byte(dup), "dup", "p1", "same", 2, false); err == nil {
+		t.Error("occurrence past the last was accepted rather than refused")
 	}
 }

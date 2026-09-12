@@ -133,9 +133,13 @@ var uiActions = map[string]uiAction{
 			if mg == "" || pv == "" || um == "" {
 				return nil, errors.New("the deployment was not fully named")
 			}
+			occ := 0
+			if n, err := strconv.Atoi(strings.TrimSpace(f.Get("occurrence"))); err == nil && n >= 0 {
+				occ = n
+			}
 			return map[string]any{
 				"model_group": mg, "provider": pv, "upstream_model": um,
-				"enabled": f.Get("enabled") == "true",
+				"occurrence": occ, "enabled": f.Get("enabled") == "true",
 			}, nil
 		},
 		notice: func(f url.Values, _ map[string]any) string {

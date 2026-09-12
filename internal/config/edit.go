@@ -69,14 +69,18 @@ func setScalar(m *yaml.Node, key, value, tag string) {
 	)
 }
 
-// findDeployment locates the (group, provider, upstream) deployment mapping in
-// a models sequence. It refuses ambiguity: a triple that matches more than one
-// entry is an error rather than a guess about which one the operator meant.
-func findDeployment(models *yaml.Node, group, provider, upstream string) (*yaml.Node, error) {
+// findDeployment locates a (group, provider, upstream) deployment mapping in a
+// models sequence. A model may carry the same triple more than once — the same
+// provider and upstream behind different credentials is a real pattern, and the
+// router disambiguates such duplicates with a `#n` suffix on the deployment id
+// — so occurrence selects which one (0-based, matching that suffix: 0 is the
+// bare id, 1 is `#1`, and so on). It is scoped to the named model, exactly as
+// the id's disambiguation is.
+func findDeployment(models *yaml.Node, group, provider, upstream string, occurrence int) (*yaml.Node, error) {
 	if models == nil || models.Kind != yaml.SequenceNode {
 		return nil, fmt.Errorf("config: models is not a sequence")
 	}
-	var found *yaml.Node
+	match := 0
 	for _, model := range models.Content {
 		if model.Kind != yaml.MappingNode || !scalarEquals(model, "name", group) {
 			continue
@@ -90,17 +94,15 @@ func findDeployment(models *yaml.Node, group, provider, upstream string) (*yaml.
 				continue
 			}
 			if scalarEquals(d, "provider", provider) && scalarEquals(d, "upstream_model", upstream) {
-				if found != nil {
-					return nil, fmt.Errorf("config: deployment %s/%s/%s matches more than one entry", group, provider, upstream)
+				if match == occurrence {
+					return d, nil
 				}
-				found = d
+				match++
 			}
 		}
 	}
-	if found == nil {
-		return nil, fmt.Errorf("config: no deployment %s/%s/%s", group, provider, upstream)
-	}
-	return found, nil
+	return nil, fmt.Errorf("config: no deployment %s/%s/%s occurrence %d (found %d)",
+		group, provider, upstream, occurrence, match)
 }
 
 // encode re-renders an edited document at the two-space indent the config uses.
@@ -119,8 +121,9 @@ func encode(doc *yaml.Node) ([]byte, error) {
 
 // SetDeploymentEnabled returns the config YAML with the named deployment's
 // `enabled` field set to the given value, editing the node tree so comments and
-// every untouched value are preserved. It does not validate the result.
-func SetDeploymentEnabled(data []byte, group, provider, upstream string, enabled bool) ([]byte, error) {
+// every untouched value are preserved. occurrence selects among duplicate
+// triples in the model (see [findDeployment]). It does not validate the result.
+func SetDeploymentEnabled(data []byte, group, provider, upstream string, occurrence int, enabled bool) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("config: parse: %w", err)
@@ -129,7 +132,7 @@ func SetDeploymentEnabled(data []byte, group, provider, upstream string, enabled
 	if root == nil || root.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("config: top level is not a mapping")
 	}
-	dep, err := findDeployment(mapValue(root, "models"), group, provider, upstream)
+	dep, err := findDeployment(mapValue(root, "models"), group, provider, upstream, occurrence)
 	if err != nil {
 		return nil, err
 	}
