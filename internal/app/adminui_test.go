@@ -159,7 +159,10 @@ func TestModelsScreenShowsTheCompiledRoutingTable(t *testing.T) {
 // agreeing with itself. This follows what the operator's browser would follow.
 func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 	a := newWiringApp(t, adminUIYAML, nil)
-	nav := regexp.MustCompile(`<nav class="screens">(?s)(.*?)</nav>`)
+	// The nav element carries attributes (aria-label) since the app-shell
+	// layout, so the open tag is matched up to its own '>' rather than assumed
+	// to be bare.
+	nav := regexp.MustCompile(`<nav class="screens"[^>]*>(?s)(.*?)</nav>`)
 	href := regexp.MustCompile(`href="([^"]+)"`)
 
 	seen := map[string]bool{}
@@ -176,8 +179,16 @@ func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 			seen[h[1]] = true
 		}
 	}
-	if len(seen) != 3 {
-		t.Errorf("the nav advertises %v; §11.3 ships three screens", seen)
+	// The exact count is deliberately not asserted: screens are advertised as
+	// their dependencies are wired (users when a directory is configured,
+	// monitoring when a ledger, credential reporter or capacity broker is), so
+	// pinning a number here would just be a second copy of the nav's own
+	// conditions. What must hold is that the core three are always present and
+	// that every advertised link answers — the loop below is the real test.
+	for _, want := range []string{"/ui/keys", "/ui/models", "/ui/usage"} {
+		if !seen[want] {
+			t.Errorf("the nav does not advertise %s; it lists %v", want, seen)
+		}
 	}
 	for link := range seen {
 		w := callWith(a, testMasterKey, http.MethodGet, link, "")

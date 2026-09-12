@@ -10,7 +10,7 @@ import (
 //
 // It answers the question a spend report cannot — "what is happening right
 // now" — from the reporters the process already exposes: the ledger for the
-// last few minutes of traffic, the credential reporter for per-credential
+// failures in the last few minutes, the credential reporter for per-credential
 // health and quota, and the capacity broker for occupancy. Nothing here is a
 // new data path; it is the same data /spend/logs, /admin/credentials/health
 // and /admin/capacity return, arranged for a glance and re-fetched on a timer
@@ -23,8 +23,8 @@ import (
 // dependency is absent, the same rule the nav and the other screens follow.
 
 const monitorWindow = 5 * time.Minute
-const monitorRecent = 25 // rows in the recent-requests table
-const monitorScan = 5000 // ledger rows scanned for the window's stats
+const monitorRecent = 25 // rows in the recent-failures table
+const monitorScan = 5000 // failure rows scanned for the window's stats
 
 func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v viewer) {
 	if !v.scope.Global {
@@ -42,11 +42,18 @@ func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v vi
 	}
 
 	if pg.HasLedger {
+		// Errors-only, deliberately. "What is happening now" has no filter to
+		// offer — no key, no team, no trace — and the ledger refuses an
+		// unfiltered range rather than turn it into a table scan (DESIGN §9.3,
+		// and adminLedger.ListRequests names the rule). The one windowed read
+		// that view CAN make is the failures, which ride their own partial
+		// index (request_logs_errors_idx) and are the signal an operator
+		// watches in real time anyway: what is breaking right now, fleet-wide.
 		page, err := s.api.cfg.Ledger.ListRequests(r.Context(), LogQuery{
-			Range: Range{Start: now.Add(-monitorWindow), End: now}, Limit: monitorScan,
+			Range: Range{Start: now.Add(-monitorWindow), End: now}, Limit: monitorScan, ErrorsOnly: true,
 		})
 		if err == nil {
-			pg.fillTraffic(page.Rows, now)
+			pg.fillFailures(page.Rows)
 		} else {
 			pg.LedgerErr = true
 		}
@@ -95,11 +102,10 @@ type monitorPage struct {
 	Window string
 
 	HasLedger, LedgerErr bool
-	Requests             int64
-	Errors               int64
-	ErrorRate            string
-	RPM                  string
-	P50, P95             string
+	Failures             int64
+	Err4xx               int64
+	Err5xx               int64
+	P95                  string
 	Recent               []recentRow
 
 	HasCreds  bool
@@ -131,24 +137,25 @@ type capRow struct {
 	InUse, Limit, Waiting int
 }
 
-func (pg *monitorPage) fillTraffic(rows []LogRow, now time.Time) {
-	pg.Requests = int64(len(rows))
+// fillFailures reads the errors-only window. Every row is a failure (status
+// >= 400), split into the two classes an operator triages differently: a 4xx
+// the gateway rejected before any upstream, and a 5xx the gateway or the
+// provider raised. p95 is over the failures' own latency, which separates a
+// fast rejection from a slow timeout.
+func (pg *monitorPage) fillFailures(rows []LogRow) {
+	pg.Failures = int64(len(rows))
 	lat := make([]int64, 0, len(rows))
 	for _, r := range rows {
-		if r.Status >= 400 {
-			pg.Errors++
+		switch {
+		case r.Status >= 500:
+			pg.Err5xx++
+		case r.Status >= 400:
+			pg.Err4xx++
 		}
 		if r.LatencyMS > 0 {
 			lat = append(lat, r.LatencyMS)
 		}
 	}
-	if pg.Requests > 0 {
-		pg.ErrorRate = pct(pg.Errors, pg.Requests)
-		pg.RPM = oneDecimal(float64(pg.Requests) / monitorWindow.Minutes())
-	} else {
-		pg.ErrorRate, pg.RPM = "0%", "0"
-	}
-	pg.P50 = percentile(lat, 50)
 	pg.P95 = percentile(lat, 95)
 
 	// Newest first for the recent table.
@@ -159,7 +166,7 @@ func (pg *monitorPage) fillTraffic(rows []LogRow, now time.Time) {
 		}
 		pg.Recent = append(pg.Recent, recentRow{
 			Time: r.TS.UTC().Format("15:04:05"), Model: r.ModelGroup, Provider: r.ProviderID,
-			Endpoint: shortEndpoint(r.Endpoint), Status: r.Status, StatusOK: r.Status < 400, LatencyMS: r.LatencyMS,
+			Endpoint: shortEndpoint(r.Endpoint), Status: r.Status, StatusOK: false, LatencyMS: r.LatencyMS,
 		})
 	}
 }
@@ -174,23 +181,6 @@ func percentile(v []int64, p int) string {
 }
 
 func itoaMS(ms int64) string { return humanInt(ms) + " ms" }
-
-func pct(n, d int64) string {
-	if d == 0 {
-		return "0%"
-	}
-	return oneDecimal(100*float64(n)/float64(d)) + "%"
-}
-
-func oneDecimal(f float64) string {
-	// One place, without pulling in fmt's float formatting rules elsewhere.
-	whole := int64(f)
-	frac := int64((f - float64(whole)) * 10)
-	if frac < 0 {
-		frac = -frac
-	}
-	return humanInt(whole) + "." + string(rune('0'+frac))
-}
 
 func shortEndpoint(e string) string {
 	switch e {

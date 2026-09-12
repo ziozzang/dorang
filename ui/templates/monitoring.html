@@ -1,21 +1,21 @@
 {{define "content"}}
 <h1>Monitoring <span class="live-dot" title="live"></span></h1>
 <p class="lede">
-  What is happening now, from the same reporters the API exposes: the ledger for the last
-  {{.Window}} of traffic, the credential reporter for health and quota, the capacity broker for
+  What is happening now, from the same reporters the API exposes: the ledger for the failures in
+  the last {{.Window}}, the credential reporter for health and quota, the capacity broker for
   occupancy. The region below re-fetches on a timer — <span class="refresh-note">every 10s</span>.
 </p>
 
 <div data-live="10">
 
 {{if .HasLedger}}
-<h2>Traffic — last {{.Window}}</h2>
-{{if .LedgerErr}}<div class="banner bad">The ledger could not be read for this window.</div>{{else}}
+<h2>Recent failures — last {{.Window}}</h2>
+{{if .LedgerErr}}<div class="banner bad">The failure ledger could not be read for this window.</div>{{else}}
 <div class="tiles">
-  <div class="tile"><div class="label">requests</div><div class="value">{{num .Requests}}</div><div class="note">{{.RPM}} / min</div></div>
-  <div class="tile"><div class="label">errors</div><div class="value">{{num .Errors}}</div><div class="note">{{.ErrorRate}} of requests</div></div>
-  <div class="tile"><div class="label">latency p50</div><div class="value">{{.P50}}</div></div>
-  <div class="tile"><div class="label">latency p95</div><div class="value">{{.P95}}</div></div>
+  <div class="tile"><div class="label">failures</div><div class="value">{{num .Failures}}</div><div class="note">last {{.Window}}, fleet-wide</div></div>
+  <div class="tile"><div class="label">client · 4xx</div><div class="value">{{num .Err4xx}}</div><div class="note">rejected before any upstream</div></div>
+  <div class="tile"><div class="label">upstream · 5xx</div><div class="value">{{num .Err5xx}}</div><div class="note">gateway or provider</div></div>
+  <div class="tile"><div class="label">slowest failure p95</div><div class="value">{{.P95}}</div></div>
 </div>
 <div class="scroll">
 <table>
@@ -27,11 +27,11 @@
       <td>{{.Model}}</td>
       <td class="mono">{{.Provider}}</td>
       <td>{{.Endpoint}}</td>
-      <td>{{if .StatusOK}}<span class="state-ok">{{.Status}}</span>{{else}}<span class="state-bad">{{.Status}}</span>{{end}}</td>
+      <td><span class="state-bad">{{.Status}}</span></td>
       <td class="num">{{num .LatencyMS}} ms</td>
     </tr>
   {{else}}
-    <tr><td colspan="6"><span class="unavailable">no requests in the window</span></td></tr>
+    <tr><td colspan="6"><span class="state-ok">no failures in the last {{$.Window}}</span></td></tr>
   {{end}}
   </tbody>
 </table>
