@@ -90,8 +90,11 @@ func TestDefaultParses(t *testing.T) {
 		// three answered as a different model. All eight were dated
 		// 2026-07-28 by a pass that read the /models listing, which is how a
 		// listing lies — it names what the route accepts, not what serves.
-		// 2026-09-12: +2 verified, glm-5.3 and glm-5.3-flash.
-		"glm": {VerificationVerified: 7, VerificationSubstituted: 3},
+		// 2026-09-12: the z.ai coding plan consolidated to glm-5.3 and
+		// glm-5.3-flash, aliasing the other eight names onto them. So two
+		// verified and eight substituted (was 7/3 when five still answered as
+		// themselves).
+		"glm": {VerificationVerified: 2, VerificationSubstituted: 8},
 
 		// 2026-08-03: the whole qwen block asked model by model. Six answered;
 		// nine refused on entitlement with AccessDenied.Unpurchased. Four of

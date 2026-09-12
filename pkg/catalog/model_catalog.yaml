@@ -125,56 +125,66 @@ models:
 
   # =========================================================================
   # Z.AI coding plan — https://api.z.ai/api/coding/paas/v4  (kind: glm)
-  # Model list fetched from the live endpoint on 2026-07-28: 8 models.
-  # Re-fetched 2026-09-12: 10 models; the two new ones, glm-5.3 and
-  # glm-5.3-flash, were asked the same day and answered as themselves. The
-  # three substitutions below were not re-asked.
-  # ASKED 2026-08-03, one minimal request each. Five answered as themselves.
-  # THREE ANSWERED AS SOMETHING ELSE.
   #
-  # This is the finding that a listing cannot produce and that a status code
-  # cannot either: `glm-5.1` returns 200, with a body, whose `model` field says
-  # `glm-5.2`. So does `glm-5`. `glm-4.5-air` answers as `glm-4.7`. Stable
-  # across three runs on 2026-08-03, and the field is not a constant — the
-  # other five echo their own names back, so it tracks what served.
+  # RE-ASKED 2026-09-12, one minimal request each against the live endpoint,
+  # reading the body's `model` field. The plan has CONSOLIDATED: it now serves
+  # exactly two models as themselves — glm-5.3 (the full tier) and
+  # glm-5.3-flash (the flash tier) — and ALIASES every older name onto one of
+  # the two. This supersedes the 2026-08-03 map entirely (then five answered
+  # as themselves; now none of the five does).
   #
-  # A 200 is the outcome that looks most like success, which is exactly why it
-  # needed a state. Routing to `glm-5.1` here does not get glm-5.1: it gets
-  # glm-5.2's behaviour, and every number this catalog holds for `glm-5.1`
-  # then describes a model the caller is not talking to. Nothing in dorang
-  # rewrites the request to the served name — recording that the endpoint
-  # substitutes is not permission to substitute.
+  #   glm-5 / glm-5.1 / glm-5.2           -> glm-5.3
+  #   glm-4.5 / glm-4.6 / glm-4.7 /
+  #     glm-5-turbo / glm-4.5-air         -> glm-5.3-flash
   #
-  # Note the collision with Ollama Cloud: `glm-5.1` and `glm-5.2` exist on
-  # both providers. They are different entries because the key is (kind,
-  # model). Nothing about the name identifies its provider — provider identity
-  # comes only from configuration (DESIGN §2.1 rule 2).
+  # This is the finding a /models listing cannot produce: the listing still
+  # returns all ten names, and each returns 200 with a body — whose `model`
+  # field names glm-5.3 or glm-5.3-flash. Nothing in dorang rewrites the
+  # request to the served name; recording that the endpoint substitutes is not
+  # permission to substitute, and a deployment pointed at one of the eight
+  # aliased names is a substitution dorang flags (X-Dorang-Served-Model).
+  #
+  # Note the collision with Ollama Cloud and the qwen plan: glm-5.2 and
+  # glm-5.3 exist on several providers. They are different entries because the
+  # key is (kind, model); on THIS kind (z.ai) glm-5.2 substitutes, while on
+  # ollama-cloud/qwen it may be a model in its own right (DESIGN §2.1 rule 2).
   # =========================================================================
 
-  - { kind: glm, model: "glm-4.5",       verified: 2026-08-03 }
-  - { kind: glm, model: "glm-4.6",       verified: 2026-08-03 }
-  - { kind: glm, model: "glm-4.7",       verified: 2026-08-03 }
-  - { kind: glm, model: "glm-5-turbo",   verified: 2026-08-03 }
-  - { kind: glm, model: "glm-5.2",       verified: 2026-08-03 }
   - { kind: glm, model: "glm-5.3",       verified: 2026-09-12 }
   - { kind: glm, model: "glm-5.3-flash", verified: 2026-09-12 }
 
   - kind: glm
-    model: "glm-4.5-air"
-    probe:
-      result: substituted
-      date: 2026-08-03
-      served: "glm-4.7"
-      note: >-
-        200 OK, body `"model":"glm-4.7"`. Dated verified: 2026-07-28 by the
-        first pass, which read the /models listing; asking is what found it.
-  - kind: glm
     model: "glm-5"
-    probe:
-      result: substituted
-      date: 2026-08-03
-      served: "glm-5.2"
-      note: '200 OK, body `"model":"glm-5.2"`. Same on three consecutive runs.'
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3",
+      note: '200 OK, body `"model":"glm-5.3"`. Verified as itself 2026-08-03; the plan now aliases it.' }
+  - kind: glm
+    model: "glm-5.1"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3",
+      note: '200 OK, body `"model":"glm-5.3"`. (2026-08-03 it served glm-5.2; the target moved with the consolidation.)' }
+  - kind: glm
+    model: "glm-5.2"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3",
+      note: '200 OK, body `"model":"glm-5.3"`. Verified as itself 2026-08-03; aliased now.' }
+  - kind: glm
+    model: "glm-4.7"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3-flash",
+      note: '200 OK, body `"model":"glm-5.3-flash"`. Verified as itself 2026-08-03; aliased now.' }
+  - kind: glm
+    model: "glm-4.6"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3-flash",
+      note: '200 OK, body `"model":"glm-5.3-flash"`. Verified as itself 2026-08-03; aliased now.' }
+  - kind: glm
+    model: "glm-4.5"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3-flash",
+      note: '200 OK, body `"model":"glm-5.3-flash"`. Verified as itself 2026-08-03; aliased now.' }
+  - kind: glm
+    model: "glm-5-turbo"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3-flash",
+      note: '200 OK, body `"model":"glm-5.3-flash"`. Verified as itself 2026-08-03; aliased now.' }
+  - kind: glm
+    model: "glm-4.5-air"
+    probe: { result: substituted, date: 2026-09-12, served: "glm-5.3-flash",
+      note: '200 OK, body `"model":"glm-5.3-flash"`. (2026-08-03 it served glm-4.7; the target moved with the consolidation.)' }
   - kind: glm
     model: "glm-5.1"
     probe:
