@@ -24,7 +24,6 @@ import (
 
 const monitorWindow = 5 * time.Minute
 const monitorRecent = 25 // rows in the recent-failures table
-const monitorScan = 5000 // failure rows scanned for the window's stats
 
 func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v viewer) {
 	if !v.scope.Global {
@@ -49,8 +48,19 @@ func (s *uiServer) screenMonitoring(w http.ResponseWriter, r *http.Request, v vi
 		// that view CAN make is the failures, which ride their own partial
 		// index (request_logs_errors_idx) and are the signal an operator
 		// watches in real time anyway: what is breaking right now, fleet-wide.
+		//
+		// The page is capped at MaxPageSize, not an arbitrary large number:
+		// the store ERRORS on a page above its maximum rather than clamping it
+		// (store.pageLimit), so asking for more than the store allows is how
+		// this screen first shipped its "could not be read" banner. MaxPageSize
+		// is the largest page the admin layer is configured to pull, and the
+		// most recent that many failures are what a five-minute glance wants.
+		limit := s.api.cfg.MaxPageSize
+		if limit <= 0 {
+			limit = DefaultMaxPageSize
+		}
 		page, err := s.api.cfg.Ledger.ListRequests(r.Context(), LogQuery{
-			Range: Range{Start: now.Add(-monitorWindow), End: now}, Limit: monitorScan, ErrorsOnly: true,
+			Range: Range{Start: now.Add(-monitorWindow), End: now}, Limit: limit, ErrorsOnly: true,
 		})
 		if err == nil {
 			pg.fillFailures(page.Rows)

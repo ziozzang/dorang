@@ -21,6 +21,13 @@ func (l refusingLedger) ListRequests(_ context.Context, q LogQuery) (LogPage, er
 	if q.Range.Start.IsZero() || q.Range.End.IsZero() || !q.Range.End.After(q.Range.Start) {
 		return LogPage{}, ErrUnboundedRange
 	}
+	// The store errors on a page above its maximum rather than clamping it, so
+	// the fake does too: a monitoring read that asks for more than the store
+	// allows must fail here, not be silently served, or the limit regression
+	// that shipped the "could not be read" banner would pass the test again.
+	if q.Limit > DefaultMaxPageSize {
+		return LogPage{}, ErrUnsupported
+	}
 	if !q.ErrorsOnly && q.KeyID == "" && q.TeamID == "" && q.TraceID == "" && q.Tag == "" && q.UserID == "" {
 		return LogPage{}, ErrUnsupported
 	}

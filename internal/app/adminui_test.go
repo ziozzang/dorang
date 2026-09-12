@@ -200,6 +200,34 @@ func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 	}
 }
 
+// The monitoring screen reads the ledger live, through the real store, within
+// the page the store accepts.
+//
+// A 200 is not enough to know the live region works: the screen returns 200
+// even when its ledger read fails, rendering "could not be read" in place of
+// the traffic. The two ways that read failed in practice were both queries the
+// real store refuses — an unfiltered window (no all-rows index, DESIGN §9.3)
+// and a page above MaxPageSize (store.pageLimit ERRORS rather than clamps) —
+// and a fake ledger answered both, so the defect reached production while the
+// handler test stayed green. This runs the real adminLedger over the real
+// store and asserts the banner is ABSENT, which is the consequence §17.1 asks
+// for: revert the window read to either refused shape and this fails.
+func TestMonitoringScreenReadsTheLedgerLive(t *testing.T) {
+	a := newWiringApp(t, adminUIYAML, nil)
+	w := callWith(a, testMasterKey, http.MethodGet, "/ui/monitoring", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("/ui/monitoring = %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "Recent failures") {
+		t.Errorf("the monitoring screen has no failures section:\n%s", body)
+	}
+	if strings.Contains(body, "could not be read") {
+		t.Errorf("the monitoring screen could not read the ledger live — its "+
+			"window query is one the real store refuses:\n%s", body)
+	}
+}
+
 // Two of the six tiles on the usage screen — notional and leverage — could not
 // hold a value in any deployment: the rollup adapter hard-wired NotionalKnown
 // to false, so §8.5's whole point (a subscription's value is visible) rendered
