@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The operator UI's mutating surface: the credential lifecycle of DESIGN
@@ -121,6 +122,13 @@ var uiActions = map[string]uiAction{
 		reveals: true,
 		needs:   func(s *uiServer) bool { return s.api.cfg.Hasher != nil },
 		body:    newKeyBody,
+	},
+	"edit": {
+		api: "/key/update", verb: "save changes to", past: "updated",
+		body: editKeyBody,
+		notice: func(f url.Values, _ map[string]any) string {
+			return "Key " + f.Get("key_id") + " updated. The fields you left empty are now unset."
+		},
 	},
 	"rotate": {
 		api: "/key/rotate", verb: "rotate", past: "rotated",
@@ -288,6 +296,102 @@ func newKeyBody(f url.Values) (any, error) {
 		b[n] = i
 	}
 	return b, nil
+}
+
+// editKeyBody maps the edit form to a /key/update body under end-state
+// semantics: the form is prefilled with the key's current values, so a box left
+// as it is re-sends that value, and a box the operator EMPTIES resets the field
+// through the update route's `clear` list. That is the answer to the objection
+// the keys screen used to carry — that a form cannot tell "leave this alone"
+// from "set this to nothing" — because a prefilled form has no "leave alone"
+// state to confuse: what you see is the key's whole desired shape.
+//
+// Fields the form does not manage (allowed_routes, priority_class) are simply
+// not sent, so they are left unchanged rather than cleared.
+func editKeyBody(f url.Values) (any, error) {
+	id := strings.TrimSpace(f.Get("key_id"))
+	if id == "" {
+		return nil, errors.New("no key was named")
+	}
+	b := map[string]any{"key_id": id}
+	var clear []string
+
+	for _, n := range []string{"key_alias", "user_id", "team_id", "tier", "budget_duration"} {
+		if v := strings.TrimSpace(f.Get(n)); v != "" {
+			b[n] = v
+		} else {
+			clear = append(clear, n)
+		}
+	}
+	for _, n := range []string{"models", "tags"} {
+		if list := splitList(f.Get(n)); len(list) > 0 {
+			b[n] = list
+		} else {
+			clear = append(clear, n)
+		}
+	}
+	for _, n := range []string{"max_budget", "soft_budget"} {
+		v := strings.TrimSpace(f.Get(n))
+		if v == "" {
+			clear = append(clear, n)
+			continue
+		}
+		if _, err := parseNano(v); err != nil {
+			return nil, errors.New(n + ` must be an exact decimal amount, as in "250" or "12.50"`)
+		}
+		b[n] = v
+	}
+	for _, n := range []string{"rpm_limit", "tpm_limit", "max_parallel_requests"} {
+		v := strings.TrimSpace(f.Get(n))
+		if v == "" {
+			clear = append(clear, n)
+			continue
+		}
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || i < 0 {
+			return nil, errors.New(n + " must be a whole number")
+		}
+		b[n] = i
+	}
+	// Expiry as a duration from now: "30d", "90d"; empty means no expiry.
+	if v := strings.TrimSpace(f.Get("expires_in")); v != "" {
+		b["duration"] = v
+	} else {
+		clear = append(clear, "expires")
+	}
+	if len(clear) > 0 {
+		b["clear"] = clear
+	}
+	return b, nil
+}
+
+// nanoDollars renders a nullable nano amount as a decimal-dollar string for a
+// form input: empty for "no ceiling", exact to the cent otherwise. It is the
+// inverse of the decimal string [Money] parses, so a value round-trips through
+// the edit form unchanged.
+func nanoDollars(n *int64) string {
+	if n == nil {
+		return ""
+	}
+	v := *n
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	cents := (v + 5_000_000) / 10_000_000 // nano to cents, rounded
+	s := strconv.FormatInt(cents/100, 10) + "." + fmt.Sprintf("%02d", cents%100)
+	if neg {
+		s = "-" + s
+	}
+	return s
+}
+
+// intStr renders a nullable limit for a form input: empty when unset.
+func intStr(n *int64) string {
+	if n == nil {
+		return ""
+	}
+	return strconv.FormatInt(*n, 10)
 }
 
 func splitList(v string) []string {
@@ -641,6 +745,76 @@ func (s *uiServer) screenNewKey(w http.ResponseWriter, r *http.Request, v viewer
 		pg.Team, pg.TeamFixed = v.scope.Teams[0], true
 	}
 	s.render(w, r, http.StatusOK, "newkey", pg)
+}
+
+// editKeyPage prefills the edit form with a key's current values. Every field
+// is a string ready to be an input's value, because the form's whole contract
+// is that what it shows is the key's desired end-state — see [editKeyBody].
+type editKeyPage struct {
+	page
+	ID, Label, Alias, UserID, TeamID string
+	Models, Tags                     string
+	MaxBudget, SoftBudget            string
+	BudgetPeriod                     string
+	RPM, TPM, MaxParallel            string
+	Tier                             string
+	ExpiresAt                        time.Time
+	Blocked                          bool
+}
+
+// screenEditKey renders the prefilled edit form for one key.
+//
+// It loads the key through the same store the API reads and applies the same
+// scope check the mutating routes do, so an operator cannot open an edit form
+// for a key they could not edit. The save itself goes through the `edit`
+// action and /key/update, so it writes the audit row and publishes the
+// invalidation exactly as a scripted update would.
+func (s *uiServer) screenEditKey(w http.ResponseWriter, r *http.Request, v viewer) {
+	ks := s.api.cfg.Keys
+	if ks == nil {
+		s.renderMessage(w, r, http.StatusNotImplemented, v, "Edit key",
+			"A key store is not configured in this process.", CodeDependencyOff)
+		return
+	}
+	if !v.canMutate() {
+		s.refuseReadOnly(w, r, v, "edit a key")
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("key_id"))
+	if id == "" {
+		s.renderMessage(w, r, http.StatusBadRequest, v, "Edit key", "No key was named.", CodeInvalidRequest)
+		return
+	}
+	k, err := ks.GetKey(r.Context(), id)
+	if err != nil {
+		s.renderError(w, r, v, "Edit key", err)
+		return
+	}
+	if !v.scope.AllowsTeam(k.TeamID) {
+		s.renderMessage(w, r, http.StatusForbidden, v, "Edit key",
+			"This key belongs to a team this session does not administer.", CodeForbidden)
+		return
+	}
+	pg := editKeyPage{
+		page:         s.newPage("keys", "Edit key", v),
+		ID:           k.ID,
+		Label:        k.KeyLabel,
+		Alias:        k.KeyAlias,
+		UserID:       k.UserID,
+		TeamID:       k.TeamID,
+		Models:       strings.Join(k.Models, ", "),
+		Tags:         strings.Join(k.Tags, ", "),
+		MaxBudget:    nanoDollars(k.MaxBudgetNano),
+		SoftBudget:   nanoDollars(k.SoftBudgetNano),
+		BudgetPeriod: k.BudgetPeriod,
+		RPM:          intStr(k.RPMLimit),
+		TPM:          intStr(k.TPMLimit),
+		MaxParallel:  intStr(k.MaxParallel),
+		Tier:         k.Tier,
+		ExpiresAt:    time.Time(k.ExpiresAt),
+		Blocked:      k.Blocked,
+	}
+	s.render(w, r, http.StatusOK, "editkey", pg)
 }
 
 // screenConfirm renders the page between a destructive control and the mutation

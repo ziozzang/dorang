@@ -55,6 +55,7 @@
          LINK to a confirmation page that names the key. The two that restore
          service are one click, because §11.6 requires a pended key to be
          released in one action and an interstitial is not one. */}}
+    <a href="{{$.Base}}/keys/edit?key_id={{.ID}}">edit</a>
     {{if $.CanRotate}}<a href="{{$.Base}}/keys/confirm?action=rotate&amp;key_id={{.ID}}">rotate</a>
     <a href="{{$.Base}}/keys/confirm?action=cut&amp;key_id={{.ID}}" title="End every superseded secret's grace period now">cut&nbsp;grace</a>{{end}}
     {{if .Blocked}}
@@ -93,10 +94,11 @@
 {{if .CanMutate}}
 <p class="lede">
   Every control above calls the same administration route a script calls — <code>{{.APIBase}}/key/generate</code>,
-  <code>/key/rotate</code>, <code>/key/block</code> and the rest — with this session's operator as the actor,
-  so each one writes the audit row and publishes the invalidation (§11.2c) that the API does.
-  Editing a key's fields is still API-only: a form cannot tell &ldquo;leave this alone&rdquo; from
-  &ldquo;set this to nothing&rdquo;, and a budget cleared by an untouched box is worse than a curl command.
+  <code>/key/rotate</code>, <code>/key/update</code>, <code>/key/block</code> and the rest — with this session's
+  operator as the actor, so each one writes the audit row and publishes the invalidation (§11.2c) that the API does.
+  <strong>Edit</strong> opens a form prefilled with the key's current fields: it is the key's whole desired
+  state, so a box left as it is keeps its value and a box you empty resets that field. That is what makes a form
+  safe here where it once was not — there is no &ldquo;leave alone&rdquo; state to confuse with &ldquo;set to nothing&rdquo;.
 </p>
 {{else}}
 <p class="lede">

@@ -1,0 +1,92 @@
+{{define "content"}}
+<h1>Edit key</h1>
+<p class="lede">
+  This edits a key through <code>POST {{.APIBase}}/key/update</code> — the same route a script
+  calls, with this session's operator as the actor and the same audit row. The form is
+  <strong>the key's whole desired state</strong>: every box is prefilled with its current value,
+  so a box left as it is keeps that value, and a box you <strong>empty is reset</strong> to
+  &ldquo;no limit&rdquo; or &ldquo;none&rdquo;. The secret is not shown or changed here; rotate a
+  key to mint a new one.
+</p>
+
+<form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="action" value="edit">
+  <input type="hidden" name="key_id" value="{{.ID}}">
+  <input type="hidden" name="return" value="{{.Base}}/keys">
+
+  <div class="grid">
+    <label class="field">id
+      <input type="text" value="{{.ID}}" readonly>
+      <small class="mono">{{.Label}}{{if .Blocked}} &middot; blocked{{end}}</small>
+    </label>
+    <label class="field">alias
+      <input type="text" name="key_alias" value="{{.Alias}}" placeholder="team-search">
+      <small>Display name. It is not the credential and not derived from it.</small>
+    </label>
+    <label class="field">user id
+      <input type="text" name="user_id" value="{{.UserID}}" placeholder="u_42">
+      <small>The owning user. Its role, block flag and ceilings apply on top of this key's.</small>
+    </label>
+    <label class="field">team id
+      <input type="text" name="team_id" value="{{.TeamID}}" placeholder="t_7">
+      <small>The owning team. Empty is a deployment-wide key.</small>
+    </label>
+  </div>
+
+  <div class="grid">
+    <label class="field">expires in
+      <input type="text" name="expires_in" placeholder="30d">
+      <small>Sets a NEW expiry from now: &ldquo;30d&rdquo;, &ldquo;12h&rdquo;. Empty removes any expiry.
+        {{if not .ExpiresAt.IsZero}}Currently expires {{stamp .ExpiresAt}}.{{else}}Currently never expires.{{end}}</small>
+    </label>
+    <label class="field">models
+      <input type="text" name="models" value="{{.Models}}" placeholder="model-large, model-small">
+      <small>Comma separated allow-list. Empty allows all.</small>
+    </label>
+    <label class="field">tags
+      <input type="text" name="tags" value="{{.Tags}}" placeholder="prod, search">
+      <small>Comma separated. They key the tag reports.</small>
+    </label>
+  </div>
+
+  <div class="grid">
+    <label class="field">budget
+      <input type="text" name="max_budget" value="{{.MaxBudget}}" inputmode="decimal" placeholder="250">
+      <small>Spend ceiling, an exact decimal. Empty is no ceiling.</small>
+    </label>
+    <label class="field">soft budget
+      <input type="text" name="soft_budget" value="{{.SoftBudget}}" inputmode="decimal" placeholder="200">
+      <small>Alert threshold below the ceiling. Empty is none.</small>
+    </label>
+    <label class="field">budget period
+      <input type="text" name="budget_duration" value="{{.BudgetPeriod}}" placeholder="monthly">
+      <small>The window the ceiling and spend are measured over.</small>
+    </label>
+    <label class="field">tier
+      <input type="text" name="tier" value="{{.Tier}}" placeholder="paid">
+      <small>Assigned by an operator, never claimed by a caller (§10.5).</small>
+    </label>
+  </div>
+
+  <div class="grid">
+    <label class="field">rpm limit
+      <input type="text" name="rpm_limit" value="{{.RPM}}" inputmode="numeric" placeholder="600">
+      <small>Requests per minute. Empty is no limit.</small>
+    </label>
+    <label class="field">tpm limit
+      <input type="text" name="tpm_limit" value="{{.TPM}}" inputmode="numeric" placeholder="120000">
+      <small>Tokens per minute. Empty is no limit.</small>
+    </label>
+    <label class="field">max parallel
+      <input type="text" name="max_parallel_requests" value="{{.MaxParallel}}" inputmode="numeric" placeholder="10">
+      <small>Concurrent requests. Empty is no limit.</small>
+    </label>
+  </div>
+
+  <div class="row">
+    <button type="submit" class="primary">save changes</button>
+    <a class="button" href="{{.Base}}/keys">cancel</a>
+  </div>
+</form>
+{{end}}

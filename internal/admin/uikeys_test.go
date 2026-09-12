@@ -701,6 +701,54 @@ func TestCreatedKeyAuthenticatesAndDeletedKeyStops(t *testing.T) {
 // Rotation from the UI keeps both secrets alive for the grace, and cutting the
 // grace short ends the old one. The states are read from /key/secrets, which is
 // the same list an operator reads to answer "did the client roll?".
+// The edit form is prefilled with the key's current values, and saving it
+// writes through /key/update: a field kept keeps its value, a field emptied is
+// cleared. This is the whole reason editing is safe from a form — the prefill
+// is what removes the "leave alone vs set to nothing" ambiguity — so the test
+// exercises both directions at once.
+//
+// Revert check: drop `key_id` from editKeyBody's clear/set logic, or stop
+// prefilling the form, and one of these assertions fails.
+func TestEditKeyFromTheUISetsAndClearsFields(t *testing.T) {
+	h := newHarness(t)
+	seedAdminSession(h)
+	id, _ := h.newKey(map[string]any{"key_alias": "editable", "max_budget": 250, "rpm_limit": 600})
+	c, token := signInUI(t, h, adminToken)
+
+	page := uiGet(h, "/ui/keys/edit?key_id="+id, c)
+	if page.Code != http.StatusOK {
+		t.Fatalf("GET edit form = %d\n%s", page.Code, page.Body.String())
+	}
+	for _, want := range []string{`value="editable"`, `value="250.00"`, `value="600"`, id} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Errorf("the edit form is not prefilled with %q", want)
+		}
+	}
+
+	// Raise rpm, keep the alias, and EMPTY the budget box — which must clear it.
+	rec := uiPost(h, "/ui"+uiActionPath, form(
+		"action", "edit", "key_id", id, csrfField, token,
+		"key_alias", "editable", "rpm_limit", "999", "max_budget", "",
+	), c)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("edit status %d\n%s", rec.Code, rec.Body.String())
+	}
+
+	k, err := h.store.GetKey(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if k.RPMLimit == nil || *k.RPMLimit != 999 {
+		t.Errorf("rpm was not updated to 999: %v", k.RPMLimit)
+	}
+	if k.MaxBudgetNano != nil {
+		t.Errorf("an emptied budget box did not clear the budget: %d", *k.MaxBudgetNano)
+	}
+	if k.KeyAlias != "editable" {
+		t.Errorf("the kept alias changed to %q", k.KeyAlias)
+	}
+}
+
 func TestRotateFromTheUIKeepsBothSecretsForTheGrace(t *testing.T) {
 	h, inv := newInvalidatingHarness(t)
 	seedAdminSession(h)

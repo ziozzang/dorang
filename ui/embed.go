@@ -44,7 +44,7 @@ func Templates() fs.FS { return must(fs.Sub(files, "templates")) }
 // names a key before something irreversible happens to it, and the one page in
 // dorang that ever displays a plaintext credential.
 func Pages() []string {
-	return []string{"keys", "users", "models", "usage", "monitoring", "login", "message", "newkey", "confirm", "secret"}
+	return []string{"keys", "users", "models", "usage", "monitoring", "login", "message", "newkey", "editkey", "confirm", "secret"}
 }
 
 func must(f fs.FS, err error) fs.FS {

@@ -743,6 +743,8 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 		s.screenKeys(w, r, v)
 	case "/keys/new":
 		s.screenNewKey(w, r, v)
+	case "/keys/edit":
+		s.screenEditKey(w, r, v)
 	case "/keys/confirm":
 		s.screenConfirm(w, r, v)
 	case "/keys/secret":
