@@ -109,16 +109,27 @@ type Options struct {
 // a test or an administrative surface can reach it without a second assembly
 // path existing.
 type App struct {
-	Store    *store.Store
-	Catalog  *catalog.Catalog
-	Broker   *capacity.Broker
-	Health   *health.Tracker
-	Prefix   *prefix.Table
-	Interner *prefix.Interner
-	Auth     *auth.Authenticator
-	Meter    *meter.Meter
-	Server   *server.Server
-	Batch    *batch.Service
+	Store   *store.Store
+	Catalog *catalog.Catalog
+	Broker  *capacity.Broker
+	Health  *health.Tracker
+	// configPath and reloadNow are the config-control seam. They are set after
+	// construction by [App.SetConfigControl] because the file watcher that owns
+	// the reload is created after New (it is built with the app it reloads).
+	// The admin config writer and reloader read them at call time and answer
+	// "not ready" until they are set, the same late-bind adminSurface uses for
+	// the server. reloadNow re-reads the file now rather than on the watcher's
+	// next poll, so a UI edit applies on this node at once and on the others
+	// within their poll interval.
+	configPath    string
+	reloadNow     func() error
+	configWriteMu sync.Mutex
+	Prefix        *prefix.Table
+	Interner      *prefix.Interner
+	Auth          *auth.Authenticator
+	Meter         *meter.Meter
+	Server        *server.Server
+	Batch         *batch.Service
 	// Node is this process's membership in the cluster (DESIGN §13): the
 	// registry row, the heartbeat, the leadership lease, the leader-only jobs,
 	// and the durable ledger.

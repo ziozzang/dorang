@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -230,9 +231,14 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		// counters, the same set GET /metrics exposes. Late-bound to a.Server
 		// because the server does not exist yet — see [adminSurface].
 		Surface: &adminSurface{a: a},
-		Catalog: &adminCatalog{c: a.Catalog},
-		Pricing: &adminPricer{d: a.dispatch},
-		Health:  admin.NewMemoryHealthHistory(1024, a.now()),
+		// Config reload and structured config edits (take a deployment in or out
+		// of routing). Both late-bind to the file watcher via SetConfigControl,
+		// so they answer "not ready" until start-up wires it.
+		Reloader:     &adminReloader{a: a},
+		ConfigWriter: &adminConfigWriter{a: a},
+		Catalog:      &adminCatalog{c: a.Catalog},
+		Pricing:      &adminPricer{d: a.dispatch},
+		Health:       admin.NewMemoryHealthHistory(1024, a.now()),
 
 		Now: a.now,
 	})
@@ -1106,6 +1112,73 @@ func (s *adminSurface) Surface(context.Context) (admin.Surface, error) {
 		out.AvgLatencyMS = int64(st.DurationSumNS / st.Requests / 1_000_000)
 	}
 	return out, nil
+}
+
+// SetConfigControl gives the admin surface the config path and an immediate
+// reload trigger, wired after the file watcher that owns the reload is built
+// (the watcher is created with the app it reloads, so it does not exist at New
+// time). Before this is called, the reloader and config writer answer
+// "not ready" — the same late-bind adminSurface uses for the server.
+func (a *App) SetConfigControl(path string, reload func() error) {
+	a.configPath = path
+	a.reloadNow = reload
+}
+
+// adminReloader re-reads the config file on demand for /admin/config/reload,
+// through the same watcher path a SIGHUP or a file change takes.
+type adminReloader struct{ a *App }
+
+func (r *adminReloader) Reload(context.Context) (admin.ReloadResult, error) {
+	if r.a.reloadNow == nil {
+		return admin.ReloadResult{}, admin.ErrUnsupported
+	}
+	if err := r.a.reloadNow(); err != nil {
+		return admin.ReloadResult{}, err
+	}
+	return admin.ReloadResult{LoadedAt: r.a.now()}, nil
+}
+
+// adminConfigWriter takes a deployment in or out of routing by editing the
+// config file and re-reading it. It validates the candidate before it touches
+// the live file, and writes in place because the config is a single-file bind
+// mount — see [writeConfigInPlace].
+type adminConfigWriter struct{ a *App }
+
+func (w *adminConfigWriter) SetDeploymentEnabled(_ context.Context, group, provider, upstream string, enabled bool) error {
+	path := w.a.configPath
+	if path == "" || w.a.reloadNow == nil {
+		return admin.ErrUnsupported
+	}
+	// One writer at a time on this node, and the lock is held across the apply
+	// so the writer does not race its own reload. Cross-node writers are
+	// serialized by the exclusive file lock inside EditLocked; this mutex adds
+	// same-process ordering the file lock alone would not give.
+	w.a.configWriteMu.Lock()
+	defer w.a.configWriteMu.Unlock()
+
+	// The whole read-edit-validate-write runs under an exclusive lock on the
+	// shared config inode, so a concurrent edit on the other node cannot lose
+	// this one and no reader sees a partial file. The candidate is validated
+	// inside the transaction, before any byte is written: a file that would not
+	// load is never written, or the next start-up could not come up.
+	err := config.EditLocked(path, func(cur []byte) ([]byte, error) {
+		next, err := config.SetDeploymentEnabled(cur, group, provider, upstream, enabled)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := config.LoadBytes(next); err != nil {
+			return nil, fmt.Errorf("the edited config would not load, so nothing was written: %w", err)
+		}
+		return next, nil
+	})
+	if err != nil {
+		return err
+	}
+	// Apply on this node at once and surface a refusal: reloadNow returns the
+	// error if the process declines the new file, so the operator learns the
+	// file changed but routing did not, rather than reading a false success.
+	// The other nodes' watchers see the change within their poll interval.
+	return w.a.reloadNow()
 }
 
 type adminCapacityReporter struct{ b *capacity.Broker }

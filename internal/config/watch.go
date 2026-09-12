@@ -30,7 +30,7 @@ type Watcher struct {
 	cfg     atomic.Pointer[Config]
 	lastErr atomic.Pointer[errBox]
 
-	onReload func(*Config)
+	onReload func(*Config) error
 	onError  func(error)
 
 	mu   sync.Mutex // serializes reloads
@@ -60,7 +60,7 @@ func WithPollInterval(d time.Duration) WatchOption {
 
 // WithReloadHandler registers a callback invoked with each newly applied
 // configuration. It runs on the watcher's goroutine, so it must not block.
-func WithReloadHandler(f func(*Config)) WatchOption {
+func WithReloadHandler(f func(*Config) error) WatchOption {
 	return func(w *Watcher) { w.onReload = f }
 }
 
@@ -228,7 +228,15 @@ func (w *Watcher) reload(force bool) error {
 	w.cfg.Store(cfg)
 	w.lastErr.Store(nil)
 	if w.onReload != nil {
-		w.onReload(cfg)
+		// The handler applies the new config; if the process refuses it (a
+		// valid file that still cannot be built into a running gateway), that
+		// refusal is the reload's outcome and is returned to an explicit caller
+		// so an operator sees it, rather than being swallowed into a success.
+		// The stat is already recorded above, so the poll path does not retry a
+		// file it has seen; a further edit changes the stat again.
+		if err := w.onReload(cfg); err != nil {
+			return err
+		}
 	}
 	return nil
 }

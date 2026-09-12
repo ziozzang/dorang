@@ -1049,3 +1049,17 @@ type ReloadResult struct {
 type Reloader interface {
 	Reload(ctx context.Context) (ReloadResult, error)
 }
+
+// ConfigWriter applies a structured change to the deployment's config file and
+// re-reads it, so an operator can take a deployment out of routing (and put it
+// back) from the UI without hand-editing YAML. It is deliberately narrow: a set
+// of named, validated mutations, not a free-form file write. An implementation
+// must validate the candidate (that it still parses and routes) BEFORE it
+// touches the live file, and leave the running configuration in place if the
+// change is refused. Optional; nil leaves the model controls read-only.
+type ConfigWriter interface {
+	// SetDeploymentEnabled takes the (group, provider, upstream) deployment in
+	// or out of routing. It is idempotent and applies as soon as the re-read
+	// completes on this node.
+	SetDeploymentEnabled(ctx context.Context, group, provider, upstream string, enabled bool) error
+}

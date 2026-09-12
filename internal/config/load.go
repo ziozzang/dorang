@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,7 +15,7 @@ import (
 // *[ValidationError] listing each problem with the YAML path it was found at.
 // A secret value never appears in it.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := readLocked(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}

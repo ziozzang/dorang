@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -15,6 +17,52 @@ import (
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/store"
 )
+
+// The UI toggle edits the real config file through the writer and the change
+// takes effect: the file records the flag and the model stops routing. This
+// exercises the whole path — endpoint, ConfigWriter, the locked in-place edit,
+// and the reload — against a real file, which the unit tests with a fake
+// ConfigWriter cannot.
+//
+// Revert check: make writeConfig/EditLocked a no-op (or unwire ConfigWriter)
+// and the file is unchanged and the model still serves — both assertions fail.
+func TestToggleDeploymentEditsConfigAndReroutes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(adminUIYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := newWiringApp(t, adminUIYAML, nil)
+	// Stand in for the start-up wiring main.go does after building the watcher.
+	a.SetConfigControl(path, func() error {
+		cfg, err := config.Load(path)
+		if err != nil {
+			return err
+		}
+		return a.Reload(cfg)
+	})
+
+	body := `{"model_group":"chat","provider":"p1","upstream_model":"vendor/chat-2026","enabled":false}`
+	w := callWith(a, testMasterKey, http.MethodPost, "/model/deployment/set_enabled", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set_enabled = %d: %s", w.Code, w.Body.String())
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "enabled: false") {
+		t.Errorf("the config file was not edited to disable the deployment:\n%s", after)
+	}
+	// The reload applied: chat's only deployment is disabled, so it no longer
+	// serves.
+	cw := callWith(a, testMasterKey, http.MethodPost, "/v1/chat/completions",
+		`{"model":"chat","messages":[{"role":"user","content":"hi"}]}`)
+	if cw.Code == http.StatusOK {
+		t.Errorf("chat still served after its only deployment was disabled: %s", cw.Body.String())
+	}
+}
 
 // A deployment marked enabled:false is defined but not routed: buildRouter
 // skips it, so it is absent from the compiled routing the models screen shows,

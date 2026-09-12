@@ -952,6 +952,15 @@ type fakeReloader struct{ res ReloadResult }
 
 func (f fakeReloader) Reload(context.Context) (ReloadResult, error) { return f.res, nil }
 
+// fakeConfigWriter accepts any structured config edit without touching a file,
+// so a route that goes through ConfigWriter reaches its handler in a test that
+// has no config file to write.
+type fakeConfigWriter struct{}
+
+func (fakeConfigWriter) SetDeploymentEnabled(context.Context, string, string, string, bool) error {
+	return nil
+}
+
 // fakeSpend answers "what has this key spent" from the SAME ledger rows the
 // report endpoints aggregate.
 //

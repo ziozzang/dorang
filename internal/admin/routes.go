@@ -54,6 +54,10 @@ func (a *API) registerShapeCompatible() {
 	a.read("/model/info", (*call).modelInfo)
 	a.write("/model/update", (*call).modelUpdate)
 	a.write("/model/delete", (*call).modelDelete)
+	// Take a deployment in or out of routing by editing the config file. Unlike
+	// the CRUD above (which writes a DB registry nothing routes on, so it 501s),
+	// this edits the config the router actually compiles — see [ConfigWriter].
+	a.write("/model/deployment/set_enabled", (*call).modelDeploymentSetEnabled)
 	a.read("/model_group/info", (*call).modelGroupInfo)
 
 	// Budgets. new and update share one implementation, differing in whether

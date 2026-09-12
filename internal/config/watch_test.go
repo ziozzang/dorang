@@ -59,7 +59,7 @@ func TestWatcherAppliesAValidChange(t *testing.T) {
 	w, err := NewWatcher(path,
 		WithPollInterval(5*time.Millisecond),
 		WithSignals(),
-		WithReloadHandler(func(*Config) { reloaded <- struct{}{} }),
+		WithReloadHandler(func(*Config) error { reloaded <- struct{}{}; return nil }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestWatcherKeepsTheOldConfigOnAnInvalidChange(t *testing.T) {
 		WithPollInterval(5*time.Millisecond),
 		WithSignals(),
 		WithErrorHandler(func(error) { failed <- struct{}{} }),
-		WithReloadHandler(func(*Config) { reloaded <- struct{}{} }),
+		WithReloadHandler(func(*Config) error { reloaded <- struct{}{}; return nil }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestWatcherReloadsOnSIGHUP(t *testing.T) {
 	reloaded := make(chan struct{}, 4)
 	w, err := NewWatcher(path,
 		WithPollInterval(time.Hour), // only the signal can trigger a reload
-		WithReloadHandler(func(*Config) { reloaded <- struct{}{} }),
+		WithReloadHandler(func(*Config) error { reloaded <- struct{}{}; return nil }),
 	)
 	if err != nil {
 		t.Fatal(err)

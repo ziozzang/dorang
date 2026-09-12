@@ -41,7 +41,7 @@
   <th>model group</th><th>deployment</th><th>provider</th><th>upstream model</th>
   <th class="num">weight</th><th class="num">priority</th>
   <th class="num">rpm</th><th class="num">tpm</th><th class="num">parallel</th>
-  <th>enabled</th>
+  <th>enabled</th>{{if .CanToggle}}<th>routing</th>{{end}}
 </tr>
 </thead>
 <tbody>
@@ -57,9 +57,18 @@
   <td class="num">{{limit .TPMLimit}}</td>
   <td class="num">{{limit .MaxParallel}}</td>
   <td>{{if .Enabled}}<span class="state-ok">yes</span>{{else}}<span class="state-bad">no</span>{{end}}</td>
+  {{if $.CanToggle}}
+  <td class="actions">
+    {{if .Enabled}}
+      <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="toggle_deployment"><input type="hidden" name="model_group" value="{{.ModelGroup}}"><input type="hidden" name="provider" value="{{.ProviderID}}"><input type="hidden" name="upstream_model" value="{{.UpstreamModel}}"><input type="hidden" name="enabled" value="false"><input type="hidden" name="return" value="{{$.Base}}/models"><button type="submit" class="link">disable</button></form>
+    {{else}}
+      <form class="inline" method="POST" action="{{$.Base}}{{$.ActionPath}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="action" value="toggle_deployment"><input type="hidden" name="model_group" value="{{.ModelGroup}}"><input type="hidden" name="provider" value="{{.ProviderID}}"><input type="hidden" name="upstream_model" value="{{.UpstreamModel}}"><input type="hidden" name="enabled" value="true"><input type="hidden" name="return" value="{{$.Base}}/models"><button type="submit" class="link ok">enable</button></form>
+    {{end}}
+  </td>
+  {{end}}
 </tr>
 {{else}}
-<tr><td colspan="10" class="unavailable">No deployments.</td></tr>
+<tr><td colspan="{{if .CanToggle}}11{{else}}10{{end}}" class="unavailable">No deployments.</td></tr>
 {{end}}
 </tbody>
 </table>

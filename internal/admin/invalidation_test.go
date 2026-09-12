@@ -172,6 +172,7 @@ func newSubjectFixture(t *testing.T) *subjectFixture {
 	// never reached its handler.
 	h.api.cfg.Pricing = fakePricer{}
 	h.api.cfg.Reloader = fakeReloader{}
+	h.api.cfg.ConfigWriter = fakeConfigWriter{}
 
 	f := &subjectFixture{h: h, inv: inv}
 	mustOK(t, h.do(http.MethodPost, "/user/new",
@@ -402,6 +403,17 @@ func mutationRows() []mutationRow {
 			why: "a reload is this node's own by construction; OPERATIONS tells the operator " +
 				"to run it against the fleet",
 			body: map[string]any{},
+			want: none,
+		},
+		{
+			path: "/model/deployment/set_enabled",
+			why: "taking a deployment in or out of routing is a config fact, not a credential " +
+				"one: it reaches no credential-cache entry, and it propagates by the config file " +
+				"the other nodes' watchers re-read, not by the key-invalidation bus",
+			body: map[string]any{
+				"model_group": "gpt-4", "provider": "openai",
+				"upstream_model": "gpt-4o", "enabled": false,
+			},
 			want: none,
 		},
 

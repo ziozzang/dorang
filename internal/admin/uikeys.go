@@ -123,6 +123,28 @@ var uiActions = map[string]uiAction{
 		needs:   func(s *uiServer) bool { return s.api.cfg.Hasher != nil },
 		body:    newKeyBody,
 	},
+	"toggle_deployment": {
+		api: "/model/deployment/set_enabled", verb: "change routing for", past: "updated",
+		needs: func(s *uiServer) bool { return s.api.cfg.ConfigWriter != nil },
+		body: func(f url.Values) (any, error) {
+			mg := strings.TrimSpace(f.Get("model_group"))
+			pv := strings.TrimSpace(f.Get("provider"))
+			um := strings.TrimSpace(f.Get("upstream_model"))
+			if mg == "" || pv == "" || um == "" {
+				return nil, errors.New("the deployment was not fully named")
+			}
+			return map[string]any{
+				"model_group": mg, "provider": pv, "upstream_model": um,
+				"enabled": f.Get("enabled") == "true",
+			}, nil
+		},
+		notice: func(f url.Values, _ map[string]any) string {
+			if f.Get("enabled") == "true" {
+				return "Deployment enabled; routing updated."
+			}
+			return "Deployment disabled; it is out of routing until re-enabled."
+		},
+	},
 	"edit": {
 		api: "/key/update", verb: "save changes to", past: "updated",
 		body: editKeyBody,

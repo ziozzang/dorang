@@ -529,6 +529,50 @@ func (c *call) adminConfigReload() error {
 	return nil
 }
 
+// POST /model/deployment/set_enabled takes a deployment in or out of routing.
+//
+// It is the one /model/* write that is not a 501: the CRUD endpoints write a DB
+// registry the router does not read, but this edits the config the router
+// compiles from, through [ConfigWriter], which validates the candidate before
+// it touches the live file and re-reads it on success.
+func (c *call) modelDeploymentSetEnabled() error {
+	if err := c.requireGlobal("changing deployment routing"); err != nil {
+		return err
+	}
+	if c.a.cfg.ConfigWriter == nil {
+		return dependencyOff("config writer", "enabling or disabling a deployment")
+	}
+	if err := c.requireAudit(); err != nil {
+		return err
+	}
+	var body struct {
+		ModelGroup    string `json:"model_group"`
+		Provider      string `json:"provider"`
+		UpstreamModel string `json:"upstream_model"`
+		Enabled       *bool  `json:"enabled"`
+	}
+	if err := decodeBody(c.w, c.r, &body); err != nil {
+		return err
+	}
+	if body.ModelGroup == "" || body.Provider == "" || body.UpstreamModel == "" {
+		return badRequest("model_group, provider and upstream_model are all required")
+	}
+	if body.Enabled == nil {
+		return badRequest("enabled is required, true or false")
+	}
+	if err := c.a.cfg.ConfigWriter.SetDeploymentEnabled(c.ctx(),
+		body.ModelGroup, body.Provider, body.UpstreamModel, *body.Enabled); err != nil {
+		return err
+	}
+	id := body.ModelGroup + "|" + body.Provider + "|" + body.UpstreamModel
+	after := map[string]any{"enabled": *body.Enabled}
+	if err := c.recordAudit("deployment.set_enabled", "deployment", id, nil, after); err != nil {
+		return err
+	}
+	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"deployment": id, "enabled": *body.Enabled})
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // GET /admin/status
 // ---------------------------------------------------------------------------

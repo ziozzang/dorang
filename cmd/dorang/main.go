@@ -186,12 +186,13 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 	if explicit || fileExists(path) {
 		w, werr := config.NewWatcher(path,
 			config.WithSignals(syscall.SIGHUP),
-			config.WithReloadHandler(func(c *config.Config) {
+			config.WithReloadHandler(func(c *config.Config) error {
 				if err := a.Reload(c); err != nil {
 					logf("dorang: reload refused, keeping the running configuration: %v", err)
-					return
+					return err
 				}
 				logf("dorang: configuration reloaded from %s", path)
+				return nil
 			}),
 			config.WithErrorHandler(func(err error) {
 				logf("dorang: reload failed, keeping the running configuration: %v", err)
@@ -200,6 +201,11 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 		if werr != nil {
 			logf("dorang: configuration watch disabled: %v", werr)
 		} else {
+			// Hand the admin surface the reload trigger and the path it edits,
+			// now that the watcher that owns them exists. Before this, the
+			// config reload and the model enable/disable controls answer
+			// "not ready".
+			a.SetConfigControl(w.Path(), w.Reload)
 			w.Start()
 			defer w.Close()
 		}

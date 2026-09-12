@@ -445,6 +445,10 @@ type modelsPage struct {
 
 	CapacityAvailable bool
 	Capacity          CapacityOccupancy
+
+	// CanToggle reports that this process can take a deployment in or out of
+	// routing from the UI: a config writer is wired and the viewer may mutate.
+	CanToggle bool
 }
 
 type usageRow struct {
@@ -1427,6 +1431,7 @@ func (s *uiServer) screenModels(w http.ResponseWriter, r *http.Request, v viewer
 		Aliases:     aliases,
 		Compiled:    compiled,
 	}
+	pg.CanToggle = pg.CanMutate && s.api.cfg.ConfigWriter != nil
 	if compiled {
 		pg.Provenance = "The deployments and aliases are the routing table this process " +
 			"compiled, and the ids are the ones the ledger records."

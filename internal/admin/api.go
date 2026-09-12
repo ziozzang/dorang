@@ -101,6 +101,10 @@ type Config struct {
 	Catalog  Catalog
 	Pricing  Pricer
 	Reloader Reloader
+	// ConfigWriter applies validated, structured edits to the config file (take
+	// a deployment in or out of routing). Optional; nil leaves the model
+	// controls read-only. See [ConfigWriter].
+	ConfigWriter ConfigWriter
 
 	// MaxTimeRange caps a ledger query's width. Zero means
 	// DefaultMaxTimeRange.
