@@ -217,6 +217,12 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 		}
 		for j := range m.Deployments {
 			d := &m.Deployments[j]
+			// A disabled deployment is defined but not routed: skip it here so
+			// it contributes no router.Deployment, leaving its siblings to
+			// serve. nil means enabled — the default every prior config means.
+			if d.Enabled != nil && !*d.Enabled {
+				continue
+			}
 			p, ok := cfg.Provider(d.Provider)
 			if !ok {
 				return nil, fmt.Errorf("app: model %s: no provider named %q", m.Name, d.Provider)

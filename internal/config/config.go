@@ -962,6 +962,14 @@ type Deployment struct {
 	Credentials   []string `yaml:"credentials,omitempty"`
 	Weight        int      `yaml:"weight,omitempty"`
 	Priority      int      `yaml:"priority,omitempty"`
+	// Enabled takes a deployment in or out of routing without deleting its
+	// definition. Absent (nil) means enabled — the default and what every
+	// existing config means — so the field only ever appears to say "false".
+	// buildRouter skips a disabled deployment; the definition stays in the file
+	// so it can be re-enabled, and its siblings keep serving. Disabling every
+	// deployment of a model leaves the group empty, which selection answers
+	// with a routable 503 rather than a build error.
+	Enabled       *bool    `yaml:"enabled,omitempty"`
 	Timeout       Duration `yaml:"timeout,omitempty"`
 	StreamTimeout Duration `yaml:"stream_timeout,omitempty"`
 	Limits        []Limit  `yaml:"limits,omitempty"`

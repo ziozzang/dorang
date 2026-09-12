@@ -998,10 +998,12 @@ func (r *adminRouting) ListDeployments(context.Context) ([]*admin.Deployment, er
 				Weight:   max(d.Weight, 1),
 				Priority: d.Priority,
 				Params:   "{}",
-				// Every deployment in the compiled table can serve. There is no
-				// disabled state in `models:` — a deployment one does not want
-				// is removed — so the column is honest rather than decorative.
-				Enabled: true,
+				// Reflect the config flag: nil means enabled (the default every
+				// prior config means), so this reads false only where an operator
+				// wrote enabled:false. buildRouter skips those from routing; the
+				// models screen shows them as disabled rather than hiding them,
+				// which is what lets an operator re-enable one.
+				Enabled: d.Enabled == nil || *d.Enabled,
 			}
 			timeout := d.Timeout.Duration()
 			if p, ok := cfg.Provider(d.Provider); ok && timeout == 0 {

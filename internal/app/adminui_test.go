@@ -12,8 +12,45 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/store"
 )
+
+// A deployment marked enabled:false is defined but not routed: buildRouter
+// skips it, so it is absent from the compiled routing the models screen shows,
+// while its enabled sibling remains. This is the routing half of the
+// enable/disable control.
+//
+// Revert check: drop the Enabled skip in buildRouter and the disabled
+// deployment is routed and listed — the first assertion fails.
+func TestDisabledDeploymentIsNotRouted(t *testing.T) {
+	disabled := false
+	a := newWiringApp(t, adminUIYAML, func(cfg *config.Config) {
+		for i := range cfg.Models {
+			if cfg.Models[i].Name == "chat" {
+				for j := range cfg.Models[i].Deployments {
+					cfg.Models[i].Deployments[j].Enabled = &disabled
+				}
+			}
+		}
+	})
+	// The model's only deployment is disabled, so the group is empty and a
+	// request to it is refused as unroutable rather than served.
+	body := `{"model":"chat","messages":[{"role":"user","content":"hi"}]}`
+	w := callWith(a, testMasterKey, http.MethodPost, "/v1/chat/completions", body)
+	if w.Code == http.StatusOK {
+		t.Fatalf("a model whose only deployment is disabled served a request:\n%s", w.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(w.Body.String()), "deployment") {
+		t.Errorf("expected a no-deployment routing refusal, got %d: %s", w.Code, w.Body.String())
+	}
+	// The disabled deployment is still shown on the models screen — marked
+	// disabled, not hidden — so an operator can see and re-enable it.
+	m := callWith(a, testMasterKey, http.MethodGet, "/ui/models", "")
+	if !strings.Contains(m.Body.String(), "vendor/chat-2026") {
+		t.Errorf("the disabled deployment vanished from the models screen instead of showing as disabled")
+	}
+}
 
 // The operator UI, against an assembled gateway.
 //
