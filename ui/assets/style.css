@@ -11,82 +11,82 @@
  */
 
 :root {
-  --bg: #f4f5f8;
+  --bg: #f7f8fa;
   --surface: #ffffff;
-  --surface-2: #fafbfc;
+  --surface-2: #f5f7f8;
   --side: #ffffff;
-  --border: #e6e8ee;
-  --border-strong: #d4d8e0;
-  --text: #131722;
-  --muted: #667085;
-  --faint: #98a2b3;
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
+  --border: #e4e8eb;
+  --border-strong: #ced6dc;
+  --text: #1c2933;
+  --muted: #63717d;
+  --faint: #687985;
+  --accent: #087f70;
+  --accent-hover: #0a6a5d;
   --accent-contrast: #ffffff;
-  --accent-soft: #eef1fe;
-  --ok: #15803d;
-  --ok-soft: #e9f6ee;
-  --warn: #b45309;
-  --warn-soft: #fdf1e3;
-  --bad: #dc2626;
-  --bad-soft: #fdecec;
-  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
-  --shadow-lg: 0 8px 24px rgba(16,24,40,.10);
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Inter, sans-serif;
-  --r: 10px;
+  --accent-soft: #e9f5f0;
+  --ok: #15805d;
+  --ok-soft: #e6f4ec;
+  --warn: #a5650b;
+  --warn-soft: #f7efe1;
+  --bad: #c74455;
+  --bad-soft: #fbebed;
+  --shadow: 0 1px 2px rgba(23,44,64,.06), 0 1px 3px rgba(23,44,64,.08);
+  --shadow-lg: 0 18px 70px rgba(23,44,64,.12);
+  --mono: "SFMono-Regular", ui-monospace, Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --r: 9px;
   color-scheme: light;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0e1016;
-    --surface: #171a22;
-    --surface-2: #1c2029;
-    --side: #12141b;
-    --border: #262b36;
-    --border-strong: #333a48;
-    --text: #e8ebf2;
-    --muted: #98a2b3;
-    --faint: #6b7486;
-    --accent: #818cf8;
-    --accent-hover: #a5b4fc;
-    --accent-contrast: #0e1016;
-    --accent-soft: #1c1f33;
-    --ok: #4ade80;
-    --ok-soft: #14251b;
-    --warn: #f0b45e;
+    --bg: #111519;
+    --surface: #191e23;
+    --surface-2: #20272d;
+    --side: #15191d;
+    --border: #2c353c;
+    --border-strong: #414e58;
+    --text: #e6ecef;
+    --muted: #a0adb7;
+    --faint: #96a5b0;
+    --accent: #63d4b3;
+    --accent-hover: #7fe0c4;
+    --accent-contrast: #111519;
+    --accent-soft: #183e34;
+    --ok: #68d3ab;
+    --ok-soft: #183e34;
+    --warn: #e8b665;
     --warn-soft: #2a2013;
-    --bad: #f87171;
+    --bad: #fb8490;
     --bad-soft: #2a1717;
     --shadow: 0 1px 2px rgba(0,0,0,.4);
-    --shadow-lg: 0 10px 30px rgba(0,0,0,.5);
+    --shadow-lg: 0 18px 70px rgba(0,0,0,.5);
     color-scheme: dark;
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #0e1016;
-  --surface: #171a22;
-  --surface-2: #1c2029;
-  --side: #12141b;
-  --border: #262b36;
-  --border-strong: #333a48;
-  --text: #e8ebf2;
-  --muted: #98a2b3;
-  --faint: #6b7486;
-  --accent: #818cf8;
-  --accent-hover: #a5b4fc;
-  --accent-contrast: #0e1016;
-  --accent-soft: #1c1f33;
-  --ok: #4ade80;
-  --ok-soft: #14251b;
-  --warn: #f0b45e;
+  --bg: #111519;
+  --surface: #191e23;
+  --surface-2: #20272d;
+  --side: #15191d;
+  --border: #2c353c;
+  --border-strong: #414e58;
+  --text: #e6ecef;
+  --muted: #a0adb7;
+  --faint: #96a5b0;
+  --accent: #63d4b3;
+  --accent-hover: #7fe0c4;
+  --accent-contrast: #111519;
+  --accent-soft: #183e34;
+  --ok: #68d3ab;
+  --ok-soft: #183e34;
+  --warn: #e8b665;
   --warn-soft: #2a2013;
-  --bad: #f87171;
+  --bad: #fb8490;
   --bad-soft: #2a1717;
   --shadow: 0 1px 2px rgba(0,0,0,.4);
-  --shadow-lg: 0 10px 30px rgba(0,0,0,.5);
+  --shadow-lg: 0 18px 70px rgba(0,0,0,.5);
   color-scheme: dark;
 }
 
@@ -98,7 +98,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.55 var(--sans);
+  font: 14px/1.55 var(--sans);
   -webkit-text-size-adjust: 100%;
   -webkit-font-smoothing: antialiased;
 }
@@ -242,7 +242,7 @@ code { font-family: var(--mono); font-size: .88em; background: var(--surface-2);
   box-shadow: var(--shadow);
 }
 .tile .label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
-.tile .value { font: 700 1.7rem/1.15 var(--sans); margin-top: 6px; overflow-wrap: anywhere; letter-spacing: -.02em; }
+.tile .value { font: 580 1.7rem/1.2 var(--sans); margin-top: 6px; overflow-wrap: anywhere; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
 .tile .value.mono, .tile .value:has(+ .note) { font-family: var(--sans); }
 .tile .note { color: var(--faint); font-size: .8rem; margin-top: 6px; }
 .metrics-note { color: var(--muted); font-size: .82rem; margin: 6px 0 4px; }
