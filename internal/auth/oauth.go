@@ -317,7 +317,8 @@ func NewOAuthCredential(cfg OAuthConfig, refresher Refresher) (*OAuthCredential,
 	c := &OAuthCredential{cfg: cfg, rf: refresher, healthy: true}
 	switch cfg.Source {
 	case SourceFile:
-		c.store = &fileStore{path: cfg.Path, fields: cfg.Fields}
+		c.store = &fileStore{path: cfg.Path, fields: cfg.Fields,
+			readOnly: cfg.StoreFormat == FormatGCPServiceAccount}
 	case SourceExec:
 		c.store = &execStore{command: cfg.Command, fields: cfg.Fields, timeout: cfg.ExecTimeout}
 	case SourceEnv:
@@ -384,6 +385,17 @@ func (c *OAuthCredential) ExpiresAt() time.Time { return c.current().ExpiresAt }
 // never before: the client credential must not reach a provider, and the
 // provider credential must not be stripped after it is applied.
 func (c *OAuthCredential) Apply(h http.Header) error {
+	if c.current().Empty() && c.rf != nil {
+		// A store that holds no token at all — a service-account key file,
+		// which is minted from rather than read — gets its first token on
+		// first use, synchronously and single-flighted. An EXPIRED token is a
+		// different case and stays with the refresh-ahead loop and the 401
+		// path: minting here on every stale token would turn a revoked
+		// credential into a refresh storm on the request path.
+		if _, err := c.refresh(context.Background(), true); err != nil {
+			return err
+		}
+	}
 	tok, err := c.AccessToken()
 	if err != nil {
 		return err

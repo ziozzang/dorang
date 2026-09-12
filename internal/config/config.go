@@ -497,6 +497,10 @@ type Params struct {
 	// its mandatory `api-version` query parameter. Unset takes the unified
 	// /openai/v1 surface. Refused on any kind but azure.
 	APIVersion string `yaml:"api_version,omitempty"`
+	// Project and Location scope a Vertex AI route. Required on the vertex
+	// kind, refused on any other.
+	Project  string `yaml:"project,omitempty"`
+	Location string `yaml:"location,omitempty"`
 }
 
 // Output-ceiling spellings for `max_tokens_field`.

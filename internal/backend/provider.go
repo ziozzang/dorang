@@ -109,6 +109,11 @@ type Spec struct {
 	// and is its mandatory query parameter (`params.api_version`). Refused on
 	// any other kind: only [azureAdapter] reads it.
 	AzureAPIVersion string
+	// VertexProject and VertexLocation scope a Vertex AI route
+	// (`params.project`, `params.location`). Required on the vertex kind,
+	// refused elsewhere; the location also names the default host.
+	VertexProject  string
+	VertexLocation string
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -144,7 +149,13 @@ type Provider struct {
 	drop   []string
 	// azureAPIVersion: see [Spec.AzureAPIVersion].
 	azureAPIVersion string
+	// vertexProject and vertexLocation: see [Spec.VertexProject].
+	vertexProject, vertexLocation string
 }
+
+// errVertexNeedsProject is a vertex provider whose route cannot be built.
+var errVertexNeedsProject = errors.New("backend: a vertex provider needs params.project and params.location; " +
+	"the route is scoped to both and there is no default for either")
 
 // NewProvider resolves a spec.
 //
@@ -153,6 +164,11 @@ type Provider struct {
 // only sees in production — are worse than a start-up error.
 func NewProvider(s Spec) (*Provider, error) {
 	base := trimBase(s.BaseURL)
+	if base == "" && s.API == catalog.APIVertex {
+		// The location names the host on Vertex; an operator who states the
+		// location has stated the host.
+		base = vertexHost(s.VertexLocation)
+	}
 	if base == "" {
 		return nil, ErrNoBaseURL
 	}
@@ -177,6 +193,9 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err := checkAzureParams(s, api); err != nil {
 		return nil, err
 	}
+	if err := checkVertexParams(s, api); err != nil {
+		return nil, err
+	}
 	drop, err := resolveDropParams(api, s.DropParams)
 	if err != nil {
 		return nil, err
@@ -194,6 +213,8 @@ func NewProvider(s Spec) (*Provider, error) {
 		drop:    drop,
 
 		azureAPIVersion: s.AzureAPIVersion,
+		vertexProject:   s.VertexProject,
+		vertexLocation:  s.VertexLocation,
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,

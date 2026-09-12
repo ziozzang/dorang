@@ -21,14 +21,17 @@ const (
 	APIAzureOpenAI       API = "azure-openai"
 	APIAnthropicMessages API = "anthropic-messages"
 	APIGemini            API = "gemini"
-	APICohere            API = "cohere"
-	APIJina              API = "jina"
-	APIEcho              API = "echo"
+	// APIVertex is the Gemini wire shape on Vertex AI: the same body, under a
+	// project- and location-scoped path, with a Google OAuth bearer.
+	APIVertex API = "vertex"
+	APICohere API = "cohere"
+	APIJina   API = "jina"
+	APIEcho   API = "echo"
 )
 
 var validAPIs = map[API]bool{
 	APIOpenAIChat: true, APIOpenAIResponses: true, APIAzureOpenAI: true, APIAnthropicMessages: true,
-	APIGemini: true, APICohere: true, APIJina: true, APIEcho: true,
+	APIGemini: true, APIVertex: true, APICohere: true, APIJina: true, APIEcho: true,
 }
 
 // CacheScheme names how prompt caching is expressed on the wire for a kind.

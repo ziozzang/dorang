@@ -58,7 +58,10 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			ResponsesStoreFalse:  p.Params.StoreFalse,
 			// Azure's legacy surface, by its one mandatory parameter.
 			AzureAPIVersion: p.Params.APIVersion,
-			Timeout:         p.Timeout.Duration(),
+			// Vertex AI's route scope.
+			VertexProject:  p.Params.Project,
+			VertexLocation: p.Params.Location,
+			Timeout:        p.Timeout.Duration(),
 			// providers[].retry, which is a different thing from the fallback
 			// chain of §7.6 and is documented as such on [backend.Policy].
 			Retry: backend.Policy{

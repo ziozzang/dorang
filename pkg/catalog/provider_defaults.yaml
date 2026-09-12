@@ -187,14 +187,21 @@ kinds:
     supports_streaming: true
 
   vertex:
-    api: gemini
+    api: vertex
     cache: google_cached_contents
     category: chat
     supports_tools: true
     supports_streaming: true
     note: >-
       §4.3 elides vertex's defaults; it also fronts non-Gemini families that a
-      deployment must configure explicitly.
+      deployment must configure explicitly (anthropic-vertex is its own kind
+      and is not served in this build). Gemini on Vertex: params.project and
+      params.location are required; base_url defaults to the location's
+      regional host, https://{location}-aiplatform.googleapis.com (the global
+      host for `global`); the credential is a Google OAuth bearer — a
+      service-account key file through `auth: oauth` with
+      `format: gcp-service-account` — or an API key as x-goog-api-key. Not
+      measured against a live project (the operator has none).
 
   # ---- Chat providers on the OpenAI wire -----------------------------------
 

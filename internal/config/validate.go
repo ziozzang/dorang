@@ -740,7 +740,7 @@ func (c *Config) validateCredentials(col *collector, providers map[string]*Provi
 // both packages are already imported. It fails when either side moves.
 var (
 	oauthSources = []string{"file", "exec", "env"}
-	oauthFormats = []string{"claude", "codex", "gemini", "generic"}
+	oauthFormats = []string{"claude", "codex", "gcp-service-account", "gemini", "generic"}
 	oauthEncodes = []string{"form", "json"}
 )
 
@@ -809,6 +809,10 @@ func validateOAuth(col *collector, o *OAuth, path, env string) {
 		col.add(path+".format", "unknown token store format %q: want one of %s",
 			o.Format, strings.Join(oauthFormats, ", "))
 	}
+	if o.Format == "gcp-service-account" && o.Source != "" && o.Source != "file" {
+		col.add(path+".oauth.format",
+			"gcp-service-account is a key FILE that an access token is minted from; it needs `source: file`")
+	}
 	if o.RefreshMargin < 0 {
 		col.add(path+".refresh_margin", "must not be negative")
 	}
@@ -841,7 +845,10 @@ func validateOAuth(col *collector, o *OAuth, path, env string) {
 			"must be https: the body of a refresh is a refresh token, and posting one in "+
 				"clear hands the account to anything on the path")
 	}
-	if strings.TrimSpace(o.Refresh.ClientID) == "" {
+	if strings.TrimSpace(o.Refresh.ClientID) == "" && o.Format != "gcp-service-account" {
+		// A service account has no client: its "refresh" is a signed
+		// assertion from the key file, and the block's token_url only
+		// overrides the file's own token_uri.
 		col.add(rpath+".client_id", "must be set when a refresh block is configured")
 	}
 	if o.Refresh.Encoding != "" && !containsString(oauthEncodes, o.Refresh.Encoding) {

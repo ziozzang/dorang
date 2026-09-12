@@ -105,6 +105,22 @@ func newOAuthCredential(cr *config.Credential, now func() time.Time) (*auth.OAut
 // A refresh token is spent only when an operator has said where to spend it.
 func oauthRefresher(cr *config.Credential, now func() time.Time) (auth.Refresher, error) {
 	r := cr.OAuth.Refresh
+	if cr.OAuth.Format == string(auth.FormatGCPServiceAccount) {
+		// Minted from the key, not refreshed from a token: the file IS the
+		// credential. token_url, when set, overrides the file's token_uri
+		// (a test's fake; production leaves it to the file).
+		sa, err := auth.NewServiceAccountRefresher(auth.ServiceAccountConfig{
+			Path:     cr.OAuth.Path,
+			Scope:    r.Scope,
+			TokenURL: r.TokenURL,
+			Timeout:  r.Timeout.Duration(),
+			Now:      now,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("app: credential %q: %w", cr.ID, err)
+		}
+		return sa, nil
+	}
 	if r.TokenURL == "" {
 		return nil, nil
 	}

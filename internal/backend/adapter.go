@@ -292,6 +292,8 @@ func adapterFor(api catalog.API, kind string, responsesOnly bool) (adapter, erro
 		return anthropicAdapter{}, nil
 	case catalog.APIGemini:
 		return geminiAdapter{}, nil
+	case catalog.APIVertex:
+		return vertexAdapter{}, nil
 	case catalog.APICohere:
 		return cohereAdapter{}, nil
 	case catalog.APIJina:
@@ -354,7 +356,7 @@ func CapabilitiesForAPI(api catalog.API) canonical.Capability {
 	switch api {
 	case catalog.APIAnthropicMessages:
 		return anthropic.DefaultCapabilities
-	case catalog.APIGemini:
+	case catalog.APIGemini, catalog.APIVertex:
 		return GeminiCapabilities
 	}
 	return openai.DefaultCapabilities

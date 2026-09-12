@@ -58,6 +58,13 @@ const (
 // configuration error has to be able to say.
 var storeFormats = map[StoreFormat]TokenFields{
 	FormatGeneric: {},
+	// A service-account key file: no access token to read, a non-secret key
+	// id standing in as the "refresh token" so the credential knows it can
+	// mint, the client email as the account. See [FormatGCPServiceAccount].
+	FormatGCPServiceAccount: {
+		RefreshToken: "private_key_id",
+		AccountID:    "client_email",
+	},
 	FormatCodex: {
 		AccessToken:  "tokens.access_token",  // pragma: allowlist secret — a field name
 		RefreshToken: "tokens.refresh_token", // pragma: allowlist secret — a field name

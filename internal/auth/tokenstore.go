@@ -530,10 +530,14 @@ const DefaultTokenFileMode os.FileMode = 0o600
 type fileStore struct {
 	path   string
 	fields TokenFields
+	// readOnly marks a file that is the operator's own key material rather
+	// than a token cache — a service-account key — which a refresh must
+	// never rewrite.
+	readOnly bool
 }
 
 func (s *fileStore) Describe() string { return s.path }
-func (s *fileStore) Writable() bool   { return true }
+func (s *fileStore) Writable() bool   { return !s.readOnly }
 
 func (s *fileStore) Load() (Token, error) {
 	b, err := os.ReadFile(s.path)

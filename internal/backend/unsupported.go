@@ -51,11 +51,11 @@ var unsupportedKinds = map[string]unsupportedAdapter{
 			"request shape, neither of which dorang implements. Front Bedrock with a gateway that speaks " +
 			"anthropic-messages or openai-chat, and point a provider at that.",
 	},
-	"vertex": {
-		code: "vertex_unsupported",
-		reason: "the vertex kind has no adapter in this build: it needs a project id, a location and a Google " +
-			"service-account OAuth exchange in a project-scoped path, none of which this configuration carries. " +
-			"The gemini adapter serves generativelanguage.googleapis.com only.",
+	"anthropic-vertex": {
+		code: "anthropic_vertex_unsupported",
+		reason: "the anthropic-vertex kind has no adapter in this build: Claude on Vertex is addressed at a " +
+			"project-scoped rawPredict route with anthropic_version in the body and no model field, which " +
+			"the anthropic-messages adapter does not spell. Gemini on Vertex is served by the vertex kind.",
 	},
 }
 

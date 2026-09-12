@@ -101,3 +101,14 @@ func TestTheAzureKindSpeaksTheAzureShape(t *testing.T) {
 		}
 	}
 }
+
+// The vertex kind speaks the Vertex shape; Claude on Vertex stays its own kind.
+func TestTheVertexKindSpeaksTheVertexShape(t *testing.T) {
+	c := loadWith(t, "version: 1\n")
+	if kd, ok := c.Kind("vertex"); !ok || kd.API != APIVertex {
+		t.Errorf("vertex api = %q ok=%t", kd.API, ok)
+	}
+	if kd, ok := c.Kind("anthropic-vertex"); !ok || kd.API != APIAnthropicMessages {
+		t.Errorf("anthropic-vertex api = %q ok=%t", kd.API, ok)
+	}
+}
