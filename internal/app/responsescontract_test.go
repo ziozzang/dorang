@@ -283,3 +283,71 @@ models:
 		t.Errorf("body:\n%s", w.Body.String())
 	}
 }
+
+// `params.api_version` reaches the wire from an operator's file, on the kind it
+// is for, and is refused on any other.
+func TestAzureAPIVersionFollowsTheKind(t *testing.T) {
+	var mu sync.Mutex
+	var seen string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		seen = r.URL.Path + "?" + r.URL.RawQuery + " api-key=" + r.Header.Get("api-key")
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"c1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`))
+	}))
+	t.Cleanup(up.Close)
+	yaml := `
+version: 1
+providers:
+  - {name: p1, kind: azure, base_url: "` + up.URL + `", params: {api_version: "2024-10-21"}}
+credentials:
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: p1, upstream_model: my-deployment, credentials: [c1]}
+`
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	key := issueKey(t, a, nil)
+	w := callWith(a, key, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m1","messages":[{"role":"user","content":"go"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d\n%s", w.Code, w.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen != "/openai/deployments/my-deployment/chat/completions?api-version=2024-10-21 api-key="+testUpstreamKey { // pragma: allowlist secret — a test fixture key
+		t.Errorf("host saw %q", seen)
+	}
+
+	t.Run("refused on an openai kind", func(t *testing.T) {
+		isolateState(t)
+		t.Setenv("DORANG_APP_TEST_KEY", testUpstreamKey)
+		cfg, err := config.LoadBytes([]byte(`
+version: 1
+providers:
+  - {name: p1, kind: openai, base_url: "https://example.invalid", params: {api_version: "2024-10-21"}}
+credentials:
+  - {id: c1, provider: p1, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    deployments:
+      - {provider: p1, upstream_model: gpt-4o, credentials: [c1]}
+`))
+		if err != nil {
+			t.Fatalf("config: %v", err)
+		}
+		cfg.Storage.SQLite.Path = filepath.Join(t.TempDir(), "dorang.db")
+		t.Setenv(cfg.Server.KeyPepperEnv, testPepper)
+		t.Setenv(cfg.Server.MasterKeyEnv, testMasterKey)
+		a, err := New(context.Background(), Options{Config: cfg})
+		if a != nil {
+			t.Cleanup(func() { _ = a.Close(context.Background()) })
+		}
+		if err == nil || !strings.Contains(err.Error(), "api_version") {
+			t.Errorf("api_version on an openai provider assembled: %v", err)
+		}
+	})
+}

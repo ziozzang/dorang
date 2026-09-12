@@ -90,3 +90,14 @@ kinds:
     surfaces: [messages]
 `, "responses_only")
 }
+
+// The azure kind speaks the Azure wire shape, which its aliases inherit.
+func TestTheAzureKindSpeaksTheAzureShape(t *testing.T) {
+	c := loadWith(t, "version: 1\n")
+	for _, name := range []string{"azure", "azure-openai", "microsoft-foundry"} {
+		kd, ok := c.Kind(name)
+		if !ok || kd.API != APIAzureOpenAI {
+			t.Errorf("%s: api = %q ok=%t, want %q", name, kd.API, ok, APIAzureOpenAI)
+		}
+	}
+}

@@ -57,12 +57,6 @@ var unsupportedKinds = map[string]unsupportedAdapter{
 			"service-account OAuth exchange in a project-scoped path, none of which this configuration carries. " +
 			"The gemini adapter serves generativelanguage.googleapis.com only.",
 	},
-	"azure": {
-		code: "azure_unsupported",
-		reason: "the azure kind has no adapter in this build: its route carries the deployment name in the path " +
-			"and a mandatory api-version query parameter, and the credential is an api-key header rather than a " +
-			"bearer token. Set base_url to a route that serves /v1/chat/completions to use the openai-chat adapter.",
-	},
 }
 
 // unsupportedAdapter refuses every operation with the same named 501.

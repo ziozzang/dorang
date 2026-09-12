@@ -286,6 +286,8 @@ func adapterFor(api catalog.API, kind string, responsesOnly bool) (adapter, erro
 	switch api {
 	case catalog.APIOpenAIChat, catalog.APIOpenAIResponses:
 		return openaiAdapter{}, nil
+	case catalog.APIAzureOpenAI:
+		return azureAdapter{}, nil
 	case catalog.APIAnthropicMessages:
 		return anthropicAdapter{}, nil
 	case catalog.APIGemini:

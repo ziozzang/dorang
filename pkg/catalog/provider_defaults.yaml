@@ -107,7 +107,7 @@ kinds:
     verified: 2026-07-28
 
   azure:
-    api: openai-chat
+    api: azure-openai
     cache: openai_cache_key
     category: chat
     supports_tools: true
@@ -115,6 +115,11 @@ kinds:
     note: >-
       Deployment-name indirection is configuration, not name parsing: the
       upstream deployment is an explicit field, never derived from the model.
+      The unified /openai/v1 surface is the default route and takes the
+      deployment name in the body; params.api_version selects the legacy
+      per-deployment path. The credential travels as the api-key header. Not
+      measured against a live resource (the operator has none); the contract
+      is Azure's published one and is pinned against a fake.
 
   # ---- Anthropic-shaped ----------------------------------------------------
 

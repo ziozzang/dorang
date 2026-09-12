@@ -493,6 +493,10 @@ type Params struct {
 	// receives one buffered answer.
 	ForceStream bool `yaml:"force_stream,omitempty"`
 	StoreFalse  bool `yaml:"store_false,omitempty"`
+	// APIVersion selects Azure OpenAI's legacy per-deployment surface and is
+	// its mandatory `api-version` query parameter. Unset takes the unified
+	// /openai/v1 surface. Refused on any kind but azure.
+	APIVersion string `yaml:"api_version,omitempty"`
 }
 
 // Output-ceiling spellings for `max_tokens_field`.

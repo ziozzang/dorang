@@ -56,7 +56,9 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			// A Responses-only host's contract, stated by the deployment.
 			ResponsesForceStream: p.Params.ForceStream,
 			ResponsesStoreFalse:  p.Params.StoreFalse,
-			Timeout:              p.Timeout.Duration(),
+			// Azure's legacy surface, by its one mandatory parameter.
+			AzureAPIVersion: p.Params.APIVersion,
+			Timeout:         p.Timeout.Duration(),
 			// providers[].retry, which is a different thing from the fallback
 			// chain of §7.6 and is documented as such on [backend.Policy].
 			Retry: backend.Policy{

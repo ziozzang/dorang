@@ -13,8 +13,12 @@ type API string
 
 // Wire adapters.
 const (
-	APIOpenAIChat        API = "openai-chat"
-	APIOpenAIResponses   API = "openai-responses"
+	APIOpenAIChat      API = "openai-chat"
+	APIOpenAIResponses API = "openai-responses"
+	// APIAzureOpenAI is the OpenAI wire shape on an Azure OpenAI resource:
+	// the same body, the routes under /openai/v1 (or the legacy
+	// per-deployment path with api-version), and an api-key header.
+	APIAzureOpenAI       API = "azure-openai"
 	APIAnthropicMessages API = "anthropic-messages"
 	APIGemini            API = "gemini"
 	APICohere            API = "cohere"
@@ -23,7 +27,7 @@ const (
 )
 
 var validAPIs = map[API]bool{
-	APIOpenAIChat: true, APIOpenAIResponses: true, APIAnthropicMessages: true,
+	APIOpenAIChat: true, APIOpenAIResponses: true, APIAzureOpenAI: true, APIAnthropicMessages: true,
 	APIGemini: true, APICohere: true, APIJina: true, APIEcho: true,
 }
 

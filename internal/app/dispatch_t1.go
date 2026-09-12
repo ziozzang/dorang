@@ -134,13 +134,13 @@ func checkFamily(c *call, api catalog.API) error {
 		// The relayed OpenAI shape, and the one vendor whose /v1/embeddings is
 		// close enough to relay into — same route, same members, with `input`
 		// normalized to an array by that adapter.
-		ok = api == catalog.APIOpenAIChat || api == catalog.APIJina
+		ok = api == catalog.APIOpenAIChat || api == catalog.APIAzureOpenAI || api == catalog.APIJina
 	case callRerank:
 		// The self-hosted engines serve the same shape at /rerank, so they are
 		// accepted alongside the two vendors whose protocol it is.
 		ok = api == catalog.APICohere || api == catalog.APIJina || api == catalog.APIOpenAIChat
 	case callModerations, callSpeech, callTranscription, callImages:
-		ok = api == catalog.APIOpenAIChat || api == catalog.APIOpenAIResponses
+		ok = api == catalog.APIOpenAIChat || api == catalog.APIOpenAIResponses || api == catalog.APIAzureOpenAI
 	case callCompletions:
 		// A non-streaming legacy request crosses into any family: it is a
 		// conversation in the neutral form and comes back through it. A
@@ -148,7 +148,7 @@ func checkFamily(c *call, api catalog.API) error {
 		// streaming work emits chat.completion.chunk frames and a
 		// /v1/completions client reads text_completion ones. Emitting the wrong
 		// shape is worse than refusing.
-		ok = !c.stream || api == catalog.APIOpenAIChat
+		ok = !c.stream || api == catalog.APIOpenAIChat || api == catalog.APIAzureOpenAI
 	}
 	if ok {
 		return nil

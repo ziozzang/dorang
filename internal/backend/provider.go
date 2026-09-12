@@ -105,6 +105,10 @@ type Spec struct {
 	// [NewProvider] unless ResponsesOnly: nothing else reads them.
 	ResponsesForceStream bool
 	ResponsesStoreFalse  bool
+	// AzureAPIVersion selects Azure OpenAI's legacy per-deployment surface
+	// and is its mandatory query parameter (`params.api_version`). Refused on
+	// any other kind: only [azureAdapter] reads it.
+	AzureAPIVersion string
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -138,6 +142,8 @@ type Provider struct {
 	// primary, keyed by the caller family it serves. [Provider.pick] reads it.
 	native map[catalog.API]adapter
 	drop   []string
+	// azureAPIVersion: see [Spec.AzureAPIVersion].
+	azureAPIVersion string
 }
 
 // NewProvider resolves a spec.
@@ -168,6 +174,9 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := checkAzureParams(s, api); err != nil {
+		return nil, err
+	}
 	drop, err := resolveDropParams(api, s.DropParams)
 	if err != nil {
 		return nil, err
@@ -183,6 +192,8 @@ func NewProvider(s Spec) (*Provider, error) {
 		ad:      ad,
 		native:  native,
 		drop:    drop,
+
+		azureAPIVersion: s.AzureAPIVersion,
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,
@@ -259,6 +270,14 @@ type nativeMessagesAdapter struct {
 
 func (a nativeMessagesAdapter) credential(secret string, h http.Header) {
 	a.primary.credential(secret, h)
+}
+
+// errParamOnWrongKind is the refusal for a provider setting only one adapter
+// reads, found on a kind that adapter does not serve (CONFIG §23.2).
+func errParamOnWrongKind(param, kind, api, what string) error {
+	return fmt.Errorf("backend: params.%s is set, but kind %q speaks %s, and the setting is %s — "+
+		"it would load and change nothing. Remove it, or move the provider to the kind it is for",
+		param, kind, api, what)
 }
 
 // checkResponsesContract refuses the Responses-only settings on a host that is

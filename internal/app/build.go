@@ -439,7 +439,7 @@ func checkMaxTokensField(cat *catalog.Catalog, model, provider, kind, field stri
 	if field == "" {
 		return nil
 	}
-	if api := apiFor(cat, kind); api != catalog.APIOpenAIChat && api != catalog.APIOpenAIResponses {
+	if api := apiFor(cat, kind); api != catalog.APIOpenAIChat && api != catalog.APIOpenAIResponses && api != catalog.APIAzureOpenAI {
 		return fmt.Errorf("app: model %s deployment on provider %q: max_tokens_field is set to %q, "+
 			"but this provider's kind %q speaks %s, whose request has no such choice — "+
 			"the setting would load and change nothing. Remove it, or move the deployment "+
