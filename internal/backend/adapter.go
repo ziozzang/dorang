@@ -97,9 +97,10 @@ type exchange struct {
 	// "exactly once" is a property of this struct rather than of the reader of
 	// two call sites in [Backend.finish].
 	accepted bool
-	// ad is the adapter this exchange speaks through and api the family it
-	// is encoded against — the provider's primary pair, or the native pair
-	// for the caller's own surface when the host serves it ([Provider.pick]).
+	// ad is the adapter this exchange speaks through and api the surface it
+	// took — the provider's primary pair, or the native pair for the caller's
+	// own surface when the host serves it ([Provider.pick]). api is recorded
+	// for the report and reads nothing else.
 	ad  adapter
 	api catalog.API
 }
@@ -188,13 +189,13 @@ func (x *exchange) toolNames() *openai.ToolNames {
 // answering the question separately is exactly how a request gets refused
 // against one capability set and encoded against another.
 func (x *exchange) capabilities() canonical.Capability {
-	if x.api != "" && x.api != x.prov.api {
-		// A native surface is that family's shape on this host, so it is
-		// that family's capability set: a deployment's declared set describes
-		// the primary route and would report a construct the Anthropic route
-		// takes natively as lost on the chat route it never went to.
-		return CapabilitiesForAPI(x.api)
-	}
+	// The deployment's declared set, whichever of the host's surfaces the
+	// exchange takes: it is the operator's statement about what the
+	// deployment can express, and the route does not change it. (A branch
+	// that swapped in the native surface's family default was tried and
+	// removed: no test could observe it, because the OpenAI-shaped default is
+	// a superset of the Anthropic one in this build, and an unobservable
+	// branch is the §17.1 defect waiting to happen.)
 	if x.target.Capabilities != 0 {
 		return x.target.Capabilities
 	}
