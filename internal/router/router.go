@@ -1475,6 +1475,11 @@ func (r *Router) Report(d *Decision, o Outcome) {
 	case CauseRateLimit:
 		if o.RetryAfter > 0 {
 			r.deps.Health.MarkUnavailable(d.Deployment, o.RetryAfter)
+		} else if w := o.ResetAt.Sub(r.now()); !o.ResetAt.IsZero() && w > 0 {
+			// The provider named the instant its window recovers; that is a
+			// better cooldown than the configured default, which is a guess
+			// made before the provider had said anything.
+			r.deps.Health.MarkUnavailable(d.Deployment, w)
 		} else if r.cfg.Fallback.RateLimitCooldown > 0 {
 			r.deps.Health.MarkUnavailable(d.Deployment, r.cfg.Fallback.RateLimitCooldown)
 		}

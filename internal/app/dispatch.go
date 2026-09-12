@@ -810,6 +810,10 @@ func backendResult(br backend.Result) result {
 		Err: br.Err, Status: br.Status, Cause: cause,
 		TTFT: br.TTFT, Total: br.Total,
 		FirstByteSent: br.FirstByteSent, RetryAfter: br.RetryAfter,
+		// The upstream-signalled reset (DESIGN §17.1's third harness row):
+		// the router reads it for the cooldown and the client sees it as
+		// Retry-After through router.Error.ResetAt.
+		ResetAt: br.ResetAt,
 	}
 	return res
 }

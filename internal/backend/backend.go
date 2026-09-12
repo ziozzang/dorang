@@ -345,6 +345,13 @@ type Result struct {
 	Total time.Duration
 	// RetryAfter is a provider-signalled cooldown, zero when none was sent.
 	RetryAfter time.Duration
+	// ResetAt is the instant the provider said its exhausted window recovers,
+	// read from the rate-limit headers of a 429/503/529 that carried no
+	// Retry-After (see [rateLimitReset]). Zero when nothing was said. It is
+	// what [router.Outcome.ResetAt] is filled from, and until it was, an
+	// upstream that signalled its reset this way — the OpenAI-shaped hosts do —
+	// reached neither the deployment cooldown nor the client's Retry-After.
+	ResetAt time.Time
 	// FirstByteSent reports that the client has already seen output, which
 	// closes fail-back for good (§7.6).
 	FirstByteSent bool
@@ -599,6 +606,24 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		if res.Err.RetryAfterSeconds > 0 && res.RetryAfter == 0 {
 			res.RetryAfter = time.Duration(res.Err.RetryAfterSeconds) * time.Second
 		}
+		if res.RetryAfter == 0 && retrySignalling(resp.StatusCode) {
+			// No Retry-After. The rate-limit headers may still name the
+			// instant the exhausted window recovers, and that instant is the
+			// same fact in another spelling. It travels as two things on
+			// purpose: the seconds the CLIENT is told, on the error it will
+			// receive, and the instant the ROUTER reads for the cooldown, on
+			// ResetAt — RetryAfter stays the literal header, so a reader can
+			// tell which of the two the provider actually sent.
+			now := b.now()
+			if t := rateLimitReset(resp.Header, now); !t.IsZero() {
+				res.ResetAt = t
+				secs := int((t.Sub(now) + time.Second - 1) / time.Second)
+				if secs < 1 {
+					secs = 1
+				}
+				res.Err.RetryAfterSeconds = secs
+			}
+		}
 		res.Retryable = true
 		b.report(&res, *x.target, x.call)
 		return res
@@ -727,6 +752,13 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	res.ContentType = ctype
 	res.ServedModel, res.ModelAgreement = x.served, x.agree
 	return res
+}
+
+// retrySignalling names the statuses whose whole content is "come back later"
+// (COMPATIBILITY §11.4): 429, 503, and 529 — the Anthropic family's spelling of
+// 503. A reset header on any other status is a stray and is not read.
+func retrySignalling(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status == 529
 }
 
 // jsonLabelled reports whether a Content-Type names a JSON document.

@@ -319,6 +319,105 @@ func upstreamError(status int, body []byte, h http.Header, secrets []string) *se
 	return e
 }
 
+// rateLimitReset reads the instant an upstream's exhausted window recovers
+// from the rate-limit headers a 429 carries when it carries no Retry-After.
+//
+// Three spellings are read, because three families emit them and a client
+// behind this gateway sees none of them:
+//
+//   - OpenAI-shaped: `x-ratelimit-reset-requests` / `-tokens`, a duration
+//     ("1s", "6m0s", "20ms"), beside `x-ratelimit-remaining-*` counts.
+//   - Anthropic: `anthropic-ratelimit-requests-reset` / `-tokens-reset` /
+//     `-input-tokens-reset` / `-output-tokens-reset`, RFC 3339 instants,
+//     beside `anthropic-ratelimit-*-remaining`.
+//   - IETF draft: `RateLimit-Reset`, delta seconds; and the widespread
+//     `X-RateLimit-Reset`, delta seconds or a Unix epoch (told apart by size).
+//
+// Which window? The one that is EXHAUSTED: a counter whose `remaining` reads
+// zero names the reason for the 429, and its reset is the answer. Among
+// several exhausted, the earliest — the deployment is worth asking again the
+// moment any of them frees, and if another is still exhausted the next 429
+// says so with its own headers. When no counter reports itself exhausted the
+// earliest reset of all is taken, on the same reasoning: too short a cooldown
+// costs one more 429, too long one withholds a working deployment for a window
+// nobody named. An instant already past is nothing.
+func rateLimitReset(h http.Header, now time.Time) time.Time {
+	if h == nil {
+		return time.Time{}
+	}
+	var exhausted, any_ []time.Time
+	note := func(remaining, reset string, at time.Time) {
+		if at.IsZero() || !at.After(now) {
+			return
+		}
+		any_ = append(any_, at)
+		if n, err := strconv.ParseInt(strings.TrimSpace(remaining), 10, 64); err == nil && n <= 0 {
+			exhausted = append(exhausted, at)
+		}
+	}
+	// OpenAI-shaped: durations.
+	for _, w := range [...]string{"requests", "tokens"} {
+		if v := h.Get("x-ratelimit-reset-" + w); v != "" {
+			if d, ok := parseResetDuration(v); ok {
+				note(h.Get("x-ratelimit-remaining-"+w), v, now.Add(d))
+			}
+		}
+	}
+	// Anthropic: instants.
+	for _, w := range [...]string{"requests", "tokens", "input-tokens", "output-tokens"} {
+		if v := h.Get("anthropic-ratelimit-" + w + "-reset"); v != "" {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				note(h.Get("anthropic-ratelimit-"+w+"-remaining"), v, t)
+			}
+		}
+	}
+	// IETF draft and the X- spelling.
+	for _, name := range [...]string{"RateLimit-Reset", "X-RateLimit-Reset"} {
+		v := strings.TrimSpace(h.Get(name))
+		if v == "" {
+			continue
+		}
+		n, err := strconv.ParseFloat(v, 64)
+		if err != nil || n <= 0 {
+			continue
+		}
+		var at time.Time
+		if n > 1e9 {
+			at = time.Unix(int64(n), 0) // an epoch, not a delta
+		} else {
+			at = now.Add(time.Duration(n * float64(time.Second)))
+		}
+		remaining := h.Get(strings.Replace(name, "Reset", "Remaining", 1))
+		note(remaining, v, at)
+	}
+	pick := exhausted
+	if len(pick) == 0 {
+		pick = any_
+	}
+	var best time.Time
+	for _, t := range pick {
+		if best.IsZero() || t.Before(best) {
+			best = t
+		}
+	}
+	return best
+}
+
+// parseResetDuration reads OpenAI's reset spelling. It is Go's duration
+// grammar for every value the surface has been seen to emit ("1s", "6m0s",
+// "20ms", "1h2m3s"); a bare number is seconds, which some compatible hosts
+// send instead.
+func parseResetDuration(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d, true
+	}
+	if n, err := strconv.ParseFloat(v, 64); err == nil && n > 0 {
+		return time.Duration(n * float64(time.Second)), true
+	}
+	return 0, false
+}
+
 // redirectError is a 30x that dorang refused to follow.
 //
 // The Location is deliberately absent from the message. It is a string the

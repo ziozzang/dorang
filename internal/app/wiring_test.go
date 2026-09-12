@@ -694,3 +694,98 @@ func degradeMeter(t *testing.T, m *meter.Meter) {
 	}
 	t.Fatal("could not make the meter drop a trace, so this test proves nothing")
 }
+
+// A relayed 429 that carried only a rate-limit reset header reaches the caller
+// with a Retry-After.
+//
+// COMPATIBILITY §11.4's fourth case: the provider said when its window recovers
+// in the header its family uses, not in Retry-After, and the gateway forwarded
+// nothing. The whole stack, with the one deployment rate-limited: the caller's
+// 429 must carry the seconds the provider's instant implies.
+func TestAnUpstreamResetHeaderReachesTheCallerAsRetryAfter(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("x-ratelimit-remaining-requests", "0")
+		w.Header().Set("x-ratelimit-reset-requests", "6m0s")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"slow down","type":"rate_limit_error"}}`))
+	}))
+	t.Cleanup(up.Close)
+	yaml := fmt.Sprintf(spellingYAML, up.URL, "{}", "")
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = up.Client() })
+	key := issueKey(t, a, nil)
+	w := callWith(a, key, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m1","messages":[{"role":"user","content":"go"}]}`)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429\n%s", w.Code, w.Body.String())
+	}
+	got, err := strconv.Atoi(w.Header().Get("Retry-After"))
+	if err != nil || got < 359 || got > 361 {
+		t.Errorf("Retry-After = %q, want ~360 from the provider's 6m0s reset", w.Header().Get("Retry-After"))
+	}
+}
+
+// The reset instant takes the deployment out of selection for the window the
+// provider named — through the whole stack.
+//
+// Two deployments in one group. The first answers 429 with only a rate-limit
+// reset header (no Retry-After); the second answers. Request one falls back
+// and succeeds; request two must go straight to the second deployment,
+// because the first is in the cooldown the provider named. The observable is
+// how many requests the rate-limited upstream received: one. It is what the
+// backend's ResetAt is FOR, and the one consequence the client's Retry-After
+// cannot stand in for.
+func TestAProviderNamedResetKeepsTheDeploymentOutOfSelection(t *testing.T) {
+	var limited, healthy atomic.Int64
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		limited.Add(1)
+		w.Header().Set("x-ratelimit-remaining-requests", "0")
+		w.Header().Set("x-ratelimit-reset-requests", "10m0s")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"slow down","type":"rate_limit_error"}}`))
+	}))
+	t.Cleanup(upA.Close)
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		healthy.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"1","object":"chat.completion","created":1,"model":"m1-b",
+			"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+			"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`)
+	}))
+	t.Cleanup(upB.Close)
+	yaml := `
+version: 1
+providers:
+  - {name: pa, kind: openai, base_url: "` + upA.URL + `"}
+  - {name: pb, kind: openai, base_url: "` + upB.URL + `"}
+credentials:
+  - {id: ca, provider: pa, key_env: DORANG_APP_TEST_KEY}
+  - {id: cb, provider: pb, key_env: DORANG_APP_TEST_KEY}
+models:
+  - name: m1
+    strategy: [priority]
+    deployments:
+      - {provider: pa, upstream_model: m1-a, credentials: [ca], priority: 0}
+      - {provider: pb, upstream_model: m1-b, credentials: [cb], priority: 1}
+`
+	a := newWiringApp(t, yaml, nil, func(o *Options) { o.Upstream = upA.Client() })
+	key := issueKey(t, a, nil)
+	for i := 1; i <= 2; i++ {
+		w := callWith(a, key, http.MethodPost, "/v1/chat/completions",
+			`{"model":"m1","messages":[{"role":"user","content":"go"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d\n%s", i, w.Code, w.Body.String())
+		}
+	}
+	if got := limited.Load(); got != 1 {
+		t.Errorf("the rate-limited deployment received %d requests, want 1: the reset the provider named "+
+			"did not keep it out of selection", got)
+	}
+	if got := healthy.Load(); got != 2 {
+		t.Errorf("the healthy deployment received %d requests, want 2", got)
+	}
+}

@@ -699,13 +699,17 @@ both directions — the three statuses that carry it and the three that must not
 > on every X" is a completeness claim, and a completeness claim in prose is a test nobody runs.**
 > The table above is now pinned by name.
 
-> ⚠️ **A fourth case is not covered, and it is stated rather than left to be discovered.** "The
-> upstream supplies one" means a literal `Retry-After` header: `internal/backend`'s parser
-> reads that name and no other. An upstream that answers `429` carrying only
-> `x-ratelimit-reset-requests` — a window reset instant rather than a delay — supplies nothing
-> this gateway forwards. `router.Outcome.ResetAt` is the field that would carry it and **it has
-> no producer anywhere in the tree**, so the reset reaches neither this header nor §7.6's
-> cooldown, and the deployment is not taken out of selection for the window the provider named.
-> dorang's *own* quota source populates the header correctly; only the upstream-signalled reset
-> is affected. Tracked as the third row of DESIGN §17.1's harness table, which is where it was
-> found: the scenario harness read the reset header and production never has.
+> ✅ **The fourth case is covered since 2026-09-12.** "The upstream supplies one" used to mean a
+> literal `Retry-After` header and nothing else, so an upstream answering `429` with only
+> `x-ratelimit-reset-requests` — a window reset instant rather than a delay — supplied nothing
+> this gateway forwarded, and `router.Outcome.ResetAt` had no producer anywhere in the tree.
+> `internal/backend.rateLimitReset` now reads the three spellings on a `429`, `503` or `529` that
+> carries no `Retry-After`: OpenAI's `x-ratelimit-reset-*` durations, Anthropic's
+> `anthropic-ratelimit-*-reset` instants, and the IETF `RateLimit-Reset` / `X-RateLimit-Reset`
+> deltas. The exhausted window (its `remaining` reads zero) is the one taken, the earliest among
+> several; the instant becomes the client's `Retry-After`, the deployment's cooldown (in place of
+> `fallback.rate_limit_cooldown`, which is a guess made before the provider said anything) and the
+> outcome's reset. A stray reset header on a `400` is not read. Pinned by
+> `TestAnUpstreamResetHeaderIsAWaitAndACooldown` (backend),
+> `TestAProviderNamedResetOutlivesTheConfiguredCooldown` (router) and
+> `TestAnUpstreamResetHeaderReachesTheCallerAsRetryAfter` (the assembled gateway).
