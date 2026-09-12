@@ -55,14 +55,18 @@ type dropRule func(*Request) bool
 
 // dropByName is the modelled half of the vocabulary.
 //
-// `max_tokens` and `max_completion_tokens` are one entry twice over, because
-// they are one field twice over: internal/wire/openai emits [Request.MaxTokens]
-// under whichever spelling the adapter selected, and an operator who has to
-// name a spelling to get a drop has been asked to know something dorang decided.
-// An incumbent configuration lists both for the same reason.
+// `max_tokens`, `max_completion_tokens` and `max_output_tokens` are one entry
+// three times over, because they are one field three times over:
+// internal/wire/openai emits [Request.MaxTokens] under whichever spelling the
+// adapter selected — the third is the Responses surface's — and an operator who
+// has to name a spelling to get a drop has been asked to know something dorang
+// decided. An incumbent configuration lists both chat spellings for the same
+// reason, and a Responses-only host that refuses the field ("Unsupported
+// parameter: max_output_tokens", measured) is refused in ITS spelling.
 var dropByName = map[string]dropRule{
 	"max_tokens":            func(r *Request) bool { return clearPtr(&r.MaxTokens) },
 	"max_completion_tokens": func(r *Request) bool { return clearPtr(&r.MaxTokens) },
+	"max_output_tokens":     func(r *Request) bool { return clearPtr(&r.MaxTokens) },
 	"temperature":           func(r *Request) bool { return clearPtr(&r.Temperature) },
 	"top_p":                 func(r *Request) bool { return clearPtr(&r.TopP) },
 	"top_k":                 func(r *Request) bool { return clearPtr(&r.TopK) },

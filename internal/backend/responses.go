@@ -78,8 +78,13 @@ func (responsesAdapter) headers(http.Header) {}
 
 func (responsesAdapter) encode(x *exchange) ([]byte, error) {
 	opt := &openai.EncodeOptions{
-		Model:       x.target.UpstreamModel,
-		Loss:        x.loss,
+		Model: x.target.UpstreamModel,
+		Loss:  x.loss,
+		// The same registry the chat adapter hands its encoder: a tool name
+		// over the wire limit is shortened reversibly (COMPATIBILITY 5.3) and
+		// restored by the decoders below. Without it the encoder sends the
+		// caller's name unchanged and this host refuses the request.
+		ToolNames:   x.toolNames(),
 		ForceStream: x.prov.ResponsesForceStream,
 		StoreFalse:  x.prov.ResponsesStoreFalse,
 	}
@@ -100,6 +105,13 @@ func (responsesAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 	if eventStream(x.respType, body) {
 		return collectResponses(body, x)
 	}
+	// The same gate the chat decoder applies before reading a JSON body: a 200
+	// carrying an error envelope, `{}` or `null` is not a response of this
+	// family, and decoding it leniently yields a successful answer with no
+	// content — the shape [openai.ErrNotAResponse] exists to refuse.
+	if !openai.IsResponsesAnswer(body) {
+		return nil, openai.ErrNotAResponse
+	}
 	resp, err := openai.DecodeResponsesResponse(body, &openai.DecodeOptions{
 		Model: x.call.Model, ToolNames: x.names,
 	})
@@ -112,29 +124,37 @@ func (responsesAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 
 // eventStream reports whether a buffered body is a server-sent event stream.
 //
-// The label decides when it is present, and the first bytes decide when it is
-// not: a JSON document begins with `{`, and an SSE stream begins with a field
-// name. Both are consulted because the relay already tolerates a mislabelled
-// stream ("an upstream that mislabels a real stream must not be turned away
-// over a header"), and a buffered reading of the same host should not be
-// stricter than a streaming one.
+// The BODY decides, and the label only breaks a tie. A JSON document begins
+// with `{` and no SSE stream does, so a JSON answer under a `text/event-stream`
+// label is read as the JSON it is — reading it as a stream would find no
+// events and offer a completed, billed generation to the fallback chain as
+// "the upstream said nothing". A body that begins with an SSE field name is a
+// stream whatever the label says, because the relay already tolerates a
+// mislabelled stream and a buffered reading of the same host should not be
+// stricter. The label decides only for a body that begins with neither: a
+// comment line, a stream of nothing.
+//
+// A byte-order mark is skipped first. It is not part of either format and a
+// proxy that re-encoded the body may have put one there.
 func eventStream(ctype string, body []byte) bool {
-	if mt := ctype; mt != "" {
-		if i := strings.IndexByte(mt, ';'); i >= 0 {
-			mt = mt[:i]
-		}
-		if strings.EqualFold(strings.TrimSpace(mt), "text/event-stream") {
-			return true
-		}
+	b := bytes.TrimLeft(bytes.TrimPrefix(body, utf8BOM), " \t\r\n")
+	if len(b) > 0 && b[0] == '{' {
+		return false
 	}
-	b := bytes.TrimLeft(body, " \t\r\n")
-	for _, field := range [...]string{"data:", "event:", "id:", "retry:", ":"} {
+	for _, field := range [...]string{"data:", "event:", "id:", "retry:"} {
 		if bytes.HasPrefix(b, []byte(field)) {
 			return true
 		}
 	}
-	return false
+	mt := ctype
+	if i := strings.IndexByte(mt, ';'); i >= 0 {
+		mt = mt[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(mt), "text/event-stream")
 }
+
+// utf8BOM is the byte-order mark; see [eventStream].
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
 func (responsesAdapter) source(r io.Reader, x *exchange) (eventSource, error) {
 	return &responsesSource{d: openai.NewResponsesStreamDecoder(r, &openai.DecodeOptions{
@@ -177,13 +197,20 @@ func (s *responsesSource) terminated() bool { return false }
 //     relay scrubs it, and it is not offered to the fallback chain: the host
 //     bills the generation it started whether or not it finished, and a hop to
 //     a sibling deployment would buy a second one.
-//   - A stream that ends without its terminal event is
-//     [CodeUpstreamStreamTruncated] and terminal for the same reason. What
-//     arrived is a prefix of an answer, and a 200 carrying a prefix is the §10.5a
-//     objection in its buffered form.
-//   - A stream with no events at all is [CodeUpstreamShape]: the host answered
-//     200 and said nothing, no generation began, and a sibling deployment is
-//     exactly the right next hop.
+//   - A stream that ends without its terminal event after the generation has
+//     produced something — a content or reasoning fragment, a tool-call
+//     fragment, a refusal, a count — is [CodeUpstreamStreamTruncated] and
+//     terminal for the same reason. What arrived is a prefix of an answer, and
+//     a 200 carrying a prefix is the §10.5a objection in its buffered form.
+//   - A stream that ends before anything was generated — no events at all, or
+//     only the opening `response.created` — is [CodeUpstreamShape]: the host
+//     answered 200 and produced nothing, and a sibling deployment is exactly
+//     the right next hop. This is the relay's own rule seen from the buffered
+//     side: the relay offers a truncated stream to the chain when nothing
+//     reached the client, and the start event writes nothing to the client.
+//   - A `data:` payload that is not JSON is [CodeUpstreamDecode] and terminal:
+//     the bytes before it may be a real prefix, and the decoder refuses to
+//     skip a frame and hand on an answer with a hole in it.
 func collectResponses(body []byte, x *exchange) (*decoded, error) {
 	src, err := x.prov.ad.source(bytes.NewReader(body), x)
 	if err != nil {
@@ -193,7 +220,7 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 
 	resp := &canonical.Response{Model: x.call.Model}
 	choice := canonical.Choice{Message: canonical.Message{Role: canonical.RoleAssistant}}
-	var text, thinking strings.Builder
+	var text, thinking, refusal strings.Builder
 	type call struct {
 		id, name string
 		args     strings.Builder
@@ -202,7 +229,9 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 	var order []int
 	var usage canonical.Usage
 	var haveUsage, terminal bool
-	var seen int
+	// progress records that the generation produced something, which is what
+	// decides whether a cut-off stream may be retried elsewhere.
+	var progress bool
 
 	for {
 		evs, err := src.next()
@@ -218,7 +247,6 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 		}
 		for i := range evs {
 			e := &evs[i]
-			seen++
 			if e.ID != "" {
 				resp.ID = e.ID
 			}
@@ -236,6 +264,7 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 				// about to leave dorang.
 				return nil, inBandFailure(e.Err, x.secrets).err
 			case canonical.EventUsage:
+				progress = true
 				if e.Usage != nil {
 					usage, haveUsage = *e.Usage, true
 				}
@@ -249,6 +278,7 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 				}
 			}
 			for _, blk := range e.Delta.Content {
+				progress = true
 				switch blk.Kind {
 				case canonical.KindText:
 					text.WriteString(blk.Text)
@@ -256,7 +286,12 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 					thinking.WriteString(blk.Text)
 				}
 			}
+			if e.Delta.Refusal != "" {
+				progress = true
+				refusal.WriteString(e.Delta.Refusal)
+			}
 			for _, tc := range e.Delta.ToolCalls {
+				progress = true
 				c, ok := calls[tc.Index]
 				if !ok {
 					c = &call{}
@@ -273,9 +308,9 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 			}
 		}
 	}
-	if seen == 0 {
+	if !terminal && !progress {
 		return nil, server.NewError(http.StatusBadGateway, server.TypeAPIError,
-			"the upstream answered 200 with an event stream carrying no events").
+			"the upstream answered 200 with an event stream that produced nothing").
 			WithCode(CodeUpstreamShape)
 	}
 	if !terminal {
@@ -291,14 +326,23 @@ func collectResponses(body []byte, x *exchange) (*decoded, error) {
 	if s := text.String(); s != "" {
 		choice.Message.Content = append(choice.Message.Content, canonical.TextBlock(s))
 	}
+	if s := refusal.String(); s != "" {
+		choice.Message.Refusal = s
+		// The JSON decoder's own ordering: a turn that ended in a call is a
+		// call, a turn with nothing but a refusal is a refusal.
+		if choice.StopReason == canonical.StopEndTurn && text.Len() == 0 && len(order) == 0 {
+			choice.StopReason = canonical.StopRefusal
+		}
+	}
 	sort.Ints(order)
 	for _, i := range order {
 		c := calls[i]
-		// The fragments are joined verbatim. A call whose arguments never
-		// streamed is handed on as an empty document, and [malformedToolCall]
-		// in [Backend.convert] decides what that is — the same rule the stream
-		// sinks apply, applied once, here in the same place as for a JSON
-		// answer.
+		// The fragments are joined verbatim, an empty document included. A
+		// call whose arguments never streamed is rendered as an empty object
+		// by EVERY client encoder (openai chat and responses, anthropic), which
+		// is where that rule lives; a second copy here would be a second place
+		// for it to drift. [malformedToolCall] in [Backend.convert] skips the
+		// empty case for the same reason.
 		choice.Message.Content = append(choice.Message.Content,
 			canonical.ToolUseBlock(c.id, c.name, json.RawMessage(c.args.String())))
 	}

@@ -310,3 +310,163 @@ data: {"type":"response.completed","response":{"id":"r","status":"completed",` +
 		}
 	})
 }
+
+// A `data:` payload that is not JSON is an error, not a skipped frame.
+//
+// The two cases look alike and are opposites. An event whose TYPE this build
+// does not know is the vendor extending an open set, and ignoring it invents
+// nothing. A payload that does not parse is corruption, and skipping it would
+// drop a text delta and hand on the rest as a whole answer — which is exactly
+// the case below: the corrupted frame is the middle of the text.
+func TestAMalformedFrameIsAnErrorNotAHole(t *testing.T) {
+	const sse = `data: {"type":"response.created","response":{"id":"r","model":"m"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"the "}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"mid
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"dle"}
+
+data: {"type":"response.completed","response":{"id":"r","status":"completed"}}
+
+`
+	_, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err == nil {
+		t.Fatal("a frame that is not JSON was skipped, and the answer went on without the " +
+			"delta it carried")
+	}
+}
+
+// One event's `data:` lines are one payload.
+//
+// The SSE rule: every `data:` line up to the dispatching blank line, joined by
+// newlines. This vendor never splits a payload and a proxy re-wrapping the
+// stream may; a decoder reading each line as its own frame would find two
+// halves of one document and parse neither.
+func TestAMultiLineDataFieldIsOneFrame(t *testing.T) {
+	const sse = "data: {\"type\":\"response.created\",\n" +
+		"data: \"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"whole\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err != nil {
+		t.Fatalf("a payload split across two data lines did not decode: %v", err)
+	}
+	var text strings.Builder
+	var start bool
+	for _, e := range evs {
+		if e.Type == canonical.EventStart {
+			start = true
+		}
+		for _, b := range e.Delta.Content {
+			text.WriteString(b.Text)
+		}
+	}
+	if !start || text.String() != "whole" {
+		t.Errorf("start=%t text=%q; the split frame was not reassembled", start, text.String())
+	}
+}
+
+// A byte-order mark does not hide the first event.
+func TestALeadingBOMDoesNotHideTheFirstEvent(t *testing.T) {
+	sse := "\xEF\xBB\xBFdata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"bom-model\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(evs) == 0 || evs[0].Type != canonical.EventStart || evs[0].Model != "bom-model" {
+		t.Errorf("the first event was lost behind the BOM: %+v", evs)
+	}
+}
+
+// `response.failed` is an error the caller sees, not a stop.
+//
+// The generation did not finish and the upstream said why, inside
+// `response.error`. Rendering that as a stop reason hands the caller a clean
+// end of turn over an answer that was never produced — and, through the relay,
+// records no failure anywhere.
+func TestAFailedResponseIsAnErrorNotAStop(t *testing.T) {
+	const sse = `data: {"type":"response.created","response":{"id":"r","model":"m"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"lookup","call_id":"c"}}
+
+data: {"type":"response.failed","response":{"id":"r","status":"failed","error":{"code":"server_error","message":"the model crashed"},"output":[{"type":"function_call","name":"lookup"}]}}
+
+`
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var errEv *canonical.StreamEvent
+	for i := range evs {
+		switch evs[i].Type {
+		case canonical.EventStop:
+			t.Errorf("a failed response produced a stop with reason %q; a client reading it "+
+				"believes the turn ended", evs[i].Delta.StopReason)
+		case canonical.EventError:
+			errEv = &evs[i]
+		}
+	}
+	if errEv == nil || errEv.Err == nil {
+		t.Fatal("no error event for a failed response")
+	}
+	if errEv.Err.Message != "the model crashed" || errEv.Err.Code != "server_error" {
+		t.Errorf("the upstream's reason was lost: %+v", errEv.Err)
+	}
+}
+
+// A ceiling that cut off a tool call is a ceiling.
+//
+// `response.incomplete` with a function call in the partial output used to be
+// reported as tool_use, because the call was there — but a call the ceiling
+// interrupted is not a turn that ended in a call, and a client acting on it
+// would run a tool the model had not finished asking for.
+func TestAnIncompleteToolCallIsNotAToolUseStop(t *testing.T) {
+	const sse = `data: {"type":"response.created","response":{"id":"r","model":"m"}}
+
+data: {"type":"response.incomplete","response":{"id":"r","status":"incomplete","output":[{"type":"function_call","name":"lookup"}]}}
+
+`
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, e := range evs {
+		if e.Type == canonical.EventStop && e.Delta.StopReason != canonical.StopMaxTokens {
+			t.Errorf("stop reason = %q for an incomplete response carrying a call, want %q",
+				e.Delta.StopReason, canonical.StopMaxTokens)
+		}
+	}
+}
+
+// A tool name shortened for the wire comes back as the caller declared it.
+func TestAShortenedToolNameIsRestoredFromTheStream(t *testing.T) {
+	long := strings.Repeat("very_long_function_name_", 4) // 96 bytes, over the limit
+	names := NewToolNames()
+	short := names.Shorten(long, nil)
+	if short == long || len(short) > MaxToolNameLen {
+		t.Fatalf("Shorten(%d bytes) = %q", len(long), short)
+	}
+	sse := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"" + short + "\",\"call_id\":\"c\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
+	evs, err := DecodeResponsesStream([]byte(sse), &DecodeOptions{ToolNames: names})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var got string
+	for _, e := range evs {
+		for _, tc := range e.Delta.ToolCalls {
+			if tc.Name != "" {
+				got = tc.Name
+			}
+		}
+	}
+	if got != long {
+		t.Errorf("tool name on the neutral stream = %q, want the caller's %d-byte name restored", got, len(long))
+	}
+}

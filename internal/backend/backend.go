@@ -680,11 +680,21 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 			b.report(&res, *x.target, x.call)
 			return res
 		}
-		res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
-			"could not read the upstream response").WithCode(CodeUpstreamBody)
-		res.Retryable = true
-		b.report(&res, *x.target, x.call)
-		return res
+		if !x.prov.ResponsesForceStream || len(body) == 0 {
+			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+				"could not read the upstream response").WithCode(CodeUpstreamBody)
+			res.Retryable = true
+			b.report(&res, *x.target, x.call)
+			return res
+		}
+		// The transport failed under a stream the host was forced to send. The
+		// bytes that arrived are read exactly as a clean end would have read
+		// them: a terminal event that got through is a whole answer and is
+		// served, and anything short of one is classified by the collector —
+		// truncated after the generation produced something, and not offered
+		// to the fallback chain, because the host bills the turn it began.
+		// Calling this "could not read the upstream response" and retrying
+		// would buy that generation twice.
 	}
 
 	// The upstream's own labelling is the only way to tell a JSON transcript
@@ -765,7 +775,11 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 	}
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return nil, err
+		// What was read before the failure travels with it. For most callers
+		// it is nothing they can use; for a forced stream it is the part of
+		// the answer that arrived, and whether that part is complete is a
+		// question the stream itself answers.
+		return b, err
 	}
 	if int64(len(b)) > limit {
 		return nil, errUpstreamTooLarge

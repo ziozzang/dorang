@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -427,6 +429,25 @@ func TestATruncatedStreamIsNotAPartialAnswer(t *testing.T) {
 		}
 	})
 
+	t.Run("only the opening event", func(t *testing.T) {
+		// The relay's own rule: the start event writes nothing to the client,
+		// so a stream cut off after it is offered to the chain there — and the
+		// buffered side must not be stricter about a generation that produced
+		// nothing.
+		f := newFakeUpstream(t)
+		serveStream(t, f, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n")
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err == nil {
+			t.Fatalf("a stream that only opened became a 200:\n%s", res.Body)
+		}
+		if res.Err.Code != CodeUpstreamShape || !res.Retryable {
+			t.Errorf("code=%q retryable=%t; nothing was generated, and the sibling deployment "+
+				"was not offered", res.Err.Code, res.Retryable)
+		}
+	})
+
 	t.Run("no events at all", func(t *testing.T) {
 		f := newFakeUpstream(t)
 		serveStream(t, f, "")
@@ -527,4 +548,339 @@ func TestTheContractSettingsAreRefusedOffAResponsesOnlyHost(t *testing.T) {
 			t.Errorf("adapter = %T; the catalog flag, not a kind-name table, decides", p.ad)
 		}
 	})
+}
+
+// serveHijacked answers a raw HTTP/1.1 chunked response and closes the
+// connection without the terminating chunk, which is what a transport failure
+// under a stream looks like from the client: bytes, then unexpected EOF.
+func serveHijacked(t *testing.T, f *fakeUpstream, partial string) {
+	t.Helper()
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("the test server cannot hijack")
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Fatalf("hijack: %v", err)
+		}
+		defer conn.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+		if partial != "" {
+			_, _ = buf.WriteString(strconv.FormatInt(int64(len(partial)), 16) + "\r\n" + partial + "\r\n")
+		}
+		_ = buf.Flush()
+	})
+}
+
+// A transport failure under a forced stream is read for what arrived.
+//
+// A buffered caller's stream is read to the end and then converted; when the
+// read itself fails, the bytes that arrived are still the answer's own record.
+// Three cases, three different truths: the terminal event got through and the
+// answer is whole; the generation produced something and was cut off, which
+// the host bills and a fallback hop would buy again; nothing arrived at all,
+// which is the plain transport failure it always was. Calling all three "could
+// not read the upstream response" and retrying was the first draft's rule.
+func TestATransportFailureUnderAForcedStreamIsReadForWhatArrived(t *testing.T) {
+	const opened = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"yes\"}\n\n"
+
+	t.Run("terminal event arrived before the failure", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		serveHijacked(t, f, opened+"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n")
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err != nil {
+			t.Fatalf("a whole answer was refused over the transport failure after it: %v", res.Err)
+		}
+		if !strings.Contains(string(res.Body), `"content":"yes"`) {
+			t.Errorf("body:\n%s", res.Body)
+		}
+	})
+
+	t.Run("cut off after the generation began", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		serveHijacked(t, f, opened)
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err == nil {
+			t.Fatalf("a cut-off generation became an answer:\n%s", res.Body)
+		}
+		if res.Err.Code != CodeUpstreamStreamTruncated {
+			t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamStreamTruncated)
+		}
+		if res.Retryable {
+			t.Error("a generation the host began and bills was offered to the fallback chain")
+		}
+	})
+
+	t.Run("nothing arrived", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		serveHijacked(t, f, "")
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err == nil {
+			t.Fatal("an empty failed read became an answer")
+		}
+		if !res.Retryable {
+			t.Errorf("nothing was generated and the sibling deployment was not offered: %v", res.Err)
+		}
+	})
+}
+
+// A JSON error envelope on a 200 is not an empty successful answer.
+//
+// The same gate the chat decoder applies. Without it `{"error":{...}}`, `{}`
+// and `null` decode leniently to an assistant turn with no content and a clean
+// stop, and a quota refusal reaches the caller as "the model said nothing".
+func TestAJSONErrorEnvelopeOnA200IsRefused(t *testing.T) {
+	for _, body := range []string{`{"error":{"message":"quota exhausted","type":"insufficient_quota"}}`, `{}`, `null`} {
+		t.Run(body, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			})
+			b := testBackend("sk-test")
+			res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+				chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+			if res.Err == nil {
+				t.Fatalf("%s on a 200 became a successful answer:\n%s", body, res.Body)
+			}
+			if res.Err.Code != CodeUpstreamShape {
+				t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamShape)
+			}
+			if !res.Retryable {
+				t.Error("nothing was generated; the sibling deployment was not offered")
+			}
+		})
+	}
+}
+
+// `response.failed` is a failure on both paths.
+//
+// Collected, it is the same scrubbed, terminal envelope an `error` event is.
+// Relayed, the client receives an in-band error frame rather than a clean stop
+// over an answer that was never produced.
+func TestAFailedResponseIsAFailureOnBothPaths(t *testing.T) {
+	const secret = "sk-test-fedcba9876543210"
+	failed := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"par\"}\n\n" +
+		"data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"crashed holding " + secret + "\"}}}\n\n"
+
+	t.Run("collected", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		serveStream(t, f, failed)
+		b := testBackend(secret)
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err == nil {
+			t.Fatalf("a failed response became an answer:\n%s", res.Body)
+		}
+		if res.Err.Code != CodeUpstreamStreamError {
+			t.Errorf("code = %q, want %q", res.Err.Code, CodeUpstreamStreamError)
+		}
+		if res.Retryable {
+			t.Error("a failure after generation began was offered to the fallback chain")
+		}
+		if strings.Contains(res.Err.NativeMessage, secret) || !strings.Contains(res.Err.NativeMessage, "crashed") {
+			t.Errorf("native message = %q: the reason must survive and the credential must not", res.Err.NativeMessage)
+		}
+	})
+
+	t.Run("relayed", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		serveStream(t, f, failed)
+		b := testBackend(secret)
+		c := chatCall(catalog.APIOpenAIChat)
+		c.Stream, c.Request.Stream = true, true
+		rec := httptest.NewRecorder()
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)), c, rec)
+		if res.Err == nil {
+			t.Fatal("a relayed failed response was recorded as a success")
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `"error"`) {
+			t.Errorf("the client received no error frame:\n%s", body)
+		}
+		if strings.Contains(body, `"finish_reason":"stop"`) {
+			t.Errorf("the client received a clean stop over a failed generation:\n%s", body)
+		}
+		if strings.Contains(body, secret) {
+			t.Fatal("the credential reached the client in the error frame")
+		}
+	})
+}
+
+// A refusal survives collection, as it survives JSON decoding.
+func TestARefusalSurvivesCollection(t *testing.T) {
+	f := newFakeUpstream(t)
+	serveStream(t, f, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n"+
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\"}}\n\n"+
+		"data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"I can't \"}\n\n"+
+		"data: {\"type\":\"response.refusal.delta\",\"output_index\":0,\"delta\":\"help with that\"}\n\n"+
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n")
+	b := testBackend("sk-test")
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+		chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+	if res.Err != nil {
+		t.Fatalf("Do: %v", res.Err)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Refusal string `json:"refusal"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(res.Body, &out); err != nil || len(out.Choices) != 1 {
+		t.Fatalf("body: %v\n%s", err, res.Body)
+	}
+	if out.Choices[0].Message.Refusal != "I can't help with that" {
+		t.Errorf("refusal = %q; a refusal-only answer became an empty success:\n%s",
+			out.Choices[0].Message.Refusal, res.Body)
+	}
+}
+
+// A tool name over the wire limit is shortened on the way out and restored on
+// the way back, on this adapter as on the chat one.
+func TestAToolNameIsShortenedAndRestoredOnAResponsesOnlyHost(t *testing.T) {
+	long := strings.Repeat("very_long_function_name_", 4)
+	f := newFakeUpstream(t)
+	f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back whatever name reached the wire, as the host would.
+		var sent struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		}
+		_ = json.Unmarshal(f.last().body, &sent)
+		wire := ""
+		if len(sent.Tools) == 1 {
+			wire = sent.Tools[0].Name
+		}
+		if len(wire) > openai.MaxToolNameLen {
+			http.Error(w, `{"error":{"message":"Invalid 'tools[0].name': string too long"}}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n" +
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"" + wire + "\",\"call_id\":\"c1\"}}\n\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}]}}\n\n"))
+	})
+	b := testBackend("sk-test")
+	c := chatCall(catalog.APIOpenAIChat)
+	c.Request.Tools = []canonical.Tool{{Type: "function", Name: long, Parameters: json.RawMessage(`{"type":"object"}`)}}
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)), c, httptest.NewRecorder())
+	if res.Err != nil {
+		t.Fatalf("Do: %v (the host refuses a name over %d bytes)", res.Err, openai.MaxToolNameLen)
+	}
+	if !strings.Contains(string(res.Body), `"name":"`+long+`"`) {
+		t.Errorf("the caller's own tool name did not come back:\n%s", res.Body)
+	}
+}
+
+// Empty streamed arguments reach the caller as an empty object.
+//
+// A consequence guard rather than a fix's witness: the collector hands the
+// empty document on and every client encoder renders it as `{}`, the same as
+// the JSON decoder's `arguments: ""`. The assertion is on what the caller
+// receives, so a future encoder that stopped doing so would fail here.
+func TestEmptyCollectedArgumentsAreAnEmptyObject(t *testing.T) {
+	f := newFakeUpstream(t)
+	serveStream(t, f, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"gpt-5.5\"}}\n\n"+
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"ping\",\"call_id\":\"c1\"}}\n\n"+
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}]}}\n\n")
+	b := testBackend("sk-test")
+	res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+		chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+	if res.Err != nil {
+		t.Fatalf("Do: %v", res.Err)
+	}
+	if !strings.Contains(string(res.Body), `"arguments":"{}"`) {
+		t.Errorf("arguments were not normalised to an empty object:\n%s", res.Body)
+	}
+}
+
+// The body decides the transport; the label only breaks a tie.
+//
+// A JSON answer under a `text/event-stream` label is a completed, billed
+// generation. Reading it as a stream finds no events and offers it to the
+// fallback chain as "the host said nothing", which buys the generation twice.
+// A stream behind a byte-order mark is still a stream.
+func TestTheBodyDecidesTheTransport(t *testing.T) {
+	t.Run("JSON under a stream label", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(`{"id":"r","object":"response","status":"completed","model":"gpt-5.5",` +
+				`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"yes"}]}],` +
+				`"usage":{"input_tokens":3,"output_tokens":1}}`))
+		})
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err != nil {
+			t.Fatalf("a JSON answer was refused over its label: %v (retryable=%t)", res.Err, res.Retryable)
+		}
+		if !strings.Contains(string(res.Body), `"content":"yes"`) {
+			t.Errorf("body:\n%s", res.Body)
+		}
+	})
+	t.Run("stream behind a BOM", func(t *testing.T) {
+		f := newFakeUpstream(t)
+		f.setHandler(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("\xEF\xBB\xBF" + codexStream))
+		})
+		b := testBackend("sk-test")
+		res := b.Do(context.Background(), target(responsesOnlyProvider(t, f)),
+			chatCall(catalog.APIOpenAIChat), httptest.NewRecorder())
+		if res.Err != nil {
+			t.Fatalf("a stream behind a byte-order mark was refused: %v", res.Err)
+		}
+		if !strings.Contains(string(res.Body), `"content":"yes"`) {
+			t.Errorf("body:\n%s", res.Body)
+		}
+	})
+}
+
+// The host's own spelling of the ceiling is a drop alias.
+//
+// The measured refusal is `Unsupported parameter: max_output_tokens`, and an
+// operator who copies that name into params.drop must get the drop: the three
+// spellings are one field, and naming any of them clears it.
+func TestTheResponsesSpellingOfTheCeilingIsADropAlias(t *testing.T) {
+	f := newFakeUpstream(t)
+	serveCodex(t, f)
+	p, err := NewProvider(Spec{
+		Name: "codex", Kind: "codex-responses", API: catalog.APIOpenAIResponses,
+		BaseURL: f.srv.URL, ResponsesOnly: true, ResponsesForceStream: true, ResponsesStoreFalse: true,
+		DropParams: []string{"max_output_tokens"},
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	b := testBackend("sk-test")
+	c := chatCall(catalog.APIOpenAIChat)
+	var loss *canonical.LossReport
+	c.Accepted = func(l *canonical.LossReport) { loss = l }
+	res := b.Do(context.Background(), target(p), c, httptest.NewRecorder())
+	if res.Err != nil {
+		t.Fatalf("Do: %v", res.Err)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(f.last().body, &sent)
+	if _, ok := sent["max_output_tokens"]; ok {
+		t.Errorf("max_output_tokens reached the wire although params.drop names it: %v", sent)
+	}
+	if loss == nil || len(loss.Dropped) == 0 {
+		t.Errorf("the removal was not reported: %+v", loss)
+	}
 }

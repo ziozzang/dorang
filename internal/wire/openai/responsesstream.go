@@ -106,7 +106,23 @@ type ResponsesStreamDecoder struct {
 	usage    canonical.Usage
 	haveUsed bool
 	done     bool
+	// started records that the first line has been read, which is the only
+	// line a byte-order mark can precede.
+	started bool
 }
+
+// utf8BOM is the byte-order mark some proxies prepend to a body they
+// re-encoded. It is not part of any event.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
+// errResponsesFrame is a `data:` payload that is not JSON.
+//
+// It is an ERROR and not a skipped frame, unlike an event whose type this build
+// does not know: an unknown type is the vendor extending an open set, and
+// ignoring it invents nothing; a payload that does not parse is corruption, and
+// skipping it would drop a text delta and hand on an answer with a hole in it as
+// though it were whole.
+var errResponsesFrame = errorString("openai: a Responses stream frame is not JSON")
 
 // NewResponsesStreamDecoder returns a decoder over an SSE body.
 func NewResponsesStreamDecoder(r io.Reader, opt *DecodeOptions) *ResponsesStreamDecoder {
@@ -173,11 +189,9 @@ func (d *ResponsesStreamDecoder) frame(data []byte) ([]canonical.StreamEvent, er
 	}
 	var v respStreamFrame
 	if err := json.Unmarshal(data, &v); err != nil {
-		// A frame this build cannot parse is skipped rather than fatal. The
-		// event set is open and the vendor adds to it without a version bump;
-		// failing the whole stream on an unknown shape would take a working
-		// deployment down on somebody else's release schedule.
-		return nil, nil
+		// See [errResponsesFrame]: an unknown TYPE is skipped below, a payload
+		// that is not JSON is not.
+		return nil, errResponsesFrame
 	}
 	// The event name is on the SSE line and repeated in the payload. The payload
 	// wins: a proxy that rewrote the line still carries the original here.
@@ -198,6 +212,15 @@ func (d *ResponsesStreamDecoder) frame(data []byte) ([]canonical.StreamEvent, er
 				// later, so the opening fragment carries the name and nothing
 				// else. A consumer that waited for both in one event would
 				// never see either.
+				//
+				// The name is the one the CALLER declared: a name shortened
+				// for the wire (COMPATIBILITY 5.3) comes back through the same
+				// registry the chat stream uses, or the caller receives a call
+				// to a function it never defined.
+				name := v.Item.Name
+				if d.opt != nil && d.opt.ToolNames != nil {
+					name = d.opt.ToolNames.Restore(name)
+				}
 				return []canonical.StreamEvent{d.stamp(canonical.StreamEvent{
 					Type: canonical.EventDelta,
 					Delta: canonical.Delta{
@@ -205,7 +228,7 @@ func (d *ResponsesStreamDecoder) frame(data []byte) ([]canonical.StreamEvent, er
 						ToolCalls: []canonical.ToolCallDelta{{
 							Index: v.OutputIndex,
 							ID:    firstNonEmpty(v.Item.CallID, v.Item.ID),
-							Name:  v.Item.Name,
+							Name:  name,
 						}},
 					},
 				})}, nil
@@ -262,8 +285,27 @@ func (d *ResponsesStreamDecoder) frame(data []byte) ([]canonical.StreamEvent, er
 			},
 		})}, nil
 
-	case respEventCompleted, respEventIncomplete, respEventFailed:
+	case respEventCompleted, respEventIncomplete:
 		return d.terminal(name, &v), nil
+
+	case respEventFailed:
+		// A failure is an ERROR, not a stop with an unusual reason. The
+		// generation did not finish and the upstream said why, in
+		// `response.error`; rendering it as a stop would hand the caller a
+		// clean end-of-turn over an answer that was never produced, and the
+		// relay would record no failure at all.
+		d.done = true
+		e := &canonical.Error{Message: "the upstream reported the response failed"}
+		if v.Response != nil && len(v.Response.Error) > 0 {
+			var re respStreamErr
+			if json.Unmarshal(v.Response.Error, &re) == nil {
+				e.Message, e.Code, e.Type = firstNonEmpty(re.Message, e.Message), re.Code, re.Type
+			}
+		}
+		return []canonical.StreamEvent{d.stamp(canonical.StreamEvent{
+			Type: canonical.EventError,
+			Err:  e,
+		})}, nil
 
 	case respEventError:
 		d.done = true
@@ -293,16 +335,17 @@ func (d *ResponsesStreamDecoder) terminal(name string, v *respStreamFrame) []can
 	switch name {
 	case respEventIncomplete:
 		// The surface's own word for "the ceiling stopped it", which is a
-		// different fact from a model that finished.
+		// different fact from a model that finished — and one a tool call in
+		// the partial output does not override: a call cut off by the ceiling
+		// is a ceiling, not a turn that ended in a call.
 		reason = canonical.StopMaxTokens
-	case respEventFailed:
-		reason = canonical.StopError
-	}
-	if v.Response != nil && len(v.Response.Output) > 0 {
-		for _, it := range v.Response.Output {
-			if it.Type == "function_call" {
-				reason = canonical.StopToolUse
-				break
+	case respEventCompleted:
+		if v.Response != nil {
+			for _, it := range v.Response.Output {
+				if it.Type == "function_call" {
+					reason = canonical.StopToolUse
+					break
+				}
 			}
 		}
 	}
@@ -360,20 +403,64 @@ const maxResponsesFrameBytes = 8 << 20
 
 // nextData returns the payload of the next `data:` line.
 func (d *ResponsesStreamDecoder) nextData() ([]byte, bool) {
-	for d.sc.Scan() {
-		line := bytes.TrimRight(d.sc.Bytes(), "\r")
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		payload := bytes.TrimSpace(line[len("data:"):])
+	// One event is every `data:` line up to the blank line that dispatches it,
+	// joined with newlines — the SSE rule, which this vendor does not exercise
+	// and a proxy re-wrapping the stream may. Reading each line as its own
+	// frame would split one JSON document into two unparseable halves.
+	var buf []byte
+	have := false
+	flush := func() ([]byte, bool) {
+		payload := bytes.TrimSpace(buf)
+		buf, have = buf[:0], false
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
-			continue
+			return nil, false
 		}
-		// The scanner reuses its buffer, and a caller may hold an event past the
-		// next Scan; the copy is one per frame and buys that safety.
+		// The scanner reuses its buffer, and a caller may hold an event past
+		// the next Scan; the copy is one per frame and buys that safety.
 		out := make([]byte, len(payload))
 		copy(out, payload)
 		return out, true
+	}
+	for d.sc.Scan() {
+		line := bytes.TrimRight(d.sc.Bytes(), "\r")
+		if !d.started {
+			d.started = true
+			line = bytes.TrimPrefix(line, utf8BOM)
+		}
+		if len(line) == 0 {
+			if out, ok := flush(); ok {
+				return out, true
+			}
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			// An `event:` line while data is pending opens the NEXT event on
+			// a stream that omits the blank line between them — which the
+			// capture this decoder is tested against does, and which the
+			// spec's dispatch rule alone would read as one event with two
+			// payloads. The name on the line is not needed: the payload
+			// repeats it, and the payload wins.
+			if have && bytes.HasPrefix(line, []byte("event:")) {
+				if out, ok := flush(); ok {
+					return out, true
+				}
+			}
+			continue
+		}
+		payload := line[len("data:"):]
+		if len(payload) > 0 && payload[0] == ' ' {
+			payload = payload[1:]
+		}
+		if have {
+			buf = append(buf, '\n')
+		}
+		buf = append(buf, payload...)
+		have = true
+	}
+	// A stream that ends without the dispatching blank line still said what
+	// it said.
+	if have {
+		return flush()
 	}
 	return nil, false
 }

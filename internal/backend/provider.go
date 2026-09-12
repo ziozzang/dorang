@@ -219,8 +219,10 @@ func requiredOutputCeiling(api catalog.API) bool {
 	return api == catalog.APIAnthropicMessages
 }
 
-// outputCeilingNames are the two spellings of the one field.
-var outputCeilingNames = map[string]bool{"max_tokens": true, "max_completion_tokens": true}
+// outputCeilingNames are the three spellings of the one field.
+var outputCeilingNames = map[string]bool{
+	"max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
+}
 
 // resolveDropParams validates an operator's drop list against the wire shape
 // this provider actually speaks.

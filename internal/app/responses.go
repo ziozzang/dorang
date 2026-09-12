@@ -177,6 +177,13 @@ func (d *dispatcher) decodeResponses(st *dispatchState, rq *server.Request, c *c
 	// reference has always meant by chaining. Appending them would answer the
 	// old question with the new context.
 	creq.Messages = append(prev, creq.Messages...)
+	// The reference is resolved here and only here. It is dorang's own id,
+	// so it must not travel upstream: a host that resolves references would
+	// answer 404 for it, and one that applied it would chain the history a
+	// second time on top of the replay above. The caller still sees it echoed
+	// on the answer and the stored row still records it.
+	c.prevResponseID = creq.PreviousResponseID
+	creq.PreviousResponseID = ""
 	return nil
 }
 
@@ -237,7 +244,7 @@ func (d *dispatcher) storeResponse(ctx context.Context, st *dispatchState, c *ca
 		CreatedAt:          now,
 		ExpiresAt:          now.Add(st.responses.ttl),
 		OwnerKeyID:         principalID(rq),
-		PreviousResponseID: c.creq.PreviousResponseID,
+		PreviousResponseID: c.prevResponseID,
 		ModelGroup:         c.model,
 		Items:              enc,
 		ReasoningBlobs:     reasoningBlobs(c.creq.Messages),

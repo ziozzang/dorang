@@ -231,6 +231,11 @@ type call struct {
 	// the state (DESIGN §9.2 [R1-C7]), so it owns the id: an upstream id would
 	// be meaningless to the store and would change on a fail-back hop.
 	responseID string
+	// prevResponseID is the caller's `previous_response_id`, kept for the
+	// stored row after it has been resolved and REMOVED from the upstream
+	// request: it names a dorang exchange, and an upstream that resolves
+	// references would look it up and find nothing.
+	prevResponseID string
 
 	// mask is this request's reversible mask (§10.5b). It is nil unless a
 	// transform filter with a pattern set is configured for the model, it lives

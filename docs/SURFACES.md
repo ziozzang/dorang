@@ -101,6 +101,10 @@ against a verbatim capture of this host), and the routing followed:
   error event is `upstream_stream_error` with the credential scrubbed exactly as
   the relay scrubs it; neither is offered to the fallback chain, because the
   host bills the generation it began.
+- `response.failed` is an error on both paths (scrubbed, terminal), never a
+  stop; a `data:` payload that is not JSON fails the collection rather than
+  leaving a hole; a transport failure under the forced stream is read for what
+  arrived, so a terminal event that got through is still one answer.
 - Measured end to end against the live surface, buffered and streaming, from a
   distroless container holding the operator's `~/.codex/auth.json`.
 
