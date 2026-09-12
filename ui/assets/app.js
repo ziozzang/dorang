@@ -196,5 +196,40 @@
     wireFilter();
     wireRefresh();
     wireSecret();
+    startLiveRefresh();
   });
+
+  // ---- live refresh -----------------------------------------------------
+  // A screen may mark one region live: <div data-live="10"> re-fetches the
+  // current URL every 10s and swaps just that region's innerHTML, so the
+  // numbers move without a full navigation or a lost scroll position. Fetch
+  // is same-origin (the CSP allows connect-src 'self' and nothing else).
+  function startLiveRefresh() {
+    var region = document.querySelector("[data-live]");
+    if (!region) return;
+    var secs = parseInt(region.getAttribute("data-live"), 10);
+    if (!secs || secs < 2) secs = 10;
+    var busy = false;
+    setInterval(function () {
+      if (busy || document.hidden) return;
+      busy = true;
+      region.classList.add("stale");
+      fetch(window.location.href, { credentials: "same-origin", headers: { "X-Requested-With": "fetch" } })
+        .then(function (r) { return r.ok ? r.text() : null; })
+        .then(function (html) {
+          if (!html) return;
+          var doc = new DOMParser().parseFromString(html, "text/html");
+          var fresh = doc.querySelector("[data-live]");
+          var cur = document.querySelector("[data-live]");
+          if (fresh && cur) cur.innerHTML = fresh.innerHTML;
+        })
+        .catch(function () { /* a dropped poll is not an error worth showing */ })
+        .then(function () {
+          var cur = document.querySelector("[data-live]");
+          if (cur) cur.classList.remove("stale");
+          busy = false;
+        });
+    }, secs * 1000);
+  }
+
 })();

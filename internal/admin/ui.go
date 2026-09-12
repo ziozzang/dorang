@@ -496,6 +496,7 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 		{"users", "users & teams", s.api.cfg.Directory != nil && v.scope.Global},
 		{"models", "models & deployments", cat != nil && v.scope.Global},
 		{"usage", "usage & cost", s.api.cfg.Ledger != nil && v.scope.Global},
+		{"monitoring", "monitoring", (s.api.cfg.Ledger != nil || s.api.cfg.Credentials != nil || s.api.cfg.Capacity != nil) && v.scope.Global},
 	}
 	out := make([]navScreen, 0, len(all))
 	for _, n := range all {
@@ -695,6 +696,8 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 		s.screenModels(w, r, v)
 	case "/usage":
 		s.screenUsage(w, r, v)
+	case "/monitoring":
+		s.screenMonitoring(w, r, v)
 	default:
 		// The same rule as the API: an unimplemented screen says so rather
 		// than pretending the URL was wrong.

@@ -1,0 +1,97 @@
+{{define "content"}}
+<h1>Monitoring <span class="live-dot" title="live"></span></h1>
+<p class="lede">
+  What is happening now, from the same reporters the API exposes: the ledger for the last
+  {{.Window}} of traffic, the credential reporter for health and quota, the capacity broker for
+  occupancy. The region below re-fetches on a timer — <span class="refresh-note">every 10s</span>.
+</p>
+
+<div data-live="10">
+
+{{if .HasLedger}}
+<h2>Traffic — last {{.Window}}</h2>
+{{if .LedgerErr}}<div class="banner bad">The ledger could not be read for this window.</div>{{else}}
+<div class="tiles">
+  <div class="tile"><div class="label">requests</div><div class="value">{{num .Requests}}</div><div class="note">{{.RPM}} / min</div></div>
+  <div class="tile"><div class="label">errors</div><div class="value">{{num .Errors}}</div><div class="note">{{.ErrorRate}} of requests</div></div>
+  <div class="tile"><div class="label">latency p50</div><div class="value">{{.P50}}</div></div>
+  <div class="tile"><div class="label">latency p95</div><div class="value">{{.P95}}</div></div>
+</div>
+<div class="scroll">
+<table>
+  <thead><tr><th>time</th><th>model</th><th>provider</th><th>endpoint</th><th>status</th><th class="num">latency</th></tr></thead>
+  <tbody>
+  {{range .Recent}}
+    <tr>
+      <td class="mono">{{.Time}}</td>
+      <td>{{.Model}}</td>
+      <td class="mono">{{.Provider}}</td>
+      <td>{{.Endpoint}}</td>
+      <td>{{if .StatusOK}}<span class="state-ok">{{.Status}}</span>{{else}}<span class="state-bad">{{.Status}}</span>{{end}}</td>
+      <td class="num">{{num .LatencyMS}} ms</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6"><span class="unavailable">no requests in the window</span></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+{{end}}
+
+{{if .HasCreds}}
+<h2>Credentials{{if .CredTotal}} — {{.Unhealthy}} of {{.CredTotal}} not healthy{{end}}</h2>
+{{if .CredErr}}<div class="banner bad">The credential reporter could not be read.</div>{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>credential</th><th>provider</th><th>health</th><th class="num">fails</th><th class="num">latency</th><th>cooldown</th><th>quota (tightest)</th></tr></thead>
+  <tbody>
+  {{range .Creds}}
+    <tr>
+      <td class="mono">{{.ID}}</td>
+      <td class="mono">{{.Provider}}</td>
+      <td>{{if eq .Health "healthy"}}<span class="state-ok">healthy</span>{{else if eq .Health "half_open"}}<span class="state-warn">half-open</span>{{else if eq .Health "unavailable"}}<span class="state-bad">unavailable</span>{{else}}<span class="unavailable">{{or .Health "unknown"}}</span>{{end}}</td>
+      <td class="num">{{.Failures}}</td>
+      <td class="num">{{if .LatencyMS}}{{num .LatencyMS}} ms{{else}}—{{end}}</td>
+      <td>{{or .Cooldown "—"}}</td>
+      <td class="wrap">{{.Quota}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="7"><span class="unavailable">no credentials reported</span></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+{{end}}
+
+{{if .HasCap}}
+<h2>Capacity{{if or .Waiting .Reservations}} — {{.Waiting}} waiting, {{.Reservations}} reserved{{end}}</h2>
+{{if .CapErr}}<div class="banner bad">The capacity broker could not be read.</div>{{else}}
+<div class="scroll">
+<table>
+  <thead><tr><th>axis</th><th>key</th><th class="num">in use</th><th class="num">limit</th><th class="num">waiting</th></tr></thead>
+  <tbody>
+  {{range .Axes}}
+    <tr>
+      <td>{{.Axis}}</td>
+      <td class="mono">{{or .Key "—"}}</td>
+      <td class="num">{{.InUse}}</td>
+      <td class="num">{{if .Limit}}{{.Limit}}{{else}}<span class="unavailable">∞</span>{{end}}</td>
+      <td class="num">{{.Waiting}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="5"><span class="unavailable">no capacity axes constrain this deployment</span></td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}
+{{end}}
+
+{{if not (or .HasLedger .HasCreds .HasCap)}}
+<div class="panel"><p class="lede">This process exposes no ledger, credential reporter or capacity broker, so there is nothing live to show.</p></div>
+{{end}}
+
+</div>
+{{end}}
