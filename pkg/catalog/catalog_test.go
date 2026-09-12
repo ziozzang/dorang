@@ -80,21 +80,32 @@ func TestDefaultParses(t *testing.T) {
 		// serving. deepseek-v4-flash:0731 was added: the endpoint returns the
 		// rolling name AND the dated pin as separate ids, and the catalog's
 		// rule is to list what the endpoint returns.
-		"ollama-cloud": {VerificationVerified: 18},
+		// 2026-09-12: 18 → 22. The listing re-fetched at 20 names; the four
+		// new ones (deepseek-v4.1-flash, deepseek-v4-pro:0813, glm-5.3,
+		// glm-5.3-flash) asked and answered as themselves. The two bare
+		// deepseek names stay: off the listing, still resolving.
+		"ollama-cloud": {VerificationVerified: 22},
 
 		// 2026-08-03, by asking: five of the eight answered as themselves and
 		// three answered as a different model. All eight were dated
 		// 2026-07-28 by a pass that read the /models listing, which is how a
 		// listing lies — it names what the route accepts, not what serves.
-		"glm": {VerificationVerified: 5, VerificationSubstituted: 3},
+		// 2026-09-12: +2 verified, glm-5.3 and glm-5.3-flash.
+		"glm": {VerificationVerified: 7, VerificationSubstituted: 3},
 
 		// 2026-08-03: the whole qwen block asked model by model. Six answered;
 		// nine refused on entitlement with AccessDenied.Unpurchased. Four of
 		// the six came off the absorbed list in that pass.
-		"qwen": {VerificationVerified: 6, VerificationDenied: 9},
+		// 2026-09-12: qwen3.8-max-preview no longer answers as itself — the
+		// endpoint serves qwen3.8-max for it — so it moves to substituted and
+		// the release name, qwen3.8-flash and deepseek-v4-flash-0731 join
+		// verified: 6 - 1 + 3 = 8.
+		"qwen": {VerificationVerified: 8, VerificationDenied: 9, VerificationSubstituted: 1},
 
-		"xai":             {VerificationVerified: 2},
-		"codex-responses": {VerificationVerified: 4},
+		"xai": {VerificationVerified: 2},
+		// 2026-09-12: gpt-5.3-codex-spark, the one name the plan's own
+		// listing carries, asked and answered.
+		"codex-responses": {VerificationVerified: 5},
 		"jina":            {VerificationVerified: 3},
 	}
 	for kind, wantStates := range want {
@@ -647,7 +658,7 @@ func TestReasoningIsKeyedByModelNotKind(t *testing.T) {
 	c := Default()
 
 	// The one verified capability in the embedded catalog.
-	got := c.Reasoning("qwen", "qwen3.8-max-preview")
+	got := c.Reasoning("qwen", "qwen3.8-max")
 	if got.Effective() != ReasoningEffortScale {
 		t.Fatalf("capability = %s, want %s", got, ReasoningEffortScale)
 	}
@@ -727,13 +738,13 @@ func TestReasoningUnknownUnlessVerified(t *testing.T) {
 
 func TestReasoningLevelsAreCopied(t *testing.T) {
 	c := Default()
-	first := c.Reasoning("qwen", "qwen3.8-max-preview")
+	first := c.Reasoning("qwen", "qwen3.8-max")
 	if len(first.Levels) == 0 {
 		t.Fatal("no levels to mutate")
 	}
 	first.Levels[0] = "clobbered"
 
-	second := c.Reasoning("qwen", "qwen3.8-max-preview")
+	second := c.Reasoning("qwen", "qwen3.8-max")
 	if second.Levels[0] != "low" {
 		t.Errorf("Levels[0] = %q; a caller mutated the shared catalog", second.Levels[0])
 	}
@@ -781,9 +792,9 @@ func TestUnverifiedModels(t *testing.T) {
 		}
 	}
 
-	// The one probed model is absent.
+	// The one model with a verified capability is absent.
 	for _, line := range got {
-		if strings.Contains(line, "qwen3.8-max-preview") {
+		if strings.HasSuffix(line, "model=qwen3.8-max") {
 			t.Errorf("verified model still listed: %q", line)
 		}
 	}
@@ -1448,7 +1459,7 @@ func TestConcurrentUse(t *testing.T) {
 				c.Kinds()
 				c.Model("ollama-cloud", "gemma4:31b")
 				c.Model("xai", "grok-4.9")
-				r := c.Reasoning("qwen", "qwen3.8-max-preview")
+				r := c.Reasoning("qwen", "qwen3.8-max")
 				if len(r.Levels) > 0 {
 					r.Levels[0] = "mutate a copy, not the catalog"
 				}
@@ -1458,7 +1469,7 @@ func TestConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := Default().Reasoning("qwen", "qwen3.8-max-preview").Levels[0]; got != "low" {
+	if got := Default().Reasoning("qwen", "qwen3.8-max").Levels[0]; got != "low" {
 		t.Errorf("Levels[0] = %q after concurrent readers", got)
 	}
 }

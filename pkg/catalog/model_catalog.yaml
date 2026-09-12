@@ -88,6 +88,12 @@ models:
   # =========================================================================
   # Ollama Cloud — https://ollama.com/v1
   # Model list fetched from the live endpoint on 2026-07-28: 19 models.
+  # Re-fetched 2026-09-12: 20 models. Four names are new — deepseek-v4.1-flash,
+  # deepseek-v4-pro:0813, glm-5.3, glm-5.3-flash — and each was ASKED with one
+  # minimal request on 2026-09-12 and answered as itself. The bare
+  # `deepseek-v4-pro` / `deepseek-v4-flash` names are no longer on the listing,
+  # which now carries the dated tags; both still resolve (`/api/show` answers
+  # for them), so they stay, but a deployment should name the tag it means.
   #
   # `deepseek-v3.2` appears in some older deployments and is deliberately
   # absent: the provider no longer offers it. It is not an oversight, and it
@@ -95,8 +101,12 @@ models:
   # =========================================================================
 
   - { kind: ollama-cloud, model: "deepseek-v4-pro",       verified: 2026-07-28 }
+  - { kind: ollama-cloud, model: "deepseek-v4-pro:0813",  verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "deepseek-v4-flash",     verified: 2026-08-03 }
   - { kind: ollama-cloud, model: "deepseek-v4-flash:0731", verified: 2026-08-03 }
+  - { kind: ollama-cloud, model: "deepseek-v4.1-flash",   verified: 2026-09-12 }
+  - { kind: ollama-cloud, model: "glm-5.3",               verified: 2026-09-12 }
+  - { kind: ollama-cloud, model: "glm-5.3-flash",         verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "glm-5.1",               verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "glm-5.2",               verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "kimi-k3",               verified: 2026-07-28 }
@@ -116,6 +126,9 @@ models:
   # =========================================================================
   # Z.AI coding plan — https://api.z.ai/api/coding/paas/v4  (kind: glm)
   # Model list fetched from the live endpoint on 2026-07-28: 8 models.
+  # Re-fetched 2026-09-12: 10 models; the two new ones, glm-5.3 and
+  # glm-5.3-flash, were asked the same day and answered as themselves. The
+  # three substitutions below were not re-asked.
   # ASKED 2026-08-03, one minimal request each. Five answered as themselves.
   # THREE ANSWERED AS SOMETHING ELSE.
   #
@@ -143,6 +156,8 @@ models:
   - { kind: glm, model: "glm-4.7",       verified: 2026-08-03 }
   - { kind: glm, model: "glm-5-turbo",   verified: 2026-08-03 }
   - { kind: glm, model: "glm-5.2",       verified: 2026-08-03 }
+  - { kind: glm, model: "glm-5.3",       verified: 2026-09-12 }
+  - { kind: glm, model: "glm-5.3-flash", verified: 2026-09-12 }
 
   - kind: glm
     model: "glm-4.5-air"
@@ -173,9 +188,20 @@ models:
   # https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
   # =========================================================================
 
+  # Re-fetched 2026-09-12: 12 names on the listing. `qwen3.8-max-preview` is
+  # gone from it and the endpoint now SUBSTITUTES for the name — 200 OK, body
+  # `"model":"qwen3.8-max"` — so the release name is the entry to deploy.
+  # `qwen3.8-flash` and `deepseek-v4-flash-0731` are new and answered as
+  # themselves. The listing also carries qwen-audio-3.0-realtime-plus,
+  # qwen-audio-3.0-tts-plus, wan2.7-image and wan2.7-image-pro; none is
+  # reachable through this host — /audio/speech, /audio/transcriptions,
+  # /embeddings and /images/generations all answer 404 on compatible-mode, the
+  # DashScope-native routes refuse (url error / async not supported / model not
+  # exist), and the plan's key is `Incorrect API key` on the standard DashScope
+  # hosts. They are listed, not served, and are not catalogued.
   - kind: qwen
-    model: "qwen3.8-max-preview"
-    verified: 2026-08-03
+    model: "qwen3.8-max"
+    verified: 2026-09-12
     context_window: 983616
     max_output_tokens: 131072
     reasoning:
@@ -186,9 +212,30 @@ models:
       note: >-
         The only concretely claimed reasoning capability in this catalog. Basis
         is an operator configuration in production use against this endpoint
-        and this model, not a shape inferred from the kind. Note that it
-        contradicts the qwen kind's `enable_thinking` shape hint — which is why
-        capability is keyed by model (REVIEW C5).
+        under the name `qwen3.8-max-preview`, which the endpoint served as
+        THIS model (measured 2026-09-12: the preview name answers with
+        `"model":"qwen3.8-max"`), so the observation was of this model. Note
+        that it contradicts the qwen kind's `enable_thinking` shape hint —
+        which is why capability is keyed by model (REVIEW C5).
+  - kind: qwen
+    model: "qwen3.8-flash"
+    verified: 2026-09-12
+  - kind: qwen
+    model: "deepseek-v4-flash-0731"
+    verified: 2026-09-12
+    note: The dated tag of deepseek-v4-flash on this plan; the bare name is denied (below).
+  - kind: qwen
+    model: "qwen3.8-max-preview"
+    context_window: 983616
+    max_output_tokens: 131072
+    probe:
+      result: substituted
+      date: 2026-09-12
+      served: "qwen3.8-max"
+      note: >-
+        200 OK, body `"model":"qwen3.8-max"`. Verified as itself on
+        2026-08-03; no longer on the listing and no longer served as itself.
+        Deploy `qwen3.8-max`.
 
   - kind: qwen
     model: "qwen3.7-max"
@@ -210,12 +257,23 @@ models:
 
   # =========================================================================
   # OpenAI through a Codex OAuth credential
+  #
+  # Asked 2026-09-12 through dorang's Responses-only adapter, one minimal
+  # request each: the four below answered as themselves, and so did
+  # gpt-5.3-codex-spark, the one model `GET /backend-api/codex/models` lists
+  # for this plan (with codex-auto-review, hidden, and not catalogued). The
+  # listing does NOT carry the four; they answer regardless. Asked and
+  # refused the same day with "The '<name>' model is not supported when using
+  # Codex with a ChatGPT account": gpt-5.6, gpt-5.7, gpt-5.5-codex,
+  # gpt-5.6-codex, gpt-5.7-codex.
   # =========================================================================
 
-  - { kind: codex-responses, model: "gpt-5.5",       verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
-  - { kind: codex-responses, model: "gpt-5.6-sol",   verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
-  - { kind: codex-responses, model: "gpt-5.6-terra", verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
-  - { kind: codex-responses, model: "gpt-5.6-luna",  verified: 2026-07-28, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.5",       verified: 2026-09-12, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-sol",   verified: 2026-09-12, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-terra", verified: 2026-09-12, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.6-luna",  verified: 2026-09-12, context_window: 400000, max_output_tokens: 100000 }
+  - { kind: codex-responses, model: "gpt-5.3-codex-spark", verified: 2026-09-12, context_window: 128000,
+      note: "context_window from the plan's own /models listing on 2026-09-12; max_output_tokens is the prefix rule's, not measured." }
 
   # =========================================================================
   # Jina — embeddings and rerank
@@ -406,6 +464,8 @@ models:
   # Present on the route, out of reach on this plan. `qwen3.6-plus` refusing
   # while `qwen3.6-flash` answers is what makes this per-model rather than
   # per-provider: entitlement is bought tier by tier, not route by route.
+  # Re-asked 2026-09-12: `qwen3.6-plus` still denied, and none of the nine
+  # names below is on the 2026-09-12 listing any more.
   - { kind: qwen, model: "qwen3.6-plus", context_window: 1000000, max_output_tokens: 65536,   # :114
       probe: &qwen_denied { result: denied, date: 2026-08-03,
         note: 'HTTP 403 AccessDenied.Unpurchased: "Access to model denied. Please make sure you are eligible for using the model."' } }

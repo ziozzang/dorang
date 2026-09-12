@@ -542,13 +542,13 @@ func TestExplainAcrossThreeLayers(t *testing.T) {
 	filePath := writeFile(t, fileDir, "site.yaml", `
 version: 1
 models:
-  - { kind: qwen, model: "qwen3.8-max-preview", max_output_tokens: 40000 }
+  - { kind: qwen, model: "qwen3.8-max", max_output_tokens: 40000 }
 `)
 	envDir := t.TempDir()
 	envPath := writeFile(t, envDir, "hotfix.yaml", `
 version: 1
 models:
-  - { kind: qwen, model: "qwen3.8-max-preview", context_window: 700000 }
+  - { kind: qwen, model: "qwen3.8-max", context_window: 700000 }
 `)
 
 	t.Setenv(EnvCatalogPath, envDir)
@@ -557,7 +557,7 @@ models:
 		t.Fatalf("Load: %v", err)
 	}
 
-	origins := c.Explain("qwen", "qwen3.8-max-preview")
+	origins := c.Explain("qwen", "qwen3.8-max")
 
 	ctx := findOrigin(t, origins, FieldContextWindow)
 	if ctx.Origin != OriginEnv || ctx.Source != envPath || ctx.Layer != LayerModel {
@@ -1032,7 +1032,7 @@ func TestAbsorbedDataCarriesNoReasoning(t *testing.T) {
 		}
 		// Exactly one entry may claim a capability: the one an operator has
 		// in production use against that endpoint and that model.
-		if ref.Kind != "qwen" || ref.Model != "qwen3.8-max-preview" {
+		if ref.Kind != "qwen" || ref.Model != "qwen3.8-max" {
 			t.Errorf("kind=%s model=%s claims %v; nothing absorbed may",
 				ref.Kind, ref.Model, info.Reasoning)
 		}
