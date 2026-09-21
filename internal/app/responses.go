@@ -460,7 +460,7 @@ func (a *App) handleResponseInputItems(w http.ResponseWriter, rq *server.Request
 // background mode: every response it serves is complete before its id exists,
 // so there is never a window in which cancelling one would mean anything. A 501
 // with a named code says that; a 200 claiming to have cancelled something would
-// be a lie a client acts on (DESIGN §0.2).
+// be a lie a client acts on (DESIGN §0.3).
 func (a *App) handleResponseCancel(w http.ResponseWriter, rq *server.Request) error {
 	return server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
 		"background responses are not implemented, so there is nothing to cancel").

@@ -107,6 +107,19 @@ not a passthrough.
 | 6.8 | ⚠️ **Some** reference-proxy builds add a non-spec `usage.total_tokens` to non-streaming `/v1/messages` answers while streaming answers omit it, so the two shapes differ by one field. `compat.anthropic_total_tokens` selects which shape dorang serves and **both values are served**: `true` is the default and adds the member, `false` is the strict vendor shape with no `total_tokens` anywhere. It used to be refused at `false`. The switch governs the NON-STREAMING half only — a streamed message omits the member at either setting. **This is not universal, and the default is not a claim that it is:** a deployment measured in 2026-07 emitted `{"input_tokens":68,"output_tokens":8}` with no `total_tokens` at all, so byte-parity with *that* incumbent wants `anthropic_total_tokens: false`. Check the incumbent before assuming the default matches it; the member is additive and every SDK in the family tolerates one it does not model, which is why the default errs toward emitting. CONFIG §21a. |
 | 6.9 | `/v1/messages/count_tokens` returns exactly `{"input_tokens": <number>}` and accepts `?beta=true`. |
 
+## 6a. `/v1/responses` — the streamed event tree
+
+| # | Contract |
+|---|---|
+| 6a.1 | SSE framing is `event: <type>\ndata: <json>\n\n` — **both lines**, like `/v1/messages` and unlike chat completions. `sequence_number` is on every event, starts at **0**, and climbs by exactly one, failure frames included. No `[DONE]`. |
+| 6a.2 | Emitted set: `response.created`, `output_item.added`, `content_part.added`, `output_text.delta`, `reasoning_summary_part.added`, `reasoning_summary_text.delta`, `refusal.delta`, `function_call_arguments.delta`, the part/item `.done`s, and the terminal `response.completed` / `response.failed`. **Not** emitted: `response.in_progress` and the per-delta `.done` echoes. The part lifecycle is emitted even though dorang's own decoder ignores it: the reference client (codex) keys a text delta on an open part. `response.completed` exactly once, and **never after** a `response.failed`. |
+| 6a.3 | Identity is pinned across the stream: the id is dorang's own `resp_…`, `created_at` fixed at stream start, and the **client-facing** model on every response object. The served model and every upstream id never appear. |
+| 6a.4 | Item lifecycle: `output_item.added` opens an item at the next `output_index`; deltas name their `item_id`; `output_item.done` carries the **complete** item — assembled text, reasoning summary, or a `function_call` with its settled `call_id`, merged name and whole arguments — exactly once. Item ids (`msg_0`, `rs_1`, `fc_2`) are dorang-minted and stream-scoped; `call_id` is the model's own, never invented. |
+| 6a.5 | Usage appears only inside the terminal's response object. The terminal is **held** until the stop and any late usage arrive (the §3.4 rule, this family's spelling), and it is rendered by the same encoder as a buffered answer — a streamed and a non-streamed request for one exchange differ by transport only (DESIGN §10.7), and a test pins the two byte-equal. |
+| 6a.6 | A truncated upstream is never dressed as completion: no `response.completed` is synthesized, the terminal object never reaches the store, and what the client sees is the failure frame (§11.1a) or nothing at all when nothing was written. |
+| 6a.7 | Server-side state: a streamed exchange is stored from the **terminal event's own response object**, after the last byte and before the handler returns — so `previous_response_id` never observes a gap, but the buffered rule "stored before the client has the id" cannot hold (the `created` event carries it). A store failure is logged, not failed to the client: the answer is served, and the id 404s later in the TTL-expired shape. `store:false` skips the store; a store-keeping stream against a deployment with no store is refused **at decode**, before a byte is written, in the buffered path's named 501. |
+| 6a.8 | `event: dorang.usage` (opt-in `x-dorang-usage-events`) lands **after** `response.completed`; this family's terminator is load-bearing, so a dorang-aware client reads the frame after the turn. |
+
 ## 7. Cross-cutting
 
 | # | Contract |
@@ -450,6 +463,7 @@ wrong, because the client does not see the frame at all.
 |---|---|
 | OpenAI | `data: {"error":{…}}\n\n` then `data: [DONE]\n\n` (§1.1, §1.2) |
 | Anthropic | `event: error\ndata: {"type":"error","error":{…}}\n\n`, and **nothing after it** (§6.1, §6.2) |
+| Responses | `event: response.failed\ndata: {"type":"response.failed","response":{…"status":"failed","error":{…},…}}\n\n`, and **nothing after it** (§6a.2) |
 
 A client reading an Anthropic stream dispatches on the event **name**. A data-only frame is
 therefore not a frame it mis-parses — it is one it silently discards, which leaves a failed
@@ -467,7 +481,7 @@ ninth. `timeout_error`, `not_implemented_error` and `service_unavailable_error` 
 `internal/server` and are in **neither vendor's** vocabulary; the first two used to go out on
 real 504s and 501s, where this table says `api_error` in both columns. They are folded now.
 Nothing is lost: what a client acts on for a 501 is the code — `route_not_implemented` versus
-`route_unknown` (DESIGN §0.2) — and the status carries the rest.
+`route_unknown` (DESIGN §0.3) — and the status carries the rest.
 
 The two `type` columns are **not the same function of the status**. A 404 is
 `invalid_request_error` to an OpenAI client and `not_found_error` to an Anthropic one; a 413 is
@@ -499,7 +513,7 @@ they set the alternate spelling explicitly where they are raised.
 | Gateway fault | 500 | `api_error` | `internal_error` | `api_error` |
 | Upstream 5xx after fallback | **the upstream's own 5xx**, passed through | `api_error` | the upstream's own string `code` when it sent one, else the status as a string | `api_error` |
 | Upstream answered nothing dorang could use | 502 | `api_error` | `upstream_*`, naming which way it failed | `api_error` |
-| Route declared but unimplemented (§0.2) | 501 | `api_error` | `route_not_implemented` | `api_error` |
+| Route declared but unimplemented (§0.3) | 501 | `api_error` | `route_not_implemented` | `api_error` |
 | Upstream timeout | 504 | `api_error` | `timeout` when dorang's own deadline fired, else as the upstream-5xx row | `api_error` |
 
 Three of these deserve their reasoning stated, because a plausible alternative is wrong:

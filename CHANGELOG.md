@@ -11,6 +11,39 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ## Unreleased
 
+### `/v1/responses` learned to stream, and the 501 it used to answer with
+
+The refusal existed because the Responses event stream is a different protocol
+from chat SSE — a typed event tree, not a framing of the same chunks — and
+answering the non-streaming body to a client that asked for events would have
+been a half-working endpoint. The upstream half (the decoder) had existed for
+a while; what was missing was the client-facing encoder, which turned out to
+be one emitter plus one sink case, not a new pipeline.
+
+- **The event tree is emitted, with the part lifecycle.** dorang's own decoder
+  ignores `content_part.added`/`done` — `item.done` carries the assembled body
+  — but the deployed protocol's clients do not: measured against a live codex,
+  which logs a text delta with no open part as a protocol violation. The
+  frames are emitted for the protocol as deployed, not as dorang reads it.
+- **The streamed terminal and the buffered body are one rendering** — the same
+  encoder, a test pinning the two byte-equal — after the first draft let two
+  text fragments of one run complete as two parts.
+- **The store's "before the client has the id" invariant cannot hold for a
+  stream** (the `created` event carries the id), so it is restated as what it
+  protected: the row exists before the handler returns, from the terminal
+  event's own object, and `previous_response_id` never observes a gap. A store
+  failure is logged rather than failed — the answer is served and cannot be
+  retracted — and the id 404s in the TTL-expired shape. The one condition that
+  would fail after the fact (a store-keeping stream with no store) is refused
+  at decode, before a byte is written.
+- **Verified live**, not only in suites: dev instance → production dorang →
+  ollama cloud `gpt-oss:120b`, a text turn and a real tool-call turn
+  (argument deltas, done with the assembled arguments), and codex itself
+  streaming through the new surface.
+- COMPATIBILITY gains §6a (the streamed event-tree contract, eight rows) and
+  a Responses row in §11.1a's mid-stream error framing; the DESIGN §0.2
+  citations for the named-501 rule were stale and now name §0.3.
+
 ### The operator dashboard: one screen worth reading, one dead, one that lied
 
 Opened against a live ledger, all three screens answered `200`. That was the

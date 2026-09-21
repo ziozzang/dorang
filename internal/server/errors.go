@@ -318,7 +318,7 @@ func TypeForStatus(status int) string {
 // §11 opens by saying that a gateway which invents its own vocabulary "is as
 // incompatible as one that changes a field name", so they do not go on the wire.
 // Nothing is lost: what a client acts on for a 501 is the CODE
-// (`route_not_implemented` versus `route_unknown`, DESIGN §0.2), and the status
+// (`route_not_implemented` versus `route_unknown`, DESIGN §0.3), and the status
 // carries the rest.
 //
 // They stay in [knownTypes] because that set decides whether an UPSTREAM's type

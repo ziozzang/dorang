@@ -70,7 +70,7 @@ func (d *dispatcher) decodeT1(st *dispatchState, rq *server.Request, c *call) er
 		if sreq.StreamFormat == "sse" {
 			// The SSE speech container is a different response protocol, not a
 			// different parameter. Answering the non-streaming body to a client
-			// that asked for frames is worse than refusing (DESIGN §0.2).
+			// that asked for frames is worse than refusing (DESIGN §0.3).
 			return server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
 				"streamed speech (stream_format: sse) is not implemented; omit stream_format for the complete audio body").
 				WithCode("speech_stream_not_implemented").WithParam("stream_format")
@@ -124,7 +124,7 @@ func (d *dispatcher) decodeImage(rq *server.Request, body []byte) (*canonical.Im
 // checkFamily refuses a crossing that has no meaning rather than producing one.
 //
 // A 501 with a named code is the contract for "declared but not served on this
-// deployment" (DESIGN §0.2). The alternative — encoding a rerank request as
+// deployment" (DESIGN §0.3). The alternative — encoding a rerank request as
 // chat completions because the deployment happens to speak that — would answer
 // 200 with something that is not a ranking.
 func checkFamily(c *call, api catalog.API) error {
