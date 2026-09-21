@@ -226,16 +226,20 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		// this is what the gateway actually routes on. See [adminRouting].
 		Routing: &adminRouting{cfg: a.Config},
 
-		Capacity: &adminCapacityReporter{b: a.Broker},
+		Capacity:    &adminCapacityReporter{b: a.Broker},
+		Credentials: &adminCredentials{a: a},
 		// The monitoring screen's real-time pulse: this node's live HTTP
 		// counters, the same set GET /metrics exposes. Late-bound to a.Server
 		// because the server does not exist yet — see [adminSurface].
-		Surface: &adminSurface{a: a},
+		Surface:    &adminSurface{a: a},
+		Prometheus: a.Metrics,
+		Traffic:    &a.traffic,
 		// Config reload and structured config edits (take a deployment in or out
 		// of routing). Both late-bind to the file watcher via SetConfigControl,
 		// so they answer "not ready" until start-up wires it.
 		Reloader:     &adminReloader{a: a},
 		ConfigWriter: &adminConfigWriter{a: a},
+		Setup:        &adminSetup{a: a},
 		Catalog:      &adminCatalog{c: a.Catalog},
 		Pricing:      &adminPricer{d: a.dispatch},
 		Health:       admin.NewMemoryHealthHistory(1024, a.now()),
@@ -687,11 +691,7 @@ func (l *adminLedger) ListRequests(ctx context.Context, q admin.LogQuery) (admin
 	case q.ErrorsOnly:
 		page, err = l.st.ListErrors(ctx, r, p)
 	case q.UserID != "":
-		// user_id is a stored column with no index of its own, so there is no
-		// query to run. Naming which filters DO work is the difference between
-		// a caller retrying the same thing and a caller fixing it.
-		return admin.LogPage{}, unsupportedLedger(
-			"the ledger has no per-user index; filter by key_id, team_id, trace_id or tag")
+		page, err = l.st.ListRequestsByUser(ctx, q.UserID, r, p)
 	default:
 		return admin.LogPage{}, unsupportedLedger(
 			"a ledger query needs a filter: key_id, team_id, trace_id, tag or errors_only")
@@ -1101,8 +1101,12 @@ func (s *adminSurface) Surface(context.Context) (admin.Surface, error) {
 		return admin.Surface{}, admin.ErrUnsupported
 	}
 	st := srv.Stats()
+	id := ""
+	if s.a.Node != nil {
+		id = s.a.Node.ID()
+	}
 	out := admin.Surface{
-		NodeID:        nodeID(s.a.Config()),
+		NodeID:        id,
 		Requests:      int64(st.Requests),
 		Class2xx:      int64(st.ByClass[2]),
 		Class3xx:      int64(st.ByClass[3]),
@@ -1389,3 +1393,5 @@ func adminStoreError(err error) error {
 	}
 	return err
 }
+
+func (*adminLedger) ReportGroups() []string { return []string{"model", "key", "team", "day"} }

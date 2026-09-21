@@ -1,12 +1,6 @@
 {{define "content"}}
 <h1>New key</h1>
-<p class="lede">
-  This mints a credential through <code>POST {{.APIBase}}/key/generate</code> — the same route a
-  script calls, with this session's operator as the actor and the same audit row.
-  <strong>The secret is returned exactly once</strong>, on the page after this one, and dorang
-  cannot produce it again: only a non-reversible digest is stored (DESIGN §2.4).
-  Every field is optional; an empty box means &ldquo;not set&rdquo;, never &ldquo;set to empty&rdquo;.
-</p>
+<p class="lede" data-i18n>Create an API key. The secret is shown once after creation. Optional fields can be left empty.</p>
 
 <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">

@@ -5,13 +5,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="same-origin">
 <meta name="color-scheme" content="light dark">
-<title>{{.Title}} — dorang</title>
+<title data-page-title="{{.Title}}">{{.Title}} — dorang</title>
 <link rel="stylesheet" href="{{.Base}}/assets/style.css">
 <!-- Loaded without defer on purpose: it stamps the stored theme on <html>
      before the first paint, so an operator on the dark theme does not get a
      white flash on every navigation. Everything else waits for
      DOMContentLoaded. -->
 <script src="{{.Base}}/assets/app.js"></script>
+<script src="{{.Base}}/assets/i18n.js" defer></script>
+<script src="{{.Base}}/assets/console.js" defer></script>
+<script src="{{.Base}}/assets/setup.js" defer></script>
 </head>
 {{if .Screens}}
 <body>
@@ -21,58 +24,60 @@
   <header class="topbar">
     <a class="brand" href="{{.Base}}/">
       <span class="brand-mark" aria-hidden="true">d</span>
-      <span><strong>DORANG</strong><small>GATEWAY CONTROL</small></span>
+      <span><strong>dorang</strong><small>gateway console</small></span>
     </a>
-    <div class="workspace-crumb">
-      <span class="workspace-avatar" aria-hidden="true">d</span>
-      <span>Gateway</span><span class="crumb-slash">/</span><strong>admin</strong>
-    </div>
+    <div class="workspace-crumb"><span>Workspace</span><span class="crumb-slash">/</span><strong>{{.Title}}</strong></div>
     <div class="top-status">
-      {{if .Actor}}<span class="signed-in-user" title="signed in as">{{.Actor}}</span>{{end}}
+      <select id="locale-select" class="locale-select" aria-label="Language"><option value="ko">한국어</option><option value="en">English</option></select>
+      {{if .Actor}}<span class="session-indicator"><span class="small-dot"></span>Connected</span><span data-no-i18n class="signed-in-user" title="signed in as">{{.Actor}}</span>{{end}}
       <button type="button" id="theme-toggle" class="theme-toggle" title="toggle theme" aria-label="toggle theme">◐</button>
       {{if .Session}}<form method="POST" action="{{.Base}}/logout"><button type="submit" class="button button-quiet">sign out</button></form>{{end}}
     </div>
   </header>
 
   <aside class="sidebar" aria-label="Primary navigation">
+    <button type="button" class="command-trigger" id="command-open"><span data-i18n>Go to screen</span><kbd>⌘ K</kbd></button>
     <nav>
       {{range .NavGroups}}<p class="nav-group-label">{{.Title}}</p>
       {{range .Screens}}<a class="nav-link{{if .Current}} is-active{{end}}" href="{{.Href}}" {{if .Current}}aria-current="page"{{end}}><span aria-hidden="true">{{.Icon}}</span><bdi>{{.Label}}</bdi></a>
       {{end}}{{end}}
     </nav>
     <div class="sidebar-foot">
-      <span class="sidebar-system"><span class="small-dot"></span>dorang control plane</span>
+      <span class="sidebar-system"><span class="small-dot"></span>Gateway control plane</span>
     </div>
   </aside>
 
   <main id="main" tabindex="-1">
-    {{if .Problem}}<div class="alert" role="alert">{{.Problem}}</div>{{end}}
-    {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+    <div class="content-heading"><span class="eyebrow">DORANG / {{.Screen}}</span><span class="view-mode">{{if .CanMutate}}Operator access{{else}}Read-only access{{end}}</span></div>
+    {{if .Problem}}<div data-i18n-notice class="alert" role="alert">{{.Problem}}</div>{{end}}
+    {{if .Notice}}<div data-i18n-notice class="banner ok">{{.Notice}}</div>{{end}}
     {{template "content" .}}
     <footer class="foot">
-      Read-only operator view. Rendered {{rfc3339 .Generated}}.
-      {{if .Provenance}}{{.Provenance}}{{end}}
+      <span data-i18n>{{if .CanMutate}}Operator view{{else}}Read-only operator view{{end}}</span> · <span data-i18n>Rendered</span> {{rfc3339 .Generated}}.
+      {{if .Provenance}}<details class="provenance"><summary data-i18n>Data source</summary>{{.Provenance}}</details>{{end}}
     </footer>
   </main>
 
 </div>
+<dialog id="command-dialog" class="command-dialog"><label class="field"><span data-i18n>Go to screen</span><input id="command-query" type="search" autocomplete="off" placeholder="Search screens"></label><nav id="command-results"></nav><button type="button" data-close-dialog class="button" data-i18n>Close</button></dialog>
 </body>
 {{else}}
 <body class="login-body">
 <header class="topbar">
   <a class="brand" href="{{.Base}}/">
     <span class="brand-mark" aria-hidden="true">d</span>
-    <span><strong>DORANG</strong><small>GATEWAY CONTROL</small></span>
+    <span><strong>dorang</strong><small>gateway console</small></span>
   </a>
   <span class="spacer"></span>
   <div class="top-status">
+      <select id="locale-select" class="locale-select" aria-label="Language"><option value="ko">한국어</option><option value="en">English</option></select>
     <button type="button" id="theme-toggle" class="theme-toggle" title="toggle theme" aria-label="toggle theme">◐</button>
   </div>
 </header>
 <main id="main" class="login-main">
   <div class="login-card panel">
-    {{if .Problem}}<div class="alert" role="alert">{{.Problem}}</div>{{end}}
-    {{if .Notice}}<div class="banner ok">{{.Notice}}</div>{{end}}
+    {{if .Problem}}<div data-i18n-notice class="alert" role="alert">{{.Problem}}</div>{{end}}
+    {{if .Notice}}<div data-i18n-notice class="banner ok">{{.Notice}}</div>{{end}}
     {{template "content" .}}
   </div>
   <footer class="foot">Rendered {{rfc3339 .Generated}}.{{if .Provenance}} {{.Provenance}}{{end}}</footer>

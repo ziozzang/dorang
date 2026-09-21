@@ -1,11 +1,8 @@
 {{define "content"}}
 <div class="panel confirm {{if .Danger}}danger{{end}}">
-  <h1>{{if .Danger}}⚠ {{end}}Confirm: {{.Verb}}</h1>
+  <h1>{{if .Danger}}⚠ {{end}}<span data-i18n>Confirm:</span> <span data-i18n>{{.Verb}}</span></h1>
 
-  <p class="lede">
-    This page exists because the control you clicked sits one row away from another key's.
-    Check that the credential below is the one you meant.
-  </p>
+  <p class="lede" data-i18n>Check the key and the consequences below before applying this action.</p>
 
   <dl class="card">
     <dt>label</dt><dd class="mono">{{.Key.Label}}</dd>
@@ -16,8 +13,8 @@
     <dt>state</dt><dd>{{.Key.State}}</dd>
     <dt>spend</dt><dd class="mono">{{.Key.Spend}} of {{.Key.Budget}}</dd>
     <dt>expires</dt><dd>{{.Key.Expiry}}</dd>
-    <dt>models</dt><dd class="wrap">{{if .Key.Models}}{{range .Key.Models}}<span class="tag">{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</dd>
-    <dt>tags</dt><dd class="wrap">{{range .Key.Tags}}<span class="tag">{{.}}</span>{{end}}</dd>
+    <dt>models</dt><dd class="wrap">{{if .Key.Models}}{{range .Key.Models}}<span class="tag" data-no-i18n>{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</dd>
+    <dt>tags</dt><dd class="wrap">{{range .Key.Tags}}<span class="tag" data-no-i18n>{{.}}</span>{{end}}</dd>
   </dl>
 
   <p class="consequence">{{.Consequence}}</p>
@@ -34,7 +31,7 @@
     {{end}}
     <div class="row">
       <button type="submit" class="{{if $.Danger}}danger{{else}}primary{{end}}">
-        {{$.Verb}} {{$.Key.Label}}
+        <span data-i18n>{{$.Verb}}</span> <span data-no-i18n>{{$.Key.Label}}</span>
       </button>
       <a class="button" href="{{$.Base}}/keys">cancel, change nothing</a>
     </div>

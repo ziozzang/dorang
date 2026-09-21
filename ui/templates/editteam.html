@@ -1,12 +1,6 @@
 {{define "content"}}
 <h1>Edit team</h1>
-<p class="lede">
-  This edits a team through <code>POST {{.APIBase}}/team/update</code> — the same route a script
-  calls, with this session's operator as the actor and the same audit row. The form is
-  <strong>the team's desired state</strong>: a box left as it is keeps its value, and a clearable
-  box you <strong>empty is reset</strong> to &ldquo;none&rdquo;. The name is kept unless you
-  change it. Blocking is a separate control on the users screen.
-</p>
+<p class="lede" data-i18n>Edit team identity, access and limits. Empty optional fields clear their value.</p>
 
 <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">

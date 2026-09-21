@@ -200,6 +200,7 @@ type App struct {
 	// subsystem above rather than being pushed to by any of them, so nothing
 	// here imports internal/metrics except this package.
 	Metrics *metrics.Registry
+	traffic admin.TrafficBuffer
 	// Admin is the DESIGN §2.3 administration surface and the §11.3 operator
 	// UI. Nil when this process has no store — there is nothing to administer
 	// and nothing to audit — in which case the administrative paths keep

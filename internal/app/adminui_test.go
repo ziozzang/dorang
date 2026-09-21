@@ -251,7 +251,7 @@ func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 	href := regexp.MustCompile(`href="([^"]+)"`)
 
 	seen := map[string]bool{}
-	for _, p := range []string{"/ui/keys", "/ui/models", "/ui/usage"} {
+	for _, p := range []string{"/ui/keys", "/ui/models", "/ui/analytics"} {
 		w := callWith(a, testMasterKey, http.MethodGet, p, "")
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s = %d, want 200: %s", p, w.Code, w.Body.String())
@@ -270,7 +270,7 @@ func TestEveryAdvertisedScreenAnswers(t *testing.T) {
 	// pinning a number here would just be a second copy of the nav's own
 	// conditions. What must hold is that the core three are always present and
 	// that every advertised link answers — the loop below is the real test.
-	for _, want := range []string{"/ui/keys", "/ui/models", "/ui/usage"} {
+	for _, want := range []string{"/ui/keys", "/ui/models", "/ui/analytics"} {
 		if !seen[want] {
 			t.Errorf("the nav does not advertise %s; it lists %v", want, seen)
 		}

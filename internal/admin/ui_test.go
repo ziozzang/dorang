@@ -93,7 +93,7 @@ func TestThreeScreensRender(t *testing.T) {
 		path string
 		must []string
 	}{
-		{"/ui/keys", []string{"<title>Keys", ">ci<", "dk-", "aria-current"}},
+		{"/ui/keys", []string{`<title data-page-title="Keys">Keys`, ">ci<", "dk-", "aria-current"}},
 		{"/ui/models", []string{"Models &amp; deployments", "a/model", "chat-latest", "cred-a", "prov-a"}},
 		{"/ui/usage", []string{"cost (billed)", "notional (list rate)", "leverage", "By model group"}},
 	} {
@@ -468,12 +468,12 @@ func TestModelsScreenWithNeitherSource(t *testing.T) {
 func TestNavIsGroupedIntoSections(t *testing.T) {
 	h := newHarness(t)
 	body := h.do(http.MethodGet, "/ui/keys", nil).Body.String()
-	for _, title := range []string{`nav-group-label">access`, `nav-group-label">observability`} {
+	for _, title := range []string{`nav-group-label">Access`, `nav-group-label">Observe`, `nav-group-label">Cost &amp; usage`} {
 		if !strings.Contains(body, title) {
 			t.Errorf("the nav is not grouped: missing %q", title)
 		}
 	}
-	for _, href := range []string{`href="/ui/keys"`, `href="/ui/usage"`, `href="/ui/monitoring"`} {
+	for _, href := range []string{`href="/ui/keys"`, `href="/ui/analytics"`, `href="/ui/overview"`} {
 		if !strings.Contains(body, href) {
 			t.Errorf("grouping dropped a link: %s", href)
 		}
@@ -487,7 +487,7 @@ func TestNavAdvertisesOnlyScreensThatAnswer(t *testing.T) {
 		if strings.Contains(body, `href="/ui/models"`) {
 			t.Error("the nav advertises the models screen in a process that cannot serve it")
 		}
-		for _, want := range []string{`href="/ui/keys"`, `href="/ui/usage"`} {
+		for _, want := range []string{`href="/ui/keys"`, `href="/ui/analytics"`} {
 			if !strings.Contains(body, want) {
 				t.Errorf("the nav dropped %s, which this process serves", want)
 			}
@@ -522,8 +522,11 @@ func TestNavAdvertisesOnlyScreensThatAnswer(t *testing.T) {
 		// operator from a screen that failed to one that cannot answer either.
 		h2 := newHarness(t, func(c *Config) { c.Keys, c.Models, c.Ledger, c.Directory = nil, nil, nil, nil })
 		body = h2.do(http.MethodGet, "/ui/batches", nil).Body.String()
-		if strings.Contains(body, "go to") {
-			t.Errorf("a process that serves no screen still offers one: %s", body)
+		if !strings.Contains(body, `href="/ui/overview"`) {
+			t.Error("the empty gateway must still offer runtime overview")
+		}
+		if got := h2.do(http.MethodGet, "/ui/overview", nil).Code; got != http.StatusOK {
+			t.Errorf("overview=%d", got)
 		}
 	})
 }
@@ -605,7 +608,7 @@ func TestUIUnknownScreenIs501(t *testing.T) {
 func TestUIRootRedirects(t *testing.T) {
 	h := newHarness(t)
 	rec := h.do(http.MethodGet, "/ui", nil)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/ui/keys" {
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/ui/overview" {
 		t.Fatalf("status %d location %q", rec.Code, rec.Header().Get("Location"))
 	}
 }

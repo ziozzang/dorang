@@ -1,26 +1,4 @@
-// dorang admin UI — the whole client-side program.
-//
-// Everything that can be rendered on the server is rendered on the server. What
-// is left here is genuinely client-side and nothing else:
-//
-//   1. the theme toggle, because the operator's preference is not the server's
-//      business and a round trip to change a colour is absurd;
-//   2. a substring filter over an already-loaded table, because filtering rows
-//      the browser already has must not cost a query;
-//   3. an optional refresh timer, which reloads the current URL and therefore
-//      re-runs the same bounded, paginated query the server already validated;
-//   4. the copy button on the one-time secret page, because "select this and
-//      press ctrl-C" is the step at which an operator loses a credential that
-//      cannot be shown again.
-//
-// There is no framework, no bundler and no network fetch. Every mutation is a
-// plain HTML form POST carrying the session's token, so the screens work with
-// scripting disabled — the copy button degrades to selecting the field, which
-// is what it was standing in for.
-//
-// Nothing here is an authorization decision, and nothing here holds a secret
-// beyond the input the server rendered: the copy handler reads the field and
-// hands it to the clipboard, and does not stash it anywhere.
+// Session forms, theme, table filters and clipboard interactions.
 
 (function () {
   "use strict";
@@ -31,6 +9,7 @@
   // an explicit choice is stamped on <html> where the data-theme rules win.
 
   var KEY = "dorang.theme";
+  function t(key) { return window.dorangI18n ? window.dorangI18n.t(key) : key; }
 
   function stored() {
     try {
@@ -90,9 +69,9 @@
     // The button is icon-only (the glyph is a CSS ::before that tracks
     // data-theme), so the label is carried by title/aria-label rather than
     // textContent — writing text here would sit beside the icon.
-    var t = "Colour theme: " + (v === null ? "follow system" : v) + " (click to change)";
-    b.setAttribute("aria-label", t);
-    b.setAttribute("title", t);
+    var caption = t("Colour theme") + ": " + t(v === null ? "follow system" : v);
+    b.setAttribute("aria-label", caption);
+    b.setAttribute("title", caption);
   }
 
   // ---- table filter -----------------------------------------------------
@@ -116,7 +95,7 @@
         }
       }
       if (count) {
-        count.textContent = q === "" ? total + " rows" : shown + " of " + total + " rows";
+        count.textContent = q === "" ? total + " " + t("rows") : shown + " " + t("of") + " " + total + " " + t("rows");
       }
     });
   }
@@ -164,7 +143,7 @@
     if (!btn) return;
 
     function say(msg) {
-      if (state) state.textContent = msg;
+      if (state) state.textContent = t(msg);
     }
 
     btn.addEventListener("click", function () {
@@ -188,6 +167,7 @@
   // ---- boot -------------------------------------------------------------
 
   applyTheme(stored());
+  document.addEventListener("dorang:language", function () { label(stored()); var filter = document.getElementById("filter"); if (filter) filter.dispatchEvent(new Event("input")); });
 
   document.addEventListener("DOMContentLoaded", function () {
     label(stored());
@@ -221,7 +201,7 @@
           var doc = new DOMParser().parseFromString(html, "text/html");
           var fresh = doc.querySelector("[data-live]");
           var cur = document.querySelector("[data-live]");
-          if (fresh && cur) cur.innerHTML = fresh.innerHTML;
+          if (fresh && cur) { cur.innerHTML = fresh.innerHTML; if (window.dorangI18n) window.dorangI18n.refresh(); }
         })
         .catch(function () { /* a dropped poll is not an error worth showing */ })
         .then(function () {

@@ -51,6 +51,7 @@ const (
 // happen — is a nil dependency reaching a handler as a panic or as an empty
 // result that reads like "there is nothing there".
 type Config struct {
+	Setup SetupManager
 	// Auth resolves administrative credentials. Required.
 	Auth Authenticator
 
@@ -96,11 +97,13 @@ type Config struct {
 	// Surface reports this node's live HTTP counters — what GET /metrics
 	// exposes — for the monitoring screen's real-time pulse. Optional; nil
 	// leaves that section off, the same rule the other reporters follow.
-	Surface  SurfaceReporter
-	Health   HealthHistory
-	Catalog  Catalog
-	Pricing  Pricer
-	Reloader Reloader
+	Surface    SurfaceReporter
+	Prometheus PrometheusSource
+	Traffic    *TrafficBuffer
+	Health     HealthHistory
+	Catalog    Catalog
+	Pricing    Pricer
+	Reloader   Reloader
 	// ConfigWriter applies validated, structured edits to the config file (take
 	// a deployment in or out of routing). Optional; nil leaves the model
 	// controls read-only. See [ConfigWriter].
@@ -152,9 +155,10 @@ const DefaultRotationGrace = 24 * time.Hour
 
 // API is the administration HTTP surface. It is safe for concurrent use.
 type API struct {
-	cfg     Config
-	routes  map[string]*route
-	metrics Metrics
+	cfg       Config
+	routes    map[string]*route
+	metrics   Metrics
+	telemetry telemetryCache
 
 	ui *uiServer
 }
@@ -175,8 +179,9 @@ func (c *call) ctx() context.Context { return c.r.Context() }
 
 // route is one path and the methods it answers.
 type route struct {
-	methods map[string]handler
-	allow   string
+	unsupported bool
+	methods     map[string]handler
+	allow       string
 }
 
 // New validates the configuration and builds the surface.
@@ -287,6 +292,7 @@ func (a *API) stub(p, code, reason string) {
 	for _, m := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
 		a.mount(m, p, h)
 	}
+	a.routes[p].unsupported = true
 }
 
 // ServeHTTP dispatches one administrative request.

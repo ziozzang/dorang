@@ -770,8 +770,9 @@ type QuotaWindow struct {
 // It carries ids and health only. No key material reaches this package, so none
 // can appear here (§11.2b).
 type CredentialStatus struct {
-	ID         string
-	ProviderID string
+	SampleScope string
+	ID          string
+	ProviderID  string
 	// Health is "healthy", "unavailable", "half_open" or "unknown".
 	Health              string
 	UnavailableUntil    time.Time

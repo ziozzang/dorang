@@ -1,9 +1,6 @@
 {{define "content"}}
 <h1>Usage &amp; cost</h1>
-<p class="lede">
-  Every figure below is for the bounded window shown. There is no "all time" option, because
-  an unbounded ledger query is refused rather than answered slowly (DESIGN §9.3).
-</p>
+<p class="lede" data-i18n>Review persisted usage and costs for a bounded time window.</p>
 
 <form class="controls" method="GET" action="{{.Base}}/usage">
   <label class="field">from

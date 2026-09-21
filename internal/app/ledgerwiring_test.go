@@ -73,7 +73,6 @@ func TestUnfilteredSpendLogsIsNotImplementedRatherThanInternalError(t *testing.T
 		want string
 	}{
 		{"no filter at all", window, "key_id"},
-		{"user_id, which has no index", window + "&user_id=u-1", "per-user index"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := httptest.NewRecorder()

@@ -45,6 +45,27 @@ func TestQuerySetReturnsCorrectRowsAndUsesItsIndex(t *testing.T) {
 			assertIndexed(t, s, q, args, "request_logs_key_ts_idx")
 		})
 
+		t.Run("recent requests for a user", func(t *testing.T) {
+			page, err := s.ListRequestsByUser(ctx, "user-3", r, Page{Limit: 50})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(page.Rows) == 0 {
+				t.Fatal("no rows")
+			}
+			assertDescending(t, page.Rows)
+			for _, row := range page.Rows {
+				if row.UserID != "user-3" {
+					t.Fatalf("user filter leaked %s", row.UserID)
+				}
+			}
+			q, args, err := s.buildLedgerQuery(ledgerSpec{where: "l.user_id = ?", args: []any{"user-3"}}, r, Page{Limit: 50})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertIndexed(t, s, q, args, "request_logs_user_ts_idx")
+		})
+
 		t.Run("recent requests for a team", func(t *testing.T) {
 			page, err := s.ListRequestsByTeam(ctx, "team-2", r, Page{Limit: 50})
 			if err != nil {

@@ -1,17 +1,11 @@
 {{define "content"}}
 <h1>Users &amp; teams</h1>
-<p class="lede">
-  The directory the request path enforces: a user's or team's block flag, budget, rate limits and
-  model allow-list all apply on top of a key's. Every change here goes through the same
-  <code>{{.APIBase}}/user/*</code> and <code>{{.APIBase}}/team/*</code> routes a script would call,
-  with this session's operator as the actor and the same audit row. An empty box means
-  &ldquo;not set&rdquo;, never &ldquo;set to empty&rdquo;.
-</p>
+<p class="lede" data-i18n>Manage users, teams and membership. Their limits apply alongside API key limits.</p>
 
 {{if .Confirm}}
 <div class="panel confirm danger">
-  <h1>⚠ Delete this {{.Confirm.Kind}}?</h1>
-  <p class="lede">This removes <strong>{{.Confirm.Label}}</strong> (<code>{{.Confirm.ID}}</code>).
+  <h1><span data-i18n>⚠ Delete this</span> <span data-i18n>{{.Confirm.Kind}}</span>?</h1>
+  <p class="lede">This removes <strong data-no-i18n>{{.Confirm.Label}}</strong> (<code>{{.Confirm.ID}}</code>).
     Keys that named it keep working but lose its {{.Confirm.Kind}}-scoped budget and limits.</p>
   <form method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -19,7 +13,7 @@
     <input type="hidden" name="{{.Confirm.Field}}" value="{{.Confirm.ID}}">
     <input type="hidden" name="return" value="{{.Base}}/users">
     <div class="row">
-      <button type="submit" class="danger">delete {{.Confirm.Kind}} {{.Confirm.Label}}</button>
+      <button type="submit" class="danger"><span data-i18n>delete</span> <span data-i18n>{{.Confirm.Kind}}</span> <span data-no-i18n>{{.Confirm.Label}}</span></button>
       <a class="button" href="{{.Base}}/users">cancel, change nothing</a>
     </div>
   </form>
@@ -29,9 +23,9 @@
 <h2>Users</h2>
 
 {{if .CanMutate}}
-<div class="panel user-panel">
-  <h2>Register a user</h2>
-  <p class="field-help">Creates an account through <code>{{.APIBase}}/user/new</code> with this session's operator as the actor. Only the email is required; every ceiling is optional and empty means &ldquo;no limit&rdquo;.</p>
+<details class="panel user-panel editor-disclosure">
+  <summary data-i18n>Register a user</summary>
+  <p class="field-help" data-i18n>Email is required. Optional limits can be left empty.</p>
   <form class="form-grid" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <input type="hidden" name="action" value="create_user">
@@ -66,7 +60,7 @@
     </div>
     <div class="button-row span-2"><button type="submit" class="button button-primary">create user</button></div>
   </form>
-</div>
+</details>
 {{end}}
 
 <div class="scroll">
@@ -80,7 +74,7 @@
   {{range .Users}}
     <tr>
       <td class="mono">{{.Email}}</td>
-      <td>{{or .Name "—"}}</td>
+      <td data-no-i18n>{{or .Name "—"}}</td>
       <td>{{.Role}}</td>
       <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
       <td>{{.Budget}}</td>
@@ -110,6 +104,7 @@
 <h2>Teams</h2>
 
 {{if .CanMutate}}
+<details class="editor-disclosure panel"><summary data-i18n>Create team</summary>
 <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input type="hidden" name="action" value="create_team">
@@ -139,6 +134,7 @@
   </div>
   <div class="row"><button type="submit" class="primary">create team</button></div>
 </form>
+</details>
 {{end}}
 
 <div class="scroll">
@@ -151,7 +147,7 @@
   <tbody>
   {{range .Teams}}
     <tr>
-      <td>{{.Name}}</td>
+      <td data-no-i18n>{{.Name}}</td>
       <td class="mono">{{or .Alias "—"}}</td>
       <td class="mono">{{or .Org "—"}}</td>
       <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else}}<span class="state-ok">active</span>{{end}}</td>

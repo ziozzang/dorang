@@ -396,6 +396,15 @@ func (s *Store) ListRequestsByKey(ctx context.Context, apiKeyID string, r TimeRa
 	return s.runLedgerQuery(ctx, q, args, p)
 }
 
+// ListRequestsByUser uses the user/time index introduced by migration 0002.
+func (s *Store) ListRequestsByUser(ctx context.Context, userID string, r TimeRange, p Page) (LedgerPage, error) {
+	q, args, err := s.buildLedgerQuery(ledgerSpec{where: "l.user_id = ?", args: []any{userID}}, r, p)
+	if err != nil {
+		return LedgerPage{}, err
+	}
+	return s.runLedgerQuery(ctx, q, args, p)
+}
+
 // ListRequestsByTeam returns recent requests for a team.
 // Index: request_logs (team_id, ts DESC, id DESC).
 func (s *Store) ListRequestsByTeam(ctx context.Context, teamID string, r TimeRange, p Page) (LedgerPage, error) {

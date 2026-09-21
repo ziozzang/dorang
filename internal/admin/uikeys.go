@@ -62,6 +62,7 @@ type uiField struct {
 
 // uiAction is one row of the credential lifecycle as the UI performs it.
 type uiAction struct {
+	jsonResponse bool
 	// api is the administration path this action posts to. It is the same path
 	// a script calls and the same handler answers it.
 	api string
@@ -263,10 +264,10 @@ var uiActions = map[string]uiAction{
 
 // available reports whether this process can perform the action.
 func (a uiAction) available(s *uiServer) bool {
-	if s.api.cfg.Keys == nil {
-		return false
+	if a.needs != nil {
+		return a.needs(s)
 	}
-	return a.needs == nil || a.needs(s)
+	return s.api.cfg.Keys != nil
 }
 
 // keyRefBody is the body of every action that takes nothing but an id.
@@ -587,6 +588,12 @@ func (s *uiServer) act(w http.ResponseWriter, r *http.Request, v viewer) {
 		return
 	}
 	s.api.metrics.uiMutations.Add(1)
+	if a.jsonResponse {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(raw)
+		return
+	}
 
 	if a.reveals {
 		rv, err := revealFrom(a.past, raw)
@@ -620,7 +627,11 @@ func (s *uiServer) act(w http.ResponseWriter, r *http.Request, v viewer) {
 	// (safeNext's own default); the users screen sends its own path. safeNext
 	// admits only a path under this UI's mount, so a crafted return cannot
 	// bounce the operator off-site.
-	http.Redirect(w, r, safeNext(s.base(), r.PostFormValue("return")), http.StatusSeeOther)
+	target := r.PostFormValue("return")
+	if name == "setup_save" {
+		target = setupReturn(s.base(), r.PostForm)
+	}
+	http.Redirect(w, r, safeNext(s.base(), target), http.StatusSeeOther)
 }
 
 // renderActionError shows a refusal from the administration surface.

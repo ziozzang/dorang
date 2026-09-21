@@ -1418,3 +1418,30 @@ func sampleValues(t *testing.T, body []byte) map[string]float64 {
 	}
 	return out
 }
+
+func TestModelTokenAndCostAccounting(t *testing.T) {
+	q := NewRequests(RequestsOptions{})
+	q.SetAdmittedModels([]string{"m"})
+	for i := 0; i < 2; i++ {
+		q.Observe(Sample{Model: "m", Endpoint: "chat", Status: 200, Routed: true, Tokens: Tokens{Input: 100, Output: 20, CacheRead: 60, CacheWrite: 5, Reasoning: 8}, CostNano: 320000, Priced: true})
+	}
+	// An unpriced request contributes tokens, never an invented billed amount.
+	q.Observe(Sample{Model: "m", Endpoint: "chat", Status: 500, Routed: true, Tokens: Tokens{Input: 10}, CostNano: 999999, Priced: false})
+	r := New(nil)
+	r.Register(q)
+	body := string(r.Metrics(nil))
+	for _, want := range []string{
+		`dorang_model_tokens_total{model="m",kind="input"} 210`,
+		`dorang_model_tokens_total{model="m",kind="output"} 40`,
+		`dorang_model_tokens_total{model="m",kind="cache_read"} 120`,
+		`dorang_model_tokens_total{model="m",kind="cache_write"} 10`,
+		`dorang_model_tokens_total{model="m",kind="reasoning"} 16`,
+		`dorang_model_cost_nano_total{model="m"} 640000`,
+		`dorang_model_pricing_requests_total{model="m",pricing="priced"} 2`,
+		`dorang_model_pricing_requests_total{model="m",pricing="unpriced"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %s", want)
+		}
+	}
+}

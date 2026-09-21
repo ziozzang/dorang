@@ -258,6 +258,9 @@ type adminBudgets struct {
 }
 
 func (b *adminBudgets) SetBudget(ctx context.Context, in admin.Budget) error {
+	if in.SoftBudgetNano != nil && in.Subject.Kind != "key" {
+		return admin.Unsupported("Soft budget limits are supported only for API keys; use a hard budget for users and teams.")
+	}
 	sub, err := storeSubject(in.Subject)
 	if err != nil {
 		return err
@@ -372,3 +375,7 @@ func storeSubject(s admin.BudgetSubject) (store.Subject, error) {
 			"subject row, and api_keys, users and teams are the three that have one); set the "+
 			"ceiling on a key, a user or a team instead", s.Kind)
 }
+
+func (*adminBudgets) BudgetKinds() []string { return []string{"key", "user", "team"} }
+
+func (*adminBudgets) SoftBudgetKinds() []string { return []string{"key"} }

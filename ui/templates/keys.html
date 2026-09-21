@@ -1,12 +1,8 @@
 {{define "content"}}
 <h1>Keys</h1>
-<p class="lede">
-  Issued credentials and the authorization fields that travel with them. There is no column
-  here that could be turned back into a secret: dorang stores a non-reversible display label
-  rather than the trailing characters of the key (DESIGN §2.4).
-</p>
+<p class="lede" data-i18n>Manage API credentials, ownership, access rules and spending limits.</p>
 
-<form class="controls" onsubmit="return false">
+<div class="controls">
   <label class="field">filter
     <input type="search" id="filter" placeholder="label, id, user, team, tag" autocomplete="off">
   </label>
@@ -23,7 +19,7 @@
   <span class="field spacer"></span>
   <a class="button primary" href="{{.Base}}/keys/new">new key</a>
   {{end}}
-</form>
+</div>
 
 <div class="panel scroll">
 <table data-filterable>
@@ -38,12 +34,12 @@
 {{range .Keys}}
 <tr>
   <td class="mono">{{.KeyLabel}}</td>
-  <td>{{or .KeyAlias "—"}}</td>
+  <td data-no-i18n>{{or .KeyAlias "—"}}</td>
   <td class="mono">{{.ID}}</td>
   <td class="mono">{{or .UserID "—"}}</td>
   <td class="mono">{{or .TeamID "—"}}</td>
-  <td class="wrap">{{if .Models}}{{range .Models}}<span class="tag">{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</td>
-  <td class="wrap">{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</td>
+  <td class="wrap">{{if .Models}}{{range .Models}}<span class="tag" data-no-i18n>{{.}}</span>{{end}}{{else}}<span class="unavailable">all</span>{{end}}</td>
+  <td class="wrap">{{range .Tags}}<span class="tag" data-no-i18n>{{.}}</span>{{end}}</td>
   <td class="num">{{money .SpendNano}}</td>
   <td class="num">{{if .MaxBudgetNano}}{{money (deref .MaxBudgetNano)}}{{else}}<span class="unavailable">none</span>{{end}}</td>
   <td>{{if .Blocked}}<span class="state-bad">blocked</span>{{else if .Expired}}<span class="state-warn">expired</span>{{else if .Pended}}<span class="state-warn" title="{{.PendReason}}">pended</span>{{else}}<span class="state-ok">active</span>{{end}}</td>
@@ -91,20 +87,5 @@
 </table>
 </div>
 
-{{if .CanMutate}}
-<p class="lede">
-  Every control above calls the same administration route a script calls — <code>{{.APIBase}}/key/generate</code>,
-  <code>/key/rotate</code>, <code>/key/update</code>, <code>/key/block</code> and the rest — with this session's
-  operator as the actor, so each one writes the audit row and publishes the invalidation (§11.2c) that the API does.
-  <strong>Edit</strong> opens a form prefilled with the key's current fields: it is the key's whole desired
-  state, so a box left as it is keeps its value and a box you empty resets that field. That is what makes a form
-  safe here where it once was not — there is no &ldquo;leave alone&rdquo; state to confuse with &ldquo;set to nothing&rdquo;.
-</p>
-{{else}}
-<p class="lede">
-  This view is read-only: a mutation is proved by a session's own token and this page is authorized
-  by a header. Sign in for a session to create, rotate or revoke from here, or use the API —
-  <code>POST {{.APIBase}}/key/generate</code> and friends.
-</p>
-{{end}}
+{{if not .CanMutate}}<p class="lede" data-i18n>This view is read-only. Sign in with a session to create, rotate or revoke keys from this screen.</p>{{end}}
 {{end}}

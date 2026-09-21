@@ -86,7 +86,7 @@ func TestMonitoringScreenRenders(t *testing.T) {
 		t.Fatalf("GET /ui/monitoring = %d\n%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{"Monitoring", `data-live="10"`, "Recent failures — last 5m", `href="/ui/monitoring"`} {
+	for _, want := range []string{"Monitoring", `data-live="10"`, "Recent failures — last 5m", `href="/ui/overview"`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("monitoring screen missing %q", want)
 		}

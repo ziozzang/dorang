@@ -37,6 +37,7 @@ type quotaWindowView struct {
 }
 
 type credentialView struct {
+	SampleScope  string `json:"sample_scope,omitempty"`
 	CredentialID string `json:"credential_id"`
 	ProviderID   string `json:"provider_id"`
 
@@ -62,6 +63,7 @@ func viewCredential(s CredentialStatus) credentialView {
 		q = append(q, viewQuotaWindow(w))
 	}
 	return credentialView{
+		SampleScope:         s.SampleScope,
 		CredentialID:        s.ID,
 		ProviderID:          s.ProviderID,
 		Health:              s.Health,
@@ -592,13 +594,17 @@ func (c *call) adminStatus() error {
 	m := c.a.Metrics()
 	writeJSON(c.w, c.r, http.StatusOK, map[string]any{
 		"dependencies": map[string]bool{
-			"keys":      cfg.Keys != nil,
-			"hasher":    cfg.Hasher != nil,
-			"directory": cfg.Directory != nil,
-			"models":    cfg.Models != nil,
-			"budgets":   cfg.Budgets != nil,
-			"ledger":    cfg.Ledger != nil,
-			"audit":     cfg.Audit != nil,
+			"prometheus":    cfg.Prometheus != nil,
+			"live_requests": cfg.Traffic != nil,
+			"routing":       cfg.Routing != nil,
+			"config_writer": cfg.ConfigWriter != nil,
+			"keys":          cfg.Keys != nil,
+			"hasher":        cfg.Hasher != nil,
+			"directory":     cfg.Directory != nil,
+			"models":        cfg.Models != nil,
+			"budgets":       cfg.Budgets != nil,
+			"ledger":        cfg.Ledger != nil,
+			"audit":         cfg.Audit != nil,
 			// An absent invalidator refuses nothing, so it is the one dependency
 			// whose absence is invisible from every other endpoint: the
 			// mutations still apply and the fleet honours them a credential

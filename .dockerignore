@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+**/node_modules
+bin
+dist
+**/test-results
+**/playwright-report
+
+# Runtime credential files must never enter source control or image layers.
+**/secrets/

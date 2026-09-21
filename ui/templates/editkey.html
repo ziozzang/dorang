@@ -1,13 +1,6 @@
 {{define "content"}}
 <h1>Edit key</h1>
-<p class="lede">
-  This edits a key through <code>POST {{.APIBase}}/key/update</code> — the same route a script
-  calls, with this session's operator as the actor and the same audit row. The form is
-  <strong>the key's whole desired state</strong>: every box is prefilled with its current value,
-  so a box left as it is keeps that value, and a box you <strong>empty is reset</strong> to
-  &ldquo;no limit&rdquo; or &ldquo;none&rdquo;. The secret is not shown or changed here; rotate a
-  key to mint a new one.
-</p>
+<p class="lede" data-i18n>Edit the key’s desired settings. Empty fields clear their value. Rotate the key separately to replace its secret.</p>
 
 <form class="panel stack" method="POST" action="{{.Base}}{{.ActionPath}}" autocomplete="off">
   <input type="hidden" name="csrf" value="{{.CSRF}}">

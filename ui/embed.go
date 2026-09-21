@@ -10,11 +10,8 @@
 // whoever has the data — internal/admin — without ui growing a dependency on
 // the store, the router, or anything else that changes on a different schedule.
 //
-// The stylesheet and the script are the only two assets, and neither is a
-// framework. §11.3 calls this an SPA; it is served as plain server-rendered
-// HTML with a small amount of vanilla JavaScript for the parts that are
-// genuinely client-side (theme, filtering, refresh). An operator tool is judged
-// on being obviously correct, not on being impressive.
+// Server-rendered session forms and embedded JavaScript provide bilingual
+// navigation, theme preferences, filtering and live telemetry over SSE.
 package ui
 
 import (
@@ -25,7 +22,7 @@ import (
 //go:embed assets templates
 var files embed.FS
 
-// Assets returns the static asset tree: the stylesheet and the script.
+// Assets returns the static asset tree: stylesheets and JavaScript modules.
 //
 // The returned filesystem is rooted at the asset directory, so "style.css"
 // addresses the stylesheet. It is read-only and safe for concurrent use.
@@ -44,7 +41,7 @@ func Templates() fs.FS { return must(fs.Sub(files, "templates")) }
 // names a key before something irreversible happens to it, and the one page in
 // dorang that ever displays a plaintext credential.
 func Pages() []string {
-	return []string{"keys", "users", "models", "usage", "monitoring", "login", "message", "newkey", "editkey", "edituser", "editteam", "confirm", "secret"}
+	return []string{"setup", "console", "keys", "users", "models", "usage", "monitoring", "login", "message", "newkey", "editkey", "edituser", "editteam", "confirm", "secret"}
 }
 
 func must(f fs.FS, err error) fs.FS {

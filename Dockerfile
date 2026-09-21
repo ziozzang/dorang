@@ -25,6 +25,8 @@ RUN go build -trimpath \
       -ldflags "-s -w \
         -X main.version=${VERSION} \
         -X main.commit=${COMMIT} \
+        -X github.com/ziozzang/dorang/internal/app.Version=${VERSION} \
+        -X github.com/ziozzang/dorang/internal/app.Commit=${COMMIT} \
         -X main.buildDate=${BUILD_DATE}" \
       -o /out/dorang    ./cmd/dorang && \
     go build -trimpath \

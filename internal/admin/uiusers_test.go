@@ -79,7 +79,7 @@ func TestUsersScreenCreateBlockDelete(t *testing.T) {
 	}
 
 	// the delete confirmation is a GET that writes nothing
-	if body := uiGet(h, "/ui/users?del_user="+uid, c).Body.String(); !strings.Contains(body, "Delete this user") {
+	if body := uiGet(h, "/ui/users?del_user="+uid, c).Body.String(); !strings.Contains(body, "Delete this</span>") || !strings.Contains(body, ">user</span>?") {
 		t.Error("the delete confirmation did not render")
 	}
 	if u, _ := h.store.GetUser(t.Context(), uid); u == nil {

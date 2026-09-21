@@ -342,9 +342,12 @@ var navSections = []struct {
 	title   string
 	screens []string
 }{
-	{"access", []string{"keys", "users"}},
-	{"catalog", []string{"models"}},
-	{"observability", []string{"usage", "monitoring"}},
+	{"Connect & configure", []string{"setup"}},
+	{"Observe", []string{"overview", "requests", "history", "metrics"}},
+	{"Route & serve", []string{"models", "credentials", "capacity", "catalog"}},
+	{"Access", []string{"keys", "users"}},
+	{"Cost & usage", []string{"analytics", "budgets", "pricing", "usage"}},
+	{"System", []string{"operations", "monitoring"}},
 }
 
 type page struct {
@@ -537,11 +540,21 @@ func (s *uiServer) nav(current string, v viewer) []navScreen {
 		screen, label string
 		available     bool
 	}{
-		{"keys", "keys", s.api.cfg.Keys != nil},
+		{"setup", "Upstream connections", s.api.cfg.Setup != nil && v.scope.Global},
+		{"overview", "Overview", v.scope.Global},
+		{"requests", "Live requests", s.api.cfg.Traffic != nil && v.scope.Global},
+		{"history", "Request history", s.api.cfg.Ledger != nil && v.scope.Global},
+		{"metrics", "Metrics explorer", s.api.cfg.Prometheus != nil && v.scope.Global},
+		{"credentials", "Providers & credentials", s.api.cfg.Credentials != nil && v.scope.Global},
+		{"capacity", "Capacity & queues", s.api.cfg.Capacity != nil && v.scope.Global},
+		{"catalog", "Model capabilities", s.api.cfg.Catalog != nil && v.scope.Global},
+		{"analytics", "Model analytics", s.api.cfg.Ledger != nil && v.scope.Global},
+		{"budgets", "Budgets", s.api.cfg.Budgets != nil && v.scope.Global},
+		{"pricing", "Price calculator", s.api.cfg.Pricing != nil && v.scope.Global},
+		{"operations", "System & API", v.scope.Global},
+		{"keys", "API keys", s.api.cfg.Keys != nil},
 		{"users", "users & teams", s.api.cfg.Directory != nil && v.scope.Global},
 		{"models", "models & deployments", cat != nil && v.scope.Global},
-		{"usage", "usage & cost", s.api.cfg.Ledger != nil && v.scope.Global},
-		{"monitoring", "monitoring", (s.api.cfg.Ledger != nil || s.api.cfg.Credentials != nil || s.api.cfg.Capacity != nil || s.api.cfg.Surface != nil) && v.scope.Global},
 	}
 	out := make([]navScreen, 0, len(all))
 	for _, n := range all {
@@ -692,10 +705,7 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 	s.securityHeaders(w)
 
 	switch rest {
-	case "", "/":
-		http.Redirect(w, r, s.base()+"/keys", http.StatusSeeOther)
-		return
-	case "/assets/style.css", "/assets/app.js":
+	case "/assets/style.css", "/assets/app.js", "/assets/console.js", "/assets/i18n.js", "/assets/setup.js":
 		s.serveAsset(w, r, strings.TrimPrefix(rest, "/assets/"))
 		return
 	}
@@ -761,6 +771,16 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 	}
 
 	switch rest {
+	case "", "/":
+		if v.scope.Global {
+			http.Redirect(w, r, s.base()+"/overview", http.StatusSeeOther)
+		} else {
+			http.Redirect(w, r, s.base()+"/keys", http.StatusSeeOther)
+		}
+	case "/events":
+		s.streamTelemetry(w, r, v)
+	case "/setup", "/overview", "/requests", "/history", "/metrics", "/credentials", "/capacity", "/budgets", "/analytics", "/pricing", "/catalog", "/operations":
+		s.screenConsole(w, r, v, strings.TrimPrefix(rest, "/"))
 	case "/keys":
 		s.screenKeys(w, r, v)
 	case "/keys/new":
@@ -796,7 +816,7 @@ func (s *uiServer) serve(w http.ResponseWriter, r *http.Request, rest string) {
 		// than pretending the URL was wrong.
 		s.renderMessage(w, r, http.StatusNotImplemented, v,
 			"Not implemented",
-			"There is no such screen. Version 1 ships keys, models and deployments, and usage and cost (DESIGN §11.3).",
+			"This screen is not available. Choose an available workspace from the navigation.",
 			CodeNotImplemented)
 	}
 }
@@ -911,7 +931,7 @@ func (s *uiServer) authorize(w http.ResponseWriter, r *http.Request) (viewer, bo
 					"or use the administration API")
 			return viewer{}, false
 		}
-		return viewer{actor: actorLabel(p), scope: p.AdminScope()}, true
+		return viewer{actor: actorLabel(p), scope: p.AdminScope(), principal: p}, true
 	}
 	if s.api.cfg.DisableUISessions {
 		http.Error(w, "an administrative credential is required", http.StatusUnauthorized)

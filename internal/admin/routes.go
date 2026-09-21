@@ -87,7 +87,12 @@ func (a *API) registerShapeCompatible() {
 // registerNative mounts the /admin/* surface: what dorang has and the incumbent
 // does not, namespaced so a future shape-compatible path can never collide.
 func (a *API) registerNative() {
+	a.read("/admin/setup", (*call).setupSnapshot)
+	a.write("/admin/setup/change", (*call).setupChange)
+	a.write("/admin/setup/discover", (*call).setupDiscover)
 	a.read("/admin/status", (*call).adminStatus)
+	a.read("/admin/telemetry", (*call).adminTelemetry)
+	a.read("/admin/requests/recent", (*call).adminRecentRequests)
 	a.read("/admin/credentials/health", (*call).adminCredentials)
 	a.read("/admin/quota", (*call).adminQuota)
 	a.read("/admin/capacity", (*call).adminCapacity)

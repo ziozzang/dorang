@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/meter"
@@ -374,6 +375,10 @@ func legacySunset(cfg *config.Config) time.Time {
 // twice.
 func (a *App) recordMetrics(ev *server.Event) {
 	r := &ev.Result
+	// Retain inference metadata only; console and health requests must not flood it.
+	if ev.Model != "" || r.Deployment != "" {
+		a.traffic.Record(admin.LiveRequest{At: a.now(), ID: ev.RequestID, Model: ev.Model, Provider: r.Provider, Deployment: r.Deployment, Credential: r.Credential, Key: ev.KeyID, Team: ev.TeamID, User: ev.UserID, Endpoint: ev.Route, Status: ev.Status, Error: r.NativeErrorType, LatencyMS: ev.DurationNS / 1_000_000, TTFTMS: r.TTFTNS / 1_000_000, WaitMS: r.QueueNS / 1_000_000, Input: r.Tokens.Input, Output: r.Tokens.Output, CacheRead: r.Tokens.CacheRead, CacheWrite: r.Tokens.CacheWrite, Reasoning: r.Tokens.Reasoning, Cost: admin.Money(r.CostNanoUSD), Priced: r.Priced, Streamed: ev.Streamed})
+	}
 	// The token half of the rolling minute, for every subject the request
 	// belonged to. The request half was counted at the gate, because a ceiling
 	// enforced only on FINISHED requests cannot refuse a burst; tokens are not

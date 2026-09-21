@@ -173,6 +173,7 @@ func newSubjectFixture(t *testing.T) *subjectFixture {
 	h.api.cfg.Pricing = fakePricer{}
 	h.api.cfg.Reloader = fakeReloader{}
 	h.api.cfg.ConfigWriter = fakeConfigWriter{}
+	h.api.cfg.Setup = &fakeSetup{}
 
 	f := &subjectFixture{h: h, inv: inv}
 	mustOK(t, h.do(http.MethodPost, "/user/new",
@@ -416,6 +417,9 @@ func mutationRows() []mutationRow {
 			},
 			want: none,
 		},
+
+		{path: "/admin/setup/change", why: "upstream provider credentials and model bindings propagate through the shared config watcher, not the client credential cache", body: map[string]any{"action": "credential", "id": "account"}, want: none},
+		{path: "/admin/setup/discover", why: "an upstream model-list probe changes no client authorization envelope", body: map[string]any{"credential": "account"}, want: none},
 
 		// --- POST routes that compute rather than mutate ----------------------
 		{

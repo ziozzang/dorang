@@ -30,3 +30,6 @@ coverage.*
 
 # Local-only working notes (deployment specifics, not for publication)
 docs/internal/
+
+# Runtime credential files must never enter source control or image layers.
+**/secrets/

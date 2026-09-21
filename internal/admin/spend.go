@@ -378,6 +378,21 @@ func (c *call) spendLogs() error {
 		if !sc.AllowsTeam(r.TeamID) {
 			continue
 		}
+		if q.KeyID != "" && r.APIKeyID != q.KeyID || q.UserID != "" && r.UserID != q.UserID || q.TeamID != "" && r.TeamID != q.TeamID || q.TraceID != "" && r.TraceID != q.TraceID || q.ErrorsOnly && r.Status < 400 {
+			continue
+		}
+		if q.Tag != "" {
+			found := false
+			for _, tag := range r.Tags {
+				if tag == q.Tag {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
 		rows = append(rows, viewLog(r))
 	}
 	out := map[string]any{

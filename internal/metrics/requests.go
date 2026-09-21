@@ -112,6 +112,10 @@ type reqEntry struct {
 type modelKey struct{ model string }
 
 type modelEntry struct {
+	tokens   [5]atomic.Uint64
+	cost     atomic.Int64
+	unpriced atomic.Uint64
+	priced   atomic.Uint64
 	duration *Hist
 	ttft     *Hist
 	// prefixHits and routed are the numerator and the denominator of
@@ -373,6 +377,15 @@ func (q *Requests) Observe(s Sample) {
 	}
 
 	m, _ := q.models.get(modelKey{model})
+	for i, n := range [...]int64{s.Tokens.Input, s.Tokens.Output, s.Tokens.CacheRead, s.Tokens.CacheWrite, s.Tokens.Reasoning} {
+		m.tokens[i].Add(uint64(nonNeg(n)))
+	}
+	if s.Priced {
+		m.cost.Add(s.CostNano)
+		m.priced.Add(1)
+	} else if s.Routed {
+		m.unpriced.Add(1)
+	}
 	m.duration.Observe(s.Duration)
 	if s.TTFT > 0 {
 		// A zero TTFT means "not measured", not "instant". §7.5a(a) makes the
@@ -471,6 +484,30 @@ func (q *Requests) Collect(w *Writer) {
 		w.Label("kind", kind)
 		w.Uint(q.tokens[i].Load())
 	}
+
+	w.Metric("dorang_model_tokens_total", Counter, "Tokens by admitted model and kind. Cache tokens are subsets of input; reasoning is a subset of output.")
+	q.models.each(lessModelKey, func(k modelKey, m *modelEntry, over bool) {
+		for i, kind := range [...]string{"input", "output", "cache_read", "cache_write", "reasoning"} {
+			w.Label("model", modelLabel(k, over))
+			w.Label("kind", kind)
+			w.Uint(m.tokens[i].Load())
+		}
+	})
+	w.Metric("dorang_model_cost_nano_total", Counter, "Priced request cost by admitted model, in nano-USD.")
+	q.models.each(lessModelKey, func(k modelKey, m *modelEntry, over bool) {
+		w.Label("model", modelLabel(k, over))
+		w.Int(m.cost.Load())
+	})
+
+	w.Metric("dorang_model_pricing_requests_total", Counter, "Routed requests by model and pricing availability. Unpriced usage must not appear free.")
+	q.models.each(lessModelKey, func(k modelKey, m *modelEntry, over bool) {
+		w.Label("model", modelLabel(k, over))
+		w.Label("pricing", "priced")
+		w.Uint(m.priced.Load())
+		w.Label("model", modelLabel(k, over))
+		w.Label("pricing", "unpriced")
+		w.Uint(m.unpriced.Load())
+	})
 
 	w.Metric("dorang_cost_nano_total", Counter,
 		"Billed cost in nano-USD (DESIGN §8.3). Requests dorang could not price are "+
