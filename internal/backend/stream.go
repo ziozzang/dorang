@@ -275,6 +275,13 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	if err := sink.close(); err != nil {
 		return sink.usage(), fw.n, err
 	}
+	// A completed Responses stream leaves its terminal response object on the
+	// exchange, for the store. Only that family's sink implements it, and only
+	// on the clean path — a truncation never reaches this line, so no failed
+	// stream ever hands the store an object the client was not served whole.
+	if c, ok := sink.(interface{ completed() []byte }); ok {
+		x.completedResponse = c.completed()
+	}
 	return sink.usage(), fw.n, nil
 }
 
@@ -314,6 +321,16 @@ func newEventSink(c *Call, w io.Writer, now func() time.Time) (eventSink, error)
 			// shape and nothing branches for the default.
 			UsageChunkChoices: c.UsageChunkChoices,
 		})}, nil
+	case catalog.APIOpenAIResponses:
+		// Echo carries the pinned identity (dorang's resp_ id, the
+		// client-facing model) and the request fields this surface echoes on
+		// every response object. Created is left zero so the writer pins it
+		// from the same backend clock the buffered path uses — one clock, one
+		// `created`, two paths of one conversion (DESIGN §10.7).
+		return &responsesSink{w: openai.NewResponsesStreamWriter(w, openai.ResponsesStreamConfig{
+			Echo: c.ResponseEcho,
+			Now:  now,
+		})}, nil
 	}
 	return nil, noOperation(string(c.ClientAPI), OpChat, "no streaming encoder for this caller protocol")
 }
@@ -326,6 +343,19 @@ func (s *openaiSink) usage() canonical.Usage {
 	u, _ := s.w.Usage()
 	return u
 }
+
+type responsesSink struct{ w *openai.ResponsesStreamWriter }
+
+func (s *responsesSink) write(ev canonical.StreamEvent) error { return s.w.WriteEvent(ev) }
+func (s *responsesSink) close() error                         { return s.w.Close() }
+func (s *responsesSink) usage() canonical.Usage {
+	u, _ := s.w.Usage()
+	return u
+}
+
+// completed hands the relay the terminal response object for the store; see
+// [exchange.completedResponse].
+func (s *responsesSink) completed() []byte { return s.w.Completed() }
 
 type anthropicSink struct{ w *anthropic.StreamWriter }
 

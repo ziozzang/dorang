@@ -333,6 +333,11 @@ type Result struct {
 	// and mislabelling either gives the client something it cannot play or
 	// parse. Empty means application/json.
 	ContentType string
+	// CompletedResponse is the terminal response object of a streamed
+	// Responses exchange — the response member of the response.completed event,
+	// the same bytes a buffered answer of that exchange would have carried on
+	// Body. Nil on every other family and on every failed stream.
+	CompletedResponse []byte
 	Usage       canonical.Usage
 	// UsageExtra is what the upstream reported that no counter names, including
 	// what SERVER-SIDE tools cost. It is carried rather than summarised because
@@ -697,6 +702,7 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		usage, sent, err := b.relay(x, resp, w)
 		res.Total = b.now().Sub(start)
 		res.Usage = usage
+		res.CompletedResponse = x.completedResponse
 		// From the bytes that actually reached the client, not from the fact that
 		// this was a stream. The flag closes fail-back for good (§7.6), and it
 		// used to be set unconditionally — so an upstream that answered 200 and

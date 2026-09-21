@@ -38,6 +38,16 @@ type exchange struct {
 	// dropping it is a bill nobody can check.
 	usageExtra *canonical.UsageExtra
 
+	// completedResponse is the terminal response object of a streamed
+	// Responses exchange, left here by the relay after the terminal event has
+	// been written. It travels on the exchange for the same reason usageExtra
+	// does: the conversion path already has three results and a fourth would
+	// be a signature change for a value only one sink ever sets. The store
+	// serves it to GET /v1/responses/{id} exactly as the buffered path serves
+	// the body it wrote, and it is nil on every failed stream — the relay sets
+	// it only after sink.close, which a truncation deliberately never reaches.
+	completedResponse []byte
+
 	// ctype is the Content-Type of the encoded request body. An adapter that
 	// produces something other than JSON — the multipart audio and image
 	// surfaces — sets it; everything else leaves it empty and [Backend.send]
