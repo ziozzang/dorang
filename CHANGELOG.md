@@ -44,6 +44,15 @@ be one emitter plus one sink case, not a new pipeline.
   a Responses row in §11.1a's mid-stream error framing; the DESIGN §0.2
   citations for the named-501 rule were stale and now name §0.3.
 
+- **A non-function tool never reached the chat surface — until it did.** The
+  chat encoder forwarded a Responses caller's tool `type` verbatim, so codex's
+  `namespace` containers and `web_search` declaration went out as
+  `{"type":"namespace"}` and were refused by the first strict backend that saw
+  them (z.ai 1214 "tools[N].type: type is illegal" — which is what kept a
+  streamed codex turn off every chat-shaped backend, found while verifying the
+  streaming deployment live). The declaration is now dropped and named on the
+  loss ledger: a parameter fact, not a structural downgrade.
+
 ### The operator dashboard: one screen worth reading, one dead, one that lied
 
 Opened against a live ledger, all three screens answered `200`. That was the
