@@ -103,19 +103,16 @@ Under construction, and it builds and passes. 33 packages, roughly 148,000 lines
 with 1,390 tests, 60 benchmarks and 7 fuzz targets green under `-race`. It ships as a
 static binary and as a container image.
 
-Parts of it are not finished. **The current defect list lives in
-[docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)** and only there — a checklist
-duplicated into this README guarantees one of the two copies is wrong. The most common
-defect found in this codebase, by a wide margin, is *a control that exists and is not
-reached*: a limit that validates, stores, and is never consulted. Design §17.1 records
-the instances and the rule they produced.
+Parts of it are not finished. The most common defect found in this codebase, by a wide
+margin, is *a control that exists and is not reached*: a limit that validates, stores, and
+is never consulted. Design §17.1 records the instances and the rule they produced.
 
 - [Design](docs/DESIGN.md) — architecture, configuration schema, algorithms, milestones
+- [Configuration](docs/CONFIG.md) — the config schema and every field, with examples
 - [Compatibility](docs/COMPATIBILITY.md) — wire contracts pinned as golden tests, and the error taxonomy
-- [Adversarial review](docs/REVIEW.md) — findings against this design and their dispositions
-- [Security review](docs/SECURITY-REVIEW.md) — findings and their current state
+- [Operations](docs/OPERATIONS.md) — running, scaling and administering a deployment
+- [Migration](docs/MIGRATION.md) — moving from the incumbent gateway
 - [Surfaces](docs/SURFACES.md) — which API surface each provider actually serves, measured
-- [Performance](docs/PERFORMANCE.md) — measured against the gateway it replaces, with the method and its limits
 
 ## License
 

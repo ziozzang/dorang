@@ -96,17 +96,15 @@ rerank, batch, files — 여기에 **범용 패스스루 엔진**을 더해 프�
 테스트 1,390개 · 벤치마크 60개 · 퍼즈 타깃 7개가 `-race`로 통과한다. 배포 형태는
 정적 바이너리와 컨테이너 이미지 두 가지다.
 
-아직 완결되지 않은 부분이 있다. **현재 남은 결함 목록은 항상
-[docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)에 있다** — 이 README에 체크리스트를
-중복해 두면 반드시 한쪽이 낡기 때문에 한 곳에만 둔다. 이 코드베이스에서 가장 자주
-나온 결함 유형은 "존재하지만 호출되지 않는 통제(a control that exists and is not
-reached)"이며, 설계서 §17.1이 그 사례와 규칙을 기록하고 있다.
+아직 완결되지 않은 부분이 있다. 이 코드베이스에서 가장 자주 나온 결함 유형은
+"존재하지만 호출되지 않는 통제(a control that exists and is not reached)"이며,
+설계서 §17.1이 그 사례와 규칙을 기록하고 있다.
 
 - [설계서](docs/DESIGN.md) — 아키텍처, 설정 스키마, 알고리즘, 마일스톤
+- [설정](docs/CONFIG.md) — 설정 스키마와 모든 필드, 예시 포함
 - [호환성](docs/COMPATIBILITY.md) — 골든 테스트로 고정된 와이어 계약과 오류 분류
-- [적대적 검토](docs/REVIEW.md) — 이 설계에 대한 지적과 처리 결과
-- [보안 검토](docs/SECURITY-REVIEW.md) — 지적 사항과 처리 상태
-- [성능](docs/PERFORMANCE.md) — 교체 대상 게이트웨이와의 실측 비교, 측정 방법과 그 한계
+- [운영](docs/OPERATIONS.md) — 배포 실행·확장·관리
+- [마이그레이션](docs/MIGRATION.md) — 기존 게이트웨이에서 이전
 
 ## 라이선스
 

@@ -1,7 +1,7 @@
 # dorang — Design
 
 > Revision 2 · 2026-07-28
-> Revision 1 was reviewed adversarially; see [REVIEW.md](REVIEW.md). Every change below
+> Revision 1 was reviewed adversarially. Every change below
 > that carries a **[R1-n]** tag exists because revision 1 was wrong about something.
 >
 > 한국어: [DESIGN.ko.md](DESIGN.ko.md)

@@ -33,3 +33,17 @@ docs/internal/
 
 # Runtime credential files must never enter source control or image layers.
 **/secrets/
+
+# Release cleanup: internal review/research/experiment docs live on locally but
+# are not published to the remote (kept out of releases; still on disk).
+docs/REVIEW.md
+docs/REVIEW.ko.md
+docs/SECURITY-REVIEW.md
+docs/SECURITY-REVIEW.ko.md
+docs/SGLANG.md
+docs/SGLANG.ko.md
+docs/VLLM.md
+docs/VLLM.ko.md
+docs/PERFORMANCE.md
+testing/parity/REPORT.md
+testing/providers/REPORT.md
