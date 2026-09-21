@@ -233,6 +233,111 @@ func TestRoundTripStreamRelay(t *testing.T) {
 	}
 }
 
+// TestRoundTripResponsesStream: the streamed Responses surface through the
+// assembled stack. The event tree is synthesized from a chat upstream's
+// chunks, the identity is dorang's own, and — the part only this height can
+// see — the id the created event pinned resolves by GET to the object the
+// completed event carried, because the store ran off the terminal.
+func TestRoundTripResponsesStream(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("DORANG_KEY_PEPPER", "round-trip-pepper")
+
+	const frames = "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"re\"}}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"sponse\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"upstream-x\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, frames)
+	}))
+	defer up.Close()
+
+	cfg := loadRoundTripConfig(t, dir, up.URL)
+	ctx := context.Background()
+	a, err := app.New(ctx, app.Options{Config: cfg, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(ctx)
+
+	token := issueKey(t, ctx, a.Store)
+	front := httptest.NewServer(a.Server)
+	defer front.Close()
+
+	body := `{"model":"model-x","stream":true,"store":true,"input":"ping"}`
+	resp, err := postErr(front.URL+"/v1/responses", token, body, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.status, resp.body)
+	}
+	if ct := resp.header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q, want an event stream", ct)
+	}
+	// The tree, in order: the created object opens the stream, the deltas
+	// carry the text, the completed object closes it. No chat terminator and
+	// no upstream identity leak.
+	if !strings.HasPrefix(resp.body, "event: response.created\n") {
+		t.Errorf("the stream does not open with response.created:\n%s", resp.body)
+	}
+	if !strings.Contains(resp.body, "event: response.output_text.delta") ||
+		!strings.Contains(resp.body, "response") {
+		t.Errorf("the text did not stream:\n%s", resp.body)
+	}
+	if !strings.Contains(resp.body, "event: response.completed") {
+		t.Errorf("the stream has no terminal:\n%s", resp.body)
+	}
+	if strings.Contains(resp.body, "[DONE]") || strings.Contains(resp.body, "upstream-x") ||
+		strings.Contains(resp.body, "chatcmpl-") {
+		t.Errorf("the chat upstream's shapes leaked into a responses stream:\n%s", resp.body)
+	}
+	if !strings.Contains(resp.body, `"model":"model-x"`) {
+		t.Errorf("the client-facing model must appear on the response objects:\n%s", resp.body)
+	}
+
+	// The store: the pinned id resolves to the terminal object. This is the
+	// streamed spelling of the buffered invariant — a reference the client
+	// holds must resolve to the turn it saw.
+	id := resp.header.Get("X-Dorang-Request-Id")
+	if id == "" {
+		t.Fatal("no request id to key the response id from")
+	}
+	greq, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		front.URL+"/v1/responses/resp_"+id, nil)
+	greq.Header.Set("Authorization", "Bearer "+token)
+	gresp, err := http.DefaultClient.Do(greq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gresp.Body.Close()
+	gbody, _ := io.ReadAll(gresp.Body)
+	if gresp.StatusCode != http.StatusOK {
+		t.Fatalf("GET stored response = %d: %s", gresp.StatusCode, gbody)
+	}
+	var stored struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Output []struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(gbody, &stored); err != nil {
+		t.Fatalf("stored body: %v: %s", err, gbody)
+	}
+	if stored.ID != "resp_"+id || stored.Status != "completed" {
+		t.Errorf("stored = %s/%s, want resp_%s/completed", stored.ID, stored.Status, id)
+	}
+	if len(stored.Output) == 0 || len(stored.Output[0].Content) == 0 ||
+		stored.Output[0].Content[0].Text != "response" {
+		t.Errorf("stored output does not carry the answer:\n%s", gbody)
+	}
+}
+
 // loadRoundTripConfig writes and loads a configuration whose only fake part is
 // the provider's address.
 //
