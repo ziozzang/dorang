@@ -104,16 +104,20 @@ func usageEvent(in, out int) canonical.StreamEvent {
 	return canonical.StreamEvent{Type: canonical.EventUsage, Usage: &u}
 }
 
-// The emitted set is exactly the mirror of the decoded set: nothing the
-// decoder ignores is written, and the boundaries the protocol needs — item
-// added and done, the terminal — all are.
+// The emitted set is the decoder's mirror plus the part lifecycle the
+// deployed protocol's clients key on (the reference client — codex — logs a
+// delta with no open part): item added, part added, deltas, part done, item
+// done. Everything else the vendor sends is bookkeeping nothing consumed
+// here needs.
 func TestResponsesWriterEmitsTheMinimalEventSet(t *testing.T) {
 	body, _ := feed(t, startEvent(), textEvent("hi"), stopEvent(canonical.StopEndTurn), usageEvent(3, 5))
 	names := eventNames(body)
 	want := []string{
 		"response.created",
 		"response.output_item.added",
+		"response.content_part.added",
 		"response.output_text.delta",
+		"response.content_part.done",
 		"response.output_item.done",
 		"response.completed",
 	}
@@ -129,11 +133,11 @@ func TestResponsesWriterEmitsTheMinimalEventSet(t *testing.T) {
 	// opening state; the `response.in_progress` EVENT is what must never be
 	// written, so the ban is on the event line.
 	for _, banned := range []string{
-		"event: response.in_progress", "event: response.content_part",
-		"event: response.output_text.done", "[DONE]", "event: ping",
+		"event: response.in_progress", "event: response.output_text.done",
+		"[DONE]", "event: ping",
 	} {
 		if strings.Contains(body, banned) {
-			t.Errorf("body contains %q, which the decoder ignores and the writer must not emit", banned)
+			t.Errorf("body contains %q, which the writer must not emit", banned)
 		}
 	}
 }

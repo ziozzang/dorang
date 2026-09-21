@@ -99,6 +99,37 @@ type respArgsDeltaEvent struct {
 	SequenceNumber int64  `json:"sequence_number"`
 }
 
+type respPartEvent struct {
+	Type           string       `json:"type"`
+	ItemID         string       `json:"item_id"`
+	OutputIndex    int          `json:"output_index"`
+	ContentIndex   int          `json:"content_index"`
+	Part           ResponsePart `json:"part"`
+	SequenceNumber int64        `json:"sequence_number"`
+}
+
+type respReasonPartEvent struct {
+	Type           string       `json:"type"`
+	ItemID         string       `json:"item_id"`
+	OutputIndex    int          `json:"output_index"`
+	SummaryIndex   int          `json:"summary_index"`
+	Part           ResponsePart `json:"part"`
+	SequenceNumber int64        `json:"sequence_number"`
+}
+
+// Part-lifecycle event names. These ARE ignored by dorang's own decoder —
+// like the vendor's, a client that rebuilds the response object from
+// item.done needs no part frames — but a client that streams text into a UI
+// keys on them: the reference client (codex) logs a delta that arrives with
+// no open part, so the frames are emitted for the protocol as deployed, not
+// for the protocol as dorang reads it.
+const (
+	respEventPartAdded    = "response.content_part.added"
+	respEventPartDone     = "response.content_part.done"
+	respEventReasonPart   = "response.reasoning_summary_part.added"
+	respEventReasonPartDn = "response.reasoning_summary_part.done"
+)
+
 type respTerminalEvent struct {
 	Type           string             `json:"type"`
 	Response       *ResponsesResponse `json:"response"`
@@ -159,13 +190,18 @@ type ResponsesEmitter struct {
 	// claim about storage this surface does not make.
 	itemSeq int
 
-	// The open content item: its kind, its output index, its id, and its
-	// assembled text. Tool items track their own, because this protocol
-	// addresses them and therefore they need no single-open-holder.
-	openKind respItemKind
-	openIdx  int
-	openID   string
-	openText strings.Builder
+	// The open content item: its kind, its output index, its id, its assembled
+	// text, and — for a message item — the refusal part's content index and
+	// text (a refusal is a second part under the same item, opened on first
+	// use so a text-only item never carries one). Tool items track their own,
+	// because this protocol addresses them and therefore they need no
+	// single-open-holder.
+	openKind    respItemKind
+	openIdx     int
+	openID      string
+	openText    strings.Builder
+	openRefusal strings.Builder
+	refusalPart int // next content_index for a refusal part; 0 until one opens
 
 	tools map[int]*respToolItem
 	order []*respToolItem
@@ -340,14 +376,25 @@ func (e *ResponsesEmitter) pushDelta(dst []respWireEvent, d *canonical.Delta) []
 	}
 
 	if d.Refusal != "" {
-		// This surface has a part for it, unlike the chat one: `refusal.delta`
-		// streams under the open message item and the part rides item.done.
+		// This surface has a part for it, unlike the chat one: a refusal is a
+		// second content part under the open message item, opened on first use
+		// so a text-only item never carries one.
 		dst = e.ensureContentItem(dst, respItemMessage)
+		if e.refusalPart == 0 {
+			e.refusalPart = 1 // part 0 is the item's text part
+			dst = append(dst, respWireEvent{name: respEventPartAdded, payload: &respPartEvent{
+				Type: respEventPartAdded, ItemID: e.openID, OutputIndex: e.openIdx,
+				ContentIndex: e.refusalPart,
+				Part:         ResponsePart{Type: PartRefusal}, SequenceNumber: e.seq,
+			}})
+			e.seq++
+		}
 		dst = append(dst, respWireEvent{name: respEventRefusalDelta, payload: &respTextDeltaEvent{
 			Type: respEventRefusalDelta, ItemID: e.openID, OutputIndex: e.openIdx,
-			Delta: d.Refusal, SequenceNumber: e.seq,
+			ContentIndex: e.refusalPart, Delta: d.Refusal, SequenceNumber: e.seq,
 		}})
 		e.seq++
+		e.openRefusal.WriteString(d.Refusal)
 		e.msg.Refusal += d.Refusal
 	}
 
@@ -476,6 +523,8 @@ func (e *ResponsesEmitter) ensureContentItem(dst []respWireEvent, kind respItemK
 	e.openIdx = e.nextItem
 	e.nextItem++
 	e.openText.Reset()
+	e.openRefusal.Reset()
+	e.refusalPart = 0
 	var item ResponseItem
 	if kind == respItemReasoning {
 		item = ResponseItem{Type: ItemReasoning, ID: e.openID, Summary: []ResponsePart{}}
@@ -489,6 +538,22 @@ func (e *ResponsesEmitter) ensureContentItem(dst []respWireEvent, kind respItemK
 	dst = append(dst, respWireEvent{name: respEventOutputAdded, payload: &respItemEvent{
 		Type: respEventOutputAdded, OutputIndex: e.openIdx, Item: item, SequenceNumber: e.seq,
 	}})
+	e.seq++
+	// The part opens with the item: the reference client (codex) keys a text
+	// delta on an open part, and a delta that arrives before one is a protocol
+	// violation on its side of the stream even when the assembled item at
+	// done-time is complete.
+	if kind == respItemReasoning {
+		dst = append(dst, respWireEvent{name: respEventReasonPart, payload: &respReasonPartEvent{
+			Type: respEventReasonPart, ItemID: e.openID, OutputIndex: e.openIdx,
+			Part: ResponsePart{Type: PartSummaryText}, SequenceNumber: e.seq,
+		}})
+	} else {
+		dst = append(dst, respWireEvent{name: respEventPartAdded, payload: &respPartEvent{
+			Type: respEventPartAdded, ItemID: e.openID, OutputIndex: e.openIdx,
+			Part: ResponsePart{Type: PartOutputText, Annotations: emptyAnnotations()}, SequenceNumber: e.seq,
+		}})
+	}
 	e.seq++
 	return dst
 }
@@ -505,8 +570,33 @@ func (e *ResponsesEmitter) closeContentItem(dst []respWireEvent) []respWireEvent
 		return dst
 	}
 	idx, id, text := e.openIdx, e.openID, e.openText.String()
+	refusal, refIdx := e.openRefusal.String(), e.refusalPart
 	kind := e.openKind
 	e.openKind = respItemNone
+	// The part closes before the item does, carrying its assembled text — the
+	// same framing pair the vendor's stream has, and the frame the reference
+	// client's part state machine is waiting for.
+	if kind == respItemReasoning {
+		dst = append(dst, respWireEvent{name: respEventReasonPartDn, payload: &respReasonPartEvent{
+			Type: respEventReasonPartDn, ItemID: id, OutputIndex: idx,
+			Part: ResponsePart{Type: PartSummaryText, Text: text}, SequenceNumber: e.seq,
+		}})
+		e.seq++
+	} else {
+		dst = append(dst, respWireEvent{name: respEventPartDone, payload: &respPartEvent{
+			Type: respEventPartDone, ItemID: id, OutputIndex: idx,
+			Part:           ResponsePart{Type: PartOutputText, Text: text, Annotations: emptyAnnotations()},
+			SequenceNumber: e.seq,
+		}})
+		e.seq++
+		if refusal != "" {
+			dst = append(dst, respWireEvent{name: respEventPartDone, payload: &respPartEvent{
+				Type: respEventPartDone, ItemID: id, OutputIndex: idx, ContentIndex: refIdx,
+				Part: ResponsePart{Type: PartRefusal, Refusal: refusal}, SequenceNumber: e.seq,
+			}})
+			e.seq++
+		}
+	}
 	var block canonical.Block
 	if kind == respItemReasoning {
 		block = canonical.ThinkingBlock(text, "")
