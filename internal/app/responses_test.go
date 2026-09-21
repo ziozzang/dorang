@@ -164,6 +164,43 @@ func TestReasoningBlobsAreCollected(t *testing.T) {
 	}
 }
 
+// TestAStreamedExchangeStoresWhatTheTerminalCarried: a streamed exchange is
+// stored from the terminal event's own response object, so GET and chaining
+// see exactly what the buffered path would have served — same row, same
+// replay, decided only by the transport.
+func TestAStreamedExchangeStoresWhatTheTerminalCarried(t *testing.T) {
+	rs := newTestResponses(t)
+	d := newDispatcher(nil, nil, func(string, ...any) {}, rs.now)
+	st := &dispatchState{responses: rs}
+	c := &call{
+		kind: callResponses, responseID: "resp_s1", model: "m",
+		creq: &canonical.Request{
+			Messages: []canonical.Message{canonical.TextMessage(canonical.RoleUser, "weather?")},
+		},
+	}
+	rq := &server.Request{Method: http.MethodPost, Path: "/v1/responses"}
+	terminal := `{"id":"resp_s1","object":"response","created_at":1,"status":"completed","model":"m",` +
+		`"output":[{"type":"message","role":"assistant",` +
+		`"content":[{"type":"output_text","text":"18C","annotations":[]}]}]}`
+
+	d.storeStreamedResponse(context.Background(), st, c, rq, []byte(terminal))
+
+	ex, _, err := rs.get(context.Background(), "resp_s1", "")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(ex.Response) != terminal {
+		t.Errorf("stored body = %s, want the terminal object byte for byte", ex.Response)
+	}
+	msgs, err := replayMessages(ex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].Content.Flatten() != "weather?" || msgs[1].Content.Flatten() != "18C" {
+		t.Errorf("replayed %+v, want the question and the answer", msgs)
+	}
+}
+
 // TestResponsesSubResourceHandlers exercises the three routes that only exist
 // because the state does.
 func TestResponsesSubResourceHandlers(t *testing.T) {

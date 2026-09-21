@@ -124,16 +124,14 @@ func (d *dispatcher) decodeResponses(st *dispatchState, rq *server.Request, c *c
 		return server.NewError(http.StatusBadRequest, server.TypeInvalidRequest,
 			err.Error()).WithCode("invalid_request")
 	}
-	if w.Stream {
-		// The Responses event stream is a different protocol from the
-		// chat-completions one — a dozen typed events with their own sequence
-		// numbering — not a framing of the same chunks. Answering the
-		// non-streaming body to a client that asked for events would be a
-		// half-working endpoint, which DESIGN §0.2 rejects in favour of a named
-		// 501.
+	// A streamed answer cannot fail after the fact — the bytes are out — so the
+	// one store condition that WOULD fail after the fact is refused here, before
+	// a byte is written: a caller keeping server-side state (`store` defaults
+	// true) against a deployment that has no store.
+	if w.Stream && (w.Store == nil || *w.Store) && st.responses == nil {
 		return server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
-			"streamed responses are not implemented; omit stream for the complete response").
-			WithCode("responses_stream_not_implemented").WithParam("stream")
+			"this deployment has no store, so `store: true` cannot be honoured; send store: false").
+			WithCode("responses_store_unavailable").WithParam("store")
 	}
 	creq, err := openai.ResponsesRequestToCanonical(&w)
 	if err != nil {
@@ -201,7 +199,7 @@ func replayMessages(ex *storedExchange) ([]canonical.Message, error) {
 	return msgs, nil
 }
 
-// storeResponse persists a completed Responses exchange.
+// storeResponse persists a completed, buffered Responses exchange.
 //
 // It runs after the answer is complete and before it is written: a stored
 // response the client never received is a reference it can resolve to a turn it
@@ -219,27 +217,78 @@ func (d *dispatcher) storeResponse(ctx context.Context, st *dispatchState, c *ca
 		return nil
 	}
 	if st.responses == nil {
+		// A buffered answer can still fail the request, and must: the bytes
+		// have not gone out, so refusing here is a refusal the client sees.
 		return server.NewError(http.StatusNotImplemented, server.TypeNotImplemented,
 			"this deployment has no store, so `store: true` cannot be honoured; send store: false").
 			WithCode("responses_store_unavailable").WithParam("store")
 	}
-	items, err := openai.MarshalResponsesItems(c.creq.Messages)
-	if err != nil {
+	row, ok := d.storedRow(st, c, rq, body)
+	if !ok {
+		return nil
+	}
+	if err := st.responses.st.PutStoredResponse(ctx, row); err != nil {
+		d.logf("app: storing response %s: %v", c.responseID, err)
 		return server.NewError(http.StatusInternalServerError, server.TypeAPIError,
 			"the response could not be stored").WithCode("internal_error")
+	}
+	return nil
+}
+
+// storeStreamedResponse persists a completed, streamed Responses exchange.
+//
+// The bytes are already out — the terminal event carried the object being
+// stored — so a failure here cannot fail a request the client has been served.
+// It is logged, and the id 404s later in exactly the shape a TTL-expired row
+// already answers with: the one honest thing left to do, because inventing a
+// failure the client could see would be claiming the answer never happened.
+func (d *dispatcher) storeStreamedResponse(ctx context.Context, st *dispatchState, c *call,
+	rq *server.Request, body []byte) {
+
+	row, ok := d.storedRow(st, c, rq, body)
+	if !ok {
+		return
+	}
+	if err := st.responses.st.PutStoredResponse(ctx, row); err != nil {
+		d.logf("app: storing streamed response %s: %v", c.responseID, err)
+	}
+}
+
+// storedRow assembles the store row for one completed exchange, or reports
+// that this exchange is not stored (another kind, or `store: false`).
+func (d *dispatcher) storedRow(st *dispatchState, c *call, rq *server.Request,
+	body []byte) (*store.StoredResponse, bool) {
+
+	if c.kind != callResponses {
+		return nil, false
+	}
+	// The surface defaults store to true, so a nil pointer is not false.
+	if c.creq.Store != nil && !*c.creq.Store {
+		return nil, false
+	}
+	if st.responses == nil {
+		// Unreachable from either caller: the streamed one was refused at decode
+		// and the buffered one at [storeResponse], both with the named 501. The
+		// condition stays because the row contract is "never nil when ok".
+		return nil, false
+	}
+	items, err := openai.MarshalResponsesItems(c.creq.Messages)
+	if err != nil {
+		d.logf("app: assembling stored response %s: %v", c.responseID, err)
+		return nil, false
 	}
 	var input []openai.ResponseItem
 	if err := json.Unmarshal(items, &input); err != nil {
-		return server.NewError(http.StatusInternalServerError, server.TypeAPIError,
-			"the response could not be stored").WithCode("internal_error")
+		d.logf("app: assembling stored response %s: %v", c.responseID, err)
+		return nil, false
 	}
 	enc, err := json.Marshal(storedExchange{Input: input, Response: body})
 	if err != nil {
-		return server.NewError(http.StatusInternalServerError, server.TypeAPIError,
-			"the response could not be stored").WithCode("internal_error")
+		d.logf("app: assembling stored response %s: %v", c.responseID, err)
+		return nil, false
 	}
 	now := d.now()
-	row := &store.StoredResponse{
+	return &store.StoredResponse{
 		ID:                 c.responseID,
 		CreatedAt:          now,
 		ExpiresAt:          now.Add(st.responses.ttl),
@@ -248,13 +297,7 @@ func (d *dispatcher) storeResponse(ctx context.Context, st *dispatchState, c *ca
 		ModelGroup:         c.model,
 		Items:              enc,
 		ReasoningBlobs:     reasoningBlobs(c.creq.Messages),
-	}
-	if err := st.responses.st.PutStoredResponse(ctx, row); err != nil {
-		d.logf("app: storing response %s: %v", c.responseID, err)
-		return server.NewError(http.StatusInternalServerError, server.TypeAPIError,
-			"the response could not be stored").WithCode("internal_error")
-	}
-	return nil
+	}, true
 }
 
 // reasoningBlobs collects the opaque integrity-bearing reasoning handles of

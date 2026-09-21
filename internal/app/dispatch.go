@@ -416,6 +416,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 				}
 				return writeBody(w, res.body, res.contentType)
 			}
+			if res.completedResponse != nil {
+				// The streamed spelling of the same state: the answer is
+				// already out, terminal event and all, so the invariant the
+				// buffered path keeps by storing BEFORE the write is kept here
+				// by storing after the last byte — which is still before the
+				// handler returns, so no previous_response_id can observe the
+				// gap. A store failure cannot fail a request the client has
+				// already been served; it is logged, and the id 404s later in
+				// exactly the shape an expired row already answers with.
+				d.storeStreamedResponse(ctx, st, c, rq, res.completedResponse)
+			}
 			return nil
 		}
 		// The attempt produced no answer, so it cost nothing. Refunding in full
@@ -616,6 +627,11 @@ type result struct {
 	// body is the converted non-streaming answer, held rather than written so
 	// that pricing lands on the request before the headers are stamped.
 	body []byte
+	// completedResponse is the terminal response object of a streamed
+	// Responses exchange, nil on every other family and every failed stream.
+	// Unlike body it has already reached the client, inside the
+	// response.completed event; it is carried for the store alone.
+	completedResponse []byte
 	// loadMetrics is the engine's own occupancy report from this response, if it
 	// sent one (VLLM.md §3.2). Empty means no report — never an idle backend.
 	loadMetrics string
@@ -788,8 +804,9 @@ func backendResult(br backend.Result) result {
 		contentType: br.ContentType,
 		loadMetrics: br.LoadMetrics,
 
-		servedModel:    br.ServedModel,
-		modelAgreement: br.ModelAgreement,
+		servedModel:       br.ServedModel,
+		modelAgreement:    br.ModelAgreement,
+		completedResponse: br.CompletedResponse,
 	}
 	if br.Err == nil {
 		res.outcome = router.Outcome{

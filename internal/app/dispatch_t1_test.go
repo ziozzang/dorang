@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/server"
@@ -21,8 +22,14 @@ import (
 // decodeRoute runs the decode half of the dispatcher for one route and body.
 func decodeRoute(t *testing.T, family server.Family, body string, form *canonical.Form) (*call, error) {
 	t.Helper()
+	return decodeRouteWith(t, &dispatchState{}, family, body, form)
+}
+
+// decodeRouteWith is decodeRoute over a caller-supplied dispatch state, for
+// tests whose decode depends on one of its optional facilities.
+func decodeRouteWith(t *testing.T, st *dispatchState, family server.Family, body string, form *canonical.Form) (*call, error) {
+	t.Helper()
 	d := newDispatcher(nil, nil, func(string, ...any) {}, nil)
-	st := &dispatchState{}
 	d.swap(st)
 	rt := &server.Route{Family: family}
 	rq := &server.Request{
@@ -32,7 +39,12 @@ func decodeRoute(t *testing.T, family server.Family, body string, form *canonica
 		Method: http.MethodPost,
 		Path:   "/v1/x",
 	}
-	c := &call{model: "m", body: []byte(body)}
+	// The real gate fills Stream by peeking the body before decode; this helper
+	// skips the gate, so the same fact is read the same way here.
+	if strings.Contains(body, `"stream":true`) {
+		rq.Stream = true
+	}
+	c := &call{model: "m", body: []byte(body), stream: rq.Stream}
 	err := d.decodeT1(st, rq, c)
 	return c, err
 }
@@ -107,6 +119,8 @@ func TestT1DecodeSelectsTheRightNeutralType(t *testing.T) {
 // TestT1StreamingRefusalsAreNamed. Three of these surfaces have a streaming
 // mode dorang does not implement. Answering the non-streaming body to a client
 // that asked for frames is a half-working endpoint; a named 501 is the contract.
+// (/v1/responses streamed here — it is served now, and its refusal shape moved
+// to the store guard below.)
 func TestT1StreamingRefusalsAreNamed(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -115,8 +129,6 @@ func TestT1StreamingRefusalsAreNamed(t *testing.T) {
 		form   *canonical.Form
 		code   string
 	}{
-		{"responses", server.FamilyOpenAIResponses,
-			`{"model":"m","input":"x","stream":true}`, nil, "responses_stream_not_implemented"},
 		{"speech", server.FamilyOpenAISpeech,
 			`{"model":"m","input":"x","voice":"v","stream_format":"sse"}`, nil, "speech_stream_not_implemented"},
 		{"images", server.FamilyOpenAIImageGeneration,
@@ -133,6 +145,45 @@ func TestT1StreamingRefusalsAreNamed(t *testing.T) {
 			assertRefused(t, err, http.StatusNotImplemented, tc.code)
 		})
 	}
+}
+
+// TestResponsesStreamDecodes: `stream: true` on /v1/responses is served now.
+// The one condition that cannot be honoured mid-stream — a caller keeping
+// server-side state against a deployment with no store — is refused before a
+// byte is written, in the same named shape the buffered path answers with.
+func TestResponsesStreamDecodes(t *testing.T) {
+	withStore := &dispatchState{
+		responses: &responsesStore{ttl: time.Hour, now: func() time.Time { return time.Unix(1, 0) }},
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{name: "accepted", body: `{"model":"m","input":"x","stream":true}`, want: nil},
+		{name: "store false needs no store", body: `{"model":"m","input":"x","stream":true,"store":false}`, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := decodeRouteWith(t, withStore, server.FamilyOpenAIResponses, tc.body, nil)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if c.kind != callResponses || !c.stream {
+				t.Fatalf("kind/stream = %v/%v, want callResponses/true", c.kind, c.stream)
+			}
+			if c.respEcho == nil || c.respEcho.ID == "" {
+				t.Fatal("the stream's pinned identity must be filled at decode")
+			}
+		})
+	}
+
+	// A store-keeping stream against no store: refused up front, because a
+	// streamed answer cannot fail after the fact and this is the one condition
+	// that would.
+	t.Run("store keeping without a store is refused up front", func(t *testing.T) {
+		_, err := decodeRoute(t, server.FamilyOpenAIResponses, `{"model":"m","input":"x","stream":true}`, nil)
+		assertRefused(t, err, http.StatusNotImplemented, "responses_store_unavailable")
+	})
 }
 
 // TestT1MalformedBodiesAre400 rather than 501: the route exists, the request
