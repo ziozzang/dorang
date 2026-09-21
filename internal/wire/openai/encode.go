@@ -178,21 +178,32 @@ func EncodeRequest(req *canonical.Request, opt *EncodeOptions) (*Request, error)
 			out.Tools = make([]Tool, 0, len(req.Tools))
 			for i := range req.Tools {
 				t := &req.Tools[i]
+				// A tool that is not a function — the Responses surface's
+				// server-side tools (web_search, image_gen), and the namespace
+				// containers some callers declare — has no spelling on the chat
+				// surface, which carries function tools only. Forwarding the
+				// type verbatim produces `{"type":"namespace"}`, a tool no
+				// chat backend parses: measured as z.ai 1214
+				// "tools[N].type: type is illegal" from a codex caller. The
+				// declaration is dropped and reported on the loss ledger
+				// rather than downgraded structurally: a backend that cannot
+				// execute the tool would ignore the declaration at best, and
+				// the caller sees the tool missing by name, which is a
+				// parameter fact, not a broken conversation structure.
+				if t.Type != "" && t.Type != "function" {
+					loss.DropParam("tools[" + strconv.Itoa(i) + "]")
+					continue
+				}
 				// Declared whether or not it needs shortening: the set is what
 				// tells a fragmented name on the way back from a shorter name
 				// that happens to be a prefix of it (COMPATIBILITY 5.3).
 				names.Declare(t.Name)
-				wt := Tool{Type: t.Type, Extra: t.Extra}
-				if wt.Type == "" {
-					wt.Type = "function"
-				}
-				if wt.Type == "function" {
-					wt.Function = &ToolFunction{
-						Name:        names.Shorten(t.Name, opt.warn()),
-						Description: t.Description,
-						Parameters:  t.Parameters,
-						Strict:      t.Strict,
-					}
+				wt := Tool{Type: "function", Extra: t.Extra}
+				wt.Function = &ToolFunction{
+					Name:        names.Shorten(t.Name, opt.warn()),
+					Description: t.Description,
+					Parameters:  t.Parameters,
+					Strict:      t.Strict,
 				}
 				if t.CacheControl != nil {
 					if caps.Has(canonical.CapCacheBreakpoints) {

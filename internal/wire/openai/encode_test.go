@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -239,4 +240,38 @@ func TestThinkingSignatureIsAlwaysReported(t *testing.T) {
 
 func newTestWriterS(w *strings.Builder) *StreamWriter {
 	return NewStreamWriter(w, StreamConfig{ID: testID, Created: testCreated, Model: testModel})
+}
+
+// TestANonFunctionToolIsDroppedNotForwarded: the chat surface carries function
+// tools only. A Responses caller's server-side tools (web_search, image_gen)
+// and the namespace containers some clients declare have no spelling there,
+// and forwarding the type verbatim produces `{"type":"namespace"}` — a tool no
+// chat backend parses, measured as z.ai 1214 "tools[N].type: type is illegal"
+// from a codex caller. The declaration is dropped and named on the loss
+// ledger; the function tools around it survive untouched.
+func TestANonFunctionToolIsDroppedNotForwarded(t *testing.T) {
+	req := &canonical.Request{
+		Model:    "m",
+		Messages: []canonical.Message{canonical.TextMessage(canonical.RoleUser, "hi")},
+		Tools: []canonical.Tool{
+			{Name: "f", Description: "d", Parameters: json.RawMessage(`{"type":"object"}`)},
+			{Type: "namespace", Extra: map[string]json.RawMessage{"ns": []byte(`{}`)}},
+			{Type: "web_search"},
+		},
+	}
+	var loss canonical.LossReport
+	w, err := EncodeRequest(req, &EncodeOptions{Loss: &loss})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Tools) != 1 || w.Tools[0].Type != "function" || w.Tools[0].Function.Name != "f" {
+		t.Fatalf("tools = %+v, want the one function tool and nothing beside it", w.Tools)
+	}
+	b, _ := json.Marshal(w.Tools)
+	if strings.Contains(string(b), "namespace") || strings.Contains(string(b), "web_search") {
+		t.Errorf("a non-function tool type reached the chat wire: %s", b)
+	}
+	if !loss.Lossy() || len(loss.Dropped) != 2 {
+		t.Errorf("dropped = %v, want both declarations reported", loss.Dropped)
+	}
 }
