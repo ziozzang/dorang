@@ -1,0 +1,46 @@
+# dorang — minimal starter configuration
+#
+# The smallest file that runs the gateway. Copy it, set the three environment
+# variables below, and start dorang with `--config` pointing at it. Every other
+# setting takes its default; the full, commented reference is
+# deploy/config.example.yaml.
+#
+# Secrets never live in this file — only references. Set in the environment:
+#
+#   DORANG_MASTER_KEY   the admin credential for the API and the /ui console
+#   DORANG_KEY_PEPPER   a random 32+ byte secret; the HMAC pepper for key hashing
+#   OPENAI_API_KEY      the upstream provider key referenced below
+#
+# A key reference is `key_env: NAME` (environment), `key_file: /path` (a file),
+# or — only when server.env is "development" — a literal `key:`.
+
+version: 1
+
+server:
+  listen: ":4100"
+  master_key_env: DORANG_MASTER_KEY
+  key_pepper_env: DORANG_KEY_PEPPER
+
+storage:
+  driver: sqlite
+  sqlite:
+    path: ~/.dorang/dorang.db
+
+# One provider, one credential, one model — add more of each to grow. `kind`
+# selects the wire adapter; `openai` fits any OpenAI-compatible endpoint.
+providers:
+  - name: openai
+    kind: openai
+    base_url: https://api.openai.com/v1
+
+credentials:
+  - id: openai-1
+    provider: openai
+    key_env: OPENAI_API_KEY
+
+models:
+  - name: gpt-4o
+    deployments:
+      - provider: openai
+        upstream_model: gpt-4o
+        credentials: [openai-1]
