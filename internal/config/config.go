@@ -1088,6 +1088,11 @@ type Fallbacks struct {
 	On       map[string][]string `yaml:"on,omitempty"`
 	MaxHops  int                 `yaml:"max_hops,omitempty"`
 	BudgetMS int                 `yaml:"budget_ms,omitempty"`
+	// RateLimitCooldown stands a deployment down after a 429 that carried no
+	// Retry-After (a headerless provider such as ollama.com). Zero selects the
+	// router's DefaultRateLimitCooldown; set it to tune how long an exhausted
+	// account waits before it is probed again.
+	RateLimitCooldown Duration `yaml:"rate_limit_cooldown,omitempty"`
 }
 
 // Fallback causes (§7.6).

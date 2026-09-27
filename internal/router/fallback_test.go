@@ -159,6 +159,53 @@ func TestAuthIsTerminalAndMarksTheCredential(t *testing.T) {
 	}
 }
 
+// TestHeaderlessRateLimitStandsDownSoTheSiblingGetsTheNextRequest is the
+// failover an operator hit in production: one provider account was quota-exhausted
+// and answered every request with a 429 that carried NO Retry-After and NO reset
+// instant (ollama.com sends neither), yet all traffic kept going to it and the
+// healthy sibling account served nothing.
+//
+// The two accounts are separate deployments in one group under least_busy, so the
+// config-order tie always prefers the first-listed. The only thing that can move
+// the next request off it is standing it down — and a 429 does not count against
+// availability (it is capacity, not liveness), so the ONLY mechanism left is the
+// RateLimitCooldown MarkUnavailable in reportOutcome. That cooldown is 0 unless
+// something sets it, which is why New defaults it to DefaultRateLimitCooldown.
+//
+// Revert check: delete the RateLimitCooldown default in New (router.go) and this
+// test fails at both assertions — d1 stays Closed and the next request re-picks
+// it — which is exactly the live symptom (the sibling serving zero).
+func TestHeaderlessRateLimitStandsDownSoTheSiblingGetsTheNextRequest(t *testing.T) {
+	cfg := Config{
+		Groups: []Group{{Name: "g", Class: "c", Strategy: []Strategy{StrategyLeastBusy},
+			Deployments: []Deployment{
+				dep("d1", "p", "openai", "m", "k1"),
+				dep("d2", "p", "openai", "m", "k2"),
+			}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3},
+	}
+	h := newHarness(t, cfg, harnessOpts{})
+
+	d := h.route(Request{Model: "g"})
+	if d.Deployment != "d1" {
+		t.Fatalf("precondition: a least_busy tie with both idle picks the first-listed, got %s", d.Deployment)
+	}
+
+	// A 429 with neither Retry-After nor a reset instant — the whole signal a
+	// headerless provider gives. Report derives CauseRateLimit from the status.
+	h.r.Report(d, Outcome{Err: errFake, Status: 429})
+
+	if got := h.health.Stats("d1").State; got != health.Open {
+		t.Fatalf("a headerless 429 must stand the deployment down via the default "+
+			"RateLimitCooldown, got state %v", got)
+	}
+
+	d2 := h.route(Request{Model: "g"})
+	if d2.Deployment != "d2" {
+		t.Fatalf("with d1 in cooldown the next request must fail over to the sibling, got %s", d2.Deployment)
+	}
+}
+
 // TestContextWindowFallsBackToALargerWindow is §7.6's same_class_larger, and
 // §10.5a's second row: route to a same-class deployment with a bigger window
 // rather than rewriting the caller's conversation.
@@ -348,20 +395,47 @@ func TestSuccessCannotFallBack(t *testing.T) {
 }
 
 // TestRateLimitDoesNotCountAgainstAvailability is the distinction
-// health.Outcome.Failure exists for: a 429 is an error to the caller and says
-// nothing about whether the deployment is alive. Counting it would open the
-// circuit on a backend that is answering perfectly.
+// health.Outcome.Failure exists for: a 429 is an error to the caller and is NOT a
+// liveness failure of the deployment, so it never increments the failure counter
+// and so never trips the consecutive-failure circuit — that path would open on a
+// backend answering perfectly, and unlike a 400 a caller cannot force a 429, so
+// the boundary is not a denial-of-service lever either.
+//
+// It is stood down all the same, but by a DIFFERENT mechanism and for a different
+// reason: MarkUnavailable holds it out for the bounded RateLimitCooldown —
+// capacity back-pressure, not a dead backend — and it recovers on its own once
+// that window elapses. Both facts are asserted so the two mechanisms are not
+// conflated: a 429 costs zero on the failure counter yet still yields the next
+// request to a sibling, and the account is probed again shortly after.
 func TestRateLimitDoesNotCountAgainstAvailability(t *testing.T) {
-	h := newHarness(t, classConfig(), harnessOpts{})
-	for i := 0; i < 5; i++ {
-		d := h.route(Request{Model: "g"})
-		h.r.Report(d, Outcome{Err: errFake, Status: 429})
+	solo := Config{
+		Groups: []Group{{Name: "g", Class: "chat-large", Deployments: []Deployment{
+			dep("g1", "p1", "openai", "model-x"),
+		}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3, Budget: 2 * time.Minute},
 	}
+	h := newHarness(t, solo, harnessOpts{})
+
+	d := h.route(Request{Model: "g"})
+	h.r.Report(d, Outcome{Err: errFake, Status: 429})
+
 	if got := h.health.Stats("g1").Failures; got != 0 {
 		t.Fatalf("a 429 must not count against availability: %d failures recorded", got)
 	}
-	if got := h.health.Stats("g1").State; got != health.Closed {
-		t.Fatalf("the circuit must stay closed after repeated 429s: %v", got)
+	// The bounded capacity stand-down, not the liveness circuit's threshold open.
+	if got := h.health.Stats("g1").State; got != health.Open {
+		t.Fatalf("a headerless 429 stands the deployment down for RateLimitCooldown, got %v", got)
+	}
+
+	// It comes back on its own once the cooldown elapses — the difference between
+	// capacity back-pressure and a dead backend or a dead key (15m auth cooldown).
+	h.clock.advance(DefaultRateLimitCooldown + time.Second)
+	d2 := h.route(Request{Model: "g"})
+	if d2.Deployment != "g1" {
+		t.Fatalf("the deployment must be probed again once RateLimitCooldown elapses, got %s", d2.Deployment)
+	}
+	if got := h.health.Stats("g1").Failures; got != 0 {
+		t.Fatalf("recovery must not have logged a failure: %d", got)
 	}
 }
 

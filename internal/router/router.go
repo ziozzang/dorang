@@ -170,6 +170,9 @@ func New(cfg Config, deps Deps) (*Router, error) {
 	if cfg.Fallback.AuthCooldown == 0 {
 		cfg.Fallback.AuthCooldown = DefaultAuthCooldown
 	}
+	if cfg.Fallback.RateLimitCooldown == 0 {
+		cfg.Fallback.RateLimitCooldown = DefaultRateLimitCooldown
+	}
 	if deps.Capacity == nil {
 		// SweepInterval < 0 leaves no background goroutine, so a Router that
 		// builds its own broker owns nothing it must later close.
@@ -1579,10 +1582,11 @@ func countsAgainstAvailability(c Cause) bool {
 		return false
 
 	case CauseRateLimit, CauseQuotaExhausted:
-		// Capacity, not liveness — and already acted on above:
-		// MarkUnavailable stands the deployment down for exactly the
-		// Retry-After the provider named. Counting it here as well would stack
-		// a second, unrelated cooldown on top of the one that was asked for.
+		// Capacity, not liveness — and already acted on above: MarkUnavailable
+		// stands the deployment down for the Retry-After the provider named, or,
+		// when it named none, for RateLimitCooldown (DefaultRateLimitCooldown by
+		// default, never zero). Counting it here as well would stack a second,
+		// unrelated cooldown on top of the one that was asked for.
 		return false
 
 	case CauseAuth:
