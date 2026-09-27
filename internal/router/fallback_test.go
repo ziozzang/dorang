@@ -264,6 +264,134 @@ func TestConsecutiveHeaderlessRateLimitsBackOff(t *testing.T) {
 	}
 }
 
+// TestAccountSiblingsFlipLikeASwitch is the behavior two accounts on one plan
+// should have: traffic stays on whichever account is working. When account 1 is
+// rate-limited, account 2 takes over and KEEPS the traffic after account 1's
+// cooldown has elapsed — no drifting back to the first-listed account to probe it
+// on every idle tie. Only when account 2 is stood down in turn does traffic flip
+// back to account 1.
+//
+// Revert check: drop the gatherSiblings pass from order() and the "after the
+// cooldown, still d2" assertion fails — the config-order tie hands the next
+// request back to d1.
+func TestAccountSiblingsFlipLikeASwitch(t *testing.T) {
+	cfg := Config{
+		Groups: []Group{{Name: "g", Class: "c", Strategy: []Strategy{StrategyLeastBusy},
+			Deployments: []Deployment{
+				dep("d1", "p", "openai", "m", "k1"),
+				dep("d2", "p", "openai", "m", "k2"),
+			}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3},
+	}
+	h := newHarness(t, cfg, harnessOpts{})
+	step := func(want string) *Decision {
+		t.Helper()
+		d := h.route(Request{Model: "g"})
+		if d.Deployment != want {
+			t.Fatalf("want %s, got %s", want, d.Deployment)
+		}
+		return d
+	}
+
+	// Before anything has succeeded, config order decides; d1 then keeps it.
+	h.ok(step("d1"))
+	h.clock.advance(time.Second)
+	h.ok(step("d1"))
+
+	// d1 is rate-limited; d2 takes over.
+	h.r.Report(step("d1"), Outcome{Err: errFake, Status: 429})
+	h.clock.advance(time.Second)
+	h.ok(step("d2"))
+
+	// d1's cooldown has long elapsed, yet d2 stays the active account.
+	h.clock.advance(DefaultRateLimitCooldown + time.Minute)
+	h.ok(step("d2"))
+	h.clock.advance(time.Second)
+	h.ok(step("d2"))
+
+	// d2 is rate-limited in turn; traffic flips back to d1, and stays there.
+	h.r.Report(step("d2"), Outcome{Err: errFake, Status: 429})
+	h.clock.advance(time.Second)
+	h.ok(step("d1"))
+	h.clock.advance(DefaultRateLimitCooldown + time.Minute)
+	h.ok(step("d1"))
+}
+
+// TestAccountSiblingsAreNotLoadBalanced is the cache-first half of the rule:
+// under least_busy, a second concurrent request does NOT go to the idle sibling
+// just because the active account already has one in flight. Spreading a plan's
+// traffic across its accounts splits every conversation's prompt cache; the
+// active account keeps it until it is stood down.
+//
+// Revert check: drop the gatherSiblings pass and least_busy sends the second
+// request to d2.
+func TestAccountSiblingsAreNotLoadBalanced(t *testing.T) {
+	cfg := Config{
+		Groups: []Group{{Name: "g", Class: "c", Strategy: []Strategy{StrategyLeastBusy},
+			Deployments: []Deployment{
+				dep("d1", "p", "openai", "m", "k1"),
+				dep("d2", "p", "openai", "m", "k2"),
+			}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3},
+	}
+	h := newHarness(t, cfg, harnessOpts{})
+
+	// d2 becomes the active account (account 1 is not special).
+	d := h.route(Request{Model: "g"})
+	h.r.Report(d, Outcome{Err: errFake, Status: 429})
+	h.clock.advance(time.Second)
+	a := h.route(Request{Model: "g"})
+	if a.Deployment != "d2" {
+		t.Fatalf("precondition: d2 takes over, got %s", a.Deployment)
+	}
+	h.ok(a)
+	h.clock.advance(DefaultRateLimitCooldown + time.Minute) // d1 is selectable again
+
+	// One request in flight on d2, unreported; d1 is idle.
+	first := h.route(Request{Model: "g"})
+	if first.Deployment != "d2" {
+		t.Fatalf("the active account serves, got %s", first.Deployment)
+	}
+	second := h.route(Request{Model: "g"})
+	if second.Deployment != "d2" {
+		t.Fatalf("a busier active account must keep the traffic (cache first), got %s", second.Deployment)
+	}
+	if second.Reason != ReasonActiveAccount {
+		t.Fatalf("reason: want %q, got %q", ReasonActiveAccount, second.Reason)
+	}
+	h.ok(first)
+	h.ok(second)
+}
+
+// TestFlipIsOnlyBetweenAccountSiblings keeps configuration order meaningful
+// between DIFFERENT backends: a later-listed provider that served most recently
+// does not displace the first-listed one once it is available again.
+func TestFlipIsOnlyBetweenAccountSiblings(t *testing.T) {
+	cfg := Config{
+		Groups: []Group{{Name: "g", Class: "c", Strategy: []Strategy{StrategyLeastBusy},
+			Deployments: []Deployment{
+				dep("primary", "p1", "openai", "m"),
+				dep("secondary", "p2", "openai", "m"),
+			}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3},
+	}
+	h := newHarness(t, cfg, harnessOpts{})
+
+	d := h.route(Request{Model: "g"})
+	h.r.Report(d, Outcome{Err: errFake, Status: 429})
+	h.clock.advance(time.Second)
+	if d2 := h.route(Request{Model: "g"}); d2.Deployment != "secondary" {
+		t.Fatalf("while primary is stood down the secondary serves, got %s", d2.Deployment)
+	} else {
+		h.ok(d2)
+	}
+
+	h.clock.advance(DefaultRateLimitCooldown + time.Minute)
+	if d3 := h.route(Request{Model: "g"}); d3.Deployment != "primary" {
+		t.Fatalf("across providers config order is a preference and must hold, got %s", d3.Deployment)
+	}
+}
+
 // TestContextWindowFallsBackToALargerWindow is §7.6's same_class_larger, and
 // §10.5a's second row: route to a same-class deployment with a bigger window
 // rather than rewriting the caller's conversation.

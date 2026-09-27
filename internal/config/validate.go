@@ -1374,6 +1374,8 @@ func (c *Config) validateFallbacks(col *collector) {
 	}
 	nonNegative(col, "fallbacks.max_hops", int64(c.Fallbacks.MaxHops))
 	nonNegative(col, "fallbacks.budget_ms", int64(c.Fallbacks.BudgetMS))
+	nonNegative(col, "fallbacks.rate_limit_cooldown", int64(c.Fallbacks.RateLimitCooldown))
+	nonNegative(col, "fallbacks.rate_limit_cooldown_max", int64(c.Fallbacks.RateLimitCooldownMax))
 }
 
 func (c *Config) validatePricing(col *collector, providers map[string]*Provider,

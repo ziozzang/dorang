@@ -42,6 +42,13 @@ type candidate struct {
 
 	rr int
 	wr float64
+
+	// lastOK is when this deployment last served a genuine success (Unix ns, 0 =
+	// never). It feeds only the account-sibling ranking in [order].
+	lastOK int64
+	// setPos groups account siblings in [order]: the position of the first
+	// member of this candidate's sibling set after the chain sort.
+	setPos int
 }
 
 // cmp is a comparator's answer: negative if a wins, positive if b wins, and
@@ -160,6 +167,36 @@ func cmpFloat(a, b float64) int {
 // inputs always produce the same order — a router whose answer depends on map
 // iteration is untestable and unexplainable.
 //
+// # Account siblings: cache first, swap on failure
+//
+// Deployments whose configuration is identical except for the credential —
+// several accounts on one plan — are not load-balanced against each other.
+// Spreading between them (least_busy, round_robin) would split every
+// conversation across accounts and throw away the upstream's prompt cache, which
+// is per account. So after the chain has ordered the BACKENDS, each sibling set is
+// gathered at the position of its best member and ordered internally by:
+//
+//  0. the chain's account-policy strategies only ([accountPolicy]: an explicit
+//     operator choice between accounts such as quota_urgency), then
+//  1. a session pin (the conversation's account),
+//  2. a prefix-cache hit (the account that last served this prefix),
+//  3. the account that most recently served a success — the active one,
+//  4. configuration order, which only decides before any account has served.
+//
+// The effect is a swap, not a rotation: traffic stays on the active account;
+// when it is stood down (a 429, an outage) dispatch passes to the next sibling,
+// which becomes active by succeeding and KEEPS the traffic after the first one's
+// cooldown elapses. The first account is used again only when the one now
+// serving is stood down in turn. Nothing makes account 1 special.
+//
+// Between different providers, models or settings the chain decides as before:
+// there configuration order and priority can be a real preference, and one
+// transient failure must not move traffic off it for good.
+//
+// Two stable sorts on lexicographic keys rather than one comparator with a
+// sibling special case: mixing rules per pair can make the order intransitive
+// (A<B by recency, B<C and C<A by the chain), which a sort does not survive.
+//
 // slices.SortStableFunc rather than sort.SliceStable: the latter sorts through
 // reflection, which §15.5 prohibits on this path.
 func order(chain []Strategy, cands []candidate) {
@@ -172,6 +209,103 @@ func order(chain []Strategy, cands []candidate) {
 		}
 		return cmpInt(a.idx, b.idx)
 	})
+	if !gatherSiblings(cands) {
+		return
+	}
+	slices.SortStableFunc(cands, func(a, b candidate) int {
+		if c := cmpInt(a.setPos, b.setPos); c != 0 {
+			return c
+		}
+		return siblingRank(chain, &a, &b)
+	})
+}
+
+// sameAccountSet reports whether two deployments are account siblings: the same
+// backend, model and routing settings, differing only in credential.
+func sameAccountSet(a, b *Deployment) bool {
+	return a.Provider == b.Provider && a.ProviderGroup == b.ProviderGroup &&
+		a.Kind == b.Kind && a.UpstreamModel == b.UpstreamModel &&
+		a.Priority == b.Priority && a.Weight == b.Weight &&
+		a.ContextWindow == b.ContextWindow
+}
+
+// gatherSiblings sets each candidate's setPos to the position of the first member
+// of its sibling set in the current order, and reports whether any set has more
+// than one member. Candidate sets are small, so the quadratic scan costs less
+// than the map it would otherwise need.
+func gatherSiblings(cands []candidate) bool {
+	found := false
+	for i := range cands {
+		cands[i].setPos = i
+		for j := 0; j < i; j++ {
+			if sameAccountSet(cands[i].dep, cands[j].dep) {
+				cands[i].setPos = cands[j].setPos
+				found = true
+				break
+			}
+		}
+	}
+	return found
+}
+
+// anySiblings reports whether at least two candidates are account siblings.
+func anySiblings(cands []candidate) bool {
+	for i := range cands {
+		for j := 0; j < i; j++ {
+			if sameAccountSet(cands[i].dep, cands[j].dep) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// accountPolicy reports whether a strategy expresses a choice BETWEEN accounts
+// that an operator asked for — spend the allowance about to expire, use the
+// cheaper credential, keep a session or a prefix where it is — as opposed to
+// spreading load across them. Only these still rank account siblings; the
+// load-spreading ones (least_busy, round_robin, weighted_random, and the
+// latency and throughput EWMAs, which would bounce traffic between accounts on
+// noise) are exactly what splits the prompt cache.
+func accountPolicy(s Strategy) bool {
+	switch s {
+	case StrategyQuotaUrgency, StrategyLowestCost, StrategySticky,
+		StrategyPrefixSticky, StrategyPriority:
+		return true
+	}
+	return false
+}
+
+// siblingPolicy is the chain restricted to account-policy strategies: the first
+// such strategy with an opinion between two siblings, and which one it was.
+func siblingPolicy(chain []Strategy, a, b *candidate) (int, Strategy) {
+	for _, s := range chain {
+		if !accountPolicy(s) {
+			continue
+		}
+		if c := compare(s, a, b); c != 0 {
+			return c, s
+		}
+	}
+	return 0, ""
+}
+
+// siblingRank orders members of one sibling set: an operator's explicit
+// account policy first, then cache affinity, then configuration order.
+func siblingRank(chain []Strategy, a, b *candidate) int {
+	if c, _ := siblingPolicy(chain, a, b); c != 0 {
+		return c
+	}
+	if c := boolFirst(a.sticky, b.sticky); c != 0 {
+		return c
+	}
+	if c := boolFirst(a.prefixHit, b.prefixHit); c != 0 {
+		return c
+	}
+	if c := -cmpInt64(a.lastOK, b.lastOK); c != 0 {
+		return c
+	}
+	return cmpInt(a.idx, b.idx)
 }
 
 // decidedBy names the strategy that separated the winner from the runner-up.

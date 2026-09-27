@@ -1092,6 +1092,8 @@ fallbacks:
     auth:            []
   max_hops: 3
   budget_ms: 120000
+  rate_limit_cooldown: 10s
+  rate_limit_cooldown_max: 15m
 ```
 
 | Key | Type | Default | What it does | What breaks if it is wrong |
@@ -1099,6 +1101,23 @@ fallbacks:
 | `on.<cause>` | []string | the table above | The chain for one cause. Causes: `rate_limit`, `quota_exhausted`, `context_window`, `content_policy`, `upstream_5xx`, `timeout`, `budget_exceeded`, `auth`. Targets: `same_group`, `same_class`, `same_class_larger` | An unknown cause or target is refused. **`budget_exceeded` and `auth` must have empty chains** — a non-empty one is refused |
 | `max_hops` | int | `3` | Bounds fallback attempts **after the first dispatch**, so `3` permits **four attempts in total** | Negative is refused. Zero disables fallback entirely. Either reading of "hops" was defensible and the difference is a whole extra request, which is why it is stated |
 | `budget_ms` | int | `120000` | Wall-clock ceiling on a whole routing session, from the first routing call | Negative is refused |
+| `rate_limit_cooldown` | duration | `10s` | How long a deployment is stood down after the **first** `429` that named no `Retry-After` and no reset time (e.g. ollama.com). A provider-named wait always wins over it | Negative is refused; `0` selects the default. Without any cooldown a headerless-429 deployment would stay selectable forever — a `429` never opens the liveness circuit |
+| `rate_limit_cooldown_max` | duration | `15m` | Ceiling of the exponential backoff: each further headerless `429` that survives a recovery probe doubles the stand-down (`10s → 20s → … → 15m`). A single success resets it. Concurrent `429`s within one stand-down count once | Negative is refused; `0` selects the default; a value below `rate_limit_cooldown` is raised to it |
+
+**Several accounts on one plan swap; they are not load-balanced.** Deployments of one model whose
+settings are identical except for the credential (same provider, kind, upstream model, priority,
+weight and context window) are *account siblings*. The strategy chain still orders different
+backends, but between siblings only the chain's account-choice strategies (`quota_urgency`,
+`lowest_cost`, `sticky`, `prefix_sticky`, `priority`) apply; the load-spreading ones
+(`least_busy`, `round_robin`, `weighted_random`, `lowest_latency`, `highest_tps`) do not, because
+spreading one plan's traffic across its accounts splits every conversation's upstream prompt cache.
+Siblings are then ranked by cache affinity — session pin, prefix-cache hit, then **the account that
+most recently served a success** — and configuration order only decides before any has served. So
+traffic stays on the active account; when it is stood down (a `429`, an outage) the next sibling
+takes over and keeps the traffic even after the first recovers, until it is stood down in turn.
+Such a decision reports reason `active_account`. To keep a busy active account from provoking
+concurrency `429`s, cap each account's concurrency (`capacity.credential_groups`) so overflow
+spills to a sibling instead.
 
 **Why `budget_exceeded` and `auth` cannot fall back.** Falling back on an exceeded budget would
 send the request to a different deployment and spend a **different subject's** budget on a model

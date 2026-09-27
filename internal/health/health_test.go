@@ -202,6 +202,27 @@ func TestMarkRateLimitedBacksOffAndResetsOnSuccess(t *testing.T) {
 	}
 }
 
+// TestLastSuccessMovesOnlyOnSuccess: the router's account flip reads this, so a
+// 429 or a liveness failure must not make a deployment look recently healthy.
+func TestLastSuccessMovesOnlyOnSuccess(t *testing.T) {
+	now, advance := clock(time.Unix(1700000000, 0))
+	tr := New(Options{Now: now})
+	if got := tr.LastSuccess("d1"); got != 0 {
+		t.Fatalf("never-used deployment: want 0, got %d", got)
+	}
+	tr.Report("d1", succeed())
+	first := tr.LastSuccess("d1")
+	if first != now().UnixNano() {
+		t.Fatalf("success not recorded: %d", first)
+	}
+	advance(time.Minute)
+	tr.Report("d1", Outcome{Err: errors.New("429"), Failure: false})
+	tr.Report("d1", fail())
+	if got := tr.LastSuccess("d1"); got != first {
+		t.Fatalf("an error moved the last-success time: %d -> %d", first, got)
+	}
+}
+
 // TestMarkRateLimitedBurstWhileOpenDoesNotEscalate guards the concurrency case:
 // requests already in flight when a deployment is stood down will each report a
 // 429, but they are the SAME down-period and must not each escalate the backoff

@@ -10,6 +10,9 @@ const (
 	ReasonSticky        = "sticky"
 	ReasonPinned        = "pinned"
 	ReasonConfigOrder   = "config_order"
+	// ReasonActiveAccount is an account sibling chosen because it is the one
+	// currently serving (see [order]): cache affinity, not load, decided.
+	ReasonActiveAccount = "active_account"
 )
 
 // prefixHitReasons is "prefix_hit:depth=N" for every depth the chain can

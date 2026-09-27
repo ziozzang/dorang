@@ -123,6 +123,10 @@ type record struct {
 	// keeps 429ing should be stood down for longer each time rather than probed
 	// every base interval forever.
 	rlStrikes atomic.Int64
+	// lastOKNano is when the deployment last served a genuine success (0 =
+	// never). The router reads it to keep traffic on the account that is
+	// currently working rather than drifting back to an earlier-listed sibling.
+	lastOKNano atomic.Int64
 
 	// EWMAs are stored as float64 bits so they can be updated without a lock.
 	// Contention here is benign: a lost update costs one sample of accuracy in
@@ -234,6 +238,7 @@ func (t *Tracker) Report(id string, o Outcome) {
 	// rate-limit counters and closes a half-open circuit.
 	r.consecFails.Store(0)
 	r.rlStrikes.Store(0)
+	r.lastOKNano.Store(t.opts.Now().UnixNano())
 	if State(r.state.Load()) == HalfOpen {
 		r.state.Store(uint32(Closed))
 	}
@@ -400,6 +405,13 @@ func (t *Tracker) Stats(id string) Stats {
 		Total:            time.Duration(ewmaRead(&r.totalBits)),
 		TokensPerSec:     ewmaRead(&r.tpsBits),
 	}
+}
+
+// LastSuccess returns when the deployment last served a genuine success, in
+// Unix nanoseconds, or 0 if it never has. A 429 or any other error leaves it
+// unchanged.
+func (t *Tracker) LastSuccess(id string) int64 {
+	return t.rec(id).lastOKNano.Load()
 }
 
 // TTFT returns the smoothed time to first token. Zero means no sample yet;

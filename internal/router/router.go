@@ -1063,7 +1063,10 @@ func (r *Router) score(sc *scratch, cands []candidate, chain []Strategy, req *Re
 	if len(cands) == 0 {
 		return
 	}
-	if chainUses(chain, StrategyPrefixSticky) && r.deps.Prefix != nil && len(req.Digests) > 0 {
+	// Account siblings are ordered by cache affinity whatever the chain says
+	// (see [order]), so the prefix lookup runs for them too.
+	if (chainUses(chain, StrategyPrefixSticky) || anySiblings(cands)) &&
+		r.deps.Prefix != nil && len(req.Digests) > 0 {
 		target, depth, ok := r.deps.Prefix.Lookup(req.Digests, sc.valid)
 		if ok {
 			for i := range cands {
@@ -1115,6 +1118,13 @@ func (r *Router) score(sc *scratch, cands []candidate, chain []Strategy, req *Re
 	if chainUses(chain, StrategyHighestTPS) {
 		for i := range cands {
 			cands[i].tps = r.deps.Health.TokensPerSec(cands[i].dep.ID)
+		}
+	}
+	// The account-sibling flip in [order] is not a strategy and runs under any
+	// chain, so its input is always read — once per candidate, like the rest.
+	if len(cands) > 1 {
+		for i := range cands {
+			cands[i].lastOK = r.deps.Health.LastSuccess(cands[i].dep.ID)
 		}
 	}
 	if chainUses(chain, StrategyQuotaUrgency) && r.deps.Urgency != nil {
@@ -1422,6 +1432,14 @@ func (r *Router) decide(c *candidate, chain []Strategy, cands []candidate, req *
 		d.Reason = ReasonPinned
 	case len(cands) == 1:
 		d.Reason = ReasonOnlyCandidate
+	case len(cands) > 1 && sameAccountSet(cands[0].dep, cands[1].dep):
+		// The front two are account siblings, so siblingRank — not the full
+		// chain — separated them; naming a load strategy here would be false.
+		if _, s := siblingPolicy(chain, &cands[0], &cands[1]); s != "" {
+			d.Reason = string(s)
+		} else {
+			d.Reason = ReasonActiveAccount
+		}
 	default:
 		if s, ok := decidedBy(chain, cands); ok {
 			d.Reason = string(s)
