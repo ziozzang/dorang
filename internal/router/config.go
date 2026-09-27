@@ -248,9 +248,10 @@ type FallbackConfig struct {
 	// AuthCooldown is how long a credential is taken out of service after an
 	// authentication failure. Zero selects DefaultAuthCooldown.
 	AuthCooldown time.Duration
-	// RateLimitCooldown is how long a deployment is stood down after a 429 that
-	// carried no Retry-After and no reset instant — the only signal a headerless
-	// provider (e.g. ollama.com) gives. Zero selects DefaultRateLimitCooldown.
+	// RateLimitCooldown is how long a deployment is stood down after the FIRST 429
+	// that carried no Retry-After and no reset instant — the only signal a
+	// headerless provider (e.g. ollama.com) gives. Zero selects
+	// DefaultRateLimitCooldown.
 	//
 	// It cannot be left to the health tracker's consecutive-failure circuit: a
 	// 429 is capacity, not liveness, so countsAgainstAvailability (router.go)
@@ -259,6 +260,15 @@ type FallbackConfig struct {
 	// under a config-order least_busy tie it starves its healthy sibling — the
 	// failover-that-never-fired this field exists to prevent.
 	RateLimitCooldown time.Duration
+	// RateLimitCooldownMax caps the exponential backoff applied to a deployment
+	// that keeps 429ing. Each consecutive headerless 429 that survives a recovery
+	// probe doubles the stand-down, from RateLimitCooldown up to this ceiling, so
+	// a genuinely exhausted account (an ollama "session usage limit" that persists
+	// for minutes to hours) is switched away from and probed only occasionally,
+	// rather than re-tried every RateLimitCooldown forever. A single success
+	// resets the escalation. Zero selects DefaultRateLimitCooldownMax; a value
+	// below RateLimitCooldown is raised to it.
+	RateLimitCooldownMax time.Duration
 }
 
 // DefaultAuthCooldown is how long a credential that failed authentication stays
@@ -266,12 +276,21 @@ type FallbackConfig struct {
 // an operator or a rotation replaces it, so this is long rather than eager.
 const DefaultAuthCooldown = 15 * time.Minute
 
-// DefaultRateLimitCooldown is how long a deployment is stood down after a 429
-// that named no Retry-After. It is short — a rate limit is transient capacity
-// that recovers on its own, unlike a dead key — but long enough that the next
-// several requests skip the limited deployment for its healthy sibling. After it
-// elapses the circuit half-opens and one probe decides whether to renew it.
+// DefaultRateLimitCooldown is how long a deployment is stood down after the first
+// 429 that named no Retry-After. It is short — a rate limit may be transient
+// capacity that recovers on its own, unlike a dead key — but long enough that the
+// next several requests skip the limited deployment for its healthy sibling. After
+// it elapses the circuit half-opens and one probe decides whether to renew it,
+// and a probe that 429s again escalates the wait toward DefaultRateLimitCooldownMax.
 const DefaultRateLimitCooldown = 10 * time.Second
+
+// DefaultRateLimitCooldownMax caps the rate-limit backoff. It is minutes, not
+// seconds, because the failure it exists for — a provider "session usage limit"
+// or spent quota window with no reset header — persists for minutes to hours, and
+// re-probing an exhausted account every few seconds only wastes a request and a
+// latency spike each cycle. Fifteen minutes bounds the wasted probes to a handful
+// per hour while still recovering on its own once the account's window resets.
+const DefaultRateLimitCooldownMax = 15 * time.Minute
 
 // DefaultChains is the fail-back table of DESIGN §7.6, verbatim. budget_exceeded
 // and auth are present with empty chains, so "the cause is absent" and "the

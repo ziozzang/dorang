@@ -464,9 +464,10 @@ func apiFor(cat *catalog.Catalog, kind string) catalog.API {
 
 func fallbackConfig(cfg *config.Config) router.FallbackConfig {
 	fc := router.FallbackConfig{
-		MaxHops:           cfg.Fallbacks.MaxHops,
-		Budget:            time.Duration(cfg.Fallbacks.BudgetMS) * time.Millisecond,
-		RateLimitCooldown: cfg.Fallbacks.RateLimitCooldown.Duration(),
+		MaxHops:              cfg.Fallbacks.MaxHops,
+		Budget:               time.Duration(cfg.Fallbacks.BudgetMS) * time.Millisecond,
+		RateLimitCooldown:    cfg.Fallbacks.RateLimitCooldown.Duration(),
+		RateLimitCooldownMax: cfg.Fallbacks.RateLimitCooldownMax.Duration(),
 	}
 	if len(cfg.Fallbacks.On) > 0 {
 		fc.On = make(map[router.Cause][]router.Target, len(cfg.Fallbacks.On))

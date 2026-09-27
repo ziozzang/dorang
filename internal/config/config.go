@@ -1088,11 +1088,17 @@ type Fallbacks struct {
 	On       map[string][]string `yaml:"on,omitempty"`
 	MaxHops  int                 `yaml:"max_hops,omitempty"`
 	BudgetMS int                 `yaml:"budget_ms,omitempty"`
-	// RateLimitCooldown stands a deployment down after a 429 that carried no
-	// Retry-After (a headerless provider such as ollama.com). Zero selects the
+	// RateLimitCooldown stands a deployment down after the FIRST 429 that carried
+	// no Retry-After (a headerless provider such as ollama.com). Zero selects the
 	// router's DefaultRateLimitCooldown; set it to tune how long an exhausted
 	// account waits before it is probed again.
 	RateLimitCooldown Duration `yaml:"rate_limit_cooldown,omitempty"`
+	// RateLimitCooldownMax caps the exponential backoff: each consecutive
+	// headerless 429 that survives a recovery probe doubles the stand-down, from
+	// RateLimitCooldown up to this ceiling, so a persistently exhausted account is
+	// switched away from and probed only occasionally rather than every
+	// RateLimitCooldown. Zero selects the router's DefaultRateLimitCooldownMax.
+	RateLimitCooldownMax Duration `yaml:"rate_limit_cooldown_max,omitempty"`
 }
 
 // Fallback causes (§7.6).

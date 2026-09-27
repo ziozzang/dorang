@@ -167,6 +167,66 @@ func TestMarkHealthy(t *testing.T) {
 	}
 }
 
+// TestMarkRateLimitedBacksOffAndResetsOnSuccess is the escalation an exhausted
+// account needs: each headerless 429 that survives a recovery probe doubles the
+// stand-down (10s -> 20s -> 40s -> capped), so a "session usage limit" that keeps
+// refusing is probed occasionally rather than every base interval — and a single
+// success wipes the escalation so a recovered account is not punished for its past.
+//
+// Revert check: drop the rlStrikes escalation (return a fixed base from
+// MarkRateLimited) and every "doubled" assertion fails; drop rlStrikes.Store(0)
+// from Report's success path and the final reset assertion fails.
+func TestMarkRateLimitedBacksOffAndResetsOnSuccess(t *testing.T) {
+	now, advance := clock(time.Unix(1700000000, 0))
+	tr := New(Options{Cooldown: 5 * time.Second, HalfOpenProbes: 1, Now: now})
+	const base, max = 10 * time.Second, 40 * time.Second
+
+	// The failing account is probed after each window and 429s again, escalating.
+	for i, want := range []time.Duration{base, 2 * base, max, max} {
+		if got := tr.MarkRateLimited("d1", base, max); got != want {
+			t.Fatalf("strike %d: stand-down %v, want %v", i+1, got, want)
+		}
+		advance(want + time.Second) // wait out the (growing) window
+		if !tr.Allow("d1") {
+			t.Fatalf("strike %d: did not half-open after %v", i+1, want)
+		}
+	}
+
+	// A genuine success closes the circuit AND resets the escalation.
+	tr.Report("d1", succeed())
+	if !tr.Allow("d1") {
+		t.Fatal("a success must close the circuit")
+	}
+	if got := tr.MarkRateLimited("d1", base, max); got != base {
+		t.Fatalf("after a success the backoff must reset to base %v, got %v", base, got)
+	}
+}
+
+// TestMarkRateLimitedBurstWhileOpenDoesNotEscalate guards the concurrency case:
+// requests already in flight when a deployment is stood down will each report a
+// 429, but they are the SAME down-period and must not each escalate the backoff
+// or push recovery farther away.
+//
+// Revert check: remove the `if s == Open { return 0 }` guard and the burst counts
+// as six strikes instead of one.
+func TestMarkRateLimitedBurstWhileOpenDoesNotEscalate(t *testing.T) {
+	now, _ := clock(time.Unix(1700000000, 0))
+	tr := New(Options{Cooldown: 5 * time.Second, Now: now})
+	const base, max = 10 * time.Second, time.Minute
+
+	if got := tr.MarkRateLimited("d1", base, max); got != base {
+		t.Fatalf("first strike: want %v, got %v", base, got)
+	}
+	for i := 0; i < 5; i++ {
+		if got := tr.MarkRateLimited("d1", base, max); got != 0 {
+			t.Fatalf("a 429 while already stood down must be a no-op, got %v", got)
+		}
+	}
+	if got := tr.Stats("d1").RateLimitStrikes; got != 1 {
+		t.Fatalf("a burst within one down-period must count as one strike, got %d", got)
+	}
+}
+
 // An unproven deployment must not win a latency comparison on ignorance alone.
 func TestNoSampleMeansNoOpinion(t *testing.T) {
 	tr := New(Options{})

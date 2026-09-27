@@ -173,6 +173,12 @@ func New(cfg Config, deps Deps) (*Router, error) {
 	if cfg.Fallback.RateLimitCooldown == 0 {
 		cfg.Fallback.RateLimitCooldown = DefaultRateLimitCooldown
 	}
+	if cfg.Fallback.RateLimitCooldownMax == 0 {
+		cfg.Fallback.RateLimitCooldownMax = DefaultRateLimitCooldownMax
+	}
+	if cfg.Fallback.RateLimitCooldownMax < cfg.Fallback.RateLimitCooldown {
+		cfg.Fallback.RateLimitCooldownMax = cfg.Fallback.RateLimitCooldown
+	}
 	if deps.Capacity == nil {
 		// SweepInterval < 0 leaves no background goroutine, so a Router that
 		// builds its own broker owns nothing it must later close.
@@ -1480,11 +1486,15 @@ func (r *Router) Report(d *Decision, o Outcome) {
 			r.deps.Health.MarkUnavailable(d.Deployment, o.RetryAfter)
 		} else if w := o.ResetAt.Sub(r.now()); !o.ResetAt.IsZero() && w > 0 {
 			// The provider named the instant its window recovers; that is a
-			// better cooldown than the configured default, which is a guess
-			// made before the provider had said anything.
+			// better cooldown than any guess, so it wins over the backoff.
 			r.deps.Health.MarkUnavailable(d.Deployment, w)
-		} else if r.cfg.Fallback.RateLimitCooldown > 0 {
-			r.deps.Health.MarkUnavailable(d.Deployment, r.cfg.Fallback.RateLimitCooldown)
+		} else {
+			// Headerless: the provider gave no recovery time. Stand the
+			// deployment down with exponential backoff, so an account that keeps
+			// refusing is switched away from for longer each time instead of being
+			// re-probed every RateLimitCooldown forever. A success resets it.
+			r.deps.Health.MarkRateLimited(d.Deployment,
+				r.cfg.Fallback.RateLimitCooldown, r.cfg.Fallback.RateLimitCooldownMax)
 		}
 	}
 

@@ -206,6 +206,64 @@ func TestHeaderlessRateLimitStandsDownSoTheSiblingGetsTheNextRequest(t *testing.
 	}
 }
 
+// TestConsecutiveHeaderlessRateLimitsBackOff wires the health backoff to the
+// router: an account that keeps 429ing with no Retry-After is stood down for
+// LONGER each time, so the healthy sibling stays primary instead of the exhausted
+// one being re-probed every base interval. The distinguishing assertion is at a
+// time that a fixed base cooldown would already have recovered from but the
+// doubled window has not.
+//
+// Revert check: swap MarkRateLimited back for MarkUnavailable(RateLimitCooldown)
+// in reportOutcome and the +25s assertion fails — a fixed 10s window recovers d1
+// by +21s, so it would win the tie again there.
+func TestConsecutiveHeaderlessRateLimitsBackOff(t *testing.T) {
+	cfg := Config{
+		Groups: []Group{{Name: "g", Class: "c", Strategy: []Strategy{StrategyLeastBusy},
+			Deployments: []Deployment{
+				dep("d1", "p", "openai", "m", "k1"),
+				dep("d2", "p", "openai", "m", "k2"),
+			}}},
+		Fallback: FallbackConfig{On: DefaultChains(), MaxHops: 3,
+			RateLimitCooldown: 10 * time.Second, RateLimitCooldownMax: time.Minute},
+	}
+	h := newHarness(t, cfg, harnessOpts{})
+
+	// First headerless 429 on d1 -> stood down for the base 10s.
+	d := h.route(Request{Model: "g"})
+	if d.Deployment != "d1" {
+		t.Fatalf("precondition: least_busy tie picks the first-listed, got %s", d.Deployment)
+	}
+	h.r.Report(d, Outcome{Err: errFake, Status: 429})
+
+	// Inside the base window the sibling serves.
+	h.clock.advance(9 * time.Second) // t=9s
+	if got := h.route(Request{Model: "g"}).Deployment; got != "d2" {
+		t.Fatalf("within the first stand-down the next request must use the sibling, got %s", got)
+	}
+
+	// After the base window d1 is probed, 429s again -> escalate to 20s (from t=11).
+	h.clock.advance(2 * time.Second) // t=11s
+	probe := h.route(Request{Model: "g"})
+	if probe.Deployment != "d1" {
+		t.Fatalf("after the base stand-down d1 must be probed, got %s", probe.Deployment)
+	}
+	h.r.Report(probe, Outcome{Err: errFake, Status: 429})
+
+	// t=25s: 14s into the escalated 20s window (recovers at t=31s). A fixed 10s
+	// cooldown from the t=11 probe would already have recovered d1 by t=21s, so
+	// this is the assertion that proves the backoff.
+	h.clock.advance(14 * time.Second) // t=25s
+	if got := h.route(Request{Model: "g"}).Deployment; got != "d2" {
+		t.Fatalf("the second stand-down must outlast the first (backoff); got %s", got)
+	}
+
+	// Past the escalated window d1 recovers and wins the tie again.
+	h.clock.advance(7 * time.Second) // t=32s (> t=31s)
+	if got := h.route(Request{Model: "g"}).Deployment; got != "d1" {
+		t.Fatalf("d1 must recover after the escalated window elapses, got %s", got)
+	}
+}
+
 // TestContextWindowFallsBackToALargerWindow is §7.6's same_class_larger, and
 // §10.5a's second row: route to a same-class deployment with a bigger window
 // rather than rewriting the caller's conversation.
