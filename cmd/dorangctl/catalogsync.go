@@ -97,6 +97,8 @@ type providerSync struct {
 	New                 []string
 	Meta                map[string]modelMeta
 	Registry            string // matched models.dev provider id, if any
+	FreeOnly            bool   // the listing was narrowed to zero-priced models
+	ListedAll           int    // listing size before that narrowing
 }
 
 func (e env) catalogSync(args []string) int {
@@ -107,6 +109,7 @@ func (e env) catalogSync(args []string) int {
 	registry := fs.String("models-dev", defaultModelsDevURL, `models.dev registry URL or file, for metadata a provider does not publish; "off" to skip`)
 	write := fs.String("write", "", "write the metadata found as a catalog overlay")
 	includePrivate := fs.Bool("include-private", false, "also write overlay entries for providers on private or loopback addresses")
+	openrouterPaid := fs.Bool("openrouter-paid", false, "take OpenRouter's paid models too; by default only its zero-priced models are synced")
 	timeout := fs.Duration("timeout", 30*time.Second, "per-request timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -156,7 +159,7 @@ func (e env) catalogSync(args []string) int {
 				p.Name, p.Kind)
 			continue
 		}
-		results = append(results, syncProvider(client, cfg, cat, reg, p, base))
+		results = append(results, syncProvider(client, cfg, cat, reg, p, base, freeOnlyKind(p.Kind) && !*openrouterPaid))
 	}
 	if len(results) == 0 {
 		return e.fail("no provider with a base_url to sync")
@@ -192,7 +195,7 @@ func (e env) catalogSync(args []string) int {
 // syncProvider lists one provider and classifies what the configuration routes
 // to it.
 func syncProvider(client *http.Client, cfg *config.Config, cat *catalog.Catalog,
-	reg modelsDev, p *config.Provider, base string,
+	reg modelsDev, p *config.Provider, base string, freeOnly bool,
 ) *providerSync {
 	r := &providerSync{
 		Name: p.Name, Kind: p.Kind, BaseURL: strings.TrimRight(base, "/"),
@@ -200,10 +203,19 @@ func syncProvider(client *http.Client, cfg *config.Config, cat *catalog.Catalog,
 	}
 	key := providerKey(cfg, p.Name)
 
-	r.Listed, r.ListErr = fetchListing(client, r.BaseURL, key)
+	var free map[string]bool
+	r.Listed, free, r.ListErr = fetchListing(client, r.BaseURL, key)
+	// The full listing decides the status of what IS configured: a paid model
+	// the operator chose to route is listed, whatever the free-only rule says.
 	listed := map[string]bool{}
 	for _, m := range r.Listed {
 		listed[m] = true
+	}
+	if r.ListErr == nil && freeOnly {
+		// Narrowed for everything else — new-model suggestions, newer
+		// versions, the overlay — so a paid model is never taken in.
+		r.FreeOnly, r.ListedAll = true, len(r.Listed)
+		r.Listed = slices.DeleteFunc(r.Listed, func(m string) bool { return !free[m] })
 	}
 	ollama := isOllamaKind(p.Kind)
 	regProv, regModels := reg.forEndpoint(r.BaseURL)
@@ -342,44 +354,91 @@ func providerKey(cfg *config.Config, provider string) string {
 	return ""
 }
 
-// fetchListing reads an OpenAI-compatible `/models` listing.
-func fetchListing(client *http.Client, base, key string) ([]string, error) {
+// fetchListing reads an OpenAI-compatible `/models` listing: the ids, and the
+// subset whose published price is zero (see isFreePricing). A listing that
+// carries no prices has an empty free set.
+func fetchListing(client *http.Client, base, key string) ([]string, map[string]bool, error) {
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw := readAtMost(resp.Body, 8<<20)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET /models: %d %s", resp.StatusCode, firstLine(string(raw)))
+		return nil, nil, fmt.Errorf("GET /models: %d %s", resp.StatusCode, firstLine(string(raw)))
 	}
 	var doc struct {
 		Data []struct {
-			ID string `json:"id"`
+			ID      string         `json:"id"`
+			Pricing map[string]any `json:"pricing"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("GET /models: not an OpenAI-compatible listing: %v", err)
+		return nil, nil, fmt.Errorf("GET /models: not an OpenAI-compatible listing: %v", err)
 	}
 	if doc.Data == nil {
-		return nil, fmt.Errorf("GET /models: no data array; not an OpenAI-compatible listing")
+		return nil, nil, fmt.Errorf("GET /models: no data array; not an OpenAI-compatible listing")
 	}
 	out := make([]string, 0, len(doc.Data))
+	free := map[string]bool{}
 	for _, m := range doc.Data {
-		if m.ID != "" {
-			out = append(out, m.ID)
+		if m.ID == "" {
+			continue
+		}
+		out = append(out, m.ID)
+		if isFreePricing(m.Pricing) {
+			free[m.ID] = true
 		}
 	}
 	slices.Sort(out)
-	return slices.Compact(out), nil
+	return slices.Compact(out), free, nil
 }
+
+// isFreePricing reports whether a listing's published price is zero on every
+// line. Every price must parse as a number and equal zero; a missing price is
+// not free, and a negative one — OpenRouter's routers publish "-1", meaning
+// "whatever the chosen model costs" — is certainly not.
+func isFreePricing(p map[string]any) bool {
+	if len(p) == 0 {
+		return false
+	}
+	for _, v := range p {
+		var f float64
+		switch x := v.(type) {
+		case string:
+			if x == "" {
+				continue
+			}
+			n, err := strconv.ParseFloat(x, 64)
+			if err != nil {
+				return false
+			}
+			f = n
+		case float64:
+			f = x
+		case nil:
+			continue
+		default:
+			return false
+		}
+		if f != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// freeOnlyKind reports whether a kind's listing is narrowed to zero-priced
+// models by default. OpenRouter lists hundreds of paid models behind one key;
+// the operator's rule is that only its free models are taken in.
+func freeOnlyKind(kind string) bool { return kind == "openrouter" }
 
 // ollamaShow asks Ollama's `/api/show` about one model. It returns the status
 // and, on 200, the context window and tool support the provider publishes.
@@ -450,23 +509,28 @@ func isPrivateEndpoint(raw string) bool {
 // this model at the model or prefix layer. A kind-wide default does not count
 // as knowing the model.
 func missingFields(cat *catalog.Catalog, kind, model string) []string {
-	info := cat.Model(kind, model)
-	if !info.ModelKnown {
-		return []string{catalog.FieldContextWindow, catalog.FieldMaxOutputTokens, catalog.FieldSupportsTools}
-	}
-	declared := map[string]bool{}
-	for _, o := range cat.Explain(kind, model) {
-		if o.Layer == catalog.LayerModel || o.Layer == catalog.LayerPrefix {
-			declared[o.Field] = true
-		}
-	}
 	var out []string
 	for _, f := range []string{catalog.FieldContextWindow, catalog.FieldMaxOutputTokens, catalog.FieldSupportsTools} {
-		if !declared[f] {
+		if !declaredAtModel(cat, kind, model, f) {
 			out = append(out, f)
 		}
 	}
 	return out
+}
+
+// declaredAtModel reports whether one field is declared for this model at the
+// model or prefix layer.
+func declaredAtModel(cat *catalog.Catalog, kind, model, field string) bool {
+	if !cat.Model(kind, model).ModelKnown {
+		return false
+	}
+	for _, o := range cat.Explain(kind, model) {
+		if o.Field == field && (o.Layer == catalog.LayerModel || o.Layer == catalog.LayerPrefix) &&
+			o.Origin != catalog.OriginNone {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- newer-version suggestion ------------------------------------------------
@@ -629,6 +693,9 @@ func (e env) writeSyncReport(results []*providerSync) {
 			fmt.Fprintf(e.stdout, "  listing failed: %s\n", truncate(collapseSpace(r.ListErr.Error()), 160))
 		} else {
 			line := fmt.Sprintf("  listed: %d model(s)", len(r.Listed))
+			if r.FreeOnly {
+				line = fmt.Sprintf("  listed: %d free model(s) of %d (paid ones skipped; --openrouter-paid takes them)", len(r.Listed), r.ListedAll)
+			}
 			if r.Registry != "" {
 				line += "; metadata registry: models.dev/" + r.Registry
 			}
@@ -728,7 +795,13 @@ func buildSyncOverlay(cat *catalog.Catalog, results []*providerSync, includePriv
 				}
 				note = append(note, "metadata from "+src+" on "+today)
 			}
-			entry.Note = strings.Join(note, "; ")
+			// A note is merged field-wise like any other, so writing one would
+			// hide a note a human wrote on the entry — often the most important
+			// line it has (a substitution, a refusal's wording). Provenance is
+			// only recorded where no note is declared.
+			if !declaredAtModel(cat, r.Kind, m, catalog.FieldNote) {
+				entry.Note = strings.Join(note, "; ")
+			}
 			doc.Models = append(doc.Models, entry)
 		}
 	}

@@ -385,7 +385,7 @@ response. Errors are not written either; they are facts about the network or the
 
 ```
 dorangctl catalog sync [--config FILE] [--provider a,b] [--write FILE]
-                       [--models-dev URL|FILE|off] [--include-private]
+                       [--models-dev URL|FILE|off] [--include-private] [--openrouter-paid]
 ```
 
 `catalog verify` asks whether catalogued names answer. `catalog sync` asks the other question —
@@ -413,11 +413,18 @@ the catalog does not declare for a model at the model layer — `context_window`
 `max_output_tokens`, `supports_tools`. Values come from the provider when it publishes them
 (Ollama `/api/show`), otherwise from the [models.dev](https://models.dev) registry, whose provider
 is matched by **endpoint URL** rather than by name (`alibaba-token-plan` and `alibaba` share a
-vendor and differ in every limit). A registry value is noted as a citation in the entry's `note`.
+vendor and differ in every limit). A registry value is noted as a citation in the entry's `note`,
+unless the entry already has a note — a human's note is never replaced by provenance.
 It never writes `verified:` (a listing is not an answer), never removes a retired model (reported
 for a human), never overrides a value declared at the model layer, and leaves providers on private
 or loopback addresses out of the overlay unless `--include-private` — a LAN backend's model names
 are local aliases, not facts about a public kind. The file is replaced atomically.
+
+**OpenRouter is free-only by default.** Its listing carries hundreds of paid models behind one
+key, so only models whose published price is zero on every line are suggested or written (a
+negative price — OpenRouter's routers publish `-1`, "whatever the chosen model costs" — is not
+free). A paid model the configuration already routes is still checked against the full listing.
+`--openrouter-paid` takes the whole listing.
 
 A catalog layer is loaded at start-up and again on every configuration reload, so the running
 gateway picks up a regenerated overlay on its next reload — a configuration change, or

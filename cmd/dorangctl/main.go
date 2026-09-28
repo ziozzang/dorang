@@ -94,7 +94,9 @@ commands:
                                that are retired or have a newer version listed,
                                and write new models and missing metadata (from the
                                provider, else models.dev) as an overlay. Nothing
-                               billed; never writes verified:, never deletes
+                               billed; never writes verified:, never deletes.
+                               OpenRouter: free (zero-priced) models only unless
+                               --openrouter-paid
   price <model> --input N --output N
                                preview the cost of one request, rule by rule
   import config <file>         convert a foreign proxy configuration, with warnings

@@ -198,7 +198,7 @@ func TestCatalogSyncOverlayFillsOnlyWhatIsMissing(t *testing.T) {
 	if err := os.WriteFile(pinned, []byte(`version: 1
 models:
   - {kind: ollama-cloud, model: "gpt-oss:120b", context_window: 4242, max_output_tokens: 11, supports_tools: true}
-  - {kind: ollama-cloud, model: "glm-5.3", context_window: 5555}
+  - {kind: ollama-cloud, model: "glm-5.3", context_window: 5555, note: "a human wrote this"}
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -255,6 +255,9 @@ models:
 	if g.MaxOutputTokens != 777 || !g.SupportsTools {
 		t.Errorf("glm-5.3 = out %d tools %v; the undeclared fields should be filled from the registry",
 			g.MaxOutputTokens, g.SupportsTools)
+	}
+	if g.Note != "a human wrote this" {
+		t.Errorf("glm-5.3 note %q: sync's provenance replaced a note a human wrote", g.Note)
 	}
 	d := cat.Model("ollama-cloud", "deepseek-v4.1-flash")
 	if d.ContextWindow != 262144 {
@@ -346,6 +349,107 @@ kinds:
 	}
 	if line := reportLine(t, out, "deepseek-v4.1-flash"); !strings.Contains(line, "listed") {
 		t.Errorf("row: %q", line)
+	}
+}
+
+// TestCatalogSyncTakesOnlyFreeOpenRouterModels is the operator's rule: OpenRouter
+// is not opened up, so of its hundreds of listed models only the zero-priced
+// ones are taken in. A paid model the configuration already routes is still
+// reported as listed — the rule narrows what is ADDED, not what is checked.
+//
+// Revert check: drop the free-only narrowing in syncProvider and the paid and
+// negative-priced models appear as new and in the overlay.
+func TestCatalogSyncTakesOnlyFreeOpenRouterModels(t *testing.T) {
+	type priced struct{ id, prompt, completion string }
+	models := []priced{
+		{"vendor/free-a:free", "0", "0"},
+		{"vendor/zero-b", "0", "0"},
+		{"vendor/paid-c", "0.000001", "0.000002"},
+		{"openrouter/auto", "-1", "-1"}, // a router: "whatever the chosen model costs"
+		{"vendor/paid-configured", "0.000003", "0.000004"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		data := []map[string]any{}
+		for _, m := range models {
+			data = append(data, map[string]any{"id": m.id,
+				"pricing": map[string]string{"prompt": m.prompt, "completion": m.completion}})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	t.Setenv("OR_TEST_KEY", "or-test-key")
+	cfg := writeCfg(t, dir, fmt.Sprintf(`providers:
+  - {name: openrouter, kind: openrouter, base_url: "%s/api/v1"}
+credentials:
+  - {id: or-1, provider: openrouter, key_env: OR_TEST_KEY}
+models:
+  - name: p
+    deployments:
+      - {provider: openrouter, upstream_model: "vendor/paid-configured", credentials: [or-1]}
+`, srv.URL))
+	outPath := filepath.Join(dir, "sync.yaml")
+	out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--models-dev", "off",
+		"--include-private", "--write", outPath)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+	if !strings.Contains(out, "listed: 2 free model(s) of 5") {
+		t.Errorf("the free-only narrowing is not reported:\n%s", out)
+	}
+	if line := reportLine(t, out, "vendor/paid-configured"); !strings.Contains(line, "listed") {
+		t.Errorf("a configured paid model must still be checked against the full listing: %q", line)
+	}
+	for _, paid := range []string{"vendor/paid-c", "openrouter/auto"} {
+		if strings.Contains(out, "not configured: ") && strings.Contains(out[strings.Index(out, "not configured: "):], paid) {
+			t.Errorf("paid model %s was suggested:\n%s", paid, out)
+		}
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{"vendor/free-a:free", "vendor/zero-b"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("free model %s missing from the overlay", want)
+		}
+	}
+	for _, paid := range []string{"vendor/paid-c", "openrouter/auto", "vendor/paid-configured"} {
+		if strings.Contains(text, paid) {
+			t.Errorf("paid model %s was written to the overlay", paid)
+		}
+	}
+
+	// The operator can opt in to the whole listing.
+	out, _, code = invoke("catalog", "sync", "--config", cfg, "--models-dev", "off", "--openrouter-paid")
+	if code != 0 || !strings.Contains(out, "listed: 5 model(s)") {
+		t.Errorf("--openrouter-paid did not take the full listing (exit %d):\n%s", code, out)
+	}
+}
+
+func TestIsFreePricing(t *testing.T) {
+	cases := []struct {
+		p    map[string]any
+		want bool
+	}{
+		{map[string]any{"prompt": "0", "completion": "0"}, true},
+		{map[string]any{"prompt": "0", "completion": "0", "request": ""}, true},
+		{map[string]any{"prompt": 0.0, "completion": 0.0}, true},
+		{map[string]any{"prompt": "0", "completion": "0.000001"}, false},
+		{map[string]any{"prompt": "-1", "completion": "-1"}, false},
+		{map[string]any{"prompt": "free"}, false},
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := isFreePricing(c.p); got != c.want {
+			t.Errorf("isFreePricing(%v) = %v, want %v", c.p, got, c.want)
+		}
 	}
 }
 
