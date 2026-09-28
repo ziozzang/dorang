@@ -30,7 +30,10 @@ func newRotationKey(t *testing.T, s *Store, token string, mutate func(*APIKey)) 
 		PriorityClass:  "interactive",
 		Tier:           "commercial",
 		Tags:           []string{"team-a"},
-		ExpiresAt:      TimeAt(Micros(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC))),
+		// Relative to the store's clock, never a calendar date: this was
+		// 2027-01-01, which TestMaxAgeWarnsAndDoesNotExecute (now + 100 days)
+		// crossed on 2026-09-23 and every rotation test would cross on the day.
+		ExpiresAt: TimeAt(Micros(s.now().AddDate(10, 0, 0))),
 	}
 	if mutate != nil {
 		mutate(k)
