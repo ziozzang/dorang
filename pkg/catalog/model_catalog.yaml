@@ -95,6 +95,11 @@ models:
   # which now carries the dated tags; both still resolve (`/api/show` answers
   # for them), so they stay, but a deployment should name the tag it means.
   #
+  # Re-fetched 2026-09-28: 17 models. Four entries RETIRED and deleted here —
+  # `/api/show` answers 410 for `deepseek-v4-flash`, `deepseek-v4-flash:0731`,
+  # `qwen3.5:397b` and `glm-5.1`. The successor for the v4-flash builds is
+  # `deepseek-v4.1-flash`. Bare `deepseek-v4-pro` still answers 200 and stays.
+  #
   # `deepseek-v3.2` appears in some older deployments and is deliberately
   # absent: the provider no longer offers it. It is not an oversight, and it
   # should not be re-added without a fresh fetch showing it back on the list.
@@ -102,19 +107,15 @@ models:
 
   - { kind: ollama-cloud, model: "deepseek-v4-pro",       verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "deepseek-v4-pro:0813",  verified: 2026-09-12 }
-  - { kind: ollama-cloud, model: "deepseek-v4-flash",     verified: 2026-08-03 }
-  - { kind: ollama-cloud, model: "deepseek-v4-flash:0731", verified: 2026-08-03 }
   - { kind: ollama-cloud, model: "deepseek-v4.1-flash",   verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "glm-5.3",               verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "glm-5.3-flash",         verified: 2026-09-12 }
-  - { kind: ollama-cloud, model: "glm-5.1",               verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "glm-5.2",               verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "kimi-k3",               verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "kimi-k2.7-code",        verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "kimi-k2.6",             verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "minimax-m3",            verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "minimax-m2.7",          verified: 2026-07-28 }
-  - { kind: ollama-cloud, model: "qwen3.5:397b",          verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "gpt-oss:120b",          verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "gpt-oss:20b",           verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "gemma4:31b",            verified: 2026-07-28 }

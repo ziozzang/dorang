@@ -1003,7 +1003,7 @@ func TestOpaqueNamesInTheEmbeddedCatalog(t *testing.T) {
 	c := Default()
 	for _, tc := range []ModelRef{
 		{Kind: "ollama-cloud", Model: "gemma4:31b"},
-		{Kind: "ollama-cloud", Model: "deepseek-v4-flash"},
+		{Kind: "ollama-cloud", Model: "deepseek-v4.1-flash"},
 		{Kind: "kimi-coding", Model: "k3[1m]"},
 		{Kind: "synthetic", Model: "hf:zai-org/GLM-5.2"},
 		{Kind: "fireworks", Model: "accounts/fireworks/models/kimi-k2p6"},

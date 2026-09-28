@@ -84,7 +84,9 @@ func TestDefaultParses(t *testing.T) {
 		// new ones (deepseek-v4.1-flash, deepseek-v4-pro:0813, glm-5.3,
 		// glm-5.3-flash) asked and answered as themselves. The two bare
 		// deepseek names stay: off the listing, still resolving.
-		"ollama-cloud": {VerificationVerified: 22},
+		// 2026-09-28: 22 → 18. Four retired (410 on /api/show) and deleted:
+		// deepseek-v4-flash, deepseek-v4-flash:0731, qwen3.5:397b, glm-5.1.
+		"ollama-cloud": {VerificationVerified: 18},
 
 		// 2026-08-03, by asking: five of the eight answered as themselves and
 		// three answered as a different model. All eight were dated
@@ -419,13 +421,13 @@ func TestOpaqueModelNamesRoundTrip(t *testing.T) {
 		model string
 		known bool
 	}{
-		{"ollama-cloud", "gemma4:31b", true},               // family tag
-		{"ollama-cloud", "qwen3.5:397b", true},             // family tag
-		{"ollama-cloud", "gpt-oss:120b", true},             // family tag
-		{"ollama-cloud", "mistral-large-3:675b", true},     // family tag
-		{"ollama-cloud", "nemotron-3-nano:30b", true},      // family tag
-		{"glm", "zai:glm-5.1", false},                      // vendor prefix
-		{"ollama-cloud", "deepseek-v4-flash:cloud", false}, // deployment variant
+		{"ollama-cloud", "gemma4:31b", true},                 // family tag
+		{"ollama-cloud", "deepseek-v4-pro:0813", true},       // dated tag
+		{"ollama-cloud", "gpt-oss:120b", true},               // family tag
+		{"ollama-cloud", "mistral-large-3:675b", true},       // family tag
+		{"ollama-cloud", "nemotron-3-nano:30b", true},        // family tag
+		{"glm", "zai:glm-5.1", false},                        // vendor prefix
+		{"ollama-cloud", "deepseek-v4.1-flash:cloud", false}, // deployment variant
 	}
 
 	for _, g := range golden {
@@ -443,13 +445,13 @@ func TestOpaqueModelNamesRoundTrip(t *testing.T) {
 	// The decisive pair: a name that literally contains a catalogued name plus
 	// a suffix must not be treated as that catalogued model. Splitting on ':'
 	// anywhere would collapse these two.
-	base := c.Model("ollama-cloud", "deepseek-v4-flash")
-	variant := c.Model("ollama-cloud", "deepseek-v4-flash:cloud")
+	base := c.Model("ollama-cloud", "deepseek-v4.1-flash")
+	variant := c.Model("ollama-cloud", "deepseek-v4.1-flash:cloud")
 	if !base.ModelKnown {
-		t.Fatal("deepseek-v4-flash should be catalogued")
+		t.Fatal("deepseek-v4.1-flash should be catalogued")
 	}
 	if variant.ModelKnown {
-		t.Error("deepseek-v4-flash:cloud resolved to the deepseek-v4-flash entry")
+		t.Error("deepseek-v4.1-flash:cloud resolved to the deepseek-v4.1-flash entry")
 	}
 	if variant.Verified != "" {
 		t.Error("an uncatalogued variant inherited a verification date")
@@ -472,11 +474,11 @@ func TestOpaqueModelNamesRoundTrip(t *testing.T) {
 // about which provider serves it.
 func TestSameNameDifferentKinds(t *testing.T) {
 	c := Default()
-	onOllama := c.Model("ollama-cloud", "glm-5.1")
-	onZai := c.Model("glm", "glm-5.1")
+	onOllama := c.Model("ollama-cloud", "glm-5.3")
+	onZai := c.Model("glm", "glm-5.3")
 
 	if !onOllama.ModelKnown || !onZai.ModelKnown {
-		t.Fatal("glm-5.1 should be catalogued on both ollama-cloud and glm")
+		t.Fatal("glm-5.3 should be catalogued on both ollama-cloud and glm")
 	}
 	if onOllama.Kind == onZai.Kind {
 		t.Fatal("test setup: kinds should differ")
