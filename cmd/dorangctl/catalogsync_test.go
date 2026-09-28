@@ -314,6 +314,41 @@ func TestCatalogSyncFailsWhenNothingCanBeListed(t *testing.T) {
 	}
 }
 
+// TestCatalogSyncUsesTheKindEndpointWhenTheProviderNamesNone: the gateway
+// falls back to the kind's catalogued base_url, so sync must too — the live
+// openrouter provider declares none and was silently missing from the report.
+func TestCatalogSyncUsesTheKindEndpointWhenTheProviderNamesNone(t *testing.T) {
+	f := newFakeOllama(t)
+	dir := t.TempDir()
+	t.Setenv("SYNC_TEST_KEY", syncTestKey)
+	cfg := writeCfg(t, dir, `providers:
+  - {name: ollama, kind: ollama-cloud}
+credentials:
+  - {id: ollama-1, provider: ollama, key_env: SYNC_TEST_KEY}
+models:
+  - name: a
+    deployments:
+      - {provider: ollama, upstream_model: "deepseek-v4.1-flash", credentials: [ollama-1]}
+`)
+	kinds := filepath.Join(dir, "kinds.yaml")
+	if err := os.WriteFile(kinds, []byte(fmt.Sprintf(`version: 1
+kinds:
+  ollama-cloud: {base_url: "%s/v1"}
+`, f.srv.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--catalog", kinds, "--models-dev", "off")
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+	if !strings.Contains(out, "provider ollama (kind ollama-cloud)  "+f.srv.URL+"/v1") {
+		t.Errorf("the provider was not synced against its kind's endpoint:\n%s", out)
+	}
+	if line := reportLine(t, out, "deepseek-v4.1-flash"); !strings.Contains(line, "listed") {
+		t.Errorf("row: %q", line)
+	}
+}
+
 func TestVersionShapeAndNewerListed(t *testing.T) {
 	shapes := []struct {
 		name, skel string

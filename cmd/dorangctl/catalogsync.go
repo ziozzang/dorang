@@ -143,10 +143,20 @@ func (e env) catalogSync(args []string) int {
 		if len(want) > 0 && !want[p.Name] {
 			continue
 		}
-		if p.BaseURL == "" {
+		// A provider with no base_url uses its kind's catalogued endpoint, as
+		// the gateway does; skipping it would leave it out of the report.
+		base := p.BaseURL
+		if base == "" {
+			if kd, ok := cat.Kind(p.Kind); ok {
+				base = kd.BaseURL
+			}
+		}
+		if base == "" {
+			fmt.Fprintf(e.stderr, "dorangctl: provider %s has no base_url and kind %s declares none; skipped\n",
+				p.Name, p.Kind)
 			continue
 		}
-		results = append(results, syncProvider(client, cfg, cat, reg, p))
+		results = append(results, syncProvider(client, cfg, cat, reg, p, base))
 	}
 	if len(results) == 0 {
 		return e.fail("no provider with a base_url to sync")
@@ -182,11 +192,11 @@ func (e env) catalogSync(args []string) int {
 // syncProvider lists one provider and classifies what the configuration routes
 // to it.
 func syncProvider(client *http.Client, cfg *config.Config, cat *catalog.Catalog,
-	reg modelsDev, p *config.Provider,
+	reg modelsDev, p *config.Provider, base string,
 ) *providerSync {
 	r := &providerSync{
-		Name: p.Name, Kind: p.Kind, BaseURL: strings.TrimRight(p.BaseURL, "/"),
-		Private: isPrivateEndpoint(p.BaseURL), Meta: map[string]modelMeta{},
+		Name: p.Name, Kind: p.Kind, BaseURL: strings.TrimRight(base, "/"),
+		Private: isPrivateEndpoint(base), Meta: map[string]modelMeta{},
 	}
 	key := providerKey(cfg, p.Name)
 
