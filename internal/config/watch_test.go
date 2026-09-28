@@ -82,6 +82,62 @@ func TestWatcherAppliesAValidChange(t *testing.T) {
 	}
 }
 
+// TestWatcherReloadsWhenAnExtraLayerChanges: a generated catalog overlay is
+// rewritten by rename-into-place in a watched directory while the configuration
+// file itself is untouched, and the process must still reload to pick it up.
+// A file appearing where none was, and one being removed, are changes too.
+//
+// Revert check: drop the alsoChanged branch in run() and no reload arrives.
+func TestWatcherReloadsWhenAnExtraLayerChanges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dorang.yaml")
+	writeConfig(t, path, modelConfig("m1"))
+	layers := filepath.Join(dir, "catalog")
+	if err := os.Mkdir(layers, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := make(chan struct{}, 8)
+	w, err := NewWatcher(path,
+		WithPollInterval(5*time.Millisecond),
+		WithSignals(),
+		WithAlsoWatch(layers),
+		WithReloadHandler(func(*Config) error { reloaded <- struct{}{}; return nil }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	w.Start()
+
+	// Appears.
+	overlay := filepath.Join(layers, "sync-ollama.yaml")
+	writeConfig(t, overlay, "version: 1\n")
+	waitFor(t, reloaded, "a reload after an overlay appeared")
+
+	// Replaced by rename, the way catalog sync writes it.
+	tmp := filepath.Join(layers, ".tmp")
+	writeConfig(t, tmp, "version: 1\nmodels: []\n")
+	if err := os.Rename(tmp, overlay); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, reloaded, "a reload after an overlay was replaced")
+
+	// A non-YAML file is not a layer and must not cause a reload.
+	writeConfig(t, filepath.Join(layers, "README"), "notes")
+	select {
+	case <-reloaded:
+		t.Error("a non-YAML file in the layer directory triggered a reload")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Removed.
+	if err := os.Remove(overlay); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, reloaded, "a reload after an overlay was removed")
+}
+
 // TestWatcherKeepsTheOldConfigOnAnInvalidChange is the rule that matters: a
 // broken file must never be applied, not even partly.
 func TestWatcherKeepsTheOldConfigOnAnInvalidChange(t *testing.T) {

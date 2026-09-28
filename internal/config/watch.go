@@ -1,8 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -35,6 +38,12 @@ type Watcher struct {
 
 	mu   sync.Mutex // serializes reloads
 	stat os.FileInfo
+
+	// also are further files or directories whose change reloads the
+	// configuration: layers the running process derives from it, such as the
+	// model-catalog overlays, which have no file of their own to watch.
+	also      []string
+	alsoPrint string // fingerprint of also at the last applied reload
 
 	started   atomic.Bool
 	startOnce sync.Once
@@ -78,6 +87,21 @@ func WithSignals(sigs ...os.Signal) WatchOption {
 	return func(w *Watcher) { w.signals = sigs }
 }
 
+// WithAlsoWatch adds files or directories whose change triggers a reload, the
+// same as a change to the configuration file itself. A directory counts as
+// changed when a *.yaml or *.yml entry appears, disappears or is rewritten —
+// including by rename-into-place, which is how a generated file should be
+// written. A path that does not exist is watched for its appearance.
+func WithAlsoWatch(paths ...string) WatchOption {
+	return func(w *Watcher) {
+		for _, p := range paths {
+			if p != "" {
+				w.also = append(w.also, p)
+			}
+		}
+	}
+}
+
 // NewWatcher loads path and returns a watcher holding it. The configuration
 // must be valid: a watcher never starts with a broken snapshot.
 //
@@ -101,7 +125,52 @@ func NewWatcher(path string, opts ...WatchOption) (*Watcher, error) {
 	if fi, err := os.Stat(path); err == nil {
 		w.stat = fi
 	}
+	w.alsoPrint = fingerprint(w.also)
 	return w, nil
+}
+
+// fingerprint summarizes the watched extra paths: for a file its identity,
+// size and modification time; for a directory the same for each YAML entry.
+// Two equal fingerprints mean nothing a loader would read has changed.
+func fingerprint(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			fmt.Fprintf(&b, "%s:missing;", p)
+			continue
+		}
+		if !fi.IsDir() {
+			fmt.Fprintf(&b, "%s:%s;", p, fileStamp(fi))
+			continue
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			fmt.Fprintf(&b, "%s:unreadable;", p)
+			continue
+		}
+		for _, e := range entries { // ReadDir returns entries sorted by name
+			name := e.Name()
+			if e.IsDir() || !(strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")) {
+				continue
+			}
+			if efi, err := e.Info(); err == nil {
+				fmt.Fprintf(&b, "%s/%s:%s;", p, name, fileStamp(efi))
+			}
+		}
+	}
+	return b.String()
+}
+
+func fileStamp(fi os.FileInfo) string {
+	id := ""
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		id = strconv.FormatUint(st.Ino, 10)
+	}
+	return fmt.Sprintf("%s/%d/%d", id, fi.Size(), fi.ModTime().UnixNano())
 }
 
 // Path returns the file being watched.
@@ -170,6 +239,10 @@ func (w *Watcher) run() {
 		case <-t.C:
 			if w.changed() {
 				w.reload(false)
+			} else if len(w.also) > 0 && w.alsoChanged() {
+				// The configuration file is unchanged, so the reload is forced:
+				// what changed is a layer the process builds from it.
+				w.reload(true)
 			}
 		}
 	}
@@ -199,6 +272,15 @@ func (w *Watcher) changed() bool {
 		prev.Size() != fi.Size()
 }
 
+// alsoChanged reports whether the extra watched paths differ from the last
+// applied reload.
+func (w *Watcher) alsoChanged() bool {
+	now := fingerprint(w.also)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return now != w.alsoPrint
+}
+
 // Reload re-reads the file now. On failure the previous configuration stays in
 // place and the error is returned as well as reported to the error handler.
 // It is safe for concurrent use and is what an admin reload endpoint calls.
@@ -212,6 +294,11 @@ func (w *Watcher) reload(force bool) error {
 	if statErr != nil {
 		return w.failLocked(statErr, false)
 	}
+	// Taken before the load, so an extra path that changes while this reload
+	// runs is seen as changed on the next tick rather than lost. Recorded
+	// whatever the outcome, like the file's stat: a broken layer that stays
+	// broken is not re-applied on every tick.
+	w.alsoPrint = fingerprint(w.also)
 	if !force && w.stat != nil && os.SameFile(w.stat, fi) &&
 		w.stat.ModTime().Equal(fi.ModTime()) && w.stat.Size() == fi.Size() {
 		return nil

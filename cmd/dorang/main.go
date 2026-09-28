@@ -21,6 +21,7 @@ import (
 
 	"github.com/ziozzang/dorang/internal/app"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…". Without
@@ -186,12 +187,16 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 	if explicit || fileExists(path) {
 		w, werr := config.NewWatcher(path,
 			config.WithSignals(syscall.SIGHUP),
+			// The catalog overlays are rebuilt on every reload, so a change to
+			// one — `dorangctl catalog sync` rewriting its file — is a reload
+			// trigger like the configuration file itself.
+			config.WithAlsoWatch(catalog.EnvPaths()...),
 			config.WithReloadHandler(func(c *config.Config) error {
 				if err := a.Reload(c); err != nil {
 					logf("dorang: reload refused, keeping the running configuration: %v", err)
 					return err
 				}
-				logf("dorang: configuration reloaded from %s", path)
+				logf("dorang: configuration reloaded from %s (catalog layers: %d)", path, len(catalog.EnvPaths()))
 				return nil
 			}),
 			config.WithErrorHandler(func(err error) {
