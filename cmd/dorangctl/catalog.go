@@ -9,13 +9,14 @@ import (
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
-// runCatalog implements `catalog explain`, `catalog unverified` and
+// runCatalog implements `catalog explain`, `catalog unverified`, `catalog sync` and
 // `catalog verify`.
 func (e env) runCatalog(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(e.stderr, "usage: dorangctl catalog explain <kind> <model>")
 		fmt.Fprintln(e.stderr, "       dorangctl catalog unverified [--state <state>]")
 		fmt.Fprintln(e.stderr, "       dorangctl catalog verify --kind <kind> [--key-env VAR] [--write FILE]")
+		fmt.Fprintln(e.stderr, "       dorangctl catalog sync [--config FILE] [--provider NAMES] [--write FILE]")
 		return 2
 	}
 	switch args[0] {
@@ -25,6 +26,8 @@ func (e env) runCatalog(args []string) int {
 		return e.catalogUnverified(args[1:])
 	case "verify":
 		return e.catalogVerify(args[1:])
+	case "sync":
+		return e.catalogSync(args[1:])
 	}
 	return e.fail("unknown catalog subcommand %q", args[0])
 }

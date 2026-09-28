@@ -381,6 +381,49 @@ is a *deletion* — the catalog's answer to a model that serves nobody is to rem
 the reason in a comment, and no tool should delete catalog rows on the strength of one HTTP
 response. Errors are not written either; they are facts about the network or the key.
 
+#### Keeping up with providers: `dorangctl catalog sync`
+
+```
+dorangctl catalog sync [--config FILE] [--provider a,b] [--write FILE]
+                       [--models-dev URL|FILE|off] [--include-private]
+```
+
+`catalog verify` asks whether catalogued names answer. `catalog sync` asks the other question —
+what do the **configured** providers serve now — and it costs nothing: every request is a listing
+or a metadata read. It reads the configuration (so it needs the credentials the configuration
+references; run it where the gateway runs, e.g. `docker exec <container> dorangctl catalog sync`).
+
+For each provider it reports every upstream model the configuration routes to:
+
+| Status | Meaning |
+|---|---|
+| `listed` | On the provider's `/models` listing |
+| `unlisted, still served` | Off the listing, but Ollama's `/api/show` answers `200` |
+| `RETIRED` | Ollama's `/api/show` answers `410 Gone` |
+| `absent` | Ollama's `/api/show` answers `404` |
+| `unlisted` | Off the listing on a provider with no metadata endpoint — evidence, not proof; ask with `catalog verify` |
+
+— plus, for each, **`newer listed: X`** when the provider lists a higher version of the same
+family (`glm-5.2` → `glm-5.3`, `qwen3.6-flash` → `qwen3.8-flash`; a tag after `:` is a size or a
+build and is never read as a version), and the models it lists that nothing is configured for.
+Changing the configuration — an alias, a repoint — stays a human decision.
+
+`--write FILE` writes an overlay: every listed model the catalog does not know yet, and every field
+the catalog does not declare for a model at the model layer — `context_window`,
+`max_output_tokens`, `supports_tools`. Values come from the provider when it publishes them
+(Ollama `/api/show`), otherwise from the [models.dev](https://models.dev) registry, whose provider
+is matched by **endpoint URL** rather than by name (`alibaba-token-plan` and `alibaba` share a
+vendor and differ in every limit). A registry value is noted as a citation in the entry's `note`.
+It never writes `verified:` (a listing is not an answer), never removes a retired model (reported
+for a human), never overrides a value declared at the model layer, and leaves providers on private
+or loopback addresses out of the overlay unless `--include-private` — a LAN backend's model names
+are local aliases, not facts about a public kind. The file is replaced atomically.
+
+A catalog layer is loaded at start-up and again on every configuration reload, so the running
+gateway picks up a regenerated overlay on its next reload — a configuration change, or
+`SIGHUP` — with no rebuild. Keep hand edits in a
+separate overlay: `sync` rewrites its own file whole.
+
 ---
 
 ## 3. Importing credentials

@@ -88,6 +88,13 @@ commands:
                                ask the endpoint about every entry on a kind, one
                                minimal request each, and report what it said.
                                --write emits the results as a loadable overlay
+  catalog sync [--config FILE] [--provider NAMES] [--write FILE]
+                               read every configured provider's /models listing
+                               (and Ollama's /api/show), report configured models
+                               that are retired or have a newer version listed,
+                               and write new models and missing metadata (from the
+                               provider, else models.dev) as an overlay. Nothing
+                               billed; never writes verified:, never deletes
   price <model> --input N --output N
                                preview the cost of one request, rule by rule
   import config <file>         convert a foreign proxy configuration, with warnings
