@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,6 +25,7 @@ const syncTestKey = "sync-test-key-7f3a9c"
 type fakeOllama struct {
 	srv   *httptest.Server
 	shows atomic.Int64
+	lists atomic.Int64
 }
 
 func newFakeOllama(t *testing.T) *fakeOllama {
@@ -37,6 +39,7 @@ func newFakeOllama(t *testing.T) *fakeOllama {
 		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models":
+			f.lists.Add(1)
 			data := make([]map[string]string, 0, len(listed))
 			for _, m := range listed {
 				data = append(data, map[string]string{"id": m, "object": "model"})
@@ -427,9 +430,9 @@ models:
 	}
 
 	// The operator can opt in to the whole listing.
-	out, _, code = invoke("catalog", "sync", "--config", cfg, "--models-dev", "off", "--openrouter-paid")
+	out, _, code = invoke("catalog", "sync", "--config", cfg, "--models-dev", "off", "--include-paid")
 	if code != 0 || !strings.Contains(out, "listed: 5 model(s)") {
-		t.Errorf("--openrouter-paid did not take the full listing (exit %d):\n%s", code, out)
+		t.Errorf("--include-paid did not take the full listing (exit %d):\n%s", code, out)
 	}
 }
 
@@ -502,6 +505,148 @@ func TestIsPrivateEndpoint(t *testing.T) {
 	} {
 		if got := isPrivateEndpoint(raw); got != want {
 			t.Errorf("isPrivateEndpoint(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}
+
+// scheduleFixture is two providers on one fake Ollama: "ollama" scheduled
+// every minute, "ollama-b" with no schedule.
+func scheduleFixture(t *testing.T, f *fakeOllama, extraProvider string) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("SYNC_TEST_KEY", syncTestKey)
+	return writeCfg(t, dir, fmt.Sprintf(`providers:
+  - {name: ollama, kind: ollama-cloud, base_url: "%[1]s/v1", catalog_sync: {every: 1m}}
+  - {name: ollama-b, kind: ollama-cloud, base_url: "%[1]s/v1"}
+%[2]s
+credentials:
+  - {id: ollama-1, provider: ollama, key_env: SYNC_TEST_KEY}
+  - {id: ollama-b1, provider: ollama-b, key_env: SYNC_TEST_KEY}
+models:
+  - name: a
+    deployments:
+      - {provider: ollama, upstream_model: "deepseek-v4.1-flash", credentials: [ollama-1]}
+`, f.srv.URL, extraProvider))
+}
+
+// TestCatalogSyncDaemonFollowsEachProvidersSchedule: only providers with a
+// catalog_sync.every are synced, each once per interval — three ticks inside
+// one minute sync "ollama" once and never "ollama-b".
+//
+// Revert check: treat every tick as due (drop the interval comparison) and the
+// listing is read three times.
+func TestCatalogSyncDaemonFollowsEachProvidersSchedule(t *testing.T) {
+	f := newFakeOllama(t)
+	cfg := scheduleFixture(t, f, "")
+	dir := t.TempDir()
+	out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--models-dev", "off",
+		"--include-private", "--write-dir", dir, "--daemon", "--tick", "10ms", "--ticks", "3")
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+	if got := f.lists.Load(); got != 1 {
+		t.Errorf("the listing was read %d times in three ticks of a 1m schedule, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sync-ollama.yaml")); err != nil {
+		t.Errorf("the scheduled provider's overlay was not written: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "sync-ollama-b.yaml")); err == nil {
+		t.Error("a provider with no catalog_sync.every was synced by the daemon")
+	}
+	if !strings.Contains(out, "catalog sync: ollama\n") {
+		t.Errorf("the round is not announced:\n%s", out)
+	}
+}
+
+// TestCatalogSyncIsStableAgainstItsOwnOutput is what makes an hourly schedule
+// quiet: a second run writes nothing — neither because only the header's date
+// would change, nor because the overlay it wrote last time (loaded through
+// $DORANG_CATALOG_PATH, as it is in the gateway's container) now makes every
+// model look described.
+//
+// Revert check: drop the own-output exclusion in compareCatalog and the second
+// run rewrites the file with the entries it can no longer see as missing.
+func TestCatalogSyncIsStableAgainstItsOwnOutput(t *testing.T) {
+	f := newFakeOllama(t)
+	cfg := scheduleFixture(t, f, "")
+	dir := t.TempDir()
+	args := []string{"catalog", "sync", "--config", cfg, "--models-dev", "off", "--include-private",
+		"--provider", "ollama", "--write-dir", dir}
+	if _, errOut, code := invoke(args...); code != 0 {
+		t.Fatalf("first run: %s", errOut)
+	}
+	path := filepath.Join(dir, "sync-ollama.yaml")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := os.ReadFile(path)
+
+	t.Setenv(catalog.EnvCatalogPath, dir) // the gateway's view: the directory is a layer
+	out, errOut, code := invoke(args...)
+	if code != 0 {
+		t.Fatalf("second run: %s", errOut)
+	}
+	after, _ := os.Stat(path)
+	second, _ := os.ReadFile(path)
+	if !os.SameFile(before, after) || !bytes.Equal(first, second) {
+		t.Errorf("an unchanged sync rewrote the file\nbefore:\n%s\nafter:\n%s", first, second)
+	}
+	if !strings.Contains(out, "unchanged") {
+		t.Errorf("the second run does not say it wrote nothing:\n%s", out)
+	}
+}
+
+// TestCatalogSyncKeepsAFailedProvidersFile: one hour's network failure must
+// not erase what the last good sync learned.
+func TestCatalogSyncKeepsAFailedProvidersFile(t *testing.T) {
+	f := newFakeOllama(t)
+	cfg := scheduleFixture(t, f, fmt.Sprintf(`  - {name: broken, kind: ollama-cloud, base_url: "%s/nope"}`, f.srv.URL))
+	dir := t.TempDir()
+	kept := filepath.Join(dir, "sync-broken.yaml")
+	prev := "version: 1\nmodels:\n    - kind: ollama-cloud\n      model: learned-last-hour\n"
+	if err := os.WriteFile(kept, []byte(prev), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--models-dev", "off",
+		"--include-private", "--write-dir", dir)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out, errOut)
+	}
+	if got, _ := os.ReadFile(kept); string(got) != prev {
+		t.Errorf("a failed provider's overlay was changed:\n%s", got)
+	}
+	if !strings.Contains(out, kept+" kept: listing failed") {
+		t.Errorf("the kept file is not reported:\n%s", out)
+	}
+}
+
+// TestCatalogSyncHonoursFreeOnlyFromTheConfiguration: free_only is a
+// per-provider setting; false on an openrouter provider takes its whole listing.
+func TestCatalogSyncHonoursFreeOnlyFromTheConfiguration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{
+			{"id": "vendor/free:free", "pricing": map[string]string{"prompt": "0", "completion": "0"}},
+			{"id": "vendor/paid", "pricing": map[string]string{"prompt": "0.1", "completion": "0.1"}},
+		}})
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	t.Setenv("OR_TEST_KEY", "k")
+	for _, c := range []struct {
+		setting, want string
+	}{
+		{"", "listed: 1 free model(s) of 2"},                         // the kind's default
+		{", catalog_sync: {free_only: false}", "listed: 2 model(s)"}, // the operator's override
+	} {
+		cfg := writeCfg(t, dir, fmt.Sprintf(`providers:
+  - {name: openrouter, kind: openrouter, base_url: "%s/api/v1"%s}
+credentials:
+  - {id: or-1, provider: openrouter, key_env: OR_TEST_KEY}
+`, srv.URL, c.setting))
+		out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--models-dev", "off")
+		if code != 0 || !strings.Contains(out, c.want) {
+			t.Errorf("setting %q: want %q (exit %d)\n%s%s", c.setting, c.want, code, out, errOut)
 		}
 	}
 }

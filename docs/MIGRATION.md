@@ -384,8 +384,9 @@ response. Errors are not written either; they are facts about the network or the
 #### Keeping up with providers: `dorangctl catalog sync`
 
 ```
-dorangctl catalog sync [--config FILE] [--provider a,b] [--write FILE]
-                       [--models-dev URL|FILE|off] [--include-private] [--openrouter-paid]
+dorangctl catalog sync [--config FILE] [--provider a,b] [--write FILE | --write-dir DIR]
+                       [--models-dev URL|FILE|off] [--include-private] [--include-paid]
+dorangctl catalog sync --daemon --write-dir DIR [--config FILE]
 ```
 
 `catalog verify` asks whether catalogued names answer. `catalog sync` asks the other question —
@@ -420,16 +421,32 @@ for a human), never overrides a value declared at the model layer, and leaves pr
 or loopback addresses out of the overlay unless `--include-private` — a LAN backend's model names
 are local aliases, not facts about a public kind. The file is replaced atomically.
 
-**OpenRouter is free-only by default.** Its listing carries hundreds of paid models behind one
-key, so only models whose published price is zero on every line are suggested or written (a
-negative price — OpenRouter's routers publish `-1`, "whatever the chosen model costs" — is not
-free). A paid model the configuration already routes is still checked against the full listing.
-`--openrouter-paid` takes the whole listing.
+**Free-only providers.** `providers[].catalog_sync.free_only` narrows what is taken in to models
+whose published price is zero on every line (a negative price — OpenRouter's routers publish
+`-1`, "whatever the chosen model costs" — is not free). It defaults to `true` for kind
+`openrouter`, whose listing carries hundreds of paid models behind one key, and `false` otherwise.
+A paid model the configuration already routes is still checked against the full listing.
+`--include-paid` ignores the setting for one run.
 
-A catalog layer is loaded at start-up and again on every configuration reload, so the running
-gateway picks up a regenerated overlay on its next reload — a configuration change, or
-`SIGHUP` — with no rebuild. Keep hand edits in a
-separate overlay: `sync` rewrites its own file whole.
+**Scheduled: `--daemon`.** Each provider's `catalog_sync.every` (CONFIG.md §6) is its schedule;
+a provider without one is not synced by the daemon. `--write-dir DIR` writes one overlay per
+provider, `DIR/sync-<provider>.yaml`, so schedules never interfere, and:
+
+- a file is **rewritten only when its entries change** — an unchanged sync touches nothing, so
+  gateways watching the directory do not reload every hour;
+- a provider whose listing fails **keeps its previous file** — one hour's network trouble does
+  not erase what the last good sync learned;
+- sync measures against the catalog **minus its own output**, so reading back last hour's file
+  (through `$DORANG_CATALOG_PATH`, as it would where the gateway runs) does not make every model
+  look already described.
+
+The daemon re-reads the configuration every `--tick` (1m), so a changed schedule applies without a
+restart; every provider is due at start.
+
+A catalog layer is loaded at start-up and on every configuration reload, and the gateway **watches
+the `$DORANG_CATALOG_PATH` layers**: a file appearing, being replaced or removed there reloads it
+just as a configuration change does. No `SIGHUP`, no rebuild. Keep hand edits in a separate
+overlay; `sync` rewrites its own files whole.
 
 ---
 

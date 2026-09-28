@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -101,49 +104,85 @@ type providerSync struct {
 	ListedAll           int    // listing size before that narrowing
 }
 
+// syncOpts is one invocation's settings, shared by the one-shot and the daemon.
+type syncOpts struct {
+	cfgPath        string
+	overlays       []string
+	only           map[string]bool
+	registry       string
+	write          string // one file for every provider
+	writeDir       string // one file per provider: <dir>/sync-<provider>.yaml
+	includePrivate bool
+	includePaid    bool
+	client         *http.Client
+}
+
 func (e env) catalogSync(args []string) int {
 	fs := newFlagSet("catalog sync", e)
 	cfgPath := fs.String("config", "", "gateway configuration whose providers to sync (default $"+EnvConfigPath+" or "+defaultConfigPath+")")
 	overlays := fs.String("catalog", "", "extra model catalog files or directories, comma separated")
 	only := fs.String("provider", "", "sync only these providers, comma separated")
 	registry := fs.String("models-dev", defaultModelsDevURL, `models.dev registry URL or file, for metadata a provider does not publish; "off" to skip`)
-	write := fs.String("write", "", "write the metadata found as a catalog overlay")
+	write := fs.String("write", "", "write the metadata found as one catalog overlay")
+	writeDir := fs.String("write-dir", "", "write one overlay per provider into this directory, as sync-<provider>.yaml")
 	includePrivate := fs.Bool("include-private", false, "also write overlay entries for providers on private or loopback addresses")
-	openrouterPaid := fs.Bool("openrouter-paid", false, "take OpenRouter's paid models too; by default only its zero-priced models are synced")
+	includePaid := fs.Bool("include-paid", false, "ignore free_only: take paid models from every provider")
+	daemon := fs.Bool("daemon", false, "run forever, syncing each provider on its configured catalog_sync.every (needs --write-dir)")
+	tick := fs.Duration("tick", time.Minute, "daemon: how often the schedule and the configuration are re-read")
+	ticks := fs.Int("ticks", 0, "daemon: stop after this many ticks (0 = never); for tests")
 	timeout := fs.Duration("timeout", 30*time.Second, "per-request timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	path := firstNonEmpty(*cfgPath, os.Getenv(EnvConfigPath), defaultConfigPath)
+	o := syncOpts{
+		cfgPath:  firstNonEmpty(*cfgPath, os.Getenv(EnvConfigPath), defaultConfigPath),
+		overlays: splitComma(*overlays), only: map[string]bool{}, registry: *registry,
+		write: *write, writeDir: *writeDir,
+		includePrivate: *includePrivate, includePaid: *includePaid,
+		client: &http.Client{Timeout: *timeout},
+	}
+	for _, p := range splitComma(*only) {
+		o.only[p] = true
+	}
+	if *daemon {
+		if o.writeDir == "" {
+			return e.fail("catalog sync --daemon needs --write-dir: each provider's schedule writes its own file")
+		}
+		return e.syncDaemon(o, *tick, *ticks)
+	}
+	return e.syncRound(o, nil)
+}
 
-	cfg, err := config.Load(path)
+// syncRound runs one sync over the configured providers — all of them, or,
+// when due is non-nil, only those it names — and writes what was learned.
+// It returns the exit status a one-shot run reports.
+func (e env) syncRound(o syncOpts, due map[string]bool) int {
+	cfg, err := config.Load(o.cfgPath)
 	if err != nil {
 		return e.fail("%v\n(catalog sync reads the provider credentials the configuration references; "+
 			"run it where the gateway runs, e.g. docker exec <container> dorangctl catalog sync)", err)
 	}
-	cat, err := catalog.Load(splitComma(*overlays)...)
+	cat, err := compareCatalog(o)
 	if err != nil {
 		return e.fail("%v", err)
 	}
-	client := &http.Client{Timeout: *timeout}
 
 	var reg modelsDev
-	if *registry != "" && *registry != "off" {
-		reg, err = loadModelsDev(client, *registry)
+	if o.registry != "" && o.registry != "off" {
+		reg, err = loadModelsDev(o.client, o.registry)
 		if err != nil {
 			// Metadata is optional; existence is the part that matters.
 			fmt.Fprintf(e.stderr, "dorangctl: models.dev registry unavailable, continuing without it: %v\n", err)
 		}
 	}
 
-	want := map[string]bool{}
-	for _, p := range splitComma(*only) {
-		want[p] = true
-	}
 	var results []*providerSync
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
-		if len(want) > 0 && !want[p.Name] {
+		if len(o.only) > 0 && !o.only[p.Name] {
+			continue
+		}
+		if due != nil && !due[p.Name] {
 			continue
 		}
 		// A provider with no base_url uses its kind's catalogued endpoint, as
@@ -159,7 +198,8 @@ func (e env) catalogSync(args []string) int {
 				p.Name, p.Kind)
 			continue
 		}
-		results = append(results, syncProvider(client, cfg, cat, reg, p, base, freeOnlyKind(p.Kind) && !*openrouterPaid))
+		freeOnly := providerFreeOnly(p) && !o.includePaid
+		results = append(results, syncProvider(o.client, cfg, cat, reg, p, base, freeOnly))
 	}
 	if len(results) == 0 {
 		return e.fail("no provider with a base_url to sync")
@@ -177,19 +217,167 @@ func (e env) catalogSync(args []string) int {
 		return e.fail("no provider's model listing could be read; nothing was learned")
 	}
 
-	if *write != "" {
-		doc, n := buildSyncOverlay(cat, results, *includePrivate)
+	if o.write != "" {
+		doc, n := buildSyncOverlay(cat, results, o.includePrivate)
 		if n == 0 {
 			fmt.Fprintln(e.stdout, "\nnothing new to write: every listed model is already catalogued with what could be learned")
-			return 0
-		}
-		if err := writeSyncOverlay(*write, doc); err != nil {
+		} else if written, err := writeSyncOverlay(o.write, doc); err != nil {
 			return e.fail("%v", err)
+		} else if written {
+			fmt.Fprintf(e.stdout, "\nwrote %d entr(ies) to %s — load it with --catalog or $%s\n",
+				n, o.write, catalog.EnvCatalogPath)
+		} else {
+			fmt.Fprintf(e.stdout, "\n%s unchanged (%d entries)\n", o.write, n)
 		}
-		fmt.Fprintf(e.stdout, "\nwrote %d entr(ies) to %s — load it with --catalog or $%s\n",
-			n, *write, catalog.EnvCatalogPath)
+	}
+	if o.writeDir != "" {
+		for _, r := range results {
+			path := providerOverlayPath(o.writeDir, r.Name)
+			switch {
+			case r.ListErr != nil:
+				// The previous file stays: a failed listing is a fact about
+				// this hour's network, not about the models.
+				fmt.Fprintf(e.stdout, "\n%s kept: listing failed\n", path)
+				continue
+			case r.Private && !o.includePrivate:
+				continue
+			}
+			doc, n := buildSyncOverlay(cat, []*providerSync{r}, o.includePrivate)
+			written, err := writeSyncOverlay(path, doc)
+			switch {
+			case err != nil:
+				fmt.Fprintf(e.stderr, "dorangctl: %s: %v\n", path, err)
+			case written:
+				fmt.Fprintf(e.stdout, "\nwrote %d entr(ies) to %s\n", n, path)
+			default:
+				fmt.Fprintf(e.stdout, "\n%s unchanged (%d entries)\n", path, n)
+			}
+		}
 	}
 	return 0
+}
+
+// syncDaemon syncs each provider on its own catalog_sync.every. The
+// configuration is re-read every tick, so a schedule changed in the file takes
+// effect without a restart; a provider is due at start and then every
+// interval after its last run. A failed round is logged and retried on the
+// provider's next interval — the daemon does not exit on one.
+func (e env) syncDaemon(o syncOpts, tick time.Duration, maxTicks int) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if tick <= 0 {
+		tick = time.Minute
+	}
+	last := map[string]time.Time{}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for n := 0; ; n++ {
+		now := time.Now()
+		if cfg, err := config.Load(o.cfgPath); err != nil {
+			fmt.Fprintf(e.stderr, "%s dorangctl: catalog sync: %v\n", now.UTC().Format(time.RFC3339), err)
+		} else {
+			due := map[string]bool{}
+			for _, p := range cfg.Providers {
+				every := p.CatalogSync.Every.Duration()
+				if every <= 0 || (len(o.only) > 0 && !o.only[p.Name]) {
+					continue
+				}
+				if at, ok := last[p.Name]; !ok || now.Sub(at) >= every {
+					due[p.Name] = true
+				}
+			}
+			if len(due) > 0 {
+				names := make([]string, 0, len(due))
+				for name := range due {
+					names = append(names, name)
+					last[name] = now
+				}
+				slices.Sort(names)
+				fmt.Fprintf(e.stdout, "=== %s catalog sync: %s\n", now.UTC().Format(time.RFC3339), strings.Join(names, ", "))
+				e.syncRound(o, due)
+			}
+		}
+		if maxTicks > 0 && n+1 >= maxTicks {
+			return 0
+		}
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-t.C:
+		}
+	}
+}
+
+// providerFreeOnly is the provider's free_only, or its kind's default.
+func providerFreeOnly(p *config.Provider) bool {
+	if p.CatalogSync.FreeOnly != nil {
+		return *p.CatalogSync.FreeOnly
+	}
+	return freeOnlyKind(p.Kind)
+}
+
+// providerOverlayPath is where a provider's own overlay lives.
+func providerOverlayPath(dir, provider string) string {
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			return r
+		}
+		return '_'
+	}, provider)
+	return filepath.Join(dir, "sync-"+safe+".yaml")
+}
+
+// compareCatalog is the catalog sync measures against: the embedded data, the
+// --catalog layers and $DORANG_CATALOG_PATH — minus this command's own output.
+//
+// The exclusion is what keeps a scheduled sync stable. The daemon runs where
+// the gateway's overlay directory is, and if it read back the file it wrote an
+// hour ago, every model would already look described, the next file would be
+// written nearly empty, and the one after would be full again.
+func compareCatalog(o syncOpts) (*catalog.Catalog, error) {
+	own := func(path string) bool {
+		abs, _ := filepath.Abs(path)
+		if o.write != "" {
+			if w, _ := filepath.Abs(o.write); w == abs {
+				return true
+			}
+		}
+		if o.writeDir != "" {
+			d, _ := filepath.Abs(o.writeDir)
+			base := filepath.Base(abs)
+			if filepath.Dir(abs) == d && strings.HasPrefix(base, "sync-") {
+				return true
+			}
+		}
+		return false
+	}
+	var files []string
+	for _, p := range append(slices.Clone(o.overlays), catalog.EnvPaths()...) {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return nil, err
+		}
+		if !fi.IsDir() {
+			if !own(p) {
+				files = append(files, p)
+			}
+			continue
+		}
+		entries, err := os.ReadDir(p)
+		if err != nil {
+			return nil, err
+		}
+		for _, en := range entries {
+			name := en.Name()
+			if en.IsDir() || !(strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")) {
+				continue
+			}
+			if full := filepath.Join(p, name); !own(full) {
+				files = append(files, full)
+			}
+		}
+	}
+	return catalog.Loader{Paths: files}.Load()
 }
 
 // syncProvider lists one provider and classifies what the configuration routes
@@ -694,7 +882,7 @@ func (e env) writeSyncReport(results []*providerSync) {
 		} else {
 			line := fmt.Sprintf("  listed: %d model(s)", len(r.Listed))
 			if r.FreeOnly {
-				line = fmt.Sprintf("  listed: %d free model(s) of %d (paid ones skipped; --openrouter-paid takes them)", len(r.Listed), r.ListedAll)
+				line = fmt.Sprintf("  listed: %d free model(s) of %d (paid ones skipped: free_only; --include-paid takes them)", len(r.Listed), r.ListedAll)
 			}
 			if r.Registry != "" {
 				line += "; metadata registry: models.dev/" + r.Registry
@@ -808,10 +996,17 @@ func buildSyncOverlay(cat *catalog.Catalog, results []*providerSync, includePriv
 	return doc, len(doc.Models)
 }
 
-func writeSyncOverlay(path string, doc syncOverlayDoc) error {
+// writeSyncOverlay writes the overlay, unless the file already holds the same
+// entries — only the dated header would differ, and rewriting it would make
+// every gateway watching the directory reload for nothing. It reports whether
+// it wrote.
+func writeSyncOverlay(path string, doc syncOverlayDoc) (bool, error) {
 	body, err := yaml.Marshal(doc)
 	if err != nil {
-		return err
+		return false, err
+	}
+	if prev, err := os.ReadFile(path); err == nil && bytes.Equal(stripHeader(prev), body) {
+		return false, nil
 	}
 	header := fmt.Sprintf(`# Written by dorangctl catalog sync on %s.
 #
@@ -823,7 +1018,20 @@ func writeSyncOverlay(path string, doc syncOverlayDoc) error {
 # Retired models are never written or removed here; the sync report names them.
 # Regenerating this file replaces it — keep hand edits in a separate overlay.
 `, time.Now().UTC().Format(time.RFC3339))
-	return writeFileAtomic(path, append([]byte(header), body...))
+	return true, writeFileAtomic(path, append([]byte(header), body...))
+}
+
+// stripHeader drops the leading comment block writeSyncOverlay puts on a file,
+// leaving the YAML body it marshalled.
+func stripHeader(b []byte) []byte {
+	for len(b) > 0 && b[0] == '#' {
+		i := bytes.IndexByte(b, '\n')
+		if i < 0 {
+			return nil
+		}
+		b = b[i+1:]
+	}
+	return b
 }
 
 // writeFileAtomic writes through a temporary file in the same directory and

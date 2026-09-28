@@ -657,6 +657,11 @@ func (c *Config) validateProviders(col *collector, providers map[string]*Provide
 		validateProbeAllowances(col, path+".usage_probe", p.UsageProbe)
 		refuseBackendMetrics(col, path, p.Metrics)
 		checkCacheTTL(col, path+".prefix_ttl", p.PrefixTTL, false)
+		// A negative duration is refused by the Duration type itself, at parse.
+		if e := p.CatalogSync.Every.Duration(); e > 0 && e < MinCatalogSyncEvery {
+			col.add(path+".catalog_sync.every", "must be at least %s: a model listing does not change "+
+				"by the second, and the provider should not be polled as if it did", MinCatalogSyncEvery)
+		}
 		if !p.Params.DropsUnsupported() {
 			// REFUSED rather than left inert, and the reason is that dorang
 			// CONVERTS. `false` asks for a parameter the target's wire shape has

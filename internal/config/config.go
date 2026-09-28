@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -453,7 +454,28 @@ type Provider struct {
 	// where it discards hits that were still there. Write `until_evicted` for
 	// the self-hosted class.
 	PrefixTTL CacheTTL `yaml:"prefix_ttl,omitempty"`
+
+	// CatalogSync schedules `dorangctl catalog sync --daemon` for this
+	// provider: how often its model listing is re-read into the catalog
+	// overlays. The gateway itself makes no such request; the daemon does.
+	CatalogSync CatalogSync `yaml:"catalog_sync,omitempty"`
 }
+
+// CatalogSync is one provider's catalog-sync schedule.
+type CatalogSync struct {
+	// Every is the interval between syncs. Zero (the default) means the
+	// provider is not synced by the daemon; a one-shot `catalog sync` still
+	// covers it.
+	Every Duration `yaml:"every,omitempty"`
+	// FreeOnly narrows what is taken in to models whose published price is
+	// zero. Unset takes the kind's default, which is true for openrouter — its
+	// listing is hundreds of paid models behind one key — and false otherwise.
+	FreeOnly *bool `yaml:"free_only,omitempty"`
+}
+
+// MinCatalogSyncEvery bounds catalog_sync.every from below: a listing does not
+// change by the minute, and a provider should not be polled as if it did.
+const MinCatalogSyncEvery = time.Minute
 
 // Params controls parameter conversion for a provider (§10.3).
 type Params struct {

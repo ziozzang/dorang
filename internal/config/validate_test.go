@@ -1381,3 +1381,25 @@ models:
 		t.Errorf("session token = %q ok=%t, want it resolved from the env", v, ok)
 	}
 }
+
+// TestCatalogSyncEveryIsBounded: a schedule shorter than a minute polls a
+// provider's listing as if it changed by the second; negative is nonsense.
+func TestCatalogSyncEveryIsBounded(t *testing.T) {
+	for _, c := range []struct {
+		every string
+		ok    bool
+	}{
+		{"1h", true},
+		{"1m", true},
+		{"30s", false},
+		{"-1h", false},
+	} {
+		_, err := loadFragments(t, fragments{providers: "  - {name: p2, kind: openai, catalog_sync: {every: " + c.every + "}}\n"})
+		if (err == nil) != c.ok {
+			t.Errorf("catalog_sync.every %s: err = %v, want ok=%v", c.every, err, c.ok)
+		}
+		if c.every == "30s" && err != nil && !strings.Contains(err.Error(), "catalog_sync.every") {
+			t.Errorf("catalog_sync.every %s: the error does not name the field: %v", c.every, err)
+		}
+	}
+}

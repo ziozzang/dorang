@@ -495,6 +495,8 @@ providers:
 | `usage_probe.interval` | duration | `60s` | Poll interval, and the floor on how often ONE credential is read | Negative is refused. A poll is up to one interval stale — see §6.1. A second read inside the interval replays the last snapshot rather than spending a request |
 | `usage_probe.allowances[]` | list | `[]` | Files a provider's reported window under a rule's key, and declares how large it is | **Without one, a percent-reporting provider gates nothing** — see §6.1a. A window filed under a key no rule uses is inert |
 | `metrics.*` — the whole block | — | — | **Nothing. It is refused at load** (§23.2): §12.4's backend metrics scrape has no collector in this build | Writing any of `enabled`, `endpoint` or `interval` fails validation, naming what to use instead. `least_busy` and `highest_tps` do not need it — see §6.2 |
+| `catalog_sync.every` | duration | `0` (not scheduled) | How often `dorangctl catalog sync --daemon` re-reads this provider's model listing into its catalog overlay (`sync-<provider>.yaml`). The gateway makes no such request; the daemon does, and a gateway watching the overlay directory reloads when the file changes (MIGRATION.md §2, "Keeping up with providers") | Below `1m` is refused. `0` leaves the provider to one-shot runs only |
+| `catalog_sync.free_only` | bool | `true` for kind `openrouter`, else `false` | Take in only models whose published price is zero on every line | A paid model the configuration already routes is still checked; only what is *added* is narrowed |
 
 ### 6.0 What `base_url` means, and what dorang appends to it
 
