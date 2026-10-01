@@ -657,6 +657,14 @@ func (c *Config) validateProviders(col *collector, providers map[string]*Provide
 		validateProbeAllowances(col, path+".usage_probe", p.UsageProbe)
 		refuseBackendMetrics(col, path, p.Metrics)
 		checkCacheTTL(col, path+".prefix_ttl", p.PrefixTTL, false)
+		switch p.SystemOne.Mode {
+		case "", SystemOneNative, SystemOneLogprobs:
+		default:
+			col.add(path+".systemone.mode", "must be %q or %q, not %q", SystemOneNative, SystemOneLogprobs, p.SystemOne.Mode)
+		}
+		if n := p.SystemOne.TopLogprobs; n < 0 || n > 100 {
+			col.add(path+".systemone.top_logprobs", "must be between 1 and 100 (0 selects 20)")
+		}
 		// A negative duration is refused by the Duration type itself, at parse.
 		if e := p.CatalogSync.Every.Duration(); e > 0 && e < MinCatalogSyncEvery {
 			col.add(path+".catalog_sync.every", "must be at least %s: a model listing does not change "+

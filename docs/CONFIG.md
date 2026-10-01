@@ -513,8 +513,19 @@ models:
       - {provider: gpu-box, upstream_model: nimble}
 ```
 
+Any OpenAI-compatible host that returns `top_logprobs` can answer by **log-probabilities** instead
+(COMPATIBILITY.md §6b.8) — opt in per provider; a host that serves the route itself is `mode: native`:
+
+```yaml
+providers:
+  - name: vllm-box
+    kind: vllm
+    base_url: "http://10.0.0.6:8000/v1"
+    systemone: {mode: logprobs, top_logprobs: 20}   # top_logprobs: 0 selects 20
+```
+
 `ollama-cloud` cannot host one: Ollama serves System One locally only, and the hosted endpoint
-answers 501. A request a host's documented limits refuse is a 422 naming the field and the host.
+answers 501 (nor does it return log-probabilities). A request a host's documented limits refuse is a 422 naming the field and the host.
 
 ### 6.0 What `base_url` means, and what dorang appends to it
 

@@ -26,6 +26,13 @@ import (
 //   - kind `ollama` — a LOCAL Ollama, v0.35 or later
 //     (https://docs.ollama.com/api/systemone.md): 64 questions, 2–26 Choice
 //     options and Score levels, criteria written as strings, a 64 KiB body.
+//   - kind `sglang` — SGLang serves /v1/systemone itself (its decision-model
+//     docs, 2026-10-01): Choice 1–255 options, Score 1–10 levels.
+//   - any kind with `systemone: {mode: native}` — a host the operator states
+//     serves the route, at <base>/v1/systemone.
+//   - any kind with `systemone: {mode: logprobs}` — never reaches this
+//     adapter: [Backend.Do] scores it question by question on the host's
+//     chat route (systemone_logprobs.go).
 //   - kind `ollama-cloud` — refused by name. Ollama documents System One as
 //     local-only, and the hosted endpoint answers 501 "not implemented"
 //     (asked 2026-10-01); sending it there would spend a hop to learn that.
@@ -57,11 +64,12 @@ func (systemoneAdapter) endpoint(p *Provider, op Operation, _ string, _ bool) (s
 		return "", noOperation("ollama-cloud", op,
 			"Ollama serves System One on a local server only; the hosted endpoint answers 501. "+
 				"Route this model to a local `ollama` provider, `typesafe`, or another `systemone` host")
-	case "ollama", "typesafe", "systemone":
-		// The local Ollama base carries /v1 already; TypeSafe's does not.
+	case "ollama", "typesafe", "systemone", "sglang":
+		// The local Ollama and SGLang bases carry /v1 already; TypeSafe's
+		// does not.
 		return joinVersioned(p.base, "/v1", pathSystemOne), nil
 	}
-	if p.api == catalog.APISystemOne {
+	if p.api == catalog.APISystemOne || p.s1Mode == "native" {
 		return joinVersioned(p.base, "/v1", pathSystemOne), nil
 	}
 	return "", noOperation(p.kind, op,
@@ -90,15 +98,15 @@ func checkSystemOneLimits(kind string, req *canonical.SystemOneRequest, bodyLen 
 		return &systemone.Error{Param: param, Message: fmt.Sprintf(format, args...)}
 	}
 	switch kind {
-	case "typesafe":
+	case "typesafe", "sglang":
 		for _, q := range req.Questions {
 			switch {
 			case q.Type == canonical.SystemOneScore && q.Options > typesafeMaxScoreLevels:
 				return limit("questions."+q.ID+".criteria",
-					"has %d levels; TypeSafe accepts at most %d", q.Options, typesafeMaxScoreLevels)
+					"has %d levels; %s accepts at most %d", q.Options, hostName(kind), typesafeMaxScoreLevels)
 			case q.Type == canonical.SystemOneChoice && q.Options > typesafeMaxOptions:
 				return limit("questions."+q.ID+".criteria",
-					"has %d options; TypeSafe accepts at most %d", q.Options, typesafeMaxOptions)
+					"has %d options; %s accepts at most %d", q.Options, hostName(kind), typesafeMaxOptions)
 			}
 		}
 	case "ollama":
@@ -154,4 +162,11 @@ func (systemoneAdapter) decode(body []byte, x *exchange) (*decoded, error) {
 
 func (systemoneAdapter) source(io.Reader, *exchange) (eventSource, error) {
 	return nil, noOperation("systemone", OpSystemOne, "System One answers one JSON body and does not stream")
+}
+
+func hostName(kind string) string {
+	if kind == "sglang" {
+		return "SGLang"
+	}
+	return "TypeSafe"
 }

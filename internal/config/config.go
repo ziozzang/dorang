@@ -459,7 +459,34 @@ type Provider struct {
 	// provider: how often its model listing is re-read into the catalog
 	// overlays. The gateway itself makes no such request; the daemon does.
 	CatalogSync CatalogSync `yaml:"catalog_sync,omitempty"`
+
+	// SystemOne says how this provider serves POST /v1/systemone, the
+	// decision-model surface (COMPATIBILITY §6b).
+	SystemOne ProviderSystemOne `yaml:"systemone,omitempty"`
 }
+
+// ProviderSystemOne is how a provider serves System One decisions.
+type ProviderSystemOne struct {
+	// Mode is "native" — the host serves /v1/systemone itself — or "logprobs":
+	// each question is compiled into one single-token multiple-choice prompt
+	// on the host's chat route, and the answer's probabilities are read from
+	// the label tokens' log-probabilities. Empty takes the kind's default:
+	// native for typesafe, systemone, a local ollama and sglang; unserved for
+	// everything else. "logprobs" is opt-in because only a host that returns
+	// top_logprobs at the answer position can serve it, and that is a fact
+	// about the deployment, not the kind.
+	Mode string `yaml:"mode,omitempty"`
+	// TopLogprobs is how many alternatives a logprobs-mode request asks for at
+	// the answer position. It caps how many options a Choice can have there.
+	// Zero selects 20, the ceiling most OpenAI-compatible hosts accept.
+	TopLogprobs int `yaml:"top_logprobs,omitempty"`
+}
+
+// System One modes.
+const (
+	SystemOneNative   = "native"
+	SystemOneLogprobs = "logprobs"
+)
 
 // CatalogSync is one provider's catalog-sync schedule.
 type CatalogSync struct {

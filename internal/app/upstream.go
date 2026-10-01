@@ -81,6 +81,9 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			// name is a START-UP error naming the provider rather than a 400
 			// from the upstream on the first request.
 			DropParams: p.Params.Drop,
+			// providers[].systemone: how this host serves /v1/systemone.
+			SystemOneMode:        p.SystemOne.Mode,
+			SystemOneTopLogprobs: p.SystemOne.TopLogprobs,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("app: provider %q (kind %q): %w", p.Name, p.Kind, err)

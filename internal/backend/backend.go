@@ -415,6 +415,11 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 		return res
 	}
 	p := t.Provider
+	if c.Op == OpSystemOne && p.s1Mode == "logprobs" {
+		// Scored question by question on the host's chat route; see
+		// systemone_logprobs.go.
+		return b.systemOneByLogprobs(ctx, t, c)
+	}
 
 	ad, api := p.pick(c)
 	endpoint, err := ad.endpoint(p, c.Op, t.UpstreamModel, c.Stream)

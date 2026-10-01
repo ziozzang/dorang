@@ -122,6 +122,13 @@ type Spec struct {
 	BedrockRegion       string
 	BedrockAccessKeyID  string
 	BedrockSessionToken string
+
+	// SystemOneMode is how the provider serves /v1/systemone: "native",
+	// "logprobs", or empty for the kind's default (see systemoneAdapter).
+	SystemOneMode string
+	// SystemOneTopLogprobs is the top_logprobs a logprobs-mode request asks
+	// for; zero selects 20.
+	SystemOneTopLogprobs int
 }
 
 // ErrNoBaseURL is returned for a provider with no endpoint at all.
@@ -134,6 +141,10 @@ type Provider struct {
 	kind string
 	api  catalog.API
 	base string
+	// s1Mode and s1TopK are how the provider serves /v1/systemone; see
+	// [Spec.SystemOneMode].
+	s1Mode string
+	s1TopK int
 	// ResponsesForceStream and ResponsesStoreFalse are the contract of a
 	// Responses-only host, stated by the deployment instead of discovered by
 	// every caller as a 400.
@@ -247,6 +258,9 @@ func NewProvider(s Spec) (*Provider, error) {
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,
+
+		s1Mode: s.SystemOneMode,
+		s1TopK: s.SystemOneTopLogprobs,
 	}, nil
 }
 
