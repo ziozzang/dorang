@@ -175,6 +175,10 @@ type Call struct {
 	// representation, in internal/canonical). Nil for every other operation.
 	Rerank *canonical.RerankRequest
 
+	// SystemOne is what the gateway learned validating a System One request;
+	// the body itself is relayed. Nil for every other operation.
+	SystemOne *canonical.SystemOneRequest
+
 	// The T1 surface's neutral forms. Exactly one is set, selected by Op. They
 	// are separate fields rather than an `any` because every consumer switches
 	// on Op already, and a type assertion would add a second, independent way

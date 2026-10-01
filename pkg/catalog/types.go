@@ -29,11 +29,18 @@ const (
 	APICohere  API = "cohere"
 	APIJina    API = "jina"
 	APIEcho    API = "echo"
+	// APISystemOne is the decision-model surface: POST /v1/systemone with a
+	// shared `state` and named Choice, Score and Noul questions, answered with
+	// typed answers and probabilities. TypeSafe defines it (Jev), local Ollama
+	// serves the same shape, and aggregators expose it for several vendors'
+	// decision models. It serves nothing but that one operation.
+	APISystemOne API = "systemone"
 )
 
 var validAPIs = map[API]bool{
 	APIOpenAIChat: true, APIOpenAIResponses: true, APIAzureOpenAI: true, APIAnthropicMessages: true,
 	APIGemini: true, APIVertex: true, APIBedrock: true, APICohere: true, APIJina: true, APIEcho: true,
+	APISystemOne: true,
 }
 
 // CacheScheme names how prompt caching is expressed on the wire for a kind.
@@ -68,12 +75,15 @@ const (
 	CategoryAudio      Category = "audio"
 	CategoryModeration Category = "moderation"
 	CategoryOCR        Category = "ocr"
+	// CategoryDecision is a System One decision model: it answers typed
+	// questions with probabilities and does not generate text.
+	CategoryDecision Category = "decision"
 )
 
 var validCategories = map[Category]bool{
 	CategoryChat: true, CategoryCompletion: true, CategoryEmbedding: true,
 	CategoryRerank: true, CategoryImage: true, CategoryAudio: true,
-	CategoryModeration: true, CategoryOCR: true,
+	CategoryModeration: true, CategoryOCR: true, CategoryDecision: true,
 }
 
 // ReasoningCapability is the form a model accepts its reasoning control in

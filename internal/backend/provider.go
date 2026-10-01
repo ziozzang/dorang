@@ -296,6 +296,11 @@ func nativeAdapters(api catalog.API, primary adapter, surfaces []string) (map[ca
 // returns is the family the request is encoded against, which is what the
 // §10.1 gate and the encoder read their capability set from.
 func (p *Provider) pick(c *Call) (adapter, catalog.API) {
+	if c != nil && c.Op == OpSystemOne {
+		// One adapter serves the operation on every kind that has it, and
+		// refuses it by name on every kind that does not (see systemoneAdapter).
+		return systemoneAdapter{}, catalog.APISystemOne
+	}
 	if c != nil && p.native != nil {
 		switch {
 		case c.Op == OpResponses:

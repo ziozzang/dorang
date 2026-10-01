@@ -326,6 +326,24 @@ func probeRequest(endpoint string, api catalog.API, info catalog.ModelInfo, maxT
 		})
 		return endpoint + "/rerank", b, nil, nil
 
+	case catalog.CategoryDecision:
+		if api != catalog.APISystemOne {
+			return "", nil, nil, fmt.Errorf("no decision probe shape for api %q", api)
+		}
+		// One Noul: the smallest question the contract has. TypeSafe answers an
+		// alias with the versioned id that served it, so jev-latest comes back
+		// as "substituted" by jev-1.13.0 — which is the alias resolving, and
+		// the date it was true.
+		b, _ := json.Marshal(map[string]any{
+			"model": info.Model, "state": "hi",
+			"questions": map[string]any{"q": map[string]string{"type": "noul", "instructions": "Is this a greeting?"}},
+		})
+		base := strings.TrimRight(endpoint, "/")
+		if !strings.HasSuffix(base, "/v1") {
+			base += "/v1"
+		}
+		return base + "/systemone", b, nil, nil
+
 	case catalog.CategoryChat, catalog.CategoryCompletion, "":
 		switch api {
 		case catalog.APIOpenAIChat, catalog.APIOpenAIResponses:

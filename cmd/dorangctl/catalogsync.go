@@ -198,6 +198,12 @@ func (e env) syncRound(o syncOpts, due map[string]bool) int {
 				p.Name, p.Kind)
 			continue
 		}
+		// A decision host's base is the bare host (https://api.typesafe.ai)
+		// and its listing is /v1/models, where every OpenAI-compatible base
+		// already carries the version.
+		if kd, ok := cat.Kind(p.Kind); ok && kd.API == catalog.APISystemOne && !strings.HasSuffix(strings.TrimRight(base, "/"), "/v1") {
+			base = strings.TrimRight(base, "/") + "/v1"
+		}
 		freeOnly := providerFreeOnly(p) && !o.includePaid
 		results = append(results, syncProvider(o.client, cfg, cat, reg, p, base, freeOnly))
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
+	"github.com/ziozzang/dorang/internal/wire/systemone"
 )
 
 // Error codes this package authors. Every one names a condition an operator can
@@ -496,6 +497,14 @@ func unsupportedError(code, message string) *server.Error {
 // capability, and a client that fed it to a field-locating SDK would be pointed
 // at a member that does not exist.
 func encodeError(err error) *server.Error {
+	// A System One request this deployment's host cannot take: the host's own
+	// documented limit, named, with the field. 422 is what the contract answers
+	// a body that fails validation with.
+	var se *systemone.Error
+	if errors.As(err, &se) {
+		return server.NewError(http.StatusUnprocessableEntity, server.TypeInvalidRequest, se.Error()).
+			WithCode("systemone_limit").WithParam(se.Param)
+	}
 	var oe *anthropic.OpaqueError
 	if errors.As(err, &oe) {
 		we := oe.ToError()

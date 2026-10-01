@@ -113,6 +113,12 @@ func (s *Server) baseRoutes(access MetricsAccess) []*Route {
 		inference("/rerank", "rerank", FamilyOpenAIRerank),
 		inference("/v2/rerank", "rerank", FamilyOpenAIRerank),
 
+		// Decision models — TypeSafe's System One contract, which local Ollama
+		// and the aggregators also serve. One spelling: every client of it
+		// (TypeSafe's SDKs, Ollama's docs) addresses /v1/systemone on a bare
+		// host.
+		inference("/v1/systemone", "systemone", FamilySystemOne),
+
 		// T1 — moderations.
 		inference("/v1/moderations", "moderations", FamilyOpenAIModerations),
 		inference("/moderations", "moderations", FamilyOpenAIModerations),

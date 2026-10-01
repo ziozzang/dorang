@@ -32,6 +32,9 @@ const (
 	OpImageGenerate
 	OpImageEdit
 	OpImageVariation
+
+	// OpSystemOne is the decision-model surface, POST /v1/systemone.
+	OpSystemOne
 )
 
 // operationNames is the label set. A table rather than a switch so that a new
@@ -50,6 +53,7 @@ var operationNames = [...]string{
 	OpImageGenerate:  "images.generation",
 	OpImageEdit:      "images.edit",
 	OpImageVariation: "images.variation",
+	OpSystemOne:      "systemone",
 }
 
 // String names the operation for an error message.
@@ -114,6 +118,7 @@ const (
 	pathImageGenerate  = "/images/generations"
 	pathImageEdit      = "/images/edits"
 	pathImageVariation = "/images/variations"
+	pathSystemOne      = "/systemone"
 )
 
 // joinVersioned joins a suffix onto a base URL, supplying the family's default

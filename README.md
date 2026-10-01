@@ -77,7 +77,7 @@ design target is that turning it on costs less than 5%.
 ### Full protocol surface
 
 OpenAI chat/completions/embeddings/responses/audio/images/moderations, Anthropic
-messages, rerank, batch, files — plus a **generic passthrough engine** so provider-native
+messages, rerank, decision models (`/v1/systemone`), batch, files — plus a **generic passthrough engine** so provider-native
 routes are opened by configuration rather than by writing another adapter.
 
 ---

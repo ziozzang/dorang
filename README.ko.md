@@ -70,7 +70,7 @@ h₀ = H(group)                        hᵢ = H(hᵢ₋₁ ‖ cᵢ ‖ len(cᵢ
 ### 전체 프로토콜 표면
 
 OpenAI chat/completions/embeddings/responses/audio/images/moderations, Anthropic messages,
-rerank, batch, files — 여기에 **범용 패스스루 엔진**을 더해 프로바이더 고유 경로는
+rerank, 결정 모델(`/v1/systemone`), batch, files — 여기에 **범용 패스스루 엔진**을 더해 프로바이더 고유 경로는
 어댑터를 새로 짜는 대신 **설정으로 열린다**.
 
 ---

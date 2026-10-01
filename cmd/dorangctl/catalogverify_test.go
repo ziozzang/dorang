@@ -324,3 +324,22 @@ models:
 		t.Errorf("neither surface verified:\n%s", out)
 	}
 }
+
+// TestDecisionProbeIsOneNoulOnSystemOne: the smallest request the decision
+// contract has, at the path TypeSafe documents.
+func TestDecisionProbeIsOneNoulOnSystemOne(t *testing.T) {
+	url, body, _, err := probeRequest("https://api.typesafe.ai", catalog.APISystemOne,
+		catalog.ModelInfo{Model: "jev-latest", Category: catalog.CategoryDecision}, 16)
+	if err != nil || url != "https://api.typesafe.ai/v1/systemone" {
+		t.Fatalf("url %q err %v", url, err)
+	}
+	var b struct {
+		Model     string                       `json:"model"`
+		State     string                       `json:"state"`
+		Questions map[string]map[string]string `json:"questions"`
+	}
+	if err := json.Unmarshal(body, &b); err != nil || b.Model != "jev-latest" || b.State == "" ||
+		len(b.Questions) != 1 || b.Questions["q"]["type"] != "noul" {
+		t.Errorf("probe body %s (%v)", body, err)
+	}
+}

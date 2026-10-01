@@ -305,6 +305,22 @@ models:
   - { kind: jina, model: "jina-reranker-v3",              verified: 2026-08-03, category: rerank }
 
   # =========================================================================
+  # TypeSafe — https://api.typesafe.ai  (kind: typesafe, POST /v1/systemone)
+  #
+  # Transcribed from https://docs.typesafe.ai/models.md on 2026-10-01, NOT
+  # asked: no TypeSafe credential exists where this catalog is maintained.
+  # The aliases resolve to jev-1.13.0 that day; a response names the versioned
+  # model that answered. 64k tokens per request (32k for the state plus the
+  # longest question) is the documented budget; it is left out of
+  # context_window because the page does not say whether "64k" is 64,000 or
+  # 65,536, and a ceiling that is too large is the dangerous direction.
+  # =========================================================================
+
+  - { kind: typesafe, model: "jev-latest",  category: decision }
+  - { kind: typesafe, model: "jev-preview", category: decision }
+  - { kind: typesafe, model: "jev-1.13.0",  category: decision }
+
+  # =========================================================================
   # ABSORBED 2026-07-28 from openclaw and hermes-agent. Read this before
   # trusting any number below it.
   # =========================================================================

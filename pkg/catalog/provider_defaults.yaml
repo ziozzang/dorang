@@ -315,6 +315,38 @@ kinds:
     supports_tools: true
     supports_streaming: true
 
+  # ---- Decision models (System One) ----------------------------------------
+  #
+  # One surface, POST /v1/systemone: a shared `state` and named Choice, Score
+  # and Noul questions, answered with typed answers and probabilities. Nothing
+  # else is served on these kinds. Contract: https://docs.typesafe.ai/api.md
+  # (2026-10-01). Local Ollama (kind `ollama`) serves the same shape at the same
+  # path — https://docs.ollama.com/api/systemone.md — and Ollama Cloud answers
+  # 501 "not implemented" there (asked 2026-10-01).
+
+  # TypeSafe's own endpoint. Models: https://docs.typesafe.ai/models.md —
+  # `jev-latest` and `jev-preview` are aliases of `jev-1.13.0` on 2026-10-01.
+  typesafe:
+    api: systemone
+    base_url: https://api.typesafe.ai
+    cache: none
+    category: decision
+    supports_tools: false
+    supports_streaming: false
+    # No TypeSafe credential exists where this catalog is maintained, so the
+    # model rows are the vendor's documentation, not an answer.
+    probe: { result: citation_only, date: 2026-10-01 }
+
+  # Any other host that speaks the same contract — an aggregator such as
+  # decisionapi.net (third party; `typesafe/jev-1.13`-style model names), or a
+  # self-hosted gateway. There is no default endpoint: base_url is the operator's.
+  systemone:
+    api: systemone
+    cache: none
+    category: decision
+    supports_tools: false
+    supports_streaming: false
+
   # ---- Self-hosted / local -------------------------------------------------
 
   ollama:

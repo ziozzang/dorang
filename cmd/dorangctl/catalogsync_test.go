@@ -650,3 +650,26 @@ credentials:
 		}
 	}
 }
+
+// TestCatalogSyncListsADecisionHostUnderV1: TypeSafe's base is the bare host
+// and its listing is /v1/models; reading /models there would be a 404 and an
+// unsynced provider.
+func TestCatalogSyncListsADecisionHostUnderV1(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": []map[string]any{{"id": "jev-latest"}}})
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	t.Setenv("TS_TEST_KEY", "k")
+	cfg := writeCfg(t, dir, fmt.Sprintf(`providers:
+  - {name: ts, kind: typesafe, base_url: %q}
+credentials:
+  - {id: ts-1, provider: ts, key_env: TS_TEST_KEY}
+`, srv.URL))
+	out, errOut, code := invoke("catalog", "sync", "--config", cfg, "--models-dev", "off")
+	if code != 0 || path != "/v1/models" || !strings.Contains(out, "listed: 1 model(s)") {
+		t.Errorf("exit %d, path %q\n%s%s", code, path, out, errOut)
+	}
+}

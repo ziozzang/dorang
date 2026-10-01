@@ -12,6 +12,7 @@ import (
 	"github.com/ziozzang/dorang/internal/wire/bedrock"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/internal/wire/rerank"
+	"github.com/ziozzang/dorang/internal/wire/systemone"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -311,6 +312,8 @@ func adapterFor(api catalog.API, kind string, responsesOnly bool) (adapter, erro
 		return cohereAdapter{}, nil
 	case catalog.APIJina:
 		return jinaAdapter{}, nil
+	case catalog.APISystemOne:
+		return systemoneAdapter{}, nil
 	case catalog.APIEcho:
 		// The catalog's echo kind is a deterministic in-process adapter for
 		// tests (DESIGN §4.3). It has no HTTP surface, so it is refused here
@@ -403,6 +406,8 @@ func (e *errNoOperation) code() string {
 		return "count_tokens_unsupported"
 	case OpRerank:
 		return "rerank_unsupported"
+	case OpSystemOne:
+		return "systemone_unsupported"
 	default:
 		return "chat_unsupported"
 	}
@@ -440,7 +445,8 @@ func isNotAResponse(err error) bool {
 		errors.Is(err, openai.ErrNotAModerationResponse) ||
 		errors.Is(err, openai.ErrNotAnImageResponse) ||
 		errors.Is(err, openai.ErrNotATranscriptionResponse) ||
-		errors.Is(err, rerank.ErrNotAResponse)
+		errors.Is(err, rerank.ErrNotAResponse) ||
+		errors.Is(err, systemone.ErrNotAResponse)
 }
 
 // noOperation builds an errNoOperation.

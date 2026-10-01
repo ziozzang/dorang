@@ -120,6 +120,25 @@ not a passthrough.
 | 6a.7 | Server-side state: a streamed exchange is stored from the **terminal event's own response object**, after the last byte and before the handler returns — so `previous_response_id` never observes a gap, but the buffered rule "stored before the client has the id" cannot hold (the `created` event carries it). A store failure is logged, not failed to the client: the answer is served, and the id 404s later in the TTL-expired shape. `store:false` skips the store; a store-keeping stream against a deployment with no store is refused **at decode**, before a byte is written, in the buffered path's named 501. |
 | 6a.8 | `event: dorang.usage` (opt-in `x-dorang-usage-events`) lands **after** `response.completed`; this family's terminator is load-bearing, so a dorang-aware client reads the frame after the turn. |
 
+## 6b. `/v1/systemone` — decision models (System One)
+
+The contract is TypeSafe's ([docs.typesafe.ai/api](https://docs.typesafe.ai/api.md)): one shared
+`state` and a map of named `questions` — **Noul** (probability of yes), **Choice** (one option of a
+set, with a probability for every option and a confidence), **Score** (a probability-weighted
+level on an ordered rubric, with a legend) — answered under the same ids with token usage. Local
+Ollama v0.35+ serves the same shape at the same path
+([docs.ollama.com/api/systemone](https://docs.ollama.com/api/systemone.md)), and aggregators
+expose other vendors' decision models through it.
+
+| # | Contract |
+|---|---|
+| 6b.1 | One route, `POST /v1/systemone`, one JSON answer. No streaming: neither contract has it. |
+| 6b.2 | The body is **relayed**, not converted: every host speaks the same contract, so only `model` is replaced (with the deployment's upstream model) and the answer comes back with the **client-facing** model restored. The model the host reports — TypeSafe answers an alias with the versioned id — is kept as the served model. Usage is `input_tokens` / `output_tokens`, metered like every other surface. |
+| 6b.3 | The gateway validates structure and refuses with **422** (the contract's status for a malformed body), naming the field in `param`. It admits what **either** host takes — Choice 2–255 options, Score 2–26 levels — so a request one host accepts is never refused for the other's rule. Two floors are dorang's own: a Choice and a Score need at least two entries. |
+| 6b.4 | Each deployment applies its host's documented ceiling before sending, as a **422 `systemone_limit`** naming the field and the host: TypeSafe — 10 Score levels, 255 options; local Ollama — 64 questions, 26 options or levels, criteria written as strings, a 64 KiB body. Other `systemone` hosts' limits are theirs and come back as their own 422. |
+| 6b.5 | Hosts: kind `typesafe` (`https://api.typesafe.ai`), kind `systemone` (any other host of the contract, `base_url` required), and a **local** kind `ollama`. Kind `ollama-cloud` is refused by name (`501 systemone_unsupported`): Ollama documents System One as local-only and the hosted endpoint answers `501 not implemented` (measured 2026-10-01). Every other kind is the same named 501. |
+| 6b.6 | **OpenAI's Decisions API** (DevDay, 2026-09-29) is in limited preview and has **no published contract** — no guide, no reference, no OpenAPI path, no SDK method (checked 2026-10-01). It is not translated: a translation written before the contract is published would be a guess shipped as compatibility. When it is published it becomes a client surface or a host translated onto this one. |
+
 ## 7. Cross-cutting
 
 | # | Contract |

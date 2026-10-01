@@ -498,6 +498,24 @@ providers:
 | `catalog_sync.every` | duration | `0` (not scheduled) | How often `dorangctl catalog sync --daemon` re-reads this provider's model listing into its catalog overlay (`sync-<provider>.yaml`). The gateway makes no such request; the daemon does, and a gateway watching the overlay directory reloads when the file changes (MIGRATION.md §2, "Keeping up with providers") | Below `1m` is refused. `0` leaves the provider to one-shot runs only |
 | `catalog_sync.free_only` | bool | `true` for kind `openrouter`, else `false` | Take in only models whose published price is zero on every line | A paid model the configuration already routes is still checked; only what is *added* is narrowed |
 
+**Decision models (`/v1/systemone`).** A System One host is a provider like any other; its models
+are routed by `models[]` and answer only `/v1/systemone` (COMPATIBILITY.md §6b):
+
+```yaml
+providers:
+  - {name: typesafe, kind: typesafe}                                   # https://api.typesafe.ai
+  - {name: decisions, kind: systemone, base_url: "https://host.example"}  # any host of the contract
+  - {name: gpu-box, kind: ollama, base_url: "http://10.0.0.5:11434/v1"}   # local Ollama v0.35+
+models:
+  - name: decide
+    deployments:
+      - {provider: typesafe, upstream_model: jev-latest, credentials: [typesafe-1]}
+      - {provider: gpu-box, upstream_model: nimble}
+```
+
+`ollama-cloud` cannot host one: Ollama serves System One locally only, and the hosted endpoint
+answers 501. A request a host's documented limits refuse is a 422 naming the field and the host.
+
 ### 6.0 What `base_url` means, and what dorang appends to it
 
 **Write the root the vendor documents. dorang appends the version segment unless your URL

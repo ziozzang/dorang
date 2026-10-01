@@ -217,6 +217,7 @@ type call struct {
 	allowUsg  bool
 
 	rerankReq *canonical.RerankRequest
+	s1Req     *canonical.SystemOneRequest
 	modReq    *canonical.ModerationRequest
 	speechReq *canonical.SpeechRequest
 	transReq  *canonical.TranscriptionRequest
@@ -268,6 +269,7 @@ const (
 	callSpeech
 	callTranscription
 	callImages
+	callSystemOne
 )
 
 // callKindNames is the label set, a table rather than a switch so that a new
@@ -283,6 +285,7 @@ var callKindNames = [...]string{
 	callSpeech:        "audio.speech",
 	callTranscription: "audio.transcription",
 	callImages:        "images",
+	callSystemOne:     "systemone",
 }
 
 // String names the kind for a human-readable message.
@@ -721,6 +724,7 @@ func (d *dispatcher) backendCall(st *dispatchState, c *call, dec *router.Decisio
 		Body:          c.body,
 		Request:       c.creq,
 		Rerank:        c.rerankReq,
+		SystemOne:     c.s1Req,
 		Moderation:    c.modReq,
 		Speech:        c.speechReq,
 		Transcription: c.transReq,
@@ -771,6 +775,8 @@ func (c *call) operation() backend.Operation {
 		return backend.OpModerations
 	case callRerank:
 		return backend.OpRerank
+	case callSystemOne:
+		return backend.OpSystemOne
 	case callSpeech:
 		return backend.OpSpeech
 	case callTranscription:

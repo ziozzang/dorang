@@ -63,6 +63,11 @@ func assertRefused(t *testing.T, err error, status int, code string) {
 	}
 }
 
+func asServerError(err error) *server.Error {
+	e, _ := err.(*server.Error)
+	return e
+}
+
 // TestT1DecodeSelectsTheRightNeutralType. One typed pointer per kind, so a
 // consumer that switches on kind cannot read a field that was never filled.
 func TestT1DecodeSelectsTheRightNeutralType(t *testing.T) {
@@ -87,6 +92,8 @@ func TestT1DecodeSelectsTheRightNeutralType(t *testing.T) {
 			func(c *call) bool { return c.modReq != nil }},
 		{server.FamilyOpenAIRerank, `{"model":"m","query":"q","documents":["a"]}`, nil, callRerank,
 			func(c *call) bool { return c.rerankReq != nil }},
+		{server.FamilySystemOne, `{"model":"m","state":"s","questions":{"q":{"type":"noul","instructions":"i"}}}`,
+			nil, callSystemOne, func(c *call) bool { return c.s1Req != nil && len(c.s1Req.Questions) == 1 }},
 		{server.FamilyOpenAISpeech, `{"model":"m","input":"x","voice":"v"}`, nil, callSpeech,
 			func(c *call) bool { return c.speechReq != nil }},
 		{server.FamilyOpenAITranscription, ``, form, callTranscription,
@@ -195,6 +202,15 @@ func TestT1MalformedBodiesAre400(t *testing.T) {
 	_, err = decodeRoute(t, server.FamilyOpenAICompletions, `{"model":`, nil)
 	assertRefused(t, err, http.StatusBadRequest, "invalid_request")
 
+	// System One answers a malformed body with 422 — the status its contract
+	// uses — and names the field.
+	_, err = decodeRoute(t, server.FamilySystemOne, `{"model":"m","state":"s","questions":{"q":{"type":"choice",
+		"instructions":"i","criteria":{"only":"one"}}}}`, nil)
+	assertRefused(t, err, http.StatusUnprocessableEntity, "invalid_systemone_request")
+	if se := asServerError(err); se == nil || se.Param == nil || *se.Param != "questions.q.criteria" {
+		t.Errorf("the refusal does not name the field: %+v", err)
+	}
+
 	_, err = decodeRoute(t, server.FamilyOpenAITranscription, ``,
 		&canonical.Form{Values: map[string][]string{"model": {"m"}}})
 	assertRefused(t, err, http.StatusBadRequest, "invalid_request")
@@ -216,6 +232,9 @@ func TestFamilyMismatchIsANamed501(t *testing.T) {
 		{callSpeech, catalog.APIAnthropicMessages, "audio_speech_family_mismatch"},
 		{callImages, catalog.APIGemini, "images_family_mismatch"},
 		{callModerations, catalog.APICohere, "moderations_family_mismatch"},
+		// A decision request is not a conversation: no chat host answers it.
+		{callSystemOne, catalog.APIAnthropicMessages, "systemone_family_mismatch"},
+		{callSystemOne, catalog.APICohere, "systemone_family_mismatch"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.code, func(t *testing.T) {
@@ -243,6 +262,10 @@ func TestFamilyMismatchIsANamed501(t *testing.T) {
 		{callImages, catalog.APIOpenAIResponses},
 		{callChat, catalog.APIAnthropicMessages},
 		{callCompletions, catalog.APIAnthropicMessages},
+		// A decision host, and a local Ollama (api openai-chat), whose kind
+		// the backend adapter checks.
+		{callSystemOne, catalog.APISystemOne},
+		{callSystemOne, catalog.APIOpenAIChat},
 	} {
 		if err := checkFamily(&call{kind: ok.kind}, ok.api); err != nil {
 			t.Errorf("%v on %s was refused: %v", ok.kind, ok.api, err)

@@ -111,6 +111,8 @@ const (
 	FamilyOpenAIImageGeneration
 	FamilyOpenAIImageEdit
 	FamilyOpenAIImageVariation
+	// FamilySystemOne is the decision-model surface, POST /v1/systemone.
+	FamilySystemOne
 
 	// FamilyAdmin is the administration surface (DESIGN §2.3). It is one
 	// family for the whole of it rather than one per path, because these are
@@ -142,6 +144,7 @@ var familyNames = [...]string{
 	FamilyOpenAIImageGeneration: "openai-image-generation",
 	FamilyOpenAIImageEdit:       "openai-image-edit",
 	FamilyOpenAIImageVariation:  "openai-image-variation",
+	FamilySystemOne:             "systemone",
 	FamilyAdmin:                 "admin",
 }
 

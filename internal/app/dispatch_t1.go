@@ -1,12 +1,14 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/internal/wire/rerank"
+	"github.com/ziozzang/dorang/internal/wire/systemone"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -61,6 +63,22 @@ func (d *dispatcher) decodeT1(st *dispatchState, rq *server.Request, c *call) er
 				WithCode("invalid_parameter").WithParam("documents")
 		}
 		c.kind, c.clientAPI, c.rerankReq = callRerank, catalog.APICohere, rreq
+
+	case server.FamilySystemOne:
+		sreq, err := systemone.DecodeRequest(body)
+		if err != nil {
+			var se *systemone.Error
+			if errors.As(err, &se) {
+				// 422, the status the contract answers a malformed body with,
+				// naming the field.
+				return server.NewError(http.StatusUnprocessableEntity, server.TypeInvalidRequest, se.Error()).
+					WithCode("invalid_systemone_request").WithParam(se.Param)
+			}
+			return bad(err)
+		}
+		// The request's `model` is the client-facing model name; the routing
+		// that follows reads it from the body like every JSON surface.
+		c.kind, c.clientAPI, c.s1Req = callSystemOne, catalog.APISystemOne, sreq
 
 	case server.FamilyOpenAISpeech:
 		sreq, err := openai.DecodeSpeechRequest(body)
@@ -139,6 +157,11 @@ func checkFamily(c *call, api catalog.API) error {
 		// The self-hosted engines serve the same shape at /rerank, so they are
 		// accepted alongside the two vendors whose protocol it is.
 		ok = api == catalog.APICohere || api == catalog.APIJina || api == catalog.APIOpenAIChat
+	case callSystemOne:
+		// A decision host, or a local Ollama (whose api is openai-chat). The
+		// adapter refuses every openai-chat kind that is not a local Ollama,
+		// by name, at the endpoint — it can see the kind and this cannot.
+		ok = api == catalog.APISystemOne || api == catalog.APIOpenAIChat
 	case callModerations, callSpeech, callTranscription, callImages:
 		ok = api == catalog.APIOpenAIChat || api == catalog.APIOpenAIResponses || api == catalog.APIAzureOpenAI
 	case callCompletions:
