@@ -196,6 +196,10 @@ type spendLogView struct {
 	// when no notional rule matched, so that a flat plan cannot be made to
 	// look infinitely efficient by an absent rule.
 	Notional *Money `json:"notional_spend"`
+	// ReportedSpend is what the UPSTREAM stated this request cost, null when it
+	// stated nothing. It is the vendor's bill beside dorang's `spend`, and the
+	// two agree only where a reported_cost rule bills it.
+	ReportedSpend *Money `json:"reported_spend"`
 	// Utilization is the §8.6 disclosure of a price that MOVED, and is absent —
 	// not zero — on every rate card that does not price on occupancy. A reader
 	// summing invoices needs it for one question: whether this row's charge is
@@ -285,6 +289,10 @@ func viewLog(r LogRow) spendLogView {
 	if r.NotionalKnown {
 		m := Money(r.NotionalNano)
 		v.Notional = &m
+	}
+	if r.ReportedCost {
+		m := Money(r.ReportedCostNano)
+		v.ReportedSpend = &m
 	}
 	if r.UtilSource != "" {
 		u := utilizationView{

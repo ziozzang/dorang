@@ -61,6 +61,11 @@ type exchange struct {
 	// the only way to tell a JSON transcript from an srt one, because the two
 	// arrive on the same route with the same status.
 	respType string
+	// verboseUpgraded records that a transcription the caller asked for as
+	// `json` went upstream as verbose_json so that the host would state the
+	// recording's length ([catalog.KindDefaults.TranscriptionDuration]); the
+	// answer is rendered back to the `json` shape on the way out.
+	verboseUpgraded bool
 	// attempt is the in-provider attempt number, used only to keep a retried
 	// multipart body's boundary distinct from the first one's.
 	attempt int

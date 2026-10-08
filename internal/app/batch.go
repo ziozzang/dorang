@@ -17,7 +17,6 @@ import (
 
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
-	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/pricing"
@@ -331,15 +330,16 @@ func (e *batchExecutor) Execute(ctx context.Context, req *batch.ExecRequest) (*b
 		return nil, res.Err
 	}
 	settled = true
-	hold.settle(e.d.rowCost(st, dec, res.Usage, now))
+	hold.settle(e.d.rowCost(st, dec, res, now))
 	return &batch.ExecResult{StatusCode: res.Status, Body: res.Body}, nil
 }
 
 // rowCost prices one completed batch row so the budget hold can be settled at
 // what it actually cost rather than at the estimate.
 func (d *dispatcher) rowCost(st *dispatchState, dec *router.Decision,
-	usage canonical.Usage, now time.Time) int64 {
+	res backend.Result, now time.Time) int64 {
 
+	usage := res.Usage
 	if st == nil || st.pricing == nil {
 		return 0
 	}
@@ -356,7 +356,11 @@ func (d *dispatcher) rowCost(st *dispatchState, dec *router.Decision,
 		Requests:         1,
 		AudioSeconds:     usage.AudioSeconds,
 		Billed:           billedUnit(usage.Billed),
-		At:               now,
+		// The upstream's stated cost, for a reported_cost rule: a batch row is
+		// billed by the same rule an interactive request is.
+		ReportedCostNano:   res.ReportedCostNano,
+		ReportedCostStated: res.ReportedCost,
+		At:                 now,
 	})
 	// A rule that matched and could not price this row is unpriced for the same
 	// reason no rule at all is: the hold settles at what the row cost, and a

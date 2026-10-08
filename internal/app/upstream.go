@@ -35,11 +35,10 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 	}
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
+		kd, _ := cat.Kind(p.Kind)
 		base := p.BaseURL
 		if base == "" {
-			if kd, ok := cat.Kind(p.Kind); ok {
-				base = kd.BaseURL
-			}
+			base = kd.BaseURL
 		}
 		prov, err := backend.NewProvider(backend.Spec{
 			Name:    p.Name,
@@ -56,6 +55,11 @@ func newUpstreamTable(cfg *config.Config, cat *catalog.Catalog) (*upstreamTable,
 			// A Responses-only host's contract, stated by the deployment.
 			ResponsesForceStream: p.Params.ForceStream,
 			ResponsesStoreFalse:  p.Params.StoreFalse,
+			// The kind's accounting declarations: how its host states a
+			// recording's length and what a request cost.
+			TranscriptionDuration: kd.TranscriptionDuration,
+			ReportedCostPath:      kd.ReportedCost,
+			ReportedCostUnit:      kd.ReportedCostUnit,
 			// Azure's legacy surface, by its one mandatory parameter.
 			AzureAPIVersion: p.Params.APIVersion,
 			// Vertex AI's route scope.

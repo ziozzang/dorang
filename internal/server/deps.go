@@ -558,6 +558,12 @@ type Result struct {
 	// caller asked for the mechanism and the mechanism fired.
 	Downgraded string
 
+	// ReportedCostNanoUSD is what the UPSTREAM stated this request cost, and
+	// ReportedCost says it stated one. It is recorded beside CostNanoUSD and is
+	// not part of it unless a reported_cost rule made it so.
+	ReportedCostNanoUSD int64
+	ReportedCost        bool
+
 	// UtilizationPriced reports that the winning price rule scales its rate by
 	// how contended the backend was (DESIGN §8.6), so the four fields below carry
 	// a meaning and are published. It is false for every ordinary rate card,

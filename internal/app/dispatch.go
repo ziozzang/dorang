@@ -625,8 +625,12 @@ type result struct {
 	// charges part of it: a server-side web search is billed per search and a
 	// generated image's tokens at a rate unrelated to chat tokens.
 	usageExtra *canonical.UsageExtra
-	ttft       time.Duration
-	total      time.Duration
+	// reportedNano is what the upstream stated this request cost, and reported
+	// whether it stated one ([backend.Result.ReportedCost]).
+	reportedNano int64
+	reported     bool
+	ttft         time.Duration
+	total        time.Duration
 	// body is the converted non-streaming answer, held rather than written so
 	// that pricing lands on the request before the headers are stamped.
 	body []byte
@@ -802,13 +806,15 @@ func (c *call) operation() backend.Operation {
 // need: a [router.Outcome] for Report, and an error for the client.
 func backendResult(br backend.Result) result {
 	res := result{
-		usage:       br.Usage,
-		usageExtra:  br.UsageExtra,
-		ttft:        br.TTFT,
-		total:       br.Total,
-		body:        br.Body,
-		contentType: br.ContentType,
-		loadMetrics: br.LoadMetrics,
+		usage:        br.Usage,
+		usageExtra:   br.UsageExtra,
+		reportedNano: br.ReportedCostNano,
+		reported:     br.ReportedCost,
+		ttft:         br.TTFT,
+		total:        br.Total,
+		body:         br.Body,
+		contentType:  br.ContentType,
+		loadMetrics:  br.LoadMetrics,
 
 		servedModel:       br.ServedModel,
 		modelAgreement:    br.ModelAgreement,
@@ -1001,6 +1007,11 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	// about the ANSWER, and it is true whether or not this deployment is priced.
 	d.noteSubstitution(st, dec, rq, res)
 
+	// What the upstream said this cost, recorded whether or not this deployment
+	// is priced and whatever its rule does with it: the ledger row carries it
+	// beside dorang's own figure so that the two can be compared.
+	rq.Result.ReportedCostNanoUSD, rq.Result.ReportedCost = res.reportedNano, res.reported
+
 	// The tokens-per-minute ceiling is fed from App.recordMetrics, at the
 	// meter, because that is the one point every finished request passes and it
 	// carries all three subject ids. Feeding it a second time here would count
@@ -1041,11 +1052,23 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 		// prices at the base rate; it is never read as an idle machine.
 		UtilizationPPM:      util,
 		UtilizationObserved: refusal == loadsignal.RefusalNone,
-		At:                  now,
+		// The upstream's own statement of the cost. Priced only by a rule
+		// carrying a reported_cost rate; every other rule ignores it.
+		ReportedCostNano:   res.reportedNano,
+		ReportedCostStated: res.reported,
+		At:                 now,
 	})
 	if err != nil {
 		d.logf("app: pricing %s/%s: %v", dec.Provider, dec.UpstreamModel, err)
 		return
+	}
+	if cost.ReportedFallback {
+		// The rule asked for the upstream's figure and got none, so its own
+		// rates priced the request. Logged at the volume an unpriced model is:
+		// a vendor that stopped stating its cost is a vendor whose bill is now
+		// an estimate, and nothing else would say so.
+		d.logf("app: %s/%s stated no cost; its reported_cost rule priced it at "+
+			"the rule's fallback rates", dec.Provider, dec.UpstreamModel)
 	}
 	if cost.Floored {
 		// The catalog's adjustments came to more than the request they applied

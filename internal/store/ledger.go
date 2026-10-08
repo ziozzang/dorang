@@ -78,6 +78,13 @@ type RequestLog struct {
 	UtilPPM           int64
 	UtilSource        string
 
+	// ReportedCostNano is what the UPSTREAM stated this request cost, and
+	// ReportedCost whether it stated one. Written as SQL NULL when it did not:
+	// a vendor that said zero and a vendor that said nothing are different
+	// facts, and only the first is a figure to reconcile against an invoice.
+	ReportedCostNano int64
+	ReportedCost     bool
+
 	LatencyMS      int64
 	TTFTMS         int64
 	QueueMS        int64
@@ -180,7 +187,7 @@ const requestLogCols = `l.ts, l.id, l.api_key_id, l.user_id, l.team_id, l.creden
 	l.subscription_cost_nano, l.latency_ms, l.ttft_ms, l.queue_ms, l.capacity_wait_ms,
 	l.upstream_ms, l.fallback_count, l.streamed, l.trace_id, l.session_id, l.node_id,
 	l.batch_id, l.metadata, l.secret_id, l.util_multiplier_ppm, l.util_ppm,
-	l.util_source, l.notional_nano, l.notional_known`
+	l.util_source, l.notional_nano, l.notional_known, l.reported_cost_nano`
 
 const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_id,
 	provider_id, deployment_id, model_group, upstream_model, endpoint,
@@ -189,7 +196,7 @@ const requestLogInsertCols = `ts, id, api_key_id, user_id, team_id, credential_i
 	subscription_cost_nano, latency_ms, ttft_ms, queue_ms, capacity_wait_ms,
 	upstream_ms, fallback_count, streamed, trace_id, session_id, node_id,
 	batch_id, metadata, secret_id, util_multiplier_ppm, util_ppm, util_source,
-	notional_nano, notional_known`
+	notional_nano, notional_known, reported_cost_nano`
 
 // requestLogInsertArity is COUNTED from the column list rather than written
 // beside it: a literal that has to be edited whenever a column is added is a
@@ -278,7 +285,7 @@ func (s *Store) insertLogChunk(ctx context.Context, tx *sql.Tx, rows []RequestLo
 			r.FallbackCount, r.Streamed, nullStr(r.TraceID), nullStr(r.SessionID),
 			nullStr(r.NodeID), nullStr(r.BatchID), r.Metadata, nullStr(r.SecretID),
 			nullZeroInt(r.UtilMultiplierPPM), nullZeroInt(r.UtilPPM), nullStr(r.UtilSource),
-			r.NotionalNano, r.NotionalKnown)
+			r.NotionalNano, r.NotionalKnown, nullUnless(r.ReportedCost, r.ReportedCostNano))
 	}
 	_, err := s.txExec(ctx, tx, b.String(), args...)
 	return err
@@ -493,6 +500,51 @@ func (s *Store) SpendByCredential(ctx context.Context, credentialID string, r Ti
 	return out, nil
 }
 
+// ModelSpend is one upstream model's ledger totals for a credential over a range,
+// with the upstream's own statement of the cost beside dorang's figure.
+type ModelSpend struct {
+	UpstreamModel string
+	Requests      int64
+	CostNano      int64
+	// ReportedNano sums what the upstream stated over the ReportedRequests rows
+	// on which it stated anything; the other Requests-ReportedRequests rows
+	// stated nothing and are not counted as zero.
+	ReportedNano     int64
+	ReportedRequests int64
+}
+
+// SpendByCredentialModel is [Store.SpendByCredential] per upstream model, with the
+// reported-cost column. It is what `dorangctl spend reconcile` compares with a
+// vendor's account usage.
+// Index: request_logs (credential_id, ts DESC, id DESC).
+func (s *Store) SpendByCredentialModel(ctx context.Context, credentialID string, r TimeRange) ([]ModelSpend, error) {
+	if err := r.validate(s.cfg.MaxTimeRange); err != nil {
+		return nil, err
+	}
+	const q = `
+		SELECT l.upstream_model, COUNT(*), COALESCE(SUM(l.cost_nano), 0),
+		       COALESCE(SUM(l.reported_cost_nano), 0), COUNT(l.reported_cost_nano)
+		  FROM request_logs l
+		 WHERE l.credential_id = ? AND l.ts >= ? AND l.ts < ?
+		 GROUP BY l.upstream_model
+		 ORDER BY l.upstream_model`
+	rows, err := s.query(ctx, q, credentialID, Micros(r.Start), Micros(r.End))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelSpend
+	for rows.Next() {
+		var m ModelSpend
+		if err := rows.Scan(&m.UpstreamModel, &m.Requests, &m.CostNano,
+			&m.ReportedNano, &m.ReportedRequests); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // GetRequestTrace fetches the excerpt for a ledger row already in hand.
 func (s *Store) GetRequestTrace(ctx context.Context, ts time.Time, requestID string) (RequestTrace, error) {
 	var (
@@ -629,7 +681,7 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		keyID, userID, teamID, credID, provID, deplID sql.NullString
 		errClass, traceID, sessionID, nodeID, batchID sql.NullString
 		secretID, utilSource                          sql.NullString
-		utilMul, utilPPM                              sql.NullInt64
+		utilMul, utilPPM, reported                    sql.NullInt64
 	)
 	err := rows.Scan(&us, &r.ID, &keyID, &userID, &teamID, &credID, &provID, &deplID,
 		&r.ModelGroup, &r.UpstreamModel, &r.Endpoint, &r.Status, &errClass,
@@ -637,10 +689,11 @@ func scanRequestLog(rows *sql.Rows) (RequestLog, error) {
 		&r.TotalTokens, &r.CostNano, &r.MarginalCostNano, &r.SubscriptionCostNano,
 		&r.LatencyMS, &r.TTFTMS, &r.QueueMS, &r.CapacityWaitMS, &r.UpstreamMS,
 		&r.FallbackCount, &r.Streamed, &traceID, &sessionID, &nodeID, &batchID, &r.Metadata,
-		&secretID, &utilMul, &utilPPM, &utilSource, &r.NotionalNano, &r.NotionalKnown)
+		&secretID, &utilMul, &utilPPM, &utilSource, &r.NotionalNano, &r.NotionalKnown, &reported)
 	if err != nil {
 		return RequestLog{}, err
 	}
+	r.ReportedCostNano, r.ReportedCost = reported.Int64, reported.Valid
 	r.TS = TimeAt(us)
 	r.APIKeyID = str(keyID)
 	r.UserID = str(userID)

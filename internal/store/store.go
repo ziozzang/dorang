@@ -359,6 +359,15 @@ func nullZeroInt(v int64) any {
 	return v
 }
 
+// nullUnless writes v, or SQL NULL when the value was never stated. Unlike
+// [nullZeroInt] a stated zero is kept: it is a measurement.
+func nullUnless(stated bool, v int64) any {
+	if !stated {
+		return nil
+	}
+	return v
+}
+
 // nullMicros turns the zero time into a SQL NULL.
 func nullMicros(t time.Time) any {
 	if t.IsZero() {

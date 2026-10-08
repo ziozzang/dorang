@@ -105,6 +105,13 @@ type Spec struct {
 	// [NewProvider] unless ResponsesOnly: nothing else reads them.
 	ResponsesForceStream bool
 	ResponsesStoreFalse  bool
+	// TranscriptionDuration, ReportedCostPath and ReportedCostUnit are the
+	// kind's accounting declarations ([catalog.KindDefaults.TranscriptionDuration],
+	// [catalog.KindDefaults.ReportedCost]): how the host is made to state a
+	// recording's length, and where it states what a request cost.
+	TranscriptionDuration string
+	ReportedCostPath      string
+	ReportedCostUnit      string
 	// AzureAPIVersion selects Azure OpenAI's legacy per-deployment surface
 	// and is its mandatory query parameter (`params.api_version`). Refused on
 	// any other kind: only [azureAdapter] reads it.
@@ -157,6 +164,11 @@ type Provider struct {
 	// that loads and changes nothing is the CONFIG §23.2 defect.
 	ResponsesForceStream bool
 	ResponsesStoreFalse  bool
+
+	// verboseDuration is [Spec.TranscriptionDuration] == "verbose_json".
+	verboseDuration bool
+	// cost is where the host states a request's cost; nil when it does not.
+	cost *costSpec
 
 	timeout time.Duration
 	retry   Policy
@@ -236,6 +248,10 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	cost, err := newCostSpec(s.ReportedCostPath, s.ReportedCostUnit)
+	if err != nil {
+		return nil, err
+	}
 	return &Provider{
 		name:    s.Name,
 		kind:    s.Kind,
@@ -258,6 +274,9 @@ func NewProvider(s Spec) (*Provider, error) {
 
 		ResponsesForceStream: s.ResponsesForceStream,
 		ResponsesStoreFalse:  s.ResponsesStoreFalse,
+
+		verboseDuration: s.TranscriptionDuration == catalog.TranscriptionDurationVerboseJSON,
+		cost:            cost,
 
 		s1Mode: s.SystemOneMode,
 		s1TopK: s.SystemOneTopLogprobs,

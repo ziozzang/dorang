@@ -141,11 +141,16 @@ type kindDoc struct {
 	SupportsStreaming field[bool]     `yaml:"supports_streaming"`
 	ResponsesOnly     field[bool]     `yaml:"responses_only"`
 	Surfaces          field[[]string] `yaml:"surfaces"`
-	Metrics           field[string]   `yaml:"metrics"`
-	Priority          field[string]   `yaml:"priority"`
-	Verified          field[string]   `yaml:"verified"`
-	Probe             *probeDoc       `yaml:"probe"`
-	Note              field[string]   `yaml:"note"`
+	// Accounting: see [KindDefaults.TranscriptionDuration] and the three after it.
+	TranscriptionDuration field[string] `yaml:"transcription_duration"`
+	ReportedCost          field[string] `yaml:"reported_cost"`
+	ReportedCostUnit      field[string] `yaml:"reported_cost_unit"`
+	UsageAPI              field[string] `yaml:"usage_api"`
+	Metrics               field[string] `yaml:"metrics"`
+	Priority              field[string] `yaml:"priority"`
+	Verified              field[string] `yaml:"verified"`
+	Probe                 *probeDoc     `yaml:"probe"`
+	Note                  field[string] `yaml:"note"`
 
 	// Provenance for the block that merges whole rather than field-wise.
 	probeFrom fieldSource
@@ -400,6 +405,10 @@ func mergeKind(dst, src *kindDoc, from fieldSource) {
 	mergeField(&dst.SupportsStreaming, src.SupportsStreaming, from)
 	mergeField(&dst.ResponsesOnly, src.ResponsesOnly, from)
 	mergeField(&dst.Surfaces, src.Surfaces, from)
+	mergeField(&dst.TranscriptionDuration, src.TranscriptionDuration, from)
+	mergeField(&dst.ReportedCost, src.ReportedCost, from)
+	mergeField(&dst.ReportedCostUnit, src.ReportedCostUnit, from)
+	mergeField(&dst.UsageAPI, src.UsageAPI, from)
 	mergeField(&dst.Metrics, src.Metrics, from)
 	mergeField(&dst.Priority, src.Priority, from)
 	mergeField(&dst.Verified, src.Verified, from)
@@ -676,45 +685,56 @@ func resolveKind(name string, in *kindDoc) (KindDefaults, map[string]fieldSource
 		}
 	}
 
+	acct, acctErrs := resolveAccounting(name, in)
+	errs = append(errs, acctErrs...)
+
 	if len(errs) > 0 {
 		return KindDefaults{}, nil, errors.Join(errs...)
 	}
 	origins := map[string]fieldSource{
-		FieldAPI:               in.API.origin,
-		FieldBaseURL:           in.BaseURL.origin,
-		FieldCache:             cacheOrigin,
-		FieldReasoningHint:     hintOrigin,
-		FieldCategory:          catOrigin,
-		FieldContextWindow:     in.ContextWindow.origin,
-		FieldMaxOutputTokens:   in.MaxOutputTokens.origin,
-		FieldSupportsTools:     in.SupportsTools.origin,
-		FieldSupportsStreaming: in.SupportsStreaming.origin,
-		FieldResponsesOnly:     in.ResponsesOnly.origin,
-		FieldSurfaces:          in.Surfaces.origin,
-		FieldMetrics:           in.Metrics.origin,
-		FieldPriority:          in.Priority.origin,
-		FieldVerified:          in.Verified.origin,
-		FieldProbe:             in.probeFrom,
-		FieldNote:              in.Note.origin,
+		FieldAPI:                   in.API.origin,
+		FieldBaseURL:               in.BaseURL.origin,
+		FieldCache:                 cacheOrigin,
+		FieldReasoningHint:         hintOrigin,
+		FieldCategory:              catOrigin,
+		FieldContextWindow:         in.ContextWindow.origin,
+		FieldMaxOutputTokens:       in.MaxOutputTokens.origin,
+		FieldSupportsTools:         in.SupportsTools.origin,
+		FieldSupportsStreaming:     in.SupportsStreaming.origin,
+		FieldResponsesOnly:         in.ResponsesOnly.origin,
+		FieldSurfaces:              in.Surfaces.origin,
+		FieldTranscriptionDuration: in.TranscriptionDuration.origin,
+		FieldReportedCost:          in.ReportedCost.origin,
+		FieldReportedCostUnit:      in.ReportedCostUnit.origin,
+		FieldUsageAPI:              in.UsageAPI.origin,
+		FieldMetrics:               in.Metrics.origin,
+		FieldPriority:              in.Priority.origin,
+		FieldVerified:              in.Verified.origin,
+		FieldProbe:                 in.probeFrom,
+		FieldNote:                  in.Note.origin,
 	}
 	return KindDefaults{
-		Name:              name,
-		API:               api,
-		BaseURL:           in.BaseURL.get(),
-		Cache:             cache,
-		ReasoningHint:     hint,
-		Category:          cat,
-		ContextWindow:     in.ContextWindow.get(),
-		MaxOutputTokens:   in.MaxOutputTokens.get(),
-		SupportsTools:     in.SupportsTools.get(),
-		SupportsStreaming: in.SupportsStreaming.get(),
-		ResponsesOnly:     in.ResponsesOnly.get(),
-		Surfaces:          surfaces,
-		Metrics:           in.Metrics.get(),
-		Priority:          in.Priority.get(),
-		Verified:          in.Verified.get(),
-		Probe:             probe,
-		Note:              in.Note.get(),
+		Name:                  name,
+		API:                   api,
+		BaseURL:               in.BaseURL.get(),
+		Cache:                 cache,
+		ReasoningHint:         hint,
+		Category:              cat,
+		ContextWindow:         in.ContextWindow.get(),
+		MaxOutputTokens:       in.MaxOutputTokens.get(),
+		SupportsTools:         in.SupportsTools.get(),
+		SupportsStreaming:     in.SupportsStreaming.get(),
+		ResponsesOnly:         in.ResponsesOnly.get(),
+		Surfaces:              surfaces,
+		TranscriptionDuration: acct.TranscriptionDuration,
+		ReportedCost:          acct.ReportedCost,
+		ReportedCostUnit:      acct.ReportedCostUnit,
+		UsageAPI:              acct.UsageAPI,
+		Metrics:               in.Metrics.get(),
+		Priority:              in.Priority.get(),
+		Verified:              in.Verified.get(),
+		Probe:                 probe,
+		Note:                  in.Note.get(),
 	}, origins, nil
 }
 

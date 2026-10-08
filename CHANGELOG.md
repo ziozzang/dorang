@@ -11,6 +11,31 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ## Unreleased
 
+### What the upstream says a request cost is recorded, and can be billed
+
+dorang priced every request from its own rate card and dropped the figure two of
+its upstreams state on the response — OpenRouter's `usage.cost`, DeepInfra's
+`usage.estimated_cost`. The kind now declares where the figure is, the backend
+reads it from the upstream's bytes (after the answer converted; on a stream, from
+whichever event states it, with a null erasing nothing), and every request records
+it beside dorang's own price: ledger `reported_cost_nano` (migration 0009), spend
+logs `reported_spend`, `X-Dorang-Reported-Cost-Usd`. A `reported_cost` rate bills
+it, with the rule's other rates as the fallback. The trace spool is version 8.
+
+- **DeepInfra transcripts were unpriceable.** Its `json` answer states no length,
+  so the `audio_seconds` rules matched and charged nothing on every request while
+  the account billed them by input length. The kind is asked for `verbose_json`,
+  whose `duration` matched the account's billed length to the millisecond, and the
+  caller still receives `json`. A verbose answer with no usage block is metered by
+  its duration everywhere; a vendor usage block still wins.
+- **`dorangctl spend reconcile`** compares each vendor account's usage endpoint with
+  the ledger. Measured while building it: DeepInfra money fields are US cents and
+  `cost` is rounded to a whole cent, its `YYYY.MM` periods are in the account's
+  time zone, and a timestamp range ending in the future is refused; an ordinary
+  OpenRouter key states only running totals.
+- A cost figure is parsed from its JSON lexeme, never through a float: `3.4e-07`
+  USD is exactly 340 nano-USD.
+
 ### `/v1/responses` learned to stream, and the 501 it used to answer with
 
 The refusal existed because the Responses event stream is a different protocol

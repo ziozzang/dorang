@@ -142,6 +142,11 @@ const (
 	// rests on is between "the backend was idle" and "we did not observe it",
 	// and both of those charge 1.000000x.
 	HeaderUtilizationMultiplier = "X-Dorang-Utilization-Multiplier"
+	// HeaderReportedCostUSD is what the UPSTREAM stated the request cost, in
+	// USD, when its kind declares where it states one. It sits beside
+	// X-Dorang-Cost-Usd rather than replacing it: the two are dorang's price and
+	// the vendor's bill, and they agree only when a rule bills the latter.
+	HeaderReportedCostUSD = "X-Dorang-Reported-Cost-Usd"
 	// HeaderUtilizationSource names the observation the factor came from, or the
 	// refusal that stood in for it: `observed`, `streamed`, `no_load_header`,
 	// `zero_is_ambiguous`, `not_a_fraction`, and the rest of
@@ -414,6 +419,12 @@ func (s *Server) stampHeaders(h http.Header, rq *Request, status int, costDeferr
 	// are omitted rather than made to claim a factor nobody has computed — the
 	// same rule LegacyHeaderResponseCost follows, for the same reason. The
 	// number for a stream travels in the ledger, joined by x-dorang-request-id.
+	// The upstream's own figure, under the same condition: a stream's is known
+	// only after its headers left.
+	if r.ReportedCost && !costDeferred {
+		var b [32]byte
+		h.Set(HeaderReportedCostUSD, string(appendNanoUSD(b[:0], r.ReportedCostNanoUSD)))
+	}
 	if r.UtilizationPriced && !costDeferred {
 		h.Set(HeaderUtilizationMultiplier, ppmDecimal(r.UtilizationMultiplierPPM))
 		h.Set(HeaderUtilizationCeiling, ppmDecimal(r.UtilizationCeilingPPM))

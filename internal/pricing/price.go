@@ -199,11 +199,19 @@ func (c *Catalog) compute(req *Request, ev *Evaluator, settle bool, ex *Explanat
 		if err != nil {
 			return Cost{}, err
 		}
+		// A tier cannot state reported_cost (rawTier has no such key) and inherits
+		// the rule's, so the rule's own rate set answers for every tier.
+		if winner.rates.set[cReportedCost] {
+			cost.ReportedPriced = req.ReportedCostStated
+			cost.ReportedFallback = !req.ReportedCostStated
+		}
 		// The utilization factor, if the rule declares one. It scales the marginal
 		// amount and nothing else: the plan share is a function of elapsed time and
 		// has no occupancy, and the notional figure is a VENDOR's list price, which
-		// does not move with the operator's own GPU (§8.5).
-		if winner.util.declared() {
+		// does not move with the operator's own GPU (§8.5). Nor does a figure the
+		// upstream STATED: that is its bill, already priced at whatever occupancy
+		// it ran at, so the factor applies to the fallback rates alone.
+		if winner.util.declared() && !cost.ReportedPriced {
 			scaled, ppm, atCeiling, fb, err := applyUtilization(winner, req, m, &cost.Components)
 			if err != nil {
 				return Cost{}, err
@@ -560,6 +568,8 @@ func quantityOf(i int, req *Request) (int64, error) {
 		q = req.ImageOutputTokens
 	case cComputeSeconds:
 		return secondsToMicros(req.Seconds)
+	case cReportedCost:
+		q = req.ReportedCostNano
 	case cAudioSeconds:
 		// The recorded length the vendor billed, and never req.Seconds. The two are
 		// different quantities and [noPriceReason] has already refused the request if
@@ -609,6 +619,19 @@ func effectiveRates(r *rule, req *Request) rateSet {
 func noPriceReason(r *rule, req *Request) (NoPriceReason, string) {
 	rates := effectiveRates(r, req)
 
+	// The upstream's own figure, when the rule asks for it and it was stated, is the
+	// whole price: none of the rule's other rates is applied, so none of their
+	// quantities has to be measured. When it was not stated the other rates are the
+	// fallback and are checked below exactly as they would be without it.
+	if rates.set[cReportedCost] {
+		if req.ReportedCostStated {
+			return NoPriceNone, ""
+		}
+		if rates.count() == 1 {
+			return NoPriceReportedNotStated, componentInfo[cReportedCost].name
+		}
+	}
+
 	// The axis the vendor billed on, when it said. Asked as a whitelist —
 	// see [billedQuantities] — because the blacklist this replaces refused
 	// only the directions somebody had enumerated, and it left the
@@ -652,6 +675,9 @@ func notionalPriceable(r *rule, req *Request) bool {
 // `cache_read` beside `input` charges each token once. [chargedQuantity] states the rule.
 func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 	rates := effectiveRates(r, req)
+	if activeReported(&rates, req) {
+		return evalReported(r, &rates, req, comps)
+	}
 	carvedIn, carvedOut := carvedInput(&rates, req), carvedOutput(&rates, req)
 	var total amt
 	for i := 0; i < numComponents; i++ {
@@ -666,7 +692,7 @@ func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 			}
 			continue
 		}
-		if !rates.set[i] {
+		if !rates.set[i] || i == cReportedCost {
 			continue
 		}
 		qty, err := chargedQuantity(i, req, carvedIn, carvedOut)
@@ -689,6 +715,34 @@ func evalUsage(r *rule, req *Request, comps *[]Component) (amt, error) {
 		}
 	}
 	return total, nil
+}
+
+// activeReported reports whether the upstream's stated cost prices this request: the
+// rule carries a reported_cost rate and the upstream stated a figure.
+func activeReported(rates *rateSet, req *Request) bool {
+	return rates.set[cReportedCost] && req.ReportedCostStated
+}
+
+// evalReported prices a request at the upstream's stated cost times the rule's
+// multiplier, as the single component line of the rule.
+func evalReported(r *rule, rates *rateSet, req *Request, comps *[]Component) (amt, error) {
+	qty, err := quantityOf(cReportedCost, req)
+	if err != nil {
+		return amt{}, err
+	}
+	if qty == 0 {
+		// A vendor that stated zero priced the request at zero, which is a
+		// measurement and not an absence: there is no line to show.
+		return amt{}, nil
+	}
+	v, err := componentValue(rates.atto[cReportedCost], qty, componentInfo[cReportedCost].divisor)
+	if err != nil {
+		return amt{}, err
+	}
+	if err := appendComponent(comps, r, cReportedCost, rates.text[cReportedCost], qty, v); err != nil {
+		return amt{}, err
+	}
+	return v, nil
 }
 
 // componentValue is rate x quantity / divisor, formed at 128-bit width. Because a price

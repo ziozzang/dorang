@@ -774,6 +774,7 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 		Characters     string `yaml:"characters,omitempty"`
 		ComputeSeconds string `yaml:"compute_seconds,omitempty"`
 		AudioSeconds   string `yaml:"audio_seconds,omitempty"`
+		ReportedCost   string `yaml:"reported_cost,omitempty"`
 
 		AmountPerPeriod string `yaml:"amount_per_period,omitempty"`
 		Period          string `yaml:"period,omitempty"`
@@ -823,6 +824,8 @@ func encodeRule(r *config.PricingRule) (*yaml.Node, error) {
 			out.ComputeSeconds = v.String()
 		case "audio_seconds":
 			out.AudioSeconds = v.String()
+		case config.ReportedCostComponent:
+			out.ReportedCost = v.String()
 		default:
 			// Unreachable from a loaded configuration: internal/config refuses
 			// an unknown component, and `images` with it. It stays as a guard

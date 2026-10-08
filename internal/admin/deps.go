@@ -590,6 +590,10 @@ type LogRow struct {
 	UtilMultiplierPPM int64
 	UtilPPM           int64
 	UtilSource        string
+	// ReportedCostNano is what the upstream stated the request cost, and
+	// ReportedCost whether it stated one.
+	ReportedCostNano int64
+	ReportedCost     bool
 
 	LatencyMS      int64
 	TTFTMS         int64

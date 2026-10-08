@@ -43,6 +43,9 @@ func TestTraceCodecRoundTrip(t *testing.T) {
 		{}, // every field zero
 		{RequestID: "req", Excerpt: "유니코드 excerpt with emoji 🎉", CostNano: -5, Status: -1},
 		{RequestID: strings.Repeat("x", 4000), Excerpt: strings.Repeat("y", 4000)},
+		// The upstream's stated cost, and a stated zero, which is not "unstated".
+		{RequestID: "rep", ReportedCostNano: 340, ReportedCost: true, UtilSource: "observed"},
+		{RequestID: "free", ReportedCost: true},
 	}
 	for i, want := range cases {
 		b := appendTrace(nil, &want)

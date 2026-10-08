@@ -34,6 +34,12 @@ const (
 	cWebSearches
 	cImageInput
 	cImageOutput
+	// cReportedCost prices what the UPSTREAM stated the request cost, in nano-USD.
+	// Its rate is a multiplier ("1" bills the figure as stated). It belongs to no
+	// unit: it is an overlay that takes over the whole rule when the figure is
+	// stated and steps aside when it is not, so the rule's other rates are its
+	// fallback (see [activeReported]).
+	cReportedCost
 	numComponents
 )
 
@@ -60,7 +66,17 @@ var componentInfo = [numComponents]struct {
 	cImageOutput:    {"image_output", "image_output", UnitPerMillionTokens, 1_000_000, 0},
 	cComputeSeconds: {"compute_seconds", "compute_seconds", UnitPerComputeSecond, microsPerSecond, 6},
 	cAudioSeconds:   {"audio_seconds", "audio_seconds", UnitPerAudioSecond, microsPerSecond, 6},
+	cReportedCost:   {"reported_cost", "reported_cost", UnitNone, nanosPerUnit, 9},
 }
+
+// nanosPerUnit is one currency unit in the nano-units a reported cost is counted in.
+const nanosPerUnit = 1_000_000_000
+
+// reportedRateMaxFraction bounds the fractional digits of a reported_cost multiplier.
+// rate x nano-USD / 1e9 is exact in atto only when the atto-scaled rate is a multiple
+// of 1e9, which is nine fractional digits; a tenth would make the product round
+// somewhere the ledger cannot see.
+const reportedRateMaxFraction = 9
 
 // tokenComponents is the set of components that price a token count.
 var tokenComponents = [numComponents]bool{
@@ -619,6 +635,7 @@ type rawRule struct {
 	Characters     string `yaml:"characters"`
 	ComputeSeconds string `yaml:"compute_seconds"`
 	AudioSeconds   string `yaml:"audio_seconds"`
+	ReportedCost   string `yaml:"reported_cost"`
 	// Seconds is decoded ONLY so that the refusal below can name the key the operator
 	// wrote and say what to write instead. Deleting the field would turn `seconds:`
 	// into KnownFields' "field seconds not found", which reads like a typo — and it is
@@ -649,6 +666,7 @@ func (r rawRule) rateStrings() [numComponents]string {
 		cCacheWrite: r.CacheWrite, cReasoning: r.Reasoning,
 		cRequest: r.Request, cCharacters: r.Characters,
 		cComputeSeconds: r.ComputeSeconds, cAudioSeconds: r.AudioSeconds,
+		cReportedCost: r.ReportedCost,
 	}
 }
 
@@ -781,6 +799,12 @@ func (c *Catalog) compileRule(raw *rawRule) (*rule, error) {
 		if class == ClassNotional {
 			if err := compileProvenance(raw, r); err != nil {
 				return nil, err
+			}
+			// A notional rate is a LIST price (§8.5), and what an upstream said
+			// this request cost is not one — it is the bill itself.
+			if raw.ReportedCost != "" {
+				return nil, errors.New("reported_cost does not apply to a notional_rate rule: " +
+					"a notional figure is a list price, and the upstream's statement is the bill")
 			}
 		}
 	case ClassSubscription:
@@ -924,7 +948,10 @@ func compileRates(in [numComponents]string, unit Unit) (rateSet, error) {
 			continue
 		}
 		info := componentInfo[i]
-		if info.unit != unit {
+		// reported_cost belongs to no unit, so it is the one rate a rule of any
+		// unit may carry: it is that rule's statement that the upstream's own
+		// figure, when there is one, replaces the rest.
+		if i != cReportedCost && info.unit != unit {
 			return rs, fmt.Errorf("rate %q does not belong to unit %s (it is a %s rate)",
 				info.yaml, unit, info.unit)
 		}
@@ -934,6 +961,10 @@ func compileRates(in [numComponents]string, unit Unit) (rateSet, error) {
 		}
 		if d.neg {
 			return rs, fmt.Errorf("rate %q: a marginal rate may not be negative", info.yaml)
+		}
+		if i == cReportedCost && d.scale > reportedRateMaxFraction {
+			return rs, fmt.Errorf("rate %q is a multiplier and takes at most %d fractional digits",
+				info.yaml, reportedRateMaxFraction)
 		}
 		a, ok := d.atto()
 		if !ok {

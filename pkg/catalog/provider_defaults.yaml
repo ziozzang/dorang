@@ -314,6 +314,13 @@ kinds:
     category: chat
     supports_tools: true
     supports_streaming: true
+    # Measured 2026-10-09: every answer states `usage.cost` in USD — buffered,
+    # and on the final usage chunk of a stream (e.g. 8.8e-7 for 35 tokens of
+    # ibm-granite/granite-4.0-h-micro), embeddings included (0 on a :free id).
+    # Under BYOK it is OpenRouter's fee only and the provider's charge is
+    # `usage.cost_details.upstream_inference_cost`; no deployment here is BYOK.
+    reported_cost: usage.cost
+    usage_api: openrouter
 
   # ---- Decision models (System One) ----------------------------------------
   #
@@ -501,6 +508,15 @@ kinds:
       `anthropic/` (extensions/deepinfra/cache-wrapper.ts:11-26, gate at
       extensions/deepinfra/index.ts:121). A kind-level scheme would apply it to
       every model, so this declares none.
+    # Measured 2026-10-09. Chat states `usage.estimated_cost` in USD, buffered
+    # and on a stream's final usage chunk (an earlier chunk carries it as
+    # null). Embeddings and transcriptions state no cost; a transcription's
+    # `json` answer states not even a duration, so it is asked for as
+    # verbose_json, whose `duration` matches the account usage API's billed
+    # input length to the millisecond (4.008 s on both).
+    reported_cost: usage.estimated_cost
+    transcription_duration: verbose_json
+    usage_api: deepinfra
     probe: { result: citation_only, date: 2026-08-03 }
 
   novita:

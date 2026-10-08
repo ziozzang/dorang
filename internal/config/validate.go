@@ -1420,6 +1420,23 @@ func (c *Config) validatePricing(col *collector, providers map[string]*Provider,
 					r.Match.Credential)
 			}
 		}
+		if _, ok := r.Rates[ReportedCostComponent]; ok {
+			switch {
+			case r.Class == PricingNotionalRate:
+				col.add(path+".rates[\"reported_cost\"]", "reported_cost does not apply to a "+
+					"notional_rate rule: a notional figure is a list price, and what the upstream "+
+					"states is the bill itself (§8.5)")
+			case fractionDigits(string(r.Rates[ReportedCostComponent])) > 9:
+				// internal/pricing refuses it at assembly; refused here too so that
+				// `config lint` and the server agree about which files load.
+				col.add(path+".rates[\"reported_cost\"]", "reported_cost is a multiplier and "+
+					"takes at most 9 fractional digits")
+			case !strings.EqualFold(c.Pricing.Currency, "USD"):
+				col.add(path+".rates[\"reported_cost\"]", "reported_cost prices the figure an "+
+					"upstream states in USD, and pricing.currency is %q; dorang does not convert "+
+					"currencies", c.Pricing.Currency)
+			}
+		}
 		seenComp := map[string]string{}
 		for _, comp := range sortedKeys(r.Rates) {
 			cpath := fmt.Sprintf("%s.rates[%q]", path, comp)
@@ -1986,4 +2003,13 @@ func (c *Config) validateLeasedLimits(col *collector) {
 				k.MaxConcurrency)
 		}
 	}
+}
+
+// fractionDigits counts the digits after a decimal point, ignoring trailing zeros.
+func fractionDigits(s string) int {
+	i := strings.IndexByte(s, '.')
+	if i < 0 {
+		return 0
+	}
+	return len(strings.TrimRight(s[i+1:], "0"))
 }

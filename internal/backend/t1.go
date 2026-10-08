@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"encoding/json"
+
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 )
@@ -51,7 +53,13 @@ func encodeT1(x *exchange) ([]byte, error) {
 		return openai.MarshalSpeechRequest(c.Speech, model)
 
 	case OpTranscription, OpTranslation:
-		body, _, err := openai.EncodeTranscriptionForm(c.Transcription, model, x.boundary())
+		req := c.Transcription
+		if x.prov.verboseDuration && verboseUpgradable(req) {
+			up := *req
+			up.Format = "verbose_json"
+			req, x.verboseUpgraded = &up, true
+		}
+		body, _, err := openai.EncodeTranscriptionForm(req, model, x.boundary())
 		if err != nil {
 			return nil, err
 		}
@@ -125,6 +133,12 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 		if err != nil {
 			return nil, err
 		}
+		// What is metered is read before the upgraded answer is cut back to the
+		// shape the caller asked for, because the cut removes the duration.
+		metered := transcriptionMetered(cresp)
+		if x.verboseUpgraded {
+			cresp = asJSONTranscript(cresp)
+		}
 		out, mt, err := openai.MarshalTranscriptionResponse(cresp)
 		if err != nil {
 			return nil, err
@@ -137,11 +151,7 @@ func decodeT1(body []byte, x *exchange) (*decoded, error) {
 			// different facts and only one of them is this.
 			out = []byte{}
 		}
-		d := &decoded{raw: out, ctype: mt}
-		if cresp.Usage != nil {
-			d.usage = *cresp.Usage
-		}
-		return d, nil
+		return &decoded{raw: out, ctype: mt, usage: metered}, nil
 
 	case OpImageGenerate, OpImageEdit, OpImageVariation:
 		cresp, err := openai.DecodeImageResponse(body)
@@ -203,4 +213,63 @@ const jsonType = "application/json"
 
 func multipartType(boundary string) string {
 	return "multipart/form-data; boundary=" + boundary
+}
+
+// verboseUpgradable reports whether a transcription request may be sent upstream
+// as verbose_json without the caller noticing: it asked for the `json` shape (or
+// named none, which is `json`), and it did not stream. A text, srt or vtt answer is
+// never re-rendered from parsed fields — see [openai.MarshalTranscriptionResponse]
+// for why — so those formats go upstream as asked and stay unpriced on a host that
+// states no duration for them.
+func verboseUpgradable(req *canonical.TranscriptionRequest) bool {
+	if req == nil || req.Stream {
+		return false
+	}
+	return req.Format == "" || req.Format == "json"
+}
+
+// transcriptionMetered is the usage a transcript is metered with.
+//
+// The vendor's own usage block wins whenever it sent one: it is what the invoice
+// says, including a rounded billing minute. Without one, a verbose answer's
+// top-level `duration` is the length of the recording and is the quantity a
+// per-audio-second rate is quoted against. It is carried with the billed unit
+// UNSTATED, because the vendor did not say it billed by duration — the duration is
+// a measurement of the media, and a host that bills a rounded minute would differ
+// from it in the ledger, which is where that difference belongs.
+func transcriptionMetered(r *canonical.TranscriptionResponse) canonical.Usage {
+	switch {
+	case r.Usage != nil:
+		return *r.Usage
+	case r.Raw == nil && r.Duration > 0:
+		return canonical.Usage{AudioSeconds: r.Duration}
+	}
+	return canonical.Usage{}
+}
+
+// asJSONTranscript cuts a verbose transcript back to the `json` response format's
+// members: the text, and the usage block when the vendor sent one. Everything the
+// verbose form adds — language, duration, segments, words, `task` — is what the
+// caller did not ask for.
+func asJSONTranscript(r *canonical.TranscriptionResponse) *canonical.TranscriptionResponse {
+	if r.Raw != nil {
+		return r
+	}
+	out := &canonical.TranscriptionResponse{
+		Text:         r.Text,
+		Usage:        r.Usage,
+		UsageUnit:    r.UsageUnit,
+		UsageSeconds: r.UsageSeconds,
+		UsageExtra:   r.UsageExtra,
+	}
+	for k, v := range r.Extra {
+		if k == "task" {
+			continue
+		}
+		if out.Extra == nil {
+			out.Extra = make(map[string]json.RawMessage, len(r.Extra))
+		}
+		out.Extra[k] = v
+	}
+	return out
 }

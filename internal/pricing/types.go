@@ -403,6 +403,14 @@ type Request struct {
 	// Unstated is the zero value and constrains nothing.
 	Billed BilledUnit
 
+	// ReportedCostNano is what the UPSTREAM stated this request cost, in nano-units of
+	// the catalog currency, and ReportedCostStated says it stated one. A zero with the
+	// flag set is a vendor that said "free"; a zero with it clear is a vendor that said
+	// nothing, and only the first can be billed. A rule prices it only through a
+	// `reported_cost` rate.
+	ReportedCostNano   int64
+	ReportedCostStated bool
+
 	// UtilizationPPM is how contended the backend was while this request ran, in parts
 	// per million of full: 1_000_000 is a saturated engine. It is an integer and not a
 	// fraction because a price input never passes through binary floating point (§8.3);
@@ -494,6 +502,10 @@ const (
 	// this request by duration. The token counts on such a response are usually absent
 	// or synthesized, so the rule would charge a confident zero.
 	NoPriceVendorBilledDuration
+	// NoPriceReportedNotStated: the rule prices only the upstream's stated cost
+	// (`reported_cost` and no fallback rate) and the upstream stated none. This is also
+	// the ordinary state of a quote taken before the request runs.
+	NoPriceReportedNotStated
 )
 
 // Why renders the reason in words, for the preview endpoint and the operator's log line.
@@ -512,6 +524,9 @@ func (r NoPriceReason) Why() string {
 	case NoPriceVendorBilledDuration:
 		return "the rule prices tokens and the backend reported billing this request by " +
 			"duration (usage.type); a billing unit is never converted"
+	case NoPriceReportedNotStated:
+		return "the rule prices only the cost the upstream states (reported_cost) and the " +
+			"upstream stated none for this request; no fallback rate is declared"
 	}
 	return ""
 }
@@ -606,6 +621,11 @@ type Cost struct {
 	// catalog, never formatted here: §15.5 forbids building a string on the hot path.
 	NoPriceRule     string
 	NoPriceQuantity string
+	// ReportedPriced says the marginal amount is the upstream's stated cost (times the
+	// rule's multiplier). ReportedFallback says the rule asked for that figure, the
+	// upstream stated none, and the rule's other rates priced the request instead.
+	ReportedPriced   bool
+	ReportedFallback bool
 
 	// Floored reports that the adjustments summed to less than the cost they applied to,
 	// so the total was clamped to zero and AdjustmentNano reduced to match. A credit that

@@ -1037,7 +1037,7 @@ pricing:
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | 어떤 종류의 비용인가 | `notional_rate` 규칙은 `source`와 `as_of`를 실어야 하고, 다른 어떤 클래스도 그 둘을 실을 수 없다 (§8.5) |
 | `rules[].priority` | int | `0` | id보다 먼저 specificity 동률을 가른다 | 음수 거부 |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | specificity 사다리 | 선언되지 않은 `provider`나 `credential`은 거부. `model`과 `model_prefix`는 선언된 모델과 대조되지 **않는다** — 현재 어떤 배포도 서빙하지 않는 모델을 정당하게 가격 매길 수 있다 |
-| `rules[].rates.<component>` | decimal | — | 각 컴포넌트의 수량 **한 단위당** 요율이며, 토큰 5종의 그 한 단위는 **100만 토큰이다 — §13.1c**. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다. **토큰당 값은 거부되지 않는다** — 모든 요청이 0원이 되는데도 `/spend/calculate`는 규칙이 매치됐다며 여전히 `"missing": false`를 답한다(§13.1c). 대신 *경고*된다: `config lint`와 `--check`가 100만당 `0.00001` 미만의 토큰 요율을 보고한다. 지수 표기(`1.25e-7`)와 소수점 아래 12자리 초과는 로더와 엔진 양쪽에서 **거부된다**(§13.1c) |
+| `rules[].rates.<component>` | decimal | — | 각 컴포넌트의 수량 **한 단위당** 요율이며, 토큰 5종의 그 한 단위는 **100만 토큰이다 — §13.1c**. 컴포넌트: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`, 그리고 `reported_cost`(§13.1d). **요율표는 배타적이다: 부분에 대한 요율은 그 부분을 부모에서 잘라낸다 — §13.1a.** 초당 요율이 어느 초를 가격 매기는지는 §13.1b | 요율 없는 `marginal_usage` 규칙 거부. `images`는 거부되며 대신 `request`를 지목한다: 요청 타입이 이미지 수를 싣지 않는다. `seconds`도 거부되며 그것을 대체한 두 축을 지목한다. **한 규칙이 서로 다른 단위의 컴포넌트를 섞을 수 없다** — `unit`은 규칙당 하나이므로 토큰과 초는 두 규칙으로 나눠 쓴다. **토큰당 값은 거부되지 않는다** — 모든 요청이 0원이 되는데도 `/spend/calculate`는 규칙이 매치됐다며 여전히 `"missing": false`를 답한다(§13.1c). 대신 *경고*된다: `config lint`와 `--check`가 100만당 `0.00001` 미만의 토큰 요율을 보고한다. 지수 표기(`1.25e-7`)와 소수점 아래 12자리 초과는 로더와 엔진 양쪽에서 **거부된다**(§13.1c) |
 | `rules[].period` + `rules[].amount` | string + decimal | — | `fixed_subscription`의 주기와 비용 | 그 클래스에 둘 다 필수; 금액 0 거부 |
 | `rules[].percent` | decimal | — | `adjustment`의 퍼센트 | 그 클래스에 필수; 0 거부 |
 
@@ -1096,7 +1096,7 @@ DESIGN §10.7의 규칙 — *청구 단위는 절대 변환되지 않는다* —
 | 이렇게 적으면 | 이 단위에서 | dorang이 부과하는 것 | 쓰이는 곳 |
 |---|---|---|---|
 | `compute_seconds` | `per_compute_second` | **요청**이 걸린 시간 | self-hosted 배포의 GPU-초 / 점유 요율 |
-| `audio_seconds` | `per_audio_second` | **벤더가 청구한 녹음**의 길이, `usage.seconds`에서 | 음성 인식, 그리고 매체 길이로 청구되는 그 밖의 모든 것 |
+| `audio_seconds` | `per_audio_second` | **벤더가 청구한 녹음**의 길이, `usage.seconds`에서 — 응답에 usage 블록이 없으면 verbose 전사의 `duration`에서(§13.1d) | 음성 인식, 그리고 매체 길이로 청구되는 그 밖의 모든 것 |
 
 요율 이름이 축을 명명하므로 축을 말하지 않을 수 없다. `unit: per_second`와 맨 `seconds:` 요율은 두 대체
 이름을 모두 지목하는 **로드 에러**다 — 그렇게 적는 오퍼레이터는 오타를 내는 것이 아니라 예전에 존재했던
@@ -1137,6 +1137,7 @@ DESIGN §10.7의 규칙 — *청구 단위는 절대 변환되지 않는다* —
 | `characters` | `per_1k_characters` | 1,000자 | 10³ |
 | `compute_seconds` | `per_compute_second` | 요청 자체의 벽시계 1초 (§13.1b) | 1 |
 | `audio_seconds` | `per_audio_second` | 녹음된 오디오 1초 (§13.1b) | 1 |
+| `reported_cost` | 없음 (§13.1d) | **업스트림이 밝힌** 1 USD; 요율은 배수다 | 1 |
 
 이 절 맨 위의 규칙으로 계산해 보면 — 프롬프트 12,000 토큰 중 2,000이 캐시에서, 완성 800 토큰.
 §13.1a의 잘라내기로 `input`에는 10,000이 청구된다:
@@ -1205,6 +1206,52 @@ importer는 지수 표기(`2.5e-06`)로 적힌 요율도 읽는다. 부동소수
 토큰 요율은 시장에서 가장 싼 요율표보다도 세 자릿수 아래이므로, 규칙과 요율을 지목하는 **경고**를
 출력한다. 그것은 경고로 남고 결코 거절이 되지 않는다 — 100만 토큰당 $0.02인 정말로 싼 모델이
 존재하고, 틀린 가격이 게이트웨이를 서비스 못 하게 만드는 원인이 되어서는 안 된다.
+
+### 13.1d 업스트림이 밝힌 비용 — `reported_cost`
+
+어떤 업스트림은 요청마다 비용을 응답에 직접 적는다: OpenRouter의 `usage.cost`, DeepInfra의
+`usage.estimated_cost`(채팅만). 그 위치는 provider **kind**가 모델 카탈로그에 선언하고
+(`reported_cost: usage.cost`, 단위는 `reported_cost_unit: usd | usd_cents`), dorang은 업스트림의
+바이트에서 — 변환에 성공한 버퍼 본문, 또는 스트림에서 그 값을 실은 이벤트에서 — 읽어 **가격
+규칙과 무관하게** 모든 요청에 기록한다: 원장의 `reported_cost_nano`, `/spend/logs`의
+`reported_spend`(아무것도 밝히지 않았으면 0이 아니라 null), 버퍼 응답의 `X-Dorang-Reported-Cost-Usd`.
+
+규칙은 요청할 때만 그 값으로 청구한다:
+
+```yaml
+pricing:
+  currency: USD
+  rules:
+    - id: openrouter-as-billed
+      class: marginal_usage
+      match: {provider: openrouter}
+      rates: {reported_cost: "1"}          # 벤더가 밝힌 값 x1
+    - id: deepinfra-as-billed
+      class: marginal_usage
+      match: {provider: deepinfra}
+      rates: {reported_cost: "1", input: "0.02", output: "0.03"}   # 대체 요율
+```
+
+- **밝혔으면 그것이 한계 가격 전부다.** 규칙의 다른 요율은 더해지지 않고, 그 수량을 측정할 필요도
+  없다. utilization 계수(§8.6)도 곱하지 않는다: 벤더의 청구서이고, 이미 그때의 점유율로 매겨진 값이다.
+- **밝히지 않았으면 규칙의 다른 요율이 가격을 매기고**, 벤더가 밝히지 않았다고 로그에 남는다.
+  `reported_cost`만 있는 규칙이면 그 요청은 공짜가 아니라 **가격 없음**(§8.3)이다. 벤더가 `0`이라고
+  밝힌 것은 0원이라는 가격이다.
+- `reported_cost`는 어느 단위에도 속하지 않으므로 한 단위의 요율 옆에 함께 쓸 수 있다.
+  `notional_rate` 규칙(벤더의 청구서는 정가가 아니다), 소수점 아래 9자리 초과, `pricing.currency`가
+  `USD`가 아닌 경우는 거부된다.
+- 예산 hold는 요청 전에, 즉 그 값이 아직 없을 때 잡힌다: `reported_cost`만 있는 규칙은 아무것도
+  잡지 않고 밝혀진 비용으로 정산한다. 초당 규칙과 같다.
+
+**길이를 밝히지 않는 전사.** DeepInfra의 `json` 전사는 `{"text": …}`뿐이라 `audio_seconds` 규칙에
+수량이 없었다. `transcription_duration: verbose_json`을 선언한 kind는 `json`(또는 형식 미지정) 요청을
+업스트림에 `verbose_json`으로 보내 그 `duration`을 계량하고, 호출자에게는 요청한 `json` 모양으로
+돌려준다. `text`, `srt`, `vtt`는 요청한 그대로 보내지고 이런 호스트에서는 가격 없음으로 남는다.
+
+**벤더와 대조.** `dorangctl spend reconcile [--period YYYY-MM]`은 각 벤더 계정의 사용량
+엔드포인트(`usage_api`를 선언한 kind)를 게이트웨이의 credential로 읽어 원장의 reported 열, dorang 열
+옆에 출력한다. 벤더가 나눠 주면 모델별로 나온다. 읽기 전용이다. DeepInfra 값은 계정 전체(모든 키)이며
+모델별이고, 일반 OpenRouter 키는 자기 자신의 이번 달 합계만 밝힌다.
 
 ### 13.2 클래스는 경쟁하지 않고 합성한다
 

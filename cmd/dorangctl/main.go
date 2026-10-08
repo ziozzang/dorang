@@ -64,6 +64,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return e.runMigrate(args[1:])
 	case "health":
 		return e.runHealth(args[1:])
+	case "spend":
+		return e.runSpend(args[1:])
 	}
 	fmt.Fprintf(stderr, "dorangctl: unknown command %q\n", args[0])
 	usage(stderr)
@@ -113,6 +115,10 @@ commands:
   key list                     list issued keys
   key revoke <id>              block a key
   migrate                      apply database migrations and exit
+  spend reconcile [--period YYYY-MM] [--provider NAMES]
+                               compare each vendor account's own usage figure
+                               (kinds declaring usage_api) with the ledger's
+                               reported and dorang cost columns. Read-only
   health [--addr URL] [--ready]
                                probe a running gateway; exit 0 only if healthy.
                                This is what the container image's HEALTHCHECK runs

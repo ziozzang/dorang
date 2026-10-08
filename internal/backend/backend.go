@@ -342,13 +342,19 @@ type Result struct {
 	// the same bytes a buffered answer of that exchange would have carried on
 	// Body. Nil on every other family and on every failed stream.
 	CompletedResponse []byte
-	Usage       canonical.Usage
+	Usage             canonical.Usage
 	// UsageExtra is what the upstream reported that no counter names, including
 	// what SERVER-SIDE tools cost. It is carried rather than summarised because
 	// pricing charges some of it: a web search is billed per search and an
 	// image's tokens at a rate unrelated to chat tokens, and neither is
 	// reachable from any field above.
 	UsageExtra *canonical.UsageExtra
+	// ReportedCostNano is what the UPSTREAM stated this request cost, in
+	// nano-USD, read where its kind declares the figure (see cost.go), and
+	// ReportedCost says whether it stated one. Set only on a successful
+	// exchange: a figure seen before an in-band failure is not a charge.
+	ReportedCostNano int64
+	ReportedCost     bool
 
 	TTFT  time.Duration
 	Total time.Duration
@@ -708,9 +714,17 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		// (DESIGN §10.4). Nothing of the answer has been read yet, so the report
 		// carries the request direction only — see [Call.Accepted].
 		x.accept()
+		var tap *costTap
+		if x.prov.cost != nil {
+			tap = newCostTap(resp.Body, x.prov.cost)
+			resp.Body = tap
+		}
 		usage, sent, err := b.relay(x, resp, w)
 		res.Total = b.now().Sub(start)
 		res.Usage = usage
+		if err == nil {
+			res.ReportedCostNano, res.ReportedCost = tap.reported()
+		}
 		res.CompletedResponse = x.completedResponse
 		// From the bytes that actually reached the client, not from the fact that
 		// this was a stream. The flag closes fail-back for good (§7.6), and it
@@ -791,6 +805,11 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		return res
 	}
 	res.Usage = usage
+	// After the conversion succeeded, so that a vendor error wearing a 200 is
+	// never recorded as a request that cost something.
+	if n, st := x.prov.cost.read(body); st == costStated {
+		res.ReportedCostNano, res.ReportedCost = n, true
+	}
 	// The counts nothing names, carried to whoever prices this. A web search is
 	// billed per search and an image's tokens at a rate unrelated to chat
 	// tokens, and neither is reachable from res.Usage.

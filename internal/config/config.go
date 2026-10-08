@@ -1240,7 +1240,14 @@ var pricingComponents = []string{
 	// charges at unrelated rates, and folding them into `request` or `input`
 	// would price them wrongly without anything failing.
 	"web_searches", "image_input", "image_output",
+	// What the upstream STATED the request cost, times this multiplier. It belongs
+	// to no unit (see [PricingUnit]) and takes over the rule when the upstream
+	// stated a figure; the rule's other rates are the fallback when it did not.
+	"reported_cost",
 }
+
+// ReportedCostComponent is the one component that belongs to no unit.
+const ReportedCostComponent = "reported_cost"
 
 // pricingComponentUnit maps a canonical component onto the price catalog's `unit`.
 //
@@ -1276,6 +1283,10 @@ var pricingComponentUnit = map[string]string{
 func PricingUnit(components []string) (string, bool) {
 	unit := ""
 	for _, name := range components {
+		if name == ReportedCostComponent {
+			// An overlay, not a quantity: a rule of any unit may carry it.
+			continue
+		}
 		u, ok := pricingComponentUnit[CanonicalComponent(name)]
 		if !ok {
 			return "", false

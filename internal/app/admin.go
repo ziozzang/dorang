@@ -937,6 +937,8 @@ func adminLogRow(r store.RequestLog) admin.LogRow {
 		UtilMultiplierPPM: r.UtilMultiplierPPM,
 		UtilPPM:           r.UtilPPM,
 		UtilSource:        r.UtilSource,
+		ReportedCostNano:  r.ReportedCostNano,
+		ReportedCost:      r.ReportedCost,
 		LatencyMS:         r.LatencyMS, TTFTMS: r.TTFTMS, QueueMS: r.QueueMS,
 		CapacityWaitMS: r.CapacityWaitMS, UpstreamMS: r.UpstreamMS,
 		FallbackCount: r.FallbackCount, Streamed: r.Streamed,

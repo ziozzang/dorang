@@ -1206,7 +1206,7 @@ transcribing a card. A per-token rate is not refused, it prices every request to
 | `rules[].class` | `marginal_usage` \| `fixed_subscription` \| `adjustment` \| `notional_rate` | `marginal_usage` | Which kind of cost this is | A `notional_rate` rule must carry `source` and `as_of`, and no other class may (§8.5) |
 | `rules[].priority` | int | `0` | Breaks a specificity tie before the id does | Negative is refused |
 | `rules[].match.{credential,provider,model,model_prefix,deployment}` | string | `""` | The specificity ladder | A `provider` or `credential` that is not declared is refused. `model` and `model_prefix` are **not** checked against declared models — a rule may legitimately price a model that no deployment currently serves |
-| `rules[].rates.<component>` | decimal | — | Rates, each **per one unit of its component's quantity, and that quantity is a MILLION tokens for the five token components — §13.1c**. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`. **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. **A per-TOKEN rate is not refused** — it prices every request to zero while `/spend/calculate` still answers `"missing": false`, because the rule did match (§13.1c). It is *warned* about: `config lint` and `--check` report a token rate below `0.00001` per million. Exponent notation (`1.25e-7`) and more than twelve fractional digits **are** refused, by the loader and the engine alike (§13.1c). `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
+| `rules[].rates.<component>` | decimal | — | Rates, each **per one unit of its component's quantity, and that quantity is a MILLION tokens for the five token components — §13.1c**. Components: `input`, `output`, `cached_read`, `cache_write`, `reasoning`, `request`, `characters`, `compute_seconds`, `audio_seconds`, and `reported_cost` (§13.1d). **The table is exclusive: a rate for a part carves that part out of its parent — §13.1a.** Which second a per-second rate prices is §13.1b | A `marginal_usage` rule with no rates is refused. **A per-TOKEN rate is not refused** — it prices every request to zero while `/spend/calculate` still answers `"missing": false`, because the rule did match (§13.1c). It is *warned* about: `config lint` and `--check` report a token rate below `0.00001` per million. Exponent notation (`1.25e-7`) and more than twelve fractional digits **are** refused, by the loader and the engine alike (§13.1c). `images` is refused, naming `request` instead: the request type carries no image count. `seconds` is refused, naming the two axes that replaced it. **A rule may not mix components from two units** — `unit` is one value per rule — so price tokens and seconds in two rules |
 | `rules[].period` + `rules[].amount` | string + decimal | — | A `fixed_subscription` rule's period and cost | Both required for that class; a zero amount is refused |
 | `rules[].percent` | decimal | — | An `adjustment` rule's percentage | Required for that class; zero is refused |
 
@@ -1274,7 +1274,7 @@ both.
 | Write this | On this unit | And dorang charges | Use it for |
 |---|---|---|---|
 | `compute_seconds` | `per_compute_second` | how long **the request** took | a GPU-second / occupancy rate on a self-hosted deployment |
-| `audio_seconds` | `per_audio_second` | how long **the recording the vendor billed** was, from `usage.seconds` | speech-to-text, and anything else billed by media length |
+| `audio_seconds` | `per_audio_second` | how long **the recording the vendor billed** was, from `usage.seconds` — or, when the answer has no usage block, a verbose transcript's `duration` (§13.1d) | speech-to-text, and anything else billed by media length |
 
 The rate names the axis, so the axis cannot be left unsaid. `unit: per_second` and a bare
 `seconds:` rate are **load errors** that name both replacements — an operator who writes one is
@@ -1321,6 +1321,7 @@ one divisor table and it is not configurable:
 | `characters` | `per_1k_characters` | 1,000 characters | 10³ |
 | `compute_seconds` | `per_compute_second` | one second of request wall time (§13.1b) | 1 |
 | `audio_seconds` | `per_audio_second` | one second of recorded audio (§13.1b) | 1 |
+| `reported_cost` | none (§13.1d) | one USD **the upstream stated**; the rate is a multiplier | 1 |
 
 Worked, against the rule at the top of this section — 12,000 prompt tokens of which 2,000 were
 served from cache, and 800 completion tokens. The carve-out of §13.1a charges 10,000 at `input`:
@@ -1394,6 +1395,56 @@ not that the rule is right.
 they print a **warning** naming the rule and the rate. It stays a warning and never a refusal —
 a genuinely cheap model exists at $0.02 per million, and a wrong price must never be what stops
 a gateway from serving.
+
+### 13.1d What the upstream says it cost — `reported_cost`
+
+Some upstreams state the cost of each request on the response itself: OpenRouter's
+`usage.cost`, DeepInfra's `usage.estimated_cost` (chat only). The provider **kind** declares where
+(`reported_cost: usage.cost` in the model catalog, with `reported_cost_unit: usd | usd_cents`),
+and dorang reads it from the upstream's bytes — the buffered body after it converted, or the
+event of a stream that carries it — and records it on every request **whatever its pricing
+rule**: the ledger's `reported_cost_nano`, `/spend/logs`' `reported_spend` (null when nothing was
+stated, which is not zero) and, on a buffered answer, `X-Dorang-Reported-Cost-Usd`.
+
+A rule bills it only when it asks to:
+
+```yaml
+pricing:
+  currency: USD
+  rules:
+    - id: openrouter-as-billed
+      class: marginal_usage
+      match: {provider: openrouter}
+      rates: {reported_cost: "1"}          # the vendor's figure, x1
+    - id: deepinfra-as-billed
+      class: marginal_usage
+      match: {provider: deepinfra}
+      rates: {reported_cost: "1", input: "0.02", output: "0.03"}   # fallback rates
+```
+
+- **Stated → it is the whole marginal price.** The rule's other rates are not added, and their
+  quantities need not be measured. A utilization factor (§8.6) does not scale it: it is the
+  vendor's bill, already at whatever occupancy it ran.
+- **Not stated → the rule's other rates price the request** and the log says the vendor stated
+  nothing. A rule with `reported_cost` alone is then **unpriced** (§8.3), not free; a vendor
+  that stated `0` is a price of zero.
+- `reported_cost` belongs to no unit, so it may sit beside the rates of any one unit. It is
+  refused on a `notional_rate` rule (the vendor's bill is not a list price), with more than
+  nine fractional digits, and unless `pricing.currency` is `USD`.
+- A budget hold is taken before the request runs, when no figure exists: a reported-only rule
+  holds nothing and settles at the stated cost, exactly as a per-second rule does.
+
+**Transcripts that state no length.** DeepInfra's `json` transcript is `{"text": …}` and nothing
+else, so an `audio_seconds` rule had no quantity. A kind declaring
+`transcription_duration: verbose_json` has a `json` (or format-less) request sent upstream as
+`verbose_json`, meters its `duration`, and hands the caller the `json` shape it asked for.
+`text`, `srt` and `vtt` are sent as asked and stay unpriced on such a host.
+
+**Reconciling against the vendor.** `dorangctl spend reconcile [--period YYYY-MM]` reads each
+vendor account's own usage endpoint (kinds declaring `usage_api`) with the gateway's credential
+and prints it beside the ledger's reported and dorang columns, per model where the vendor breaks
+it down. Read-only. DeepInfra's figure is account-wide (every key) and per model; an ordinary
+OpenRouter key states only its own current-month total.
 
 ### 13.2 Classes compose; they do not compete
 

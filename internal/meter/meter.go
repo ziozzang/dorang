@@ -334,6 +334,8 @@ func (m *Meter) recordTrace(ev *Event, ts time.Time) {
 		UtilMultiplierPPM: ev.UtilMultiplierPPM,
 		UtilPPM:           ev.UtilPPM,
 		UtilSource:        ev.UtilSource,
+		ReportedCostNano:  ev.ReportedCostNano,
+		ReportedCost:      ev.ReportedCost,
 		Retries:           ev.Trace.Retries,
 		FallbackReason:    ev.Trace.FallbackReason,
 		ErrorMessage:      ev.Trace.ErrorMessage,

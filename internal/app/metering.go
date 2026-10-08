@@ -99,6 +99,8 @@ func (a *meterAdapter) Record(ev server.Event) {
 		UtilMultiplierPPM: r.UtilizationMultiplierPPM,
 		UtilPPM:           int64(r.UtilizationPPM),
 		UtilSource:        r.UtilizationSource,
+		ReportedCostNano:  r.ReportedCostNanoUSD,
+		ReportedCost:      r.ReportedCost,
 		Latency:           time.Duration(ev.DurationNS),
 		TTFT:              time.Duration(r.TTFTNS),
 		Trace: meter.TraceInfo{
@@ -250,6 +252,8 @@ func (s *storeSink) WriteTraces(ctx context.Context, traces []meter.Trace) error
 			UtilMultiplierPPM: t.UtilMultiplierPPM,
 			UtilPPM:           t.UtilPPM,
 			UtilSource:        t.UtilSource,
+			ReportedCostNano:  t.ReportedCostNano,
+			ReportedCost:      t.ReportedCost,
 			LatencyMS:         t.Latency.Milliseconds(),
 			TTFTMS:            t.TTFT.Milliseconds(),
 			QueueMS:           t.QueueWait.Milliseconds(),

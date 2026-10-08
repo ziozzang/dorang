@@ -306,8 +306,13 @@ type Event struct {
 	UtilMultiplierPPM int64
 	UtilPPM           int64
 	UtilSource        string
-	Latency           time.Duration
-	TTFT              time.Duration
+	// ReportedCostNano is what the upstream stated the request cost and
+	// ReportedCost whether it stated one. Stored as SQL NULL when it did not:
+	// a vendor that said "free" and one that said nothing are different rows.
+	ReportedCostNano int64
+	ReportedCost     bool
+	Latency          time.Duration
+	TTFT             time.Duration
 
 	Trace TraceInfo
 }
@@ -462,6 +467,9 @@ type Trace struct {
 	UtilMultiplierPPM int64
 	UtilPPM           int64
 	UtilSource        string
+	// The upstream's stated cost. See [Event].
+	ReportedCostNano int64
+	ReportedCost     bool
 
 	Retries        int
 	FallbackReason string

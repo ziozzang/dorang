@@ -464,6 +464,36 @@ type KindDefaults struct {
 	// three and takes the same bearer credential on each.
 	Surfaces []string
 
+	// TranscriptionDuration names how this kind's host can be made to state
+	// the length of a recording it transcribed, when its default answer does
+	// not. The one value is "verbose_json": a request the caller sent as
+	// `json` (or with no response_format) goes upstream as verbose_json, whose
+	// top-level `duration` is the quantity a per-audio-second rate is quoted
+	// against, and the caller still receives the `json` shape it asked for.
+	// Empty is a host that is sent exactly what the caller sent.
+	//
+	// Measured 2026-10-08 on DeepInfra: `json` answers `{"text":…}` alone, so
+	// a per_audio_second rule matched and priced nothing on every request,
+	// while the account's usage API billed the same requests by input length.
+	TranscriptionDuration string
+
+	// ReportedCost is where this kind's host STATES what a request cost: a
+	// dotted path into the JSON answer (for a stream, into the frame that
+	// carries it), e.g. "usage.cost". Empty is a host that states nothing.
+	// ReportedCostUnit is the unit the figure is in: "usd" (the default when
+	// a path is set) or "usd_cents".
+	//
+	// The figure is the vendor's statement, recorded beside dorang's own
+	// price and billed only by a pricing rule that asks for it
+	// (`rates: {reported_cost: …}`); see internal/pricing.
+	ReportedCost     string
+	ReportedCostUnit string
+
+	// UsageAPI names the account-level usage endpoint the host offers, which
+	// `dorangctl spend reconcile` reads to compare the vendor's invoice with
+	// the ledger: "deepinfra" or "openrouter". Empty is a host with none.
+	UsageAPI string
+
 	// Metrics and Priority record kind-specific integrations (DESIGN §4.3,
 	// e.g. vllm exposes Prometheus metrics and native request priority).
 	Metrics  string
@@ -509,24 +539,28 @@ const (
 // [Catalog.ExplainKind] report origins keyed by these, so an operator reads the
 // name they would type into a file.
 const (
-	FieldAPI               = "api"
-	FieldBaseURL           = "base_url"
-	FieldCache             = "cache"
-	FieldReasoningHint     = "reasoning" // kind-level shape hint, not a claim
-	FieldCategory          = "category"
-	FieldContextWindow     = "context_window"
-	FieldMaxOutputTokens   = "max_output_tokens"
-	FieldSupportsTools     = "supports_tools"
-	FieldSupportsStreaming = "supports_streaming"
-	FieldResponsesOnly     = "responses_only"
-	FieldSurfaces          = "surfaces"
-	FieldMetrics           = "metrics"
-	FieldPriority          = "priority"
-	FieldReasoning         = "reasoning"
-	FieldPricing           = "pricing"
-	FieldVerified          = "verified"
-	FieldProbe             = "probe"
-	FieldNote              = "note"
+	FieldAPI                   = "api"
+	FieldBaseURL               = "base_url"
+	FieldCache                 = "cache"
+	FieldReasoningHint         = "reasoning" // kind-level shape hint, not a claim
+	FieldCategory              = "category"
+	FieldContextWindow         = "context_window"
+	FieldMaxOutputTokens       = "max_output_tokens"
+	FieldSupportsTools         = "supports_tools"
+	FieldSupportsStreaming     = "supports_streaming"
+	FieldResponsesOnly         = "responses_only"
+	FieldSurfaces              = "surfaces"
+	FieldTranscriptionDuration = "transcription_duration"
+	FieldReportedCost          = "reported_cost"
+	FieldReportedCostUnit      = "reported_cost_unit"
+	FieldUsageAPI              = "usage_api"
+	FieldMetrics               = "metrics"
+	FieldPriority              = "priority"
+	FieldReasoning             = "reasoning"
+	FieldPricing               = "pricing"
+	FieldVerified              = "verified"
+	FieldProbe                 = "probe"
+	FieldNote                  = "note"
 )
 
 // Layer names, matching ModelInfo.Layers.

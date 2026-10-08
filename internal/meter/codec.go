@@ -30,12 +30,13 @@ import (
 // correctness", and nothing is reported as damage.
 const (
 	spoolMagic = "DRSP"
-	// Version 7 adds the list-rate equivalent and whether there was one
-	// (DESIGN §8.5). Version 6 added the utilization disclosure.
-	spoolVersion   = 7
+	// Version 8 adds the upstream's stated cost. Version 7 added the list-rate
+	// equivalent and whether there was one (DESIGN §8.5). Version 6 added the
+	// utilization disclosure.
+	spoolVersion   = 8
 	spoolHeaderLen = 8
 	frameHeaderLen = 8
-	traceCodecVer  = 7
+	traceCodecVer  = 8
 	// maxFrameLen bounds a single record so a corrupt length cannot make the
 	// reader allocate arbitrarily.
 	maxFrameLen = 1 << 20
@@ -262,6 +263,8 @@ func appendTrace(dst []byte, t *Trace) []byte {
 	dst = appendBool(dst, t.NotionalKnown)
 	dst = binary.AppendVarint(dst, t.UtilMultiplierPPM)
 	dst = binary.AppendVarint(dst, t.UtilPPM)
+	dst = binary.AppendVarint(dst, t.ReportedCostNano)
+	dst = appendBool(dst, t.ReportedCost)
 	dst = binary.AppendVarint(dst, int64(t.Retries))
 
 	dst = appendStr(dst, t.UtilSource)
@@ -331,6 +334,8 @@ func decodeTrace(p []byte) (Trace, error) {
 	t.NotionalKnown = num() != 0
 	t.UtilMultiplierPPM = num()
 	t.UtilPPM = num()
+	t.ReportedCostNano = num()
+	t.ReportedCost = num() != 0
 	t.Retries = int(num())
 
 	if err != nil {
