@@ -1703,11 +1703,38 @@ type Notifications struct {
 	DedupPeriods map[string]Duration `yaml:"dedup_periods,omitempty"`
 	// Retry bounds how hard a failing transport is retried.
 	Retry NotifyRetry `yaml:"retry,omitempty"`
+
+	// RemainingLow is when and how often internal/alerts says something is
+	// running out. See [RemainingLow].
+	RemainingLow RemainingLow `yaml:"remaining_low,omitempty"`
+}
+
+// RemainingLow configures the remaining_low notification: a provider plan
+// window, a vendor spend limit or balance, or a key or team budget with
+// Percent or less of its ceiling left.
+type RemainingLow struct {
+	// Percent is the share of the ceiling left at which a condition is low.
+	// Default 5.
+	Percent float64 `yaml:"percent,omitempty"`
+	// BalanceFloorUSD is the absolute floor for a prepaid balance, whose
+	// "ceiling" is whatever was last topped up: a balance below it is low
+	// whatever its percentage. Empty means percentage only.
+	BalanceFloorUSD Decimal `yaml:"balance_floor_usd,omitempty"`
+	// Interval is how often vendor and plan figures are evaluated and an
+	// undelivered alert is retried. Default 1m; the usage probes poll at the
+	// same cadence (providers[].usage_probe.interval).
+	Interval Duration `yaml:"interval,omitempty"`
+	// Remind is how long a condition may stay low before it is announced
+	// again. Default 6h.
+	Remind Duration `yaml:"remind,omitempty"`
 }
 
 // EmailNotifications selects the delivery driver and configures it.
 type EmailNotifications struct {
 	Driver string `yaml:"driver,omitempty"`
+	// Drivers lists several transports, each delivered independently
+	// (`drivers: [smtp, http]`). Exclusive with Driver.
+	Drivers []string `yaml:"drivers,omitempty"`
 	// From is the envelope sender, required by the smtp driver.
 	From string `yaml:"from,omitempty"`
 	// To are the default recipients.
@@ -1747,7 +1774,14 @@ type WebhookSettings struct {
 	Secret  SecretRef         `yaml:",inline"`
 	Timeout Duration          `yaml:"timeout,omitempty"`
 	Headers map[string]string `yaml:"headers,omitempty"`
+	// Format is the body's shape: "dorang" (the signed JSON envelope, the
+	// default), "slack" ({"text": …}) or "discord" ({"content": …}) for a chat
+	// incoming webhook. The signature header is sent with every format.
+	Format string `yaml:"format,omitempty"`
 }
+
+// WebhookFormats are the accepted notifications.email.http.format values.
+var WebhookFormats = []string{"dorang", "slack", "discord"}
 
 // NotifyRetry bounds delivery retries. A failing mail server must not be
 // retried hard: past MaxAttempts the notification is dropped and counted, and
@@ -1764,7 +1798,7 @@ type NotifyRetry struct {
 // notificationEvents are the events of §11.5.
 var notificationEvents = []string{
 	"key_created", "budget_80pct", "budget_exceeded", "quota_exhausted",
-	"credential_unhealthy", "batch_completed", "invite",
+	"credential_unhealthy", "batch_completed", "invite", "remaining_low",
 }
 
 // emailDrivers are the drivers of §11.5.

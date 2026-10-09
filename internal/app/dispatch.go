@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/alerts"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -62,6 +63,8 @@ type dispatcher struct {
 	oauth *auth.OAuthManager
 	logf  func(string, ...any)
 	now   func() time.Time
+	// alerts hears whether a credential's plan is used up (observePlan).
+	alerts *alerts.Engine
 	// filter are the §10.5b transform-filter counters. They live on the
 	// dispatcher rather than the state because a configuration reload must not
 	// reset them: a counter that restarts on SIGHUP is a counter nobody can
@@ -385,6 +388,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, rq *server.Request, w http.Re
 
 		res := d.attempt(ctx, st, c, dec, rq, w)
 		st.router.Report(dec, res.outcome)
+		d.observePlan(ctx, dec, res)
 
 		if res.err == nil {
 			// Pricing and token counts are filled BEFORE the body goes out, so

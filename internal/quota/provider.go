@@ -423,15 +423,22 @@ func (r *Registry) PollOnce(ctx context.Context) PollStats {
 			res, err := j.p.Probe(c, j.cred)
 			mu.Lock()
 			defer mu.Unlock()
+			// A credential tracked with no Tracker is read for its figures
+			// alone (internal/alerts reads the prober's snapshot); nothing of
+			// quota's gating is attached to it.
 			if err != nil {
-				j.tracker.Fail(err, now())
+				if j.tracker != nil {
+					j.tracker.Fail(err, now())
+				}
 				stat.Failed++
 				return
 			}
 			if res.FetchedAt.IsZero() {
 				res.FetchedAt = now()
 			}
-			j.tracker.Adopt(res)
+			if j.tracker != nil {
+				j.tracker.Adopt(res)
+			}
 			stat.Succeeded++
 		}()
 	}

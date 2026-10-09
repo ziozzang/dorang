@@ -1839,7 +1839,42 @@ func checkShadowReferenceURL(raw string) error {
 
 func (c *Config) validateNotifications(col *collector) {
 	n := &c.Notifications
-	mustBeOneOf(col, "notifications.email.driver", n.Email.Driver, emailDrivers)
+	drivers := n.Email.Drivers
+	if len(drivers) == 0 {
+		mustBeOneOf(col, "notifications.email.driver", n.Email.Driver, emailDrivers)
+		drivers = []string{n.Email.Driver}
+	} else {
+		if n.Email.Driver != "" {
+			col.add("notifications.email.driver", "driver and drivers are exclusive: list every "+
+				"transport under drivers")
+		}
+		seen := map[string]bool{}
+		for i, d := range drivers {
+			at := fmt.Sprintf("notifications.email.drivers[%d]", i)
+			mustBeOneOf(col, at, d, emailDrivers)
+			switch {
+			case d == "none":
+				col.add(at, "none is not a transport; leave drivers out to send nothing")
+			case seen[d]:
+				col.add(at, "%q is listed twice", d)
+			}
+			seen[d] = true
+		}
+	}
+	if f := n.Email.HTTP.Format; f != "" {
+		mustBeOneOf(col, "notifications.email.http.format", f, WebhookFormats)
+	}
+	rl := &n.RemainingLow
+	if rl.Percent <= 0 || rl.Percent >= 100 {
+		col.add("notifications.remaining_low.percent", "must be between 0 and 100 (is %v)", rl.Percent)
+	}
+	if !rl.BalanceFloorUSD.IsZero() {
+		if err := checkDecimal(string(rl.BalanceFloorUSD)); err != nil {
+			col.add("notifications.remaining_low.balance_floor_usd", "%v", err)
+		}
+	}
+	nonNegative(col, "notifications.remaining_low.interval", int64(rl.Interval))
+	nonNegative(col, "notifications.remaining_low.remind", int64(rl.Remind))
 	for i, e := range n.Events {
 		mustBeOneOf(col, fmt.Sprintf("notifications.events[%d]", i), e, notificationEvents)
 	}
@@ -1875,7 +1910,15 @@ func (c *Config) validateNotifications(col *collector) {
 		col.add("notifications.email.from", "%q is not an email address", n.Email.From)
 	}
 
-	switch n.Email.Driver {
+	for _, d := range drivers {
+		c.validateNotifyDriver(col, d)
+	}
+}
+
+// validateNotifyDriver checks what one transport needs.
+func (c *Config) validateNotifyDriver(col *collector, driver string) {
+	n := &c.Notifications
+	switch driver {
 	case "smtp":
 		if n.Email.SMTP.Addr == "" {
 			col.add("notifications.email.smtp.addr",

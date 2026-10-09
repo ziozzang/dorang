@@ -80,11 +80,21 @@ type probeSet struct {
 	// probers is kept for reporting and for the lifetime of the trackers; the
 	// registry holds them too.
 	probers []*probe.Prober
+	// creds is every probed credential, with the prober that reads it and the
+	// provider it belongs to, for internal/alerts.
+	creds []probedCredential
 	// interval is the poll cadence for the whole set: the shortest configured
 	// one. Per-provider spacing is enforced by each prober's own MinInterval,
 	// which replays its last snapshot rather than re-reading, so a common tick
 	// cannot poll any provider faster than that provider was configured for.
 	interval time.Duration
+}
+
+// probedCredential is one credential a prober reads.
+type probedCredential struct {
+	prober     *probe.Prober
+	provider   string
+	credential string
 }
 
 // DefaultUsageProbeInterval is the poll cadence for a probe that names none.
@@ -106,6 +116,7 @@ func (a *App) buildProbes(cfg *config.Config, qs *quotaSet, client *http.Client)
 		every   time.Duration
 	)
 	byProvider := map[string]*probe.Prober{}
+	var creds []probedCredential
 
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
@@ -168,10 +179,16 @@ func (a *App) buildProbes(cfg *config.Config, qs *quotaSet, client *http.Client)
 		// poll with a 401 — which its own backoff would then read as a provider
 		// problem and space out further.
 		pr.SetAuth(cr.ID, a.probeAuth(cr.ID))
+		creds = append(creds, probedCredential{prober: pr, provider: cr.Provider, credential: cr.ID})
 
 		m := qs.meter(cr.ID)
 		if m == nil {
+			// Read anyway, with no tracker: the figures still reach
+			// internal/alerts, and nothing gates on them.
 			ungated = append(ungated, cr.ID)
+			if err := reg.Track(quota.NewCredential(cr.ID, pr.ProviderID(), ""), nil); err != nil {
+				return nil, fmt.Errorf("app: usage probe for credential %q: %w", cr.ID, err)
+			}
 			continue
 		}
 		tr := quota.NewTracker(m)
@@ -191,14 +208,14 @@ func (a *App) buildProbes(cfg *config.Config, qs *quotaSet, client *http.Client)
 		// in silence, because a probe whose figures gate nothing is the defect
 		// this file was written to remove, one layer further in.
 		a.logf("app: usage probe enabled for credential(s) %s with no quota rule to gate: "+
-			"the provider's figures will be read and will constrain nothing. A rule comes "+
+			"the provider's figures will be read for remaining_low alerts and will constrain nothing. A rule comes "+
 			"from models[].deployments[].limits[] with metric rpm or tpm (§6.2, §10.2)",
 			strings.Join(ungated, ", "))
 	}
 	if every <= 0 {
 		every = DefaultUsageProbeInterval
 	}
-	return &probeSet{reg: reg, probers: probers, interval: every}, nil
+	return &probeSet{reg: reg, probers: probers, creds: creds, interval: every}, nil
 }
 
 // probeAllowances converts §6.2's configured window mappings.

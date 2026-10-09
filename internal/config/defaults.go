@@ -144,6 +144,9 @@ const (
 	defaultNotifyQueueSize       = 256
 	defaultNotifyWorkers         = 1
 	defaultNotifyDedupPeriod     = time.Hour
+	defaultRemainingLowPercent   = 5
+	defaultRemainingLowInterval  = time.Minute
+	defaultRemainingLowRemind    = 6 * time.Hour
 	defaultNotifyMaxAttempts     = 3
 	defaultNotifyInitialBackoff  = time.Second
 	defaultNotifyMaxBackoff      = 30 * time.Second
@@ -472,7 +475,14 @@ func (c *Config) ApplyDefaults() {
 	}
 
 	// notifications
-	setStr(&c.Notifications.Email.Driver, "none")
+	if len(c.Notifications.Email.Drivers) == 0 {
+		setStr(&c.Notifications.Email.Driver, "none")
+	}
+	if c.Notifications.RemainingLow.Percent == 0 {
+		c.Notifications.RemainingLow.Percent = defaultRemainingLowPercent
+	}
+	setDur(&c.Notifications.RemainingLow.Interval, defaultRemainingLowInterval)
+	setDur(&c.Notifications.RemainingLow.Remind, defaultRemainingLowRemind)
 	setInt(&c.Notifications.QueueSize, defaultNotifyQueueSize)
 	setInt(&c.Notifications.Workers, defaultNotifyWorkers)
 	setDur(&c.Notifications.DedupPeriod, defaultNotifyDedupPeriod)

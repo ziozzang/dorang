@@ -186,6 +186,9 @@ type HTTPOptions struct {
 	// anything sensitive belongs in the URL's own credential handling.
 	Headers map[string]string
 	// Client overrides the HTTP client.
+	// Format is the body's shape: "" or "dorang" (the envelope below),
+	// "slack" ({"text": …}) or "discord" ({"content": …}).
+	Format string
 	Client *http.Client
 }
 
@@ -262,7 +265,25 @@ func (d *httpDriver) Deliver(ctx context.Context, m *Message) error {
 			w.Fields[f.Name] = f.Value
 		}
 	}
-	buf, err := json.Marshal(&w)
+	var buf []byte
+	var err error
+	switch d.o.Format {
+	case "slack", "discord":
+		// A chat incoming webhook takes one text member and ignores the rest
+		// of the envelope at best, or refuses it. The text is the rendered
+		// message, which carries every field already.
+		text := "*" + m.Line + "*\n" + m.Body
+		key := "text"
+		if d.o.Format == "discord" {
+			key = "content"
+			if len(text) > 1900 {
+				text = text[:1900] + "…"
+			}
+		}
+		buf, err = json.Marshal(map[string]string{key: text})
+	default:
+		buf, err = json.Marshal(&w)
+	}
 	if err != nil {
 		return fmt.Errorf("notify: http: encode: %w", err)
 	}
@@ -351,8 +372,8 @@ func (d *luaDriver) Deliver(ctx context.Context, m *Message) error {
 var errDropped = errors.New("notify: suppressed by the on_email hook")
 
 // newDriver builds the configured transport.
-func newDriver(o *Options) (Driver, error) {
-	switch strings.ToLower(strings.TrimSpace(o.Driver)) {
+func newDriver(o *Options, name string) (Driver, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", DriverNone:
 		return noneDriver{}, nil
 	case DriverSMTP:
@@ -376,5 +397,5 @@ func newDriver(o *Options) (Driver, error) {
 	case DriverLua:
 		return &luaDriver{hook: o.Hook}, nil
 	}
-	return nil, fmt.Errorf("notify: %q is not a driver; want one of smtp, http, lua, none", o.Driver)
+	return nil, fmt.Errorf("notify: %q is not a driver; want one of smtp, http, lua, none", name)
 }

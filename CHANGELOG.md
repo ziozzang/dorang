@@ -11,6 +11,25 @@ what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 
 ## Unreleased
 
+### Running low is announced, by email and webhook at once
+
+- **`remaining_low`**: a provider plan window, a vendor's monthly spend limit or
+  prepaid balance, or a key's or team's budget with `notifications.remaining_low.percent`
+  (default 5) or less left. Probe figures are judged right after each poll (1m by
+  default); budgets on the request that crosses the line. New probe fetchers
+  `openrouter` (credits) and `deepinfra` (spend limit, credit), alert-only so they
+  never gate traffic; a probed credential with no quota rule is now read too.
+- **`quota_exhausted` is raised** — it was declared and never sent: an upstream 429
+  that says a plan is used up (Ollama Cloud's "You reached your Pro 5-hour limit"),
+  not an ordinary rate limit; cleared on the credential's next success.
+- **One crossing, one notification**, across restarts and nodes: the condition's state
+  is a row (`alert_state`, migration 0010) won by a conditional write, reminded every
+  `remind` (6h) while low and re-armed on recovery; a transport that failed is
+  retried to that transport only.
+- **`notifications.email.drivers: [smtp, http]`** delivers on every transport, each
+  with its own queue, workers, retries and breaker. **`http.format: slack | discord`**
+  posts a chat incoming-webhook body.
+
 - Releases are built for two targets, `linux/amd64` and `darwin/arm64`, and the
   image for `linux/amd64`; `dorang update` names any other platform as having no
   release build. `scripts/release.sh vX.Y.Z` cuts a release from a pushed tag

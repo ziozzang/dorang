@@ -84,10 +84,11 @@ func buildNotifier(cfg *config.Config, hooks *luaext.Engine,
 	}
 
 	nf, err := notify.New(notify.Options{
-		Driver: n.Email.Driver,
-		Events: n.Events,
-		From:   n.Email.From,
-		To:     n.Email.To,
+		Driver:  n.Email.Driver,
+		Drivers: n.Email.Drivers,
+		Events:  n.Events,
+		From:    n.Email.From,
+		To:      n.Email.To,
 		SMTP: notify.SMTPOptions{
 			Addr:          n.Email.SMTP.Addr,
 			Username:      n.Email.SMTP.Username,
@@ -102,6 +103,7 @@ func buildNotifier(cfg *config.Config, hooks *luaext.Engine,
 			Secret:  webhookSecret,
 			Timeout: n.Email.HTTP.Timeout.Duration(),
 			Headers: n.Email.HTTP.Headers,
+			Format:  n.Email.HTTP.Format,
 		},
 		Hook:         hook,
 		QueueSize:    n.QueueSize,

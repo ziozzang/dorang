@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/admin"
+	"github.com/ziozzang/dorang/internal/alerts"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/batch"
@@ -190,6 +191,10 @@ type App struct {
 	// Notify is the §11.5 notification pipeline. Nil for `driver: none`, which
 	// is the default.
 	Notify *notify.Notifier
+	// Alerts is the remaining_low / quota_exhausted state machine, nil when
+	// there is no notifier.
+	Alerts     *alerts.Engine
+	alertEvery time.Duration
 	// OAuth is the §11.2b credential set: the accounts that authenticate with a
 	// token read from a vendor CLI's own store and renewed ahead of expiry. Nil
 	// when no credential declares `auth: oauth`, which is the default — the
@@ -392,7 +397,9 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	if a.Notify, err = buildNotifier(cfg, a.Hooks, a.logf, a.now); err != nil {
 		return nil, err
 	}
-	a.budget = &budgetGate{ledger: a.Ledger, now: a.now, notify: a.Notify}
+	a.Alerts = buildAlerts(cfg, a.Notify, a.Store, a.logf, a.now)
+	a.alertEvery = cfg.Notifications.RemainingLow.Interval.Duration()
+	a.budget = &budgetGate{ledger: a.Ledger, now: a.now, notify: a.Notify, alerts: a.Alerts}
 	a.responses = newResponsesStore(a.Store, a.now)
 
 	// 4. Gate.
@@ -524,6 +531,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		return nil, err
 	}
 	a.dispatch = newDispatcher(client, a.OAuth, a.logf, a.now)
+	a.dispatch.alerts = a.Alerts
 	filters, err := buildFilters(cfg, a.logf)
 	if err != nil {
 		return nil, err
@@ -1010,6 +1018,12 @@ func (a *App) startBackground() error {
 		// so a shorter tick here cannot poll any provider faster than it was
 		// configured for. A nil channel blocks forever, so a gateway with no
 		// probe pays one dead case in a loop it already runs.
+		var alertSweep <-chan time.Time
+		if a.Alerts != nil && a.alertEvery > 0 {
+			at := time.NewTicker(a.alertEvery)
+			defer at.Stop()
+			alertSweep = at.C
+		}
 		var probes <-chan time.Time
 		if every := a.probeInterval(); every > 0 {
 			pt := time.NewTicker(every)
@@ -1026,6 +1040,15 @@ func (a *App) startBackground() error {
 				// and the budget lease renewal share it.
 				pctx, cancel := context.WithTimeout(ctx, time.Minute)
 				a.pollProbes(pctx)
+				// Judged as soon as they are read: a figure that crossed the
+				// line is announced on this tick, not on a later sweep.
+				a.evaluateProbes(pctx)
+				cancel()
+			case <-alertSweep:
+				// Undelivered announcements, to the transports that still owe
+				// them.
+				actx, cancel := context.WithTimeout(ctx, time.Minute)
+				a.Alerts.Sweep(actx)
 				cancel()
 			case <-accuracy:
 				// Conflict first. A node that has been superseded is not going

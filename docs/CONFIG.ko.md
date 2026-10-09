@@ -1704,6 +1704,56 @@ notifications:
 
 ---
 
+### 20.3 여러 전송 수단, 채팅 webhook, 그리고 "잔여 부족"
+
+**이메일과 webhook 동시 발송.** `email.drivers: [smtp, http]`는 모든 알림을 나열한 전송 수단마다 보내고,
+각각 자기 queue, worker, 재시도, breaker를 가진다. 메일 서버가 죽어도 webhook은 늦어지거나 막히지 않고,
+webhook을 재시도해도 이메일이 다시 가지 않는다. `drivers`와 `driver`는 함께 쓸 수 없고, `none`은 나열하는
+전송 수단이 아니다.
+
+**채팅 webhook.** `email.http.format: slack`은 `{"text": …}`, `discord`는 `{"content": …}`로 렌더링된 메시지
+(모든 필드 포함)를 incoming-webhook URL에 보낸다. 기본값 `dorang`은 위의 서명된 JSON envelope이다. 서명
+헤더는 어느 형식에서나 붙으므로 secret은 계속 필수다.
+
+**`remaining_low`** 는 상한이 있는 것이 `percent` 이하만 남았을 때 알린다:
+
+| 출처 | 무엇을 재는가 | 언제 판정하는가 |
+|---|---|---|
+| `usage_probe`가 켜진 provider | probe가 읽는 모든 window(플랜의 5시간 window, vendor의 월 지출 한도)와 모든 선불 잔액 | 매 poll 직후 — probe `interval`, 기본 1분 |
+| 키·팀 예산 | 현재 기간의 `max_budget` 대비 지출 | 그 선을 넘는 요청에서 |
+
+`quota_exhausted`(이제 실제로 발생한다)는 아무것도 남지 않은 플랜이다: 메시지가 플랜·계정 한도 소진을
+말하는 업스트림 429("You reached your Pro 5-hour limit", "exceeded your current quota", "usage limit")이며,
+분당 rate limit과는 구분한다. Ollama Cloud와 Qwen token plan은 남은 양을 공개하지 않으므로 이것이 유일한
+신호다. 그 credential이 다음에 성공하면 해제된다.
+
+```yaml
+notifications:
+  email:
+    drivers: [smtp, http]
+    http: {url: "https://hooks.slack.com/services/…", key_env: DORANG_WEBHOOK_SECRET, format: slack}
+  events: [remaining_low, quota_exhausted, budget_exceeded]
+  remaining_low:
+    percent: 5               # 이 비율 이하가 남으면 부족
+    balance_floor_usd: "2"   # 선불 잔액이 이보다 적으면 비율과 무관하게 부족
+    interval: 1m             # 전달 안 된 알림을 재시도하는 주기
+    remind: 6h               # 부족 상태가 이어질 때 다시 알리는 간격
+providers:
+  - {name: openrouter, kind: openrouter, usage_probe: {enabled: true, fetcher: openrouter}}
+  - {name: deepinfra,  kind: deepinfra,  usage_probe: {enabled: true, fetcher: deepinfra}}
+```
+
+각 조건 — credential 하나의 window나 잔액, 한 subject의 한 기간 예산, credential 하나의 플랜 — 은
+**부족해지는 순간 한 번 알리고, 부족이 이어지는 동안 `remind`마다 다시 알리며, 회복되면 재무장된다**. 이
+상태는 프로세스가 아니라 데이터베이스(`alert_state`, migration 0010)에 있다: 재시작이나 두 번째 노드가 같은
+crossing을 다시 알리지 않고, 어느 전송 수단이 전달했는지도 기록되므로 실패한 전송 수단만 다섯 `interval`이
+지난 뒤부터 `interval`마다 재시도된다. 잔액의 비율은 지금까지 충전된 총액 대비라 충전할 때마다 움직이므로
+`balance_floor_usd`가 더 안정적인 기준이다. `notifications.*`는 시작할 때 읽으며 reload로 바뀌지 않는다.
+
+두 vendor fetcher는 게이트웨이가 서빙에 쓰는 credential로 계정 전체 수치를 읽는다: `openrouter`(누적
+크레딧에서 사용액을 뺀 잔액)와 `deepinfra`(이번 달 지출 대비 월 지출 한도, 그리고 그 지출을 뺀 Stripe
+크레딧). 지출 한도는 알림 전용이라 트래픽을 막지 않고, `allowances[]`로 다시 매핑할 수 없다.
+
 ## 21. `priority_mapping`
 
 ```yaml

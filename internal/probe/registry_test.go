@@ -85,7 +85,7 @@ func TestSupportedTable(t *testing.T) {
 			t.Errorf("%s: an endpoint with no prober", s.Provider)
 		}
 	}
-	if got := Probed(); len(got) != 3 || strings.Join(got, ",") != "anthropic,deepseek,zai" {
+	if got := Probed(); strings.Join(got, ",") != "anthropic,deepinfra,deepseek,openrouter,zai" {
 		t.Errorf("Probed() = %v", got)
 	}
 }

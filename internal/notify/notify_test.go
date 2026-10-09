@@ -732,14 +732,15 @@ func TestDriverConfigurationErrors(t *testing.T) {
 }
 
 func TestEventNamesMatchTheDesign(t *testing.T) {
-	// §11.5's seven, then the two §11.6 and §11.2c added. The order is
+	// §11.5's seven, then the two §11.6 and §11.2c added, then remaining_low
+	// (internal/alerts). The order is
 	// load-bearing — Event is an index into eventNames and into the enabled
 	// mask — so this list is asserted position by position and new events are
 	// appended, never inserted.
 	want := []string{
 		"key_created", "budget_80pct", "budget_exceeded", "quota_exhausted",
 		"credential_unhealthy", "batch_completed", "invite",
-		"token_guard", "key_rotated",
+		"token_guard", "key_rotated", "remaining_low",
 	}
 	if len(Events()) != len(want) {
 		t.Fatalf("Events() has %d entries, the design lists %d", len(Events()), len(want))

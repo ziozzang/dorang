@@ -33,3 +33,27 @@ func TestReportedCostRefusals(t *testing.T) {
 		"      class: marginal_usage\n      rates: {reported_cost: \"1.0000000001\"}\n"),
 		at, "9 fractional digits")
 }
+
+func TestNotificationDriversAndRemainingLow(t *testing.T) {
+	ok := "\nnotifications:\n  email:\n    drivers: [smtp, http]\n    from: dorang@example.com\n" +
+		"    to: [ops@example.com]\n    smtp: {addr: \"mail.example.com:25\"}\n" +
+		"    http: {url: \"https://hooks.example.com/x\", key_env: DORANG_TEST_FIXTURE_KEY, format: slack}\n" +
+		"  remaining_low: {percent: 5, balance_floor_usd: \"2\", interval: 1m, remind: 6h}\n"
+	c, err := loadYAML(t, ok)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.Notifications.Email.Driver != "" {
+		t.Errorf("driver defaulted to %q beside drivers", c.Notifications.Email.Driver)
+	}
+	const head = "\nnotifications:\n  email:\n"
+	mustRefuse(t, loadWith(t, head+"    driver: smtp\n    drivers: [http]\n"),
+		"notifications.email.driver", "exclusive")
+	mustRefuse(t, loadWith(t, head+"    drivers: [http, http]\n    http: {url: \"https://h.example.com\", key_env: X}\n"),
+		"notifications.email.drivers[1]", "twice")
+	mustRefuse(t, loadWith(t, head+"    drivers: [http]\n"), "notifications.email.http.url", "must be set")
+	mustRefuse(t, loadWith(t, head+"    drivers: [http]\n    http: {url: \"https://h.example.com\", key_env: X, format: teams}\n"),
+		"notifications.email.http.format", "")
+	mustRefuse(t, loadWith(t, "\nnotifications:\n  remaining_low: {percent: 100}\n"),
+		"notifications.remaining_low.percent", "between 0 and 100")
+}

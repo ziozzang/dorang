@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/alerts"
 	"github.com/ziozzang/dorang/internal/auth"
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/notify"
@@ -99,6 +100,8 @@ type budgetGate struct {
 	// when notifications are off, and every method on a nil notifier is a
 	// constant — which is what keeps the check below off the allocator.
 	notify *notify.Notifier
+	// alerts hears every budget's share left (remaining_low).
+	alerts *alerts.Engine
 }
 
 // budget80Numerator and budget80Denominator are §11.5's 80% threshold as a
@@ -236,6 +239,7 @@ func (g *budgetGate) reserveFor(ctx context.Context, subs []budgetSubject,
 		if seen > 0 && spent >= seen/budget80Denominator*budget80Numerator {
 			g.raise(notify.EventBudget80, subject, now, spent, seen, s.window, nil)
 		}
+		g.observeRemaining(ctx, s, subject, now, spent, seen)
 		// x-dorang-spend-usd and its legacy mirror x-litellm-key-spend read
 		// Result.SpendNanoUSD, and NOTHING filled it: both headers reported a
 		// flat $0.00 spend on every response of every deployment that has a
@@ -453,4 +457,40 @@ func budgetSubjectsOf(p *auth.Principal) []budgetSubject {
 	add(budgetKindUser, p.UserID, p.User)
 	add(budgetKindTeam, p.TeamID, p.Team)
 	return out
+}
+
+// observeRemaining reports a budget's share left to internal/alerts. The key
+// carries the period start, so a new period is a new condition and an old one
+// is never "recovered" into. A budget that is not low costs nothing unless some
+// condition is already known to be low — then its key is built so that a
+// raised ceiling can clear it.
+//
+// The figure is this node's view of the counter (the same one budget_80pct
+// reads); across a cluster it can lag by the blocks other nodes hold, and the
+// durable alert state still makes the crossing one notification.
+func (g *budgetGate) observeRemaining(ctx context.Context, s budgetSubject, subject notify.Subject,
+	now time.Time, spent, limit int64) {
+
+	if g.alerts == nil || limit <= 0 {
+		return
+	}
+	low, pct := g.alerts.LowFraction(float64(limit-spent), float64(limit))
+	if !low && !g.alerts.AnyLow() {
+		return
+	}
+	key := "remaining_low|budget|" + subject.String() + "|" + s.window.String() + "|" +
+		strconv.FormatInt(s.window.PeriodStart(now).Unix(), 10)
+	g.alerts.Observe(ctx, alerts.Condition{
+		Event: notify.EventRemainingLow, Subject: subject, Key: key, Low: low,
+		Fields: []notify.Field{
+			{Name: "source", Value: "budget"},
+			{Name: "subject", Value: subject.String()},
+			{Name: "period", Value: s.window.String()},
+			{Name: "remaining", Value: usdString(limit - spent)},
+			{Name: "limit", Value: usdString(limit)},
+			{Name: "unit", Value: "USD"},
+			{Name: "percent_left", Value: alerts.Percent(pct)},
+			{Name: "threshold", Value: alerts.Percent(g.alerts.Percent())},
+		},
+	})
 }

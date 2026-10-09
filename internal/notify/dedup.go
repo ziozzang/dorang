@@ -140,5 +140,8 @@ func defaultPeriods(base time.Duration) [numEvents]time.Duration {
 	p[EventCredentialUnhealthy] = base / 4
 	p[EventBatchCompleted] = 0
 	p[EventInvite] = 0
+	// Both are raised by internal/alerts, which decides when a condition is
+	// news (its own durable state machine) and sends without Admit.
+	p[EventRemainingLow] = 0
 	return p
 }

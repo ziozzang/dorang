@@ -76,6 +76,29 @@ var table = []entry{
 	},
 	{
 		Support: Support{
+			Provider: "openrouter",
+			Endpoint: openrouterBaseURL + openrouterPath,
+			Auth:     "the same API key that serves inference, as a bearer token",
+			Note: "Measured 2026-10-09: lifetime total_credits and total_usage in USD; what is " +
+				"left is their difference, reported as a balance whose total is what was credited. " +
+				"Account-wide, the same for every key of the account.",
+		},
+		src: openrouterSource{},
+	},
+	{
+		Support: Support{
+			Provider: "deepinfra",
+			Endpoint: deepinfraBaseURL + deepinfraPath,
+			Auth:     "the same API key that serves inference, as a bearer token",
+			Note: "Measured 2026-10-09: the billing checklist's monthly spend limit and this month's " +
+				"spend (an alert-only window that never gates), and the Stripe credit less that " +
+				"spend. The checklist also carries billing address and payment method; only the " +
+				"four numeric members are decoded.",
+		},
+		src: deepinfraSource{},
+	},
+	{
+		Support: Support{
 			Provider: "deepseek",
 			Endpoint: deepseekBaseURL + deepseekPath,
 			Auth:     "the same API key that serves inference, as a bearer token",

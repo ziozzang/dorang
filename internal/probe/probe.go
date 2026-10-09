@@ -127,6 +127,11 @@ type Window struct {
 	// ResetAt is when the provider says this window resets. Zero is unknown,
 	// which §7.5a(c) scores as no urgency rather than as imminent.
 	ResetAt time.Time
+	// AlertOnly marks a figure that is reported for internal/alerts and never
+	// reaches quota: an account-wide spend limit is not an allowance of this
+	// credential, and gating traffic on it would be gating on a number the
+	// operator did not configure as a gate. An Allowance cannot re-file it.
+	AlertOnly bool
 }
 
 // providerWindow projects onto quota's shape. ok is false for a window that
@@ -134,7 +139,7 @@ type Window struct {
 // and quota reads an absent window as "no provider opinion", which falls back
 // to local metering.
 func (w Window) providerWindow() (quota.ProviderWindow, bool) {
-	if !w.Mapped || !w.Window.Valid() || !w.Metric.Valid() {
+	if w.AlertOnly || !w.Mapped || !w.Window.Valid() || !w.Metric.Valid() {
 		return quota.ProviderWindow{}, false
 	}
 	pw := quota.ProviderWindow{
@@ -168,6 +173,11 @@ type Balance struct {
 	// Available is the provider's own verdict on whether the credential can
 	// still serve. It is reported, never acted on here.
 	Available bool
+	// TotalNano is what was credited in all, when the provider says so; zero
+	// is unknown. It is what a percentage left is a share of, and it moves
+	// with every top-up, which is why internal/alerts also takes an absolute
+	// floor.
+	TotalNano int64
 }
 
 // Snapshot is one successful read of a provider's account status.
@@ -673,7 +683,7 @@ func (p *Prober) applyAllowances(ws []Window) []Window {
 	}
 	for i := range ws {
 		for _, a := range p.cfg.Allowances {
-			if !strings.EqualFold(a.Label, ws[i].Label) {
+			if ws[i].AlertOnly || !strings.EqualFold(a.Label, ws[i].Label) {
 				continue
 			}
 			ws[i].Window, ws[i].Metric, ws[i].Mapped = a.Window, a.Metric, true

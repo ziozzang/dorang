@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,7 +56,13 @@ func (r *RetryOptions) setDefaults() {
 // secret and the extension hook.
 type Options struct {
 	// Driver is smtp, http, lua or none.
-	Driver string
+	// Drivers lists every transport a notification goes out on, each with
+	// its own queue, workers, retries and breaker, so a mail server that is
+	// down never delays or blocks the webhook and a webhook retry never sends
+	// the email twice. Driver is the single-transport spelling and the two are
+	// exclusive.
+	Drivers []string
+	Driver  string
 	// Events are the enabled event names. Empty enables all of them: `driver:
 	// none` is the off switch, so an empty event list is far more likely to
 	// mean "everything" than "nothing".
@@ -146,24 +153,19 @@ type Stats struct {
 // costs one nil check, which is how a `driver: none` deployment pays nothing
 // for the mechanism.
 type Notifier struct {
-	opts   Options
-	mask   uint16
-	driver Driver
-	hook   EmailHook
-	dedup  *deduper
-	to     []string
+	opts     Options
+	mask     uint16
+	channels []*channel
+	hook     EmailHook
+	dedup    *deduper
+	to       []string
 
-	q       chan *job
 	stop    chan struct{}
 	closing atomic.Bool
 	workers sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	breakerMu    sync.Mutex
-	breakerFails int
-	breakerUntil time.Time
 
 	lastWarn atomic.Int64
 
@@ -176,6 +178,16 @@ type Notifier struct {
 
 // job is one queued notification. Its slices are owned by the job so the
 // caller's Fields may be reused the moment Send returns.
+// channel is one transport: its driver, its queue and its breaker.
+type channel struct {
+	drv Driver
+	q   chan *job
+
+	breakerMu    sync.Mutex
+	breakerFails int
+	breakerUntil time.Time
+}
+
 type job struct {
 	n      Notification
 	fields []Field
@@ -199,14 +211,14 @@ func putJob(j *job) {
 // configured notifications holds a typed nil rather than a queue, a worker and
 // a deduplication table it will never use.
 func New(opts Options) (*Notifier, error) {
-	driverName := strings.ToLower(strings.TrimSpace(opts.Driver))
-	if driverName == "" {
-		driverName = DriverNone
+	names, err := driverNames(opts.Driver, opts.Drivers)
+	if err != nil {
+		return nil, err
 	}
-	if driverName == DriverNone {
+	if len(names) == 0 {
 		return nil, nil
 	}
-	opts.Driver = driverName
+	opts.Driver, opts.Drivers = strings.Join(names, ","), names
 	opts.Retry.setDefaults()
 	if opts.QueueSize <= 0 {
 		opts.QueueSize = 256
@@ -224,9 +236,13 @@ func New(opts Options) (*Notifier, error) {
 		opts.Logf = func(string, ...any) {}
 	}
 
-	drv, err := newDriver(&opts)
-	if err != nil {
-		return nil, err
+	channels := make([]*channel, 0, len(names))
+	for _, name := range names {
+		drv, err := newDriver(&opts, name)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, &channel{drv: drv, q: make(chan *job, opts.QueueSize)})
 	}
 
 	mask, err := eventMask(opts.Events)
@@ -244,22 +260,23 @@ func New(opts Options) (*Notifier, error) {
 	}
 
 	n := &Notifier{
-		opts:   opts,
-		mask:   mask,
-		driver: drv,
-		hook:   opts.Hook,
-		dedup:  newDeduper(periods),
-		to:     append([]string(nil), opts.To...),
-		q:      make(chan *job, opts.QueueSize),
-		stop:   make(chan struct{}),
-		now:    opts.Now,
-		logf:   opts.Logf,
+		opts:     opts,
+		mask:     mask,
+		channels: channels,
+		hook:     opts.Hook,
+		dedup:    newDeduper(periods),
+		to:       append([]string(nil), opts.To...),
+		stop:     make(chan struct{}),
+		now:      opts.Now,
+		logf:     opts.Logf,
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 
-	n.workers.Add(opts.Workers)
-	for i := 0; i < opts.Workers; i++ {
-		go n.run()
+	for _, ch := range channels {
+		n.workers.Add(opts.Workers)
+		for i := 0; i < opts.Workers; i++ {
+			go n.run(ch)
+		}
 	}
 	return n, nil
 }
@@ -293,7 +310,40 @@ func (n *Notifier) Driver() string {
 	if n == nil {
 		return DriverNone
 	}
-	return n.driver.Name()
+	names := make([]string, len(n.channels))
+	for i, ch := range n.channels {
+		names[i] = ch.drv.Name()
+	}
+	return strings.Join(names, ",")
+}
+
+// driverNames resolves the single and the list spelling into the transports
+// to build. "none" alone is no transport; beside another it is refused.
+func driverNames(single string, list []string) ([]string, error) {
+	single = strings.ToLower(strings.TrimSpace(single))
+	if single != "" && len(list) > 0 {
+		return nil, errors.New("notify: driver and drivers are exclusive; list every transport under drivers")
+	}
+	if single != "" {
+		list = []string{single}
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, d := range list {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" || d == DriverNone {
+			if len(list) > 1 {
+				return nil, errors.New("notify: drivers lists none beside a transport")
+			}
+			continue
+		}
+		if seen[d] {
+			return nil, fmt.Errorf("notify: drivers lists %q twice", d)
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 // Admit reserves this subject's alert slot for the period containing at.
@@ -331,25 +381,35 @@ func (n *Notifier) Send(no Notification) bool {
 	if no.At.IsZero() {
 		no.At = n.now()
 	}
-	j := getJob()
-	j.fields = append(j.fields[:0], no.Fields...)
-	j.to = append(j.to[:0], no.To...)
-	j.n = no
-	j.n.Fields = j.fields
-	j.n.To = j.to
+	// One job per transport, each on its own queue: a transport whose queue is
+	// full drops its copy and the others still go.
+	queued := false
+	for _, ch := range n.channels {
+		if len(no.Only) > 0 && !slices.Contains(no.Only, ch.drv.Name()) {
+			continue
+		}
+		j := getJob()
+		j.fields = append(j.fields[:0], no.Fields...)
+		j.to = append(j.to[:0], no.To...)
+		j.n = no
+		j.n.Fields = j.fields
+		j.n.To = j.to
 
-	select {
-	case n.q <- j:
-		n.st.posted.Add(1)
-		return true
-	default:
-		putJob(j)
-		n.st.dropped.Add(1)
-		n.st.queueDrops.Add(1)
-		n.warn("notify: the queue is full; a %s notification for %s was dropped",
-			no.Event, no.Subject)
-		return false
+		select {
+		case ch.q <- j:
+			queued = true
+		default:
+			putJob(j)
+			n.st.dropped.Add(1)
+			n.st.queueDrops.Add(1)
+			n.warn("notify: the %s queue is full; a %s notification for %s was dropped",
+				ch.drv.Name(), no.Event, no.Subject)
+		}
 	}
+	if queued {
+		n.st.posted.Add(1)
+	}
+	return queued
 }
 
 // Notify deduplicates and queues in one call. It is the form for callers that
@@ -382,12 +442,20 @@ func (n *Notifier) Stats() Stats {
 		FieldsDropped:    n.st.fieldsDropped.Load(),
 		Redacted:         n.st.redacted.Load(),
 		DedupEvictions:   n.dedup.evictions.Load(),
-		QueueDepth:       uint64(len(n.q)),
+		QueueDepth:       n.queueDepth(),
 	}
 }
 
 // Degraded reports whether notifications are being lost. It is the health
 // surface's question, and the answer is never inferred from a log line.
+func (n *Notifier) queueDepth() uint64 {
+	var d uint64
+	for _, ch := range n.channels {
+		d += uint64(len(ch.q))
+	}
+	return d
+}
+
 func (n *Notifier) Degraded() bool {
 	if n == nil {
 		return false
@@ -427,18 +495,18 @@ func (n *Notifier) Close(ctx context.Context) error {
 
 // --- the worker -------------------------------------------------------------
 
-func (n *Notifier) run() {
+func (n *Notifier) run(ch *channel) {
 	defer n.workers.Done()
 	for {
 		select {
-		case j := <-n.q:
-			n.deliver(j)
+		case j := <-ch.q:
+			n.deliver(ch, j)
 			putJob(j)
 		case <-n.stop:
 			for {
 				select {
-				case j := <-n.q:
-					n.deliver(j)
+				case j := <-ch.q:
+					n.deliver(ch, j)
 					putJob(j)
 				default:
 					return
@@ -448,12 +516,12 @@ func (n *Notifier) run() {
 	}
 }
 
-func (n *Notifier) deliver(j *job) {
+func (n *Notifier) deliver(ch *channel, j *job) {
 	to := j.n.To
 	if len(to) == 0 {
 		to = n.to
 	}
-	m, rs := render(&j.n, n.opts.From, to, n.driver.Name(), j.n.At)
+	m, rs := render(&j.n, n.opts.From, to, ch.drv.Name(), j.n.At)
 	if rs.dropped > 0 {
 		n.st.fieldsDropped.Add(uint64(rs.dropped))
 	}
@@ -463,7 +531,7 @@ func (n *Notifier) deliver(j *job) {
 
 	// The on_email hook filters every driver. For the lua driver it is also the
 	// transport, so running it here as well would run it twice.
-	if n.hook != nil && n.driver.Name() != DriverLua {
+	if n.hook != nil && ch.drv.Name() != DriverLua {
 		dropped, err := n.hook.OnEmail(n.ctx, m)
 		if err != nil {
 			// A filter that fails must not swallow an alert: fail open, as
@@ -471,11 +539,12 @@ func (n *Notifier) deliver(j *job) {
 			n.warn("notify: the on_email hook failed and was ignored: %v", err)
 		} else if dropped {
 			n.st.suppressedByHook.Add(1)
+			j.n.delivered(ch.drv.Name())
 			return
 		}
 	}
 
-	if n.breakerOpen() {
+	if ch.breakerOpen(n.now()) {
 		n.st.dropped.Add(1)
 		n.st.breakerDrops.Add(1)
 		return
@@ -486,15 +555,17 @@ func (n *Notifier) deliver(j *job) {
 		if attempt > 0 {
 			n.st.retried.Add(1)
 		}
-		err := n.driver.Deliver(n.ctx, m)
+		err := ch.drv.Deliver(n.ctx, m)
 		switch {
 		case err == nil:
 			n.st.delivered.Add(1)
-			n.onDeliverySucceeded()
+			ch.onDeliverySucceeded()
+			j.n.delivered(ch.drv.Name())
 			return
 		case errors.Is(err, errDropped):
 			n.st.suppressedByHook.Add(1)
-			n.onDeliverySucceeded()
+			ch.onDeliverySucceeded()
+			j.n.delivered(ch.drv.Name())
 			return
 		case errors.Is(err, ErrNoTransport):
 			// Retrying will not conjure a transport. This is a configuration
@@ -515,9 +586,12 @@ func (n *Notifier) deliver(j *job) {
 	}
 
 	n.st.dropped.Add(1)
-	n.onDeliveryFailed()
-	n.warn("notify: a %s notification for %s was dropped after %d attempts: %v",
-		m.Event, m.Subject, n.opts.Retry.MaxAttempts, lastErr)
+	if ch.onDeliveryFailed(n.now(), n.opts.Retry) {
+		n.warn("notify: %s delivery has failed %d times; pausing for %v",
+			ch.drv.Name(), n.opts.Retry.BreakerThreshold, n.opts.Retry.BreakerCooldown)
+	}
+	n.warn("notify: a %s notification for %s was dropped after %d %s attempts: %v",
+		m.Event, m.Subject, n.opts.Retry.MaxAttempts, ch.drv.Name(), lastErr)
 }
 
 // backoff is exponential from InitialBackoff to MaxBackoff, jittered so that a
@@ -558,55 +632,56 @@ func (n *Notifier) sleep(d time.Duration) bool {
 
 // --- the breaker ------------------------------------------------------------
 
-func (n *Notifier) breakerOpen() bool {
-	n.breakerMu.Lock()
-	defer n.breakerMu.Unlock()
-	if n.breakerUntil.IsZero() {
+func (ch *channel) breakerOpen(now time.Time) bool {
+	ch.breakerMu.Lock()
+	defer ch.breakerMu.Unlock()
+	if ch.breakerUntil.IsZero() {
 		return false
 	}
-	if n.now().Before(n.breakerUntil) {
+	if now.Before(ch.breakerUntil) {
 		return true
 	}
-	// Half-open: let one message through to find out whether the server came
-	// back. If it fails, onDeliveryFailed re-opens immediately, because the
-	// failure counter is still at the threshold.
-	n.breakerUntil = time.Time{}
+	ch.breakerUntil = time.Time{}
 	return false
 }
 
-func (n *Notifier) onDeliverySucceeded() {
-	n.breakerMu.Lock()
-	n.breakerFails = 0
-	n.breakerUntil = time.Time{}
-	n.breakerMu.Unlock()
+func (ch *channel) onDeliverySucceeded() {
+	ch.breakerMu.Lock()
+	ch.breakerFails = 0
+	ch.breakerUntil = time.Time{}
+	ch.breakerMu.Unlock()
 }
 
-func (n *Notifier) onDeliveryFailed() {
-	n.breakerMu.Lock()
-	n.breakerFails++
-	open := n.breakerFails >= n.opts.Retry.BreakerThreshold
-	if open {
-		n.breakerUntil = n.now().Add(n.opts.Retry.BreakerCooldown)
+// onDeliveryFailed counts a dropped notification and reports whether that
+// opened the breaker.
+func (ch *channel) onDeliveryFailed(now time.Time, r RetryOptions) bool {
+	ch.breakerMu.Lock()
+	defer ch.breakerMu.Unlock()
+	ch.breakerFails++
+	if ch.breakerFails >= r.BreakerThreshold {
+		ch.breakerUntil = now.Add(r.BreakerCooldown)
+		return true
 	}
-	n.breakerMu.Unlock()
-	if open {
-		n.warn("notify: %s delivery has failed %d times; pausing for %v",
-			n.driver.Name(), n.opts.Retry.BreakerThreshold, n.opts.Retry.BreakerCooldown)
-	}
+	return false
 }
 
-// BreakerOpen reports whether delivery is currently paused.
+// BreakerOpen reports whether any transport is pausing delivery.
 func (n *Notifier) BreakerOpen() bool {
 	if n == nil {
 		return false
 	}
-	n.breakerMu.Lock()
-	defer n.breakerMu.Unlock()
-	return !n.breakerUntil.IsZero() && n.now().Before(n.breakerUntil)
+	now := n.now()
+	for _, ch := range n.channels {
+		ch.breakerMu.Lock()
+		open := !ch.breakerUntil.IsZero() && now.Before(ch.breakerUntil)
+		ch.breakerMu.Unlock()
+		if open {
+			return true
+		}
+	}
+	return false
 }
 
-// warn logs at most once a second. A transport that fails on every message
-// would otherwise turn one outage into two.
 func (n *Notifier) warn(format string, args ...any) {
 	now := n.now().UnixNano()
 	last := n.lastWarn.Load()

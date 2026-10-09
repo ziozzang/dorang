@@ -39,8 +39,15 @@ const (
 	// warning (§11.2c). max_age is a policy that warns and does not execute,
 	// and a warning with no transport is not a warning.
 	EventKeyRotated
+	// EventRemainingLow fires when something with a ceiling has at most the
+	// configured share of it left: a provider plan window, a vendor's spend
+	// limit or prepaid balance, a key's or team's budget. It is raised by
+	// internal/alerts, which keeps the condition's state durably so that one
+	// crossing is one notification across restarts and nodes, with a reminder
+	// while it stays low.
+	EventRemainingLow
 
-	numEvents = 9
+	numEvents = 10
 )
 
 // eventNames is indexed by Event and matches internal/config's
@@ -48,7 +55,7 @@ const (
 var eventNames = [numEvents]string{
 	"key_created", "budget_80pct", "budget_exceeded", "quota_exhausted",
 	"credential_unhealthy", "batch_completed", "invite",
-	"token_guard", "key_rotated",
+	"token_guard", "key_rotated", "remaining_low",
 }
 
 // String returns the configuration spelling.
@@ -89,6 +96,7 @@ var titles = [numEvents]string{
 	"team invitation",
 	"token guard",
 	"API key rotated",
+	"running low",
 }
 
 // Title returns the subject-line headline.
@@ -139,6 +147,21 @@ type Notification struct {
 	Fields []Field
 	// At is when the condition was observed. Zero uses the notifier's clock.
 	At time.Time
+
+	// Only, when set, restricts delivery to the named transports — a retry of
+	// an announcement that some of them already delivered.
+	Only []string
+
+	// Delivered, when set, is called once per transport that delivered this
+	// notification (or whose on_email hook chose to drop it), with the
+	// transport's name. It runs on a delivery worker and must not block.
+	Delivered func(driver string)
+}
+
+func (no *Notification) delivered(driver string) {
+	if no.Delivered != nil {
+		no.Delivered(driver)
+	}
 }
 
 // EventFields is the complete set of field names each event may carry.
@@ -160,6 +183,7 @@ var EventFields = map[Event][]string{
 	},
 	EventQuotaExhausted: {
 		"subject", "provider", "credential_id", "window", "limit", "used", "resets_at",
+		"model", "reason", "state",
 	},
 	EventCredentialUnhealthy: {
 		"credential_id", "provider", "deployment", "state",
@@ -179,6 +203,10 @@ var EventFields = map[Event][]string{
 		"key_id", "action", "condition", "observed_rate", "baseline_rate",
 		"factor", "factor_threshold", "absolute", "absolute_threshold",
 		"window", "baseline_window", "history", "min_history", "released_by",
+	},
+	EventRemainingLow: {
+		"source", "subject", "provider", "credential_id", "label", "period",
+		"remaining", "limit", "unit", "percent_left", "threshold", "resets_at", "state",
 	},
 	EventKeyRotated: {
 		"key_id", "action", "generation", "previous_generation",

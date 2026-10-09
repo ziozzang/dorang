@@ -491,7 +491,7 @@ providers:
 | `retry.backoff` | `exponential` \| `linear` \| `constant` | `exponential` | Retry spacing | Anything else is refused |
 | `retry.base` | duration | `500ms` | First retry interval | Negative is refused |
 | `usage_probe.enabled` | bool | `false` | Polls the provider's own view of remaining quota | Without it, quota is metered locally only, and local metering under-counts by exactly the traffic that did not go through dorang |
-| `usage_probe.fetcher` | string | `""` | Which provider-specific fetcher to use: `zai` (aliases `z.ai`, `glm`, `zhipu`, `bigmodel`), `anthropic`, `deepseek` | Required when the probe is enabled. **A fetcher no prober exists for stops the gateway at start-up**, naming the ones that do — the schema cannot check this itself, and the alternative is a provider that silently never reports |
+| `usage_probe.fetcher` | string | `""` | Which provider-specific fetcher to use: `zai` (aliases `z.ai`, `glm`, `zhipu`, `bigmodel`), `anthropic`, `deepseek`, `openrouter`, `deepinfra` (§20.3) | Required when the probe is enabled. **A fetcher no prober exists for stops the gateway at start-up**, naming the ones that do — the schema cannot check this itself, and the alternative is a provider that silently never reports |
 | `usage_probe.interval` | duration | `60s` | Poll interval, and the floor on how often ONE credential is read | Negative is refused. A poll is up to one interval stale — see §6.1. A second read inside the interval replays the last snapshot rather than spending a request |
 | `usage_probe.allowances[]` | list | `[]` | Files a provider's reported window under a rule's key, and declares how large it is | **Without one, a percent-reporting provider gates nothing** — see §6.1a. A window filed under a key no rule uses is inert |
 | `metrics.*` — the whole block | — | — | **Nothing. It is refused at load** (§23.2): §12.4's backend metrics scrape has no collector in this build | Writing any of `enabled`, `endpoint` or `interval` fails validation, naming what to use instead. `least_busy` and `highest_tps` do not need it — see §6.2 |
@@ -1932,6 +1932,61 @@ or not the caller tried. Both directions are asserted by tests — from the call
 the renderer's.
 
 ---
+
+### 20.3 Several transports, chat webhooks, and "running low"
+
+**Email and webhook together.** `email.drivers: [smtp, http]` sends every notification on each
+listed transport, and each has its own queue, workers, retries and breaker: a mail server that is
+down never delays or blocks the webhook, and a webhook retry never sends the email again.
+`drivers` and `driver` are exclusive; `none` is not a transport to list.
+
+**Chat webhooks.** `email.http.format: slack` posts `{"text": …}` and `discord` posts
+`{"content": …}` — the rendered message, every field in it — to an incoming-webhook URL. The
+default `dorang` is the signed JSON envelope above. The signature header goes with every format,
+so the secret stays required.
+
+**`remaining_low`** is announced when something with a ceiling has at most `percent` of it left:
+
+| Source | What is measured | When it is judged |
+|---|---|---|
+| A provider with `usage_probe` | every window the probe reads (a plan's 5-hour window, a vendor's monthly spend limit) and every prepaid balance | right after each poll — the probe's `interval`, 1m by default |
+| A key's or team's budget | spend against `max_budget` in the current period | on the request that crosses it |
+
+`quota_exhausted` — now raised — is the plan that has nothing left at all: an upstream 429 whose
+message says a plan or account allowance is used up ("You reached your Pro 5-hour limit",
+"exceeded your current quota", "usage limit"), as opposed to an ordinary per-minute rate limit. It
+is the only signal Ollama Cloud and the Qwen token plan give, since neither publishes what is
+left. It clears on the credential's next success.
+
+```yaml
+notifications:
+  email:
+    drivers: [smtp, http]
+    http: {url: "https://hooks.slack.com/services/…", key_env: DORANG_WEBHOOK_SECRET, format: slack}
+  events: [remaining_low, quota_exhausted, budget_exceeded]
+  remaining_low:
+    percent: 5               # at or under this share left is low
+    balance_floor_usd: "2"   # a prepaid balance under this is low whatever its share
+    interval: 1m             # how often an undelivered announcement is retried
+    remind: 6h               # how long a condition may stay low before it is announced again
+providers:
+  - {name: openrouter, kind: openrouter, usage_probe: {enabled: true, fetcher: openrouter}}
+  - {name: deepinfra,  kind: deepinfra,  usage_probe: {enabled: true, fetcher: deepinfra}}
+```
+
+Each condition — one credential's window or balance, one subject's budget for one period, one
+credential's plan — is **announced once when it becomes low, reminded every `remind` while it
+stays low, and re-armed when it recovers**. That state lives in the database (`alert_state`,
+migration 0010), not in the process: a restart or a second node does not announce the same crossing
+again, and the row records which transports have delivered, so a failed transport is retried — to
+that transport only — every `interval` after five of them have passed. A balance's share is of what
+was credited in all, which moves with every top-up; `balance_floor_usd` is the steadier test.
+`notifications.*` is read at start-up; a reload does not change it.
+
+The two vendor fetchers read account-wide figures with the credential the gateway serves with:
+`openrouter` (lifetime credits less usage, as a balance) and `deepinfra` (the monthly spend limit
+against this month's spend, and the Stripe credit less that spend). The spend limit is alert-only
+and never gates traffic; an `allowances[]` entry cannot re-file it.
 
 ## 21. `priority_mapping`
 
