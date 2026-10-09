@@ -9,7 +9,7 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
-## Unreleased
+## 0.3.0 — 2026-10-09
 
 - **State alerts announce transitions only**: once when a problem starts, once
   when it recovers — the recovery is now sent, with "recovered:" in the subject
