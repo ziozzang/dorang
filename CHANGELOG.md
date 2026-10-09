@@ -9,7 +9,7 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
-## Unreleased
+## 0.2.0 — 2026-10-09
 
 ### Running low is announced, by email and webhook at once
 
