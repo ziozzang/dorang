@@ -367,3 +367,29 @@ func TestLoadPrimesConditionsAfterARestart(t *testing.T) {
 		t.Error("the recovery did not clear the stored condition")
 	}
 }
+
+func TestAFullRecoveryCountsAtTheTopOfTheRange(t *testing.T) {
+	e := New(Options{Notifier: &notify.Notifier{}, Percent: 60, RecoverPercent: 100})
+	if v, _ := e.Judge(100, 100); v != OK {
+		t.Errorf("100%% left with recover_percent 100: %v, want OK", v)
+	}
+}
+
+// TestSweepLearnsWhatOtherNodesRaised: the request path asks about a recovery
+// only while this process knows something is low, so the sweep teaches it.
+func TestSweepLearnsWhatOtherNodesRaised(t *testing.T) {
+	st := &memStore{rows: map[string]*memRow{}}
+	e, sk, _ := setup(t, st)
+	st.mu.Lock()
+	st.rows["k"] = &memRow{low: true, seq: 1, event: "remaining_low"}
+	st.mu.Unlock()
+	if e.AnyLow() {
+		t.Fatal("knew of a condition nobody told it about")
+	}
+	e.Sweep(context.Background())
+	if !e.AnyLow() {
+		t.Fatal("the sweep did not learn the condition another node raised")
+	}
+	e.Observe(context.Background(), cond(false))
+	wait(t, func() bool { return sk.count() == 1 })
+}

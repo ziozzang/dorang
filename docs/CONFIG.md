@@ -1999,7 +1999,10 @@ credential's plan — is **announced on its transitions and nothing else: once w
 problem, once when it recovers**. A state notification repeated while nothing changes is spam, so
 `remind` is off unless set. A figure hovering at the line does not flap: it becomes low at
 `percent` and recovers only above `recover_percent`; between the two its state holds. A balance
-recovers once it is half again above `balance_floor_usd`. That state lives in the database (`alert_state`,
+recovers once it is half again above `balance_floor_usd`. A recovery observed while the problem's
+announcement is still owed to a transport supersedes it there: that transport is sent the recovery.
+A budget is one condition per subject and period length, so a budget that renews is announced as
+recovered. That state lives in the database (`alert_state`,
 migration 0010), not in the process: a restart or a second node does not announce the same crossing
 again, and the row records which transports have delivered, so a failed transport is retried — to
 that transport only — every `interval` after five of them have passed. A balance's share is of what

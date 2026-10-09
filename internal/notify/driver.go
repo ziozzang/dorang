@@ -256,6 +256,43 @@ func eventLevel(ev Event) string {
 	return "info"
 }
 
+// contentType is the Content-Type the operator's headers set, or JSON.
+func contentType(h map[string]string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, "Content-Type") {
+			return v
+		}
+	}
+	return "application/json"
+}
+
+func isJSONType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	return ct == "application/json" || strings.HasSuffix(ct, "+json")
+}
+
+// CheckTemplateJSON renders t over values that need escaping and refuses a
+// template whose output is not JSON when it is sent as JSON: a value spliced
+// in unquoted is valid template syntax and an invalid body.
+func CheckTemplateJSON(t *template.Template, ct string) error {
+	if !isJSONType(ct) {
+		return nil
+	}
+	tricky := "a \"quoted\" line\nand another\\"
+	var b bytes.Buffer
+	err := t.Execute(&b, TemplateData{ID: tricky, Event: tricky, Level: tricky, Status: tricky,
+		Title: tricky, Body: tricky, Subject: tricky, Key: tricky, At: tricky,
+		Fields: map[string]string{"state": tricky, "percent_left": tricky, "provider": tricky}})
+	if err != nil {
+		return err
+	}
+	if !json.Valid(b.Bytes()) {
+		return errors.New("renders invalid JSON for a value with quotes or newlines; " +
+			"quote every value with {{json …}}, or set a non-JSON Content-Type header")
+	}
+	return nil
+}
+
 // CompileTemplate parses a webhook body template. It is exported so that the
 // configuration can be refused at load rather than at the first delivery.
 func CompileTemplate(s string) (*template.Template, error) {
@@ -326,6 +363,9 @@ func (d *httpDriver) Deliver(ctx context.Context, m *Message) error {
 			At: m.At.UTC().Format(time.RFC3339), Fields: fields,
 		})
 		buf = b.Bytes()
+		if err == nil && isJSONType(contentType(d.o.Headers)) && !json.Valid(buf) {
+			err = errors.New("the template rendered invalid JSON; quote values with {{json …}}")
+		}
 	case "slack", "discord":
 		// A chat incoming webhook takes one text member and ignores the rest
 		// of the envelope at best, or refuses it. The text is the rendered
@@ -458,6 +498,9 @@ func newDriver(o *Options, name string) (Driver, error) {
 			}
 			t, err := CompileTemplate(o.HTTP.Template)
 			if err != nil {
+				return nil, fmt.Errorf("notify: http template: %w", err)
+			}
+			if err := CheckTemplateJSON(t, contentType(o.HTTP.Headers)); err != nil {
 				return nil, fmt.Errorf("notify: http template: %w", err)
 			}
 			d.tmpl = t

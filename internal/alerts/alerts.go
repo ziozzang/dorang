@@ -183,7 +183,7 @@ func (e *Engine) Judge(left, limit float64) (Verdict, float64) {
 	switch {
 	case pct <= e.o.Percent:
 		return Low, pct
-	case pct > e.o.RecoverPercent:
+	case pct > e.o.RecoverPercent || pct >= 100:
 		return OK, pct
 	}
 	return Hold, pct
@@ -345,6 +345,12 @@ func (e *Engine) Load(ctx context.Context) error {
 		return err
 	}
 	for _, a := range act {
+		e.mu.Lock()
+		cur, ok := e.cache[a.Key]
+		e.mu.Unlock()
+		if ok && cur.low {
+			continue
+		}
 		// checked stays zero: the first observation of each asks the store.
 		e.set(a.Key, cached{low: true, lastSent: a.LastSent})
 	}
@@ -356,6 +362,11 @@ func (e *Engine) Load(ctx context.Context) error {
 func (e *Engine) Sweep(ctx context.Context) {
 	if e == nil || e.o.Store == nil {
 		return
+	}
+	// Learn what other nodes have raised since: the request path asks about a
+	// recovery only while this process knows something is low.
+	if err := e.Load(ctx); err != nil {
+		e.o.Logf("alerts: sweep: %v", err)
 	}
 	now := e.o.Now()
 	pend, err := e.o.Store.AlertsPending(ctx, now.Add(-e.o.RetryAfter), 64)

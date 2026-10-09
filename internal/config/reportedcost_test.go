@@ -71,3 +71,13 @@ func TestWebhookTemplateAndHeaderEnv(t *testing.T) {
 	mustRefuse(t, loadWith(t, head+"      header_env: {X-Dorang-Signature: S}\n"),
 		"notifications.email.http.header_env[\"X-Dorang-Signature\"]", "dorang's own")
 }
+
+func TestWebhookTemplateMustRenderJSON(t *testing.T) {
+	head := "\nnotifications:\n  email:\n    drivers: [http]\n    http:\n      url: \"https://h.example.com\"\n" +
+		"      key_env: DORANG_TEST_FIXTURE_KEY\n      format: template\n"
+	mustRefuse(t, loadWith(t, head+"      template: '{\"text\": \"{{.Body}}\"}'\n"),
+		"notifications.email.http.template", "invalid JSON")
+	if _, err := loadYAML(t, head+"      template: '{{.Title}} {{.Body}}'\n      headers: {Content-Type: text/plain}\n"); err != nil {
+		t.Fatalf("a text/plain template was refused: %v", err)
+	}
+}

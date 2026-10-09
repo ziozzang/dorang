@@ -196,7 +196,8 @@ func TestTemplateStatusFollowsTheTransition(t *testing.T) {
 	n, _ := newNotifier(t, func(o *Options) {
 		o.Driver = DriverHTTP
 		o.HTTP = HTTPOptions{URL: srv.URL, Secret: "s3cret-signing", Format: "template",
-			Template: `{{.Status}} {{.Level}} {{.Title}}`}
+			Template: `{{.Status}} {{.Level}} {{.Title}}`,
+			Headers:  map[string]string{"Content-Type": "text/plain"}}
 	})
 	n.Send(Notification{Event: EventRemainingLow, Subject: Subject{Kind: "credential", ID: "c1"},
 		Fields: []Field{{Name: "state", Value: "low"}}})
@@ -209,5 +210,19 @@ func TestTemplateStatusFollowsTheTransition(t *testing.T) {
 	if !strings.HasPrefix(bodies[0], "problem warn ") || !strings.HasPrefix(bodies[1], "ok info ") ||
 		!strings.Contains(bodies[1], "recovered: running low") {
 		t.Errorf("bodies = %q", bodies)
+	}
+}
+
+func TestATemplateThatBreaksJSONIsRefused(t *testing.T) {
+	_, err := New(Options{Driver: DriverHTTP, HTTP: HTTPOptions{URL: "http://x", Secret: "s",
+		Format: "template", Template: `{"text": "{{.Body}}"}`}})
+	if err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+		t.Fatalf("err = %v", err)
+	}
+	// The same splice is fine in a body declared as plain text.
+	if _, err := New(Options{Driver: DriverHTTP, HTTP: HTTPOptions{URL: "http://x", Secret: "s",
+		Format: "template", Template: `{{.Title}}: {{.Body}}`,
+		Headers: map[string]string{"Content-Type": "text/plain"}}}); err != nil {
+		t.Fatalf("a text/plain template was refused: %v", err)
 	}
 }

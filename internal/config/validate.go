@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1871,8 +1872,7 @@ func (c *Config) validateNotifications(col *collector) {
 	case n.Email.HTTP.Format != "template" && tmpl != "":
 		col.add("notifications.email.http.template", "applies only to format: template")
 	case tmpl != "":
-		if _, err := template.New("webhook").Funcs(template.FuncMap{"json": func(any) string { return "" }}).
-			Parse(tmpl); err != nil {
+		if err := checkWebhookTemplate(tmpl, n.Email.HTTP.Headers); err != nil {
 			col.add("notifications.email.http.template", "%v", err)
 		}
 	}
@@ -2080,4 +2080,42 @@ func fractionDigits(s string) int {
 		return 0
 	}
 	return len(strings.TrimRight(s[i+1:], "0"))
+}
+
+// checkWebhookTemplate parses a webhook body template and, when it is sent as
+// JSON, renders it over values that need escaping. It mirrors
+// internal/notify.CheckTemplateJSON so that `config lint` and the server agree.
+func checkWebhookTemplate(tmpl string, headers map[string]string) error {
+	t, err := template.New("webhook").Option("missingkey=zero").Funcs(template.FuncMap{
+		"json": func(v any) (string, error) {
+			b, err := json.Marshal(v)
+			return string(b), err
+		},
+	}).Parse(tmpl)
+	if err != nil {
+		return err
+	}
+	ct := "application/json"
+	for k, v := range headers {
+		if strings.EqualFold(k, "Content-Type") {
+			ct = v
+		}
+	}
+	ct = strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	if ct != "application/json" && !strings.HasSuffix(ct, "+json") {
+		return nil
+	}
+	tricky := "a \"quoted\" line\nand another\\"
+	data := map[string]any{"ID": tricky, "Event": tricky, "Level": tricky, "Status": tricky,
+		"Title": tricky, "Body": tricky, "Subject": tricky, "Key": tricky, "At": tricky,
+		"Fields": map[string]string{"state": tricky, "percent_left": tricky, "provider": tricky}}
+	var b strings.Builder
+	if err := t.Execute(&b, data); err != nil {
+		return err
+	}
+	if !json.Valid([]byte(b.String())) {
+		return errors.New("renders invalid JSON for a value with quotes or newlines; quote every " +
+			"value with {{json …}}, or set a non-JSON Content-Type header")
+	}
+	return nil
 }

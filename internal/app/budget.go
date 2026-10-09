@@ -459,9 +459,9 @@ func budgetSubjectsOf(p *auth.Principal) []budgetSubject {
 	return out
 }
 
-// observeRemaining reports a budget's share left to internal/alerts. The key
-// carries the period start, so a new period is a new condition and an old one
-// is never "recovered" into. A budget that is not low costs nothing unless some
+// observeRemaining reports a budget's share left to internal/alerts. One
+// condition per subject and period length: a new period's spend starts at
+// zero, so a budget that was low recovers when it renews. A budget that is not low costs nothing unless some
 // condition is already known to be low — then its key is built so that a
 // raised ceiling can clear it.
 //
@@ -478,8 +478,9 @@ func (g *budgetGate) observeRemaining(ctx context.Context, s budgetSubject, subj
 	if v == alerts.Hold || (v == alerts.OK && !g.alerts.AnyLow()) {
 		return
 	}
-	key := "remaining_low|budget|" + subject.String() + "|" + s.window.String() + "|" +
-		strconv.FormatInt(s.window.PeriodStart(now).Unix(), 10)
+	// The period is not part of the key: a budget that renews is the
+	// condition recovering, and is announced as such.
+	key := "remaining_low|budget|" + subject.String() + "|" + s.window.String()
 	g.alerts.Observe(ctx, alerts.Condition{
 		Event: notify.EventRemainingLow, Subject: subject, Key: key, Low: v == alerts.Low,
 		Fields: []notify.Field{
