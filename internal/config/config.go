@@ -1724,8 +1724,13 @@ type RemainingLow struct {
 	// undelivered alert is retried. Default 1m; the usage probes poll at the
 	// same cadence (providers[].usage_probe.interval).
 	Interval Duration `yaml:"interval,omitempty"`
-	// Remind is how long a condition may stay low before it is announced
-	// again. Default 6h.
+	// RecoverPercent is the share left above which a low condition has
+	// recovered; between Percent and it nothing changes, so a figure hovering
+	// at the line does not flap. Default twice Percent.
+	RecoverPercent float64 `yaml:"recover_percent,omitempty"`
+	// Remind, when set, announces a condition again after it has stayed low
+	// that long. Omitted, only transitions are announced — a problem when it
+	// starts and its recovery — because a repeated state notification is spam.
 	Remind Duration `yaml:"remind,omitempty"`
 }
 
@@ -1776,12 +1781,22 @@ type WebhookSettings struct {
 	Headers map[string]string `yaml:"headers,omitempty"`
 	// Format is the body's shape: "dorang" (the signed JSON envelope, the
 	// default), "slack" ({"text": …}) or "discord" ({"content": …}) for a chat
-	// incoming webhook. The signature header is sent with every format.
+	// incoming webhook, or "template" for any other receiver. The signature
+	// header is sent with every format.
 	Format string `yaml:"format,omitempty"`
+	// Template is the body under format "template": Go text/template over
+	// .ID .Event .Level .Title .Body .Subject .Key .At and .Fields (a map),
+	// with `json` to quote a value as a JSON string. Refused at load if it
+	// does not parse.
+	Template string `yaml:"template,omitempty"`
+	// HeaderEnv sets headers from environment variables, header name to
+	// variable name, for a receiver that authenticates by header (an
+	// `Authorization: Bearer …` token). The value never appears in the file.
+	HeaderEnv map[string]string `yaml:"header_env,omitempty"`
 }
 
 // WebhookFormats are the accepted notifications.email.http.format values.
-var WebhookFormats = []string{"dorang", "slack", "discord"}
+var WebhookFormats = []string{"dorang", "slack", "discord", "template"}
 
 // NotifyRetry bounds delivery retries. A failing mail server must not be
 // retried hard: past MaxAttempts the notification is dropped and counted, and

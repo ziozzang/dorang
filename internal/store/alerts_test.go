@@ -69,15 +69,19 @@ func TestAlertStateAnnouncesEachCrossingOnce(t *testing.T) {
 			t.Fatalf("pending after reminder = %+v", pend)
 		}
 
-		// Recovery re-arms: the next crossing is news at once.
-		if was, _ := s.AlertClear(ctx, key, t0.Add(7*time.Hour)); !was {
-			t.Fatal("clearing a low condition reported it was not low")
+		// Recovery is a transition and is announced once; the next crossing is
+		// news at once.
+		if ok, seq, _ := s.AlertResolve(ctx, key, t0.Add(7*time.Hour), "smtp,http", `{}`); !ok || seq != 3 {
+			t.Fatalf("recovery: announce=%v seq=%d, want true 3", ok, seq)
 		}
-		if was, _ := s.AlertClear(ctx, key, t0.Add(7*time.Hour)); was {
-			t.Fatal("clearing twice reported a second recovery")
+		if ok, _, _ := s.AlertResolve(ctx, key, t0.Add(7*time.Hour), "smtp,http", `{}`); ok {
+			t.Fatal("resolving twice announced a second recovery")
 		}
-		if ok, seq := raise(t0.Add(7*time.Hour + time.Minute)); !ok || seq != 3 {
-			t.Fatalf("after recovery: announce=%v seq=%d, want true 3", ok, seq)
+		if pend, _ := s.AlertsPending(ctx, t0.Add(8*time.Hour), 10); len(pend) != 1 || pend[0].Seq != 3 {
+			t.Fatalf("the recovery announcement is not retried: %+v", pend)
+		}
+		if ok, seq := raise(t0.Add(7*time.Hour + time.Minute)); !ok || seq != 4 {
+			t.Fatalf("after recovery: announce=%v seq=%d, want true 4", ok, seq)
 		}
 	})
 }

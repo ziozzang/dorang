@@ -2,11 +2,17 @@
 // window, a vendor's spend limit or balance, a key's or team's budget, a plan
 // that has stopped serving — is news, and hands the news to internal/notify.
 //
-// A condition is observed as low or not low, as often as its source sees it:
+// News is a TRANSITION and nothing else: a condition that has just become a
+// problem, and the same condition recovering. Each is announced once. A
+// condition that stays low is not announced again unless a reminder interval
+// is configured (it is off by default), because a state notification repeated
+// while nothing changes is spam. A figure hovering at the threshold does not
+// flap: it becomes low at Percent and recovers only above RecoverPercent.
+//
+// A condition is observed as low or recovered as often as its source sees it:
 // on every request for a budget, after every usage-probe poll for a vendor
 // figure. Observing is cheap — a map lookup — unless the observation changes
-// something: a condition that has just become low, that has stayed low past
-// the reminder interval, or that has recovered.
+// the state.
 //
 // Those transitions are decided by the store, not by this process. Each is a
 // conditional write on the condition's alert_state row, and only the
@@ -36,7 +42,7 @@ import (
 type Store interface {
 	AlertRaise(ctx context.Context, key, event string, now, remindBefore time.Time,
 		pending, payload string) (bool, int64, error)
-	AlertClear(ctx context.Context, key string, now time.Time) (bool, error)
+	AlertResolve(ctx context.Context, key string, now time.Time, pending, payload string) (bool, int64, error)
 	AlertDelivered(ctx context.Context, key string, seq int64, driver string, now time.Time) error
 	AlertsPending(ctx context.Context, before time.Time, limit int) ([]Pending, error)
 	AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) ([]string, bool, error)
@@ -77,7 +83,12 @@ type Options struct {
 	Percent float64
 	// FloorNano is the absolute floor for a balance, in nano-USD; 0 is none.
 	FloorNano int64
-	// Remind is how long a condition stays low before it is announced again.
+	// RecoverPercent is the share left above which a low condition has
+	// recovered; between Percent and it the state does not change. Default
+	// twice Percent.
+	RecoverPercent float64
+	// Remind, when positive, re-announces a condition that has stayed low that
+	// long. Zero — the default — announces only transitions.
 	Remind time.Duration
 	// RetryAfter is how long an undelivered announcement waits before Sweep
 	// sends it again to the transports that still owe it.
@@ -118,8 +129,11 @@ func New(o Options) *Engine {
 	if o.Percent <= 0 {
 		o.Percent = 5
 	}
-	if o.Remind <= 0 {
-		o.Remind = 6 * time.Hour
+	if o.RecoverPercent <= o.Percent {
+		o.RecoverPercent = o.Percent * 2
+	}
+	if o.RecoverPercent > 100 {
+		o.RecoverPercent = 100
 	}
 	if o.RetryAfter <= 0 {
 		o.RetryAfter = 5 * time.Minute
@@ -144,37 +158,65 @@ func (e *Engine) Percent() float64 {
 	return e.o.Percent
 }
 
-// LowFraction reports whether left of limit is at or under the threshold, and
-// the percentage left. A non-positive limit is never low: there is nothing to
-// be a share of.
-func (e *Engine) LowFraction(left, limit float64) (bool, float64) {
+// Verdict is what one figure says about its condition.
+type Verdict int8
+
+const (
+	// Hold is a figure in the hysteresis band, or one that cannot be judged:
+	// the condition keeps whatever state it had and nothing is observed.
+	Hold Verdict = iota
+	Low
+	OK
+)
+
+// Judge classifies left of limit: Low at or under Percent, OK above
+// RecoverPercent, Hold between. It also returns the percentage left. A
+// non-positive limit has nothing to be a share of and is OK.
+func (e *Engine) Judge(left, limit float64) (Verdict, float64) {
 	if e == nil || limit <= 0 {
-		return false, 0
+		return OK, 0
 	}
 	if left < 0 {
 		left = 0
 	}
 	pct := left / limit * 100
-	return pct <= e.o.Percent, pct
+	switch {
+	case pct <= e.o.Percent:
+		return Low, pct
+	case pct > e.o.RecoverPercent:
+		return OK, pct
+	}
+	return Hold, pct
 }
 
-// BalanceLow reports whether a balance is low: under the absolute floor, or —
-// when the provider states what was credited — at or under the threshold
-// share of it.
-func (e *Engine) BalanceLow(remainingNano, totalNano int64) (bool, float64, bool) {
+// JudgeBalance classifies a prepaid balance: Low under the absolute floor or —
+// when the provider states what was credited — at or under Percent of it; OK
+// only when it is clear of both by the same hysteresis (half again the floor,
+// above RecoverPercent). hasPct says the percentage means something.
+func (e *Engine) JudgeBalance(remainingNano, totalNano int64) (v Verdict, pct float64, hasPct bool) {
 	if e == nil {
-		return false, 0, false
+		return OK, 0, false
 	}
-	low := e.o.FloorNano > 0 && remainingNano < e.o.FloorNano
+	floor := e.o.FloorNano
+	pv := Hold
 	if totalNano > 0 {
-		l, pct := e.LowFraction(float64(remainingNano), float64(totalNano))
-		return low || l, pct, true
+		pv, pct = e.Judge(float64(remainingNano), float64(totalNano))
+		hasPct = true
 	}
-	return low, 0, false
+	switch {
+	case floor > 0 && remainingNano < floor, pv == Low:
+		return Low, pct, hasPct
+	case (floor == 0 || remainingNano >= floor+floor/2) && (pv == OK || (!hasPct && floor > 0)):
+		return OK, pct, hasPct
+	}
+	return Hold, pct, hasPct
 }
 
-// Observe records one observation and announces it when it is news. It does
-// not block on delivery.
+// Observe records one observation and announces it when it is a transition:
+// Low on a condition that was not low, or Low=false on one that was. It does
+// not block on delivery. Fields describe the condition and are rendered only
+// when there is something to announce, with a `state` of low, reminder or
+// recovered.
 func (e *Engine) Observe(ctx context.Context, c Condition) {
 	if e == nil || c.Key == "" {
 		return
@@ -188,58 +230,65 @@ func (e *Engine) Observe(ctx context.Context, c Condition) {
 	case !c.Low && fresh && !st.low:
 		e.mu.Unlock()
 		return
-	case c.Low && fresh && st.low && now.Sub(st.lastSent) < e.o.Remind:
+	case c.Low && fresh && st.low && (e.o.Remind <= 0 || now.Sub(st.lastSent) < e.o.Remind):
 		e.mu.Unlock()
 		return
 	}
 	e.mu.Unlock()
 
+	state := "low"
+	switch {
+	case !c.Low:
+		state = "recovered"
+	case known && st.low:
+		state = "reminder"
+	}
+	fields := append(append([]notify.Field(nil), c.Fields...), notify.Field{Name: "state", Value: state})
+	payload, _ := json.Marshal(payloadDoc{Kind: c.Subject.Kind, ID: c.Subject.ID, Fields: fields})
+	pending := strings.Join(e.drivers(), ",")
+
 	if !c.Low {
-		was := st.low
+		announce, seq := known && st.low, int64(0)
 		if e.o.Store != nil {
 			var err error
-			if was, err = e.o.Store.AlertClear(ctx, c.Key, now); err != nil {
+			if announce, seq, err = e.o.Store.AlertResolve(ctx, c.Key, now, pending, string(payload)); err != nil {
 				e.o.Logf("alerts: %s: %v", c.Key, err)
 				return
 			}
 		}
 		e.set(c.Key, cached{checked: now})
-		if was {
-			e.o.Logf("alerts: %s recovered", c.Key)
+		if announce {
+			e.send(c.Event, c.Key, seq, c.Subject, fields, nil)
 		}
 		return
 	}
 
-	state := "low"
-	if known && st.low {
-		state = "reminder"
-	}
-	fields := append(append([]notify.Field(nil), c.Fields...), notify.Field{Name: "state", Value: state})
-	drivers := e.drivers()
 	announce, seq := true, int64(0)
 	if e.o.Store != nil {
-		payload, _ := json.Marshal(payloadDoc{Kind: c.Subject.Kind, ID: c.Subject.ID, Fields: fields})
+		// A reminder is due only when one is configured; otherwise the claim
+		// succeeds only for a condition that was not low.
+		remindBefore := time.Unix(0, 0)
+		if e.o.Remind > 0 {
+			remindBefore = now.Add(-e.o.Remind)
+		}
 		var err error
 		announce, seq, err = e.o.Store.AlertRaise(ctx, c.Key, c.Event.String(), now,
-			now.Add(-e.o.Remind), strings.Join(drivers, ","), string(payload))
+			remindBefore, pending, string(payload))
 		if err != nil {
 			e.o.Logf("alerts: %s: %v", c.Key, err)
 			return
 		}
 	}
-	// Whoever announced, the condition is low and was announced recently. A
-	// lost claim keeps the cached announcement time: another node announced at
-	// least since the reminder was last due, and the store is asked again
-	// after Recheck either way.
+	// A lost claim keeps the cached announcement time: another node announced,
+	// and the store is asked again after Recheck either way.
 	lastSent := now
 	if !announce && known && st.low {
 		lastSent = st.lastSent
 	}
 	e.set(c.Key, cached{low: true, lastSent: lastSent, checked: now})
-	if !announce {
-		return
+	if announce {
+		e.send(c.Event, c.Key, seq, c.Subject, fields, nil)
 	}
-	e.send(c.Event, c.Key, seq, c.Subject, fields, nil)
 }
 
 func (e *Engine) set(key string, st cached) {

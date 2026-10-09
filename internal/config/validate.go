@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -1864,6 +1865,26 @@ func (c *Config) validateNotifications(col *collector) {
 	if f := n.Email.HTTP.Format; f != "" {
 		mustBeOneOf(col, "notifications.email.http.format", f, WebhookFormats)
 	}
+	switch tmpl := n.Email.HTTP.Template; {
+	case n.Email.HTTP.Format == "template" && strings.TrimSpace(tmpl) == "":
+		col.add("notifications.email.http.template", "must be set when the format is template")
+	case n.Email.HTTP.Format != "template" && tmpl != "":
+		col.add("notifications.email.http.template", "applies only to format: template")
+	case tmpl != "":
+		if _, err := template.New("webhook").Funcs(template.FuncMap{"json": func(any) string { return "" }}).
+			Parse(tmpl); err != nil {
+			col.add("notifications.email.http.template", "%v", err)
+		}
+	}
+	for _, h := range sortedKeys(n.Email.HTTP.HeaderEnv) {
+		at := fmt.Sprintf("notifications.email.http.header_env[%q]", h)
+		switch v := n.Email.HTTP.HeaderEnv[h]; {
+		case v == "":
+			col.add(at, "names no environment variable")
+		case strings.EqualFold(h, "X-Dorang-Signature"):
+			col.add(at, "the signature header is dorang's own")
+		}
+	}
 	rl := &n.RemainingLow
 	if rl.Percent <= 0 || rl.Percent >= 100 {
 		col.add("notifications.remaining_low.percent", "must be between 0 and 100 (is %v)", rl.Percent)
@@ -1875,6 +1896,10 @@ func (c *Config) validateNotifications(col *collector) {
 	}
 	nonNegative(col, "notifications.remaining_low.interval", int64(rl.Interval))
 	nonNegative(col, "notifications.remaining_low.remind", int64(rl.Remind))
+	if rl.RecoverPercent != 0 && (rl.RecoverPercent <= rl.Percent || rl.RecoverPercent > 100) {
+		col.add("notifications.remaining_low.recover_percent",
+			"must be above percent (%v) and at most 100 (is %v)", rl.Percent, rl.RecoverPercent)
+	}
 	for i, e := range n.Events {
 		mustBeOneOf(col, fmt.Sprintf("notifications.events[%d]", i), e, notificationEvents)
 	}

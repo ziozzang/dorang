@@ -57,3 +57,17 @@ func TestNotificationDriversAndRemainingLow(t *testing.T) {
 	mustRefuse(t, loadWith(t, "\nnotifications:\n  remaining_low: {percent: 100}\n"),
 		"notifications.remaining_low.percent", "between 0 and 100")
 }
+
+func TestWebhookTemplateAndHeaderEnv(t *testing.T) {
+	head := "\nnotifications:\n  email:\n    drivers: [http]\n    http:\n      url: \"https://h.example.com\"\n      key_env: DORANG_TEST_FIXTURE_KEY\n"
+	if _, err := loadYAML(t, head+"      format: template\n      template: '{\"text\": {{json .Body}}}'\n"+
+		"      header_env: {Authorization: HOME_NOTIFY_AUTH}\n"); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	mustRefuse(t, loadWith(t, head+"      format: template\n"), "notifications.email.http.template", "must be set")
+	mustRefuse(t, loadWith(t, head+"      format: template\n      template: '{{ .Body '\n"),
+		"notifications.email.http.template", "")
+	mustRefuse(t, loadWith(t, head+"      template: 'x'\n"), "notifications.email.http.template", "only to format")
+	mustRefuse(t, loadWith(t, head+"      header_env: {X-Dorang-Signature: S}\n"),
+		"notifications.email.http.header_env[\"X-Dorang-Signature\"]", "dorang's own")
+}

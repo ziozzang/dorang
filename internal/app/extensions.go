@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/config"
@@ -99,11 +100,12 @@ func buildNotifier(cfg *config.Config, hooks *luaext.Engine,
 			HELO:          n.Email.SMTP.HELO,
 		},
 		HTTP: notify.HTTPOptions{
-			URL:     n.Email.HTTP.URL,
-			Secret:  webhookSecret,
-			Timeout: n.Email.HTTP.Timeout.Duration(),
-			Headers: n.Email.HTTP.Headers,
-			Format:  n.Email.HTTP.Format,
+			URL:      n.Email.HTTP.URL,
+			Secret:   webhookSecret,
+			Timeout:  n.Email.HTTP.Timeout.Duration(),
+			Headers:  webhookHeaders(n.Email.HTTP, logf),
+			Format:   n.Email.HTTP.Format,
+			Template: n.Email.HTTP.Template,
 		},
 		Hook:         hook,
 		QueueSize:    n.QueueSize,
@@ -237,4 +239,27 @@ func responseView(rq *server.Request, dec *router.Decision, res *result, status 
 // views carry no internals for an extension to leak into one.
 func hookDenied(d *luaext.RequestDecision) error {
 	return server.NewError(http.StatusForbidden, server.TypePermission, d.Reason).WithCode(d.Code)
+}
+
+// webhookHeaders merges the literal headers with those read from the
+// environment (`header_env`). A variable that is unset is logged by NAME and
+// the header left out: a notification transport is never a reason to refuse
+// to serve, and the receiver's 401 says the rest.
+func webhookHeaders(w config.WebhookSettings, logf func(string, ...any)) map[string]string {
+	if len(w.HeaderEnv) == 0 {
+		return w.Headers
+	}
+	out := make(map[string]string, len(w.Headers)+len(w.HeaderEnv))
+	for k, v := range w.Headers {
+		out[k] = v
+	}
+	for h, env := range w.HeaderEnv {
+		v := os.Getenv(env)
+		if v == "" {
+			logf("app: notifications.email.http.header_env[%q]: %s is not set; the header is not sent", h, env)
+			continue
+		}
+		out[h] = v
+	}
+	return out
 }

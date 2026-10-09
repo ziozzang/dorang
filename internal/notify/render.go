@@ -72,7 +72,15 @@ func render(n *Notification, from string, to []string, driver string, at time.Ti
 	}
 
 	m.ID = messageID(n.Event, n.Subject, at)
-	m.Line = sanitize("[dorang] " + n.Event.Title() + " — " + n.Subject.String())
+	title := n.Event.Title()
+	for _, f := range n.Fields {
+		// A state notification says which transition it is in the subject line,
+		// where a reader sees it first.
+		if f.Name == "state" && f.Value == "recovered" {
+			title = "recovered: " + title
+		}
+	}
+	m.Line = sanitize("[dorang] " + title + " — " + n.Subject.String())
 
 	var b strings.Builder
 	b.Grow(128 + 32*len(m.Fields))

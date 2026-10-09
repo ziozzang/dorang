@@ -50,17 +50,28 @@ func (s *Store) AlertRaise(ctx context.Context, key, event string, now, remindBe
 	return true, seq, nil
 }
 
-// AlertClear records that key is no longer low and reports whether it was.
-func (s *Store) AlertClear(ctx context.Context, key string, now time.Time) (bool, error) {
-	res, err := s.exec(ctx, `
-		UPDATE alert_state SET low = ?, pending = '', updated_at = ?
-		 WHERE alert_key = ? AND low = ?`,
-		false, Micros(now), key, true)
-	if err != nil {
-		return false, err
+// AlertResolve records that key is no longer low and claims the recovery's
+// announcement: announce is true for the one observation that turned a low
+// condition back, and false when it was not low (or another node already
+// resolved it). pending and payload are the recovery announcement's, as for
+// AlertRaise.
+func (s *Store) AlertResolve(ctx context.Context, key string, now time.Time,
+	pending, payload string) (announce bool, seq int64, err error) {
+
+	at := Micros(now)
+	err = s.queryRow(ctx, `
+		UPDATE alert_state
+		   SET low = ?, last_sent = ?, seq = seq + 1, pending = ?, payload = ?, updated_at = ?
+		 WHERE alert_key = ? AND low = ?
+		RETURNING seq`,
+		false, at, pending, payload, at, key, true).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, 0, nil
 	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
+	if err != nil {
+		return false, 0, err
+	}
+	return true, seq, nil
 }
 
 // AlertDelivered removes driver from the transports announcement seq of key
@@ -105,15 +116,15 @@ type AlertPending struct {
 	LastSent time.Time
 }
 
-// AlertsPending lists low conditions whose announcement is still owed to a
-// transport and was last attempted at or before before.
+// AlertsPending lists announcements — of a problem or of its recovery — still
+// owed to a transport and last attempted at or before before.
 func (s *Store) AlertsPending(ctx context.Context, before time.Time, limit int) ([]AlertPending, error) {
 	rows, err := s.query(ctx, `
 		SELECT alert_key, event, seq, pending, payload, last_sent
 		  FROM alert_state
-		 WHERE pending <> '' AND low = ? AND last_sent <= ?
+		 WHERE pending <> '' AND last_sent <= ?
 		 ORDER BY last_sent
-		 LIMIT ?`, true, Micros(before), limit)
+		 LIMIT ?`, Micros(before), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -143,9 +154,9 @@ func (s *Store) AlertRetryClaim(ctx context.Context, key string, seq int64, last
 	var pending string
 	err := s.queryRow(ctx, `
 		UPDATE alert_state SET last_sent = ?, updated_at = ?
-		 WHERE alert_key = ? AND seq = ? AND last_sent = ? AND pending <> '' AND low = ?
+		 WHERE alert_key = ? AND seq = ? AND last_sent = ? AND pending <> ''
 		RETURNING pending`,
-		Micros(now), Micros(now), key, seq, Micros(last), true).Scan(&pending)
+		Micros(now), Micros(now), key, seq, Micros(last)).Scan(&pending)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}

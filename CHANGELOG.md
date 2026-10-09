@@ -9,6 +9,18 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
+## Unreleased
+
+- **State alerts announce transitions only**: once when a problem starts, once
+  when it recovers — the recovery is now sent, with "recovered:" in the subject
+  line. `remaining_low.remind` is off by default (a repeated state notification
+  is spam), and a figure at the line cannot flap: low at `percent`, recovered
+  only above `recover_percent` (default twice `percent`).
+- **`http.format: template`** renders any receiver's body from a Go template
+  (`.Title .Body .Level .Status .Key .Fields …`), and **`http.header_env`** sets
+  headers from environment variables, so a receiver's bearer token stays out of
+  the configuration file.
+
 ## 0.2.0 — 2026-10-09
 
 ### Running low is announced, by email and webhook at once

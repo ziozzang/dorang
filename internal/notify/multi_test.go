@@ -135,3 +135,79 @@ func TestDriversAreValidated(t *testing.T) {
 		}
 	}
 }
+
+// TestTemplateFormatRendersAnyReceiversShape renders home-monitor's body,
+// {"title","text","level"}, and sends a token header taken from the options.
+func TestTemplateFormatRendersAnyReceiversShape(t *testing.T) {
+	var gotAuth string
+	var mu sync.Mutex
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		body, gotAuth = string(b), r.Header.Get("Authorization")
+		mu.Unlock()
+	}))
+	t.Cleanup(srv.Close)
+	n, _ := newNotifier(t, func(o *Options) {
+		o.Driver = DriverHTTP
+		o.HTTP = HTTPOptions{URL: srv.URL, Secret: "s3cret-signing", Format: "template",
+			Template: `{"title": {{json .Title}}, "text": {{json .Body}}, "level": {{json .Level}}, ` +
+				`"key": {{json .Key}}, "left": {{json (index .Fields "percent_left")}}}`,
+			Headers: map[string]string{"Authorization": "Bearer tok-123"}}
+	})
+	n.Send(Notification{Event: EventQuotaExhausted, Subject: Subject{Kind: "credential", ID: "ollama-1"},
+		Fields: []Field{{Name: "provider", Value: "ollama-cloud"}}})
+	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return body != "" })
+	mu.Lock()
+	defer mu.Unlock()
+	var doc map[string]string
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, body)
+	}
+	if doc["level"] != "error" || doc["key"] != "quota_exhausted:credential:ollama-1" ||
+		!strings.Contains(doc["text"], "ollama-cloud") || doc["title"] == "" || doc["left"] != "" {
+		t.Errorf("doc = %v", doc)
+	}
+	if gotAuth != "Bearer tok-123" {
+		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestTemplateFormatNeedsAValidTemplate(t *testing.T) {
+	for _, tmpl := range []string{"", "{{ .Nope "} {
+		if _, err := New(Options{Driver: DriverHTTP, HTTP: HTTPOptions{URL: "http://x", Secret: "s",
+			Format: "template", Template: tmpl}}); err == nil {
+			t.Errorf("template %q was accepted", tmpl)
+		}
+	}
+}
+
+func TestTemplateStatusFollowsTheTransition(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(b))
+		mu.Unlock()
+	}))
+	t.Cleanup(srv.Close)
+	n, _ := newNotifier(t, func(o *Options) {
+		o.Driver = DriverHTTP
+		o.HTTP = HTTPOptions{URL: srv.URL, Secret: "s3cret-signing", Format: "template",
+			Template: `{{.Status}} {{.Level}} {{.Title}}`}
+	})
+	n.Send(Notification{Event: EventRemainingLow, Subject: Subject{Kind: "credential", ID: "c1"},
+		Fields: []Field{{Name: "state", Value: "low"}}})
+	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(bodies) == 1 })
+	n.Send(Notification{Event: EventRemainingLow, Subject: Subject{Kind: "credential", ID: "c1"},
+		Fields: []Field{{Name: "state", Value: "recovered"}}})
+	waitUntil(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(bodies) == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.HasPrefix(bodies[0], "problem warn ") || !strings.HasPrefix(bodies[1], "ok info ") ||
+		!strings.Contains(bodies[1], "recovered: running low") {
+		t.Errorf("bodies = %q", bodies)
+	}
+}

@@ -474,14 +474,14 @@ func (g *budgetGate) observeRemaining(ctx context.Context, s budgetSubject, subj
 	if g.alerts == nil || limit <= 0 {
 		return
 	}
-	low, pct := g.alerts.LowFraction(float64(limit-spent), float64(limit))
-	if !low && !g.alerts.AnyLow() {
+	v, pct := g.alerts.Judge(float64(limit-spent), float64(limit))
+	if v == alerts.Hold || (v == alerts.OK && !g.alerts.AnyLow()) {
 		return
 	}
 	key := "remaining_low|budget|" + subject.String() + "|" + s.window.String() + "|" +
 		strconv.FormatInt(s.window.PeriodStart(now).Unix(), 10)
 	g.alerts.Observe(ctx, alerts.Condition{
-		Event: notify.EventRemainingLow, Subject: subject, Key: key, Low: low,
+		Event: notify.EventRemainingLow, Subject: subject, Key: key, Low: v == alerts.Low,
 		Fields: []notify.Field{
 			{Name: "source", Value: "budget"},
 			{Name: "subject", Value: subject.String()},

@@ -1715,6 +1715,24 @@ webhook을 재시도해도 이메일이 다시 가지 않는다. `drivers`와 `d
 (모든 필드 포함)를 incoming-webhook URL에 보낸다. 기본값 `dorang`은 위의 서명된 JSON envelope이다. 서명
 헤더는 어느 형식에서나 붙으므로 secret은 계속 필수다.
 
+**그 밖의 수신처.** `format: template`은 `email.http.template`을 렌더링한다. Go text/template이며
+`.ID .Event .Level .Status .Title .Body .Subject .Key .At`과 `.Fields`(map)를 쓸 수 있고, `json` 함수로 값을
+JSON 문자열로 감싼다. `.Level`은 quota_exhausted·budget_exceeded·credential_unhealthy가 `error`, 잔여 부족이
+`warn`, 그 밖과 모든 복구가 `info`이고, `.Status`는 `problem` 또는 복구일 때 `ok`다. `email.http.header_env`는
+헤더를 환경변수에서 읽으므로(헤더 → 변수) 수신처의 토큰이 파일에 남지 않는다:
+
+```yaml
+    http:
+      url: "http://10.2.2.10:16890/notify"
+      key_env: DORANG_WEBHOOK_SECRET
+      format: template
+      template: '{"title": {{json .Title}}, "text": {{json .Body}}, "level": {{json .Level}}}'
+      header_env: {Authorization: HOME_NOTIFY_AUTH}   # HOME_NOTIFY_AUTH="Bearer …"
+```
+
+파싱되지 않는 template은 로드 시 거부된다. `header_env`의 변수가 비어 있으면 이름만 로그에 남기고 그
+헤더는 빠진다.
+
 **`remaining_low`** 는 상한이 있는 것이 `percent` 이하만 남았을 때 알린다:
 
 | 출처 | 무엇을 재는가 | 언제 판정하는가 |
@@ -1736,15 +1754,19 @@ notifications:
   remaining_low:
     percent: 5               # 이 비율 이하가 남으면 부족
     balance_floor_usd: "2"   # 선불 잔액이 이보다 적으면 비율과 무관하게 부족
+    recover_percent: 10      # 이 비율을 넘어야 복구(기본은 percent의 두 배)
     interval: 1m             # 전달 안 된 알림을 재시도하는 주기
-    remind: 6h               # 부족 상태가 이어질 때 다시 알리는 간격
+    # remind: 6h             # 기본은 꺼짐: 상태 변화만 알린다
 providers:
   - {name: openrouter, kind: openrouter, usage_probe: {enabled: true, fetcher: openrouter}}
   - {name: deepinfra,  kind: deepinfra,  usage_probe: {enabled: true, fetcher: deepinfra}}
 ```
 
 각 조건 — credential 하나의 window나 잔액, 한 subject의 한 기간 예산, credential 하나의 플랜 — 은
-**부족해지는 순간 한 번 알리고, 부족이 이어지는 동안 `remind`마다 다시 알리며, 회복되면 재무장된다**. 이
+**상태가 바뀔 때만 알린다: 문제가 생길 때 한 번, 복구될 때 한 번**. 아무것도 바뀌지 않는데 반복되는 상태
+알림은 스팸이므로 `remind`는 설정하지 않으면 꺼져 있다. 임계값 근처를 오가는 값은 흔들리지 않는다:
+`percent`에서 부족이 되고 `recover_percent`를 넘어야 복구되며, 그 사이에서는 상태가 유지된다. 잔액은
+`balance_floor_usd`보다 절반 이상 많아져야 복구된다. 이
 상태는 프로세스가 아니라 데이터베이스(`alert_state`, migration 0010)에 있다: 재시작이나 두 번째 노드가 같은
 crossing을 다시 알리지 않고, 어느 전송 수단이 전달했는지도 기록되므로 실패한 전송 수단만 다섯 `interval`이
 지난 뒤부터 `interval`마다 재시도된다. 잔액의 비율은 지금까지 충전된 총액 대비라 충전할 때마다 움직이므로

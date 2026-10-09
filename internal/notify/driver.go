@@ -16,6 +16,7 @@ import (
 	"net/smtp"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 )
 
@@ -187,9 +188,13 @@ type HTTPOptions struct {
 	Headers map[string]string
 	// Client overrides the HTTP client.
 	// Format is the body's shape: "" or "dorang" (the envelope below),
-	// "slack" ({"text": …}) or "discord" ({"content": …}).
+	// "slack" ({"text": …}), "discord" ({"content": …}), or "template".
 	Format string
-	Client *http.Client
+	// Template is the body under Format "template": Go text/template over
+	// [TemplateData], with a `json` function that quotes a value as a JSON
+	// string. Compiled once, when the notifier is built.
+	Template string
+	Client   *http.Client
 }
 
 // Webhook headers.
@@ -223,6 +228,43 @@ func sign(secret string, at time.Time, body []byte) string {
 type httpDriver struct {
 	o      HTTPOptions
 	client *http.Client
+	tmpl   *template.Template
+}
+
+// TemplateData is what a "template" webhook body is rendered from.
+type TemplateData struct {
+	ID      string            // the notification's idempotency key
+	Event   string            // remaining_low, quota_exhausted, …
+	Level   string            // info | warn | error, from the event
+	Title   string            // the rendered subject line
+	Body    string            // the rendered message, every field in it
+	Subject string            // "credential:openrouter-1", "key:abc", …
+	Key     string            // "<event>:<subject>", stable for one condition
+	Status  string            // "problem", or "ok" for a recovery
+	At      string            // RFC 3339
+	Fields  map[string]string // the allow-listed, redacted fields
+}
+
+// eventLevel is a notification's severity for a receiver that has one.
+func eventLevel(ev Event) string {
+	switch ev {
+	case EventBudgetExceeded, EventQuotaExhausted, EventCredentialUnhealthy:
+		return "error"
+	case EventBudget80, EventRemainingLow, EventTokenGuard:
+		return "warn"
+	}
+	return "info"
+}
+
+// CompileTemplate parses a webhook body template. It is exported so that the
+// configuration can be refused at load rather than at the first delivery.
+func CompileTemplate(s string) (*template.Template, error) {
+	return template.New("webhook").Option("missingkey=zero").Funcs(template.FuncMap{
+		"json": func(v any) (string, error) {
+			b, err := json.Marshal(v)
+			return string(b), err
+		},
+	}).Parse(s)
 }
 
 func (d *httpDriver) Name() string { return DriverHTTP }
@@ -268,6 +310,22 @@ func (d *httpDriver) Deliver(ctx context.Context, m *Message) error {
 	var buf []byte
 	var err error
 	switch d.o.Format {
+	case "template":
+		fields := map[string]string{}
+		for _, f := range m.Fields {
+			fields[f.Name] = f.Value
+		}
+		status, level := "problem", eventLevel(m.Event)
+		if fields["state"] == "recovered" {
+			status, level = "ok", "info"
+		}
+		var b bytes.Buffer
+		err = d.tmpl.Execute(&b, TemplateData{
+			ID: m.ID, Event: m.Event.String(), Level: level, Status: status, Title: m.Line, Body: m.Body,
+			Subject: m.Subject.String(), Key: m.Event.String() + ":" + m.Subject.String(),
+			At: m.At.UTC().Format(time.RFC3339), Fields: fields,
+		})
+		buf = b.Bytes()
 	case "slack", "discord":
 		// A chat incoming webhook takes one text member and ignores the rest
 		// of the envelope at best, or refuses it. The text is the rendered
@@ -393,7 +451,18 @@ func newDriver(o *Options, name string) (Driver, error) {
 				"a webhook delivery is signed (DESIGN §11.5), and an unsigned receiver " +
 				"cannot tell a real delivery from a forged one")
 		}
-		return &httpDriver{o: o.HTTP, client: o.HTTP.Client}, nil
+		d := &httpDriver{o: o.HTTP, client: o.HTTP.Client}
+		if o.HTTP.Format == "template" {
+			if strings.TrimSpace(o.HTTP.Template) == "" {
+				return nil, errors.New("notify: http format template needs notifications.email.http.template")
+			}
+			t, err := CompileTemplate(o.HTTP.Template)
+			if err != nil {
+				return nil, fmt.Errorf("notify: http template: %w", err)
+			}
+			d.tmpl = t
+		}
+		return d, nil
 	case DriverLua:
 		return &luaDriver{hook: o.Hook}, nil
 	}

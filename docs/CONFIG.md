@@ -1945,6 +1945,25 @@ down never delays or blocks the webhook, and a webhook retry never sends the ema
 default `dorang` is the signed JSON envelope above. The signature header goes with every format,
 so the secret stays required.
 
+**Any other receiver.** `format: template` renders `email.http.template`, a Go text/template over
+`.ID .Event .Level .Status .Title .Body .Subject .Key .At` and `.Fields` (a map), with `json`
+to quote a value as a JSON string. `.Level` is `error` for quota_exhausted, budget_exceeded and
+credential_unhealthy, `warn` for running low, `info` otherwise and for every recovery;
+`.Status` is `problem`, or `ok` for a recovery. `email.http.header_env` sets headers from
+environment variables (header → variable), so a receiver's token never appears in the file:
+
+```yaml
+    http:
+      url: "http://10.2.2.10:16890/notify"
+      key_env: DORANG_WEBHOOK_SECRET
+      format: template
+      template: '{"title": {{json .Title}}, "text": {{json .Body}}, "level": {{json .Level}}}'
+      header_env: {Authorization: HOME_NOTIFY_AUTH}   # HOME_NOTIFY_AUTH="Bearer …"
+```
+
+A template that does not parse is refused at load; an unset `header_env` variable is logged by
+name and its header left out.
+
 **`remaining_low`** is announced when something with a ceiling has at most `percent` of it left:
 
 | Source | What is measured | When it is judged |
@@ -1967,16 +1986,20 @@ notifications:
   remaining_low:
     percent: 5               # at or under this share left is low
     balance_floor_usd: "2"   # a prepaid balance under this is low whatever its share
+    recover_percent: 10      # recovered only above this share (default twice percent)
     interval: 1m             # how often an undelivered announcement is retried
-    remind: 6h               # how long a condition may stay low before it is announced again
+    # remind: 6h             # off by default: only transitions are announced
 providers:
   - {name: openrouter, kind: openrouter, usage_probe: {enabled: true, fetcher: openrouter}}
   - {name: deepinfra,  kind: deepinfra,  usage_probe: {enabled: true, fetcher: deepinfra}}
 ```
 
 Each condition — one credential's window or balance, one subject's budget for one period, one
-credential's plan — is **announced once when it becomes low, reminded every `remind` while it
-stays low, and re-armed when it recovers**. That state lives in the database (`alert_state`,
+credential's plan — is **announced on its transitions and nothing else: once when it becomes a
+problem, once when it recovers**. A state notification repeated while nothing changes is spam, so
+`remind` is off unless set. A figure hovering at the line does not flap: it becomes low at
+`percent` and recovers only above `recover_percent`; between the two its state holds. A balance
+recovers once it is half again above `balance_floor_usd`. That state lives in the database (`alert_state`,
 migration 0010), not in the process: a restart or a second node does not announce the same crossing
 again, and the row records which transports have delivered, so a failed transport is retried — to
 that transport only — every `interval` after five of them have passed. A balance's share is of what

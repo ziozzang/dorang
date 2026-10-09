@@ -49,15 +49,15 @@ func (m *memStore) AlertRaise(_ context.Context, key, event string, now, remindB
 	return true, r.seq, nil
 }
 
-func (m *memStore) AlertClear(_ context.Context, key string, _ time.Time) (bool, error) {
+func (m *memStore) AlertResolve(_ context.Context, key string, now time.Time, pending, payload string) (bool, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.rows[key]
 	if r == nil || !r.low {
-		return false, nil
+		return false, 0, nil
 	}
-	r.low, r.pending = false, nil
-	return true, nil
+	r.low, r.lastSent, r.seq, r.pending, r.payload = false, now, r.seq+1, strings.Split(pending, ","), payload
+	return true, r.seq, nil
 }
 
 func (m *memStore) AlertDelivered(_ context.Context, key string, seq int64, driver string, _ time.Time) error {
@@ -81,7 +81,7 @@ func (m *memStore) AlertsPending(_ context.Context, before time.Time, _ int) ([]
 	defer m.mu.Unlock()
 	var out []Pending
 	for k, r := range m.rows {
-		if r.low && len(r.pending) > 0 && !r.lastSent.After(before) {
+		if len(r.pending) > 0 && !r.lastSent.After(before) {
 			out = append(out, Pending{Key: k, Event: r.event, Seq: r.seq, Pending: r.pending, Payload: r.payload, LastSent: r.lastSent})
 		}
 	}
@@ -92,7 +92,7 @@ func (m *memStore) AlertRetryClaim(_ context.Context, key string, seq int64, las
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.rows[key]
-	if r == nil || r.seq != seq || !r.lastSent.Equal(last) || len(r.pending) == 0 || !r.low {
+	if r == nil || r.seq != seq || !r.lastSent.Equal(last) || len(r.pending) == 0 {
 		return nil, false, nil
 	}
 	r.lastSent = now
@@ -128,6 +128,10 @@ func (c *testClock) Add(d time.Duration) time.Time { return c.now().Add(d) }
 func (c *testClock) set(t time.Time)               { c.ns.Store(t.UnixNano()) }
 
 func setup(t *testing.T, st Store) (*Engine, *sink, *testClock) {
+	return setupRemind(t, st, 0)
+}
+
+func setupRemind(t *testing.T, st Store, remind time.Duration) (*Engine, *sink, *testClock) {
 	t.Helper()
 	sk := &sink{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -149,7 +153,7 @@ func setup(t *testing.T, st Store) (*Engine, *sink, *testClock) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = n.Close(context.Background()) })
-	e := New(Options{Notifier: n, Store: st, Percent: 5, Remind: 6 * time.Hour,
+	e := New(Options{Notifier: n, Store: st, Percent: 5, Remind: remind,
 		RetryAfter: time.Minute, Now: clock.now})
 	return e, sk, clock
 }
@@ -171,45 +175,71 @@ func cond(low bool) Condition {
 		Fields:  []notify.Field{{Name: "percent_left", Value: "4.00"}}}
 }
 
-func TestOneCrossingIsOneNotification(t *testing.T) {
+// TestEachTransitionIsOneNotification: a problem is announced when it starts
+// and its recovery when it ends, once each, and nothing while the state holds —
+// not after an hour, not after a day.
+func TestEachTransitionIsOneNotification(t *testing.T) {
 	for name, st := range map[string]Store{"memory": nil, "store": &memStore{rows: map[string]*memRow{}}} {
 		t.Run(name, func(t *testing.T) {
 			e, sk, clock := setup(t, st)
 			ctx := context.Background()
 			e.Observe(ctx, cond(true))
 			wait(t, func() bool { return sk.count() == 1 })
-			for i := 0; i < 50; i++ {
+			for _, d := range []time.Duration{time.Minute, time.Hour, 24 * time.Hour} {
+				clock.set(clock.Add(d))
 				e.Observe(ctx, cond(true))
 			}
-			clock.set(clock.Add(time.Hour))
-			e.Observe(ctx, cond(true))
 			time.Sleep(30 * time.Millisecond)
 			if sk.count() != 1 {
-				t.Fatalf("%d notifications for one crossing", sk.count())
-			}
-			if !e.AnyLow() {
-				t.Error("AnyLow is false with a condition low")
+				t.Fatalf("%d notifications while the problem held", sk.count())
 			}
 			if f := sk.doc(0)["fields"].(map[string]any); f["state"] != "low" {
 				t.Errorf("fields = %v", f)
 			}
 
-			// Still low past the reminder interval: one reminder.
-			clock.set(clock.Add(6 * time.Hour))
-			e.Observe(ctx, cond(true))
-			wait(t, func() bool { return sk.count() == 2 })
-			if f := sk.doc(1)["fields"].(map[string]any); f["state"] != "reminder" {
-				t.Errorf("second notification state = %v", f["state"])
-			}
-
-			// Recovery re-arms; the next crossing is news at once.
 			e.Observe(ctx, cond(false))
+			wait(t, func() bool { return sk.count() == 2 })
+			if f := sk.doc(1)["fields"].(map[string]any); f["state"] != "recovered" {
+				t.Errorf("recovery state = %v", f["state"])
+			}
+			if line, _ := sk.doc(1)["subject_line"].(string); !strings.Contains(line, "recovered") {
+				t.Errorf("recovery subject line = %q", line)
+			}
+			for i := 0; i < 5; i++ {
+				e.Observe(ctx, cond(false))
+			}
 			if e.AnyLow() {
 				t.Error("AnyLow after recovery")
 			}
 			e.Observe(ctx, cond(true))
 			wait(t, func() bool { return sk.count() == 3 })
+			time.Sleep(30 * time.Millisecond)
+			if sk.count() != 3 {
+				t.Fatalf("%d notifications for three transitions", sk.count())
+			}
 		})
+	}
+}
+
+func TestARecoveryWithoutAProblemIsNotNews(t *testing.T) {
+	e, sk, _ := setup(t, &memStore{rows: map[string]*memRow{}})
+	e.Observe(context.Background(), cond(false))
+	time.Sleep(30 * time.Millisecond)
+	if sk.count() != 0 {
+		t.Fatal("announced a recovery from nothing")
+	}
+}
+
+func TestARemindIsOnlyWhenConfigured(t *testing.T) {
+	e, sk, clock := setupRemind(t, &memStore{rows: map[string]*memRow{}}, 6*time.Hour)
+	ctx := context.Background()
+	e.Observe(ctx, cond(true))
+	wait(t, func() bool { return sk.count() == 1 })
+	clock.set(clock.Add(6*time.Hour + time.Minute))
+	e.Observe(ctx, cond(true))
+	wait(t, func() bool { return sk.count() == 2 })
+	if f := sk.doc(1)["fields"].(map[string]any); f["state"] != "reminder" {
+		t.Errorf("state = %v", f["state"])
 	}
 }
 
@@ -257,26 +287,35 @@ func TestDeliveryIsRecordedAndSweepRetriesOnlyTheOwedTransport(t *testing.T) {
 	}
 }
 
-func TestThresholds(t *testing.T) {
+// TestJudgeHasHysteresis: low at 5%, recovered only above 10%, and nothing in
+// between, so a figure hovering at the line cannot flap.
+func TestJudgeHasHysteresis(t *testing.T) {
 	e := New(Options{Notifier: &notify.Notifier{}, Percent: 5, FloorNano: 2_000_000_000})
-	if low, pct := e.LowFraction(5, 100); !low || pct != 5 {
-		t.Errorf("5 of 100 left: %v %v", low, pct)
+	for _, tc := range []struct {
+		left float64
+		want Verdict
+	}{{5, Low}, {0, Low}, {5.01, Hold}, {10, Hold}, {10.01, OK}, {100, OK}} {
+		if v, _ := e.Judge(tc.left, 100); v != tc.want {
+			t.Errorf("%v%% left: %v, want %v", tc.left, v, tc.want)
+		}
 	}
-	if low, _ := e.LowFraction(5.01, 100); low {
-		t.Error("5.01% left is low")
+	if v, _ := e.Judge(0, 0); v != OK {
+		t.Error("a zero ceiling is not OK")
 	}
-	if low, _ := e.LowFraction(0, 0); low {
-		t.Error("a zero ceiling is low")
-	}
-	// Balance: under the floor whatever the share; at the share whatever the floor.
-	if low, _, _ := e.BalanceLow(1_900_000_000, 0); !low {
-		t.Error("$1.90 under a $2 floor with no total is not low")
-	}
-	if low, pct, has := e.BalanceLow(19_339_677_412, 40_000_000_000); low || !has || pct < 48 || pct > 49 {
-		t.Errorf("OpenRouter's 48%% left: %v %v %v", low, pct, has)
-	}
-	if low, _, _ := e.BalanceLow(30_000_000_000, 1_000_000_000_000); !low {
-		t.Error("3% of a $1000 credit is not low")
+	for _, tc := range []struct {
+		rem, total int64
+		want       Verdict
+	}{
+		{1_900_000_000, 0, Low},                   // under the $2 floor, no total
+		{2_500_000_000, 0, Hold},                  // above the floor, inside half again
+		{3_000_000_000, 0, OK},                    // clear of it
+		{19_339_677_412, 40_000_000_000, OK},      // OpenRouter's 48% left
+		{30_000_000_000, 1_000_000_000_000, Low},  // 3% of $1000
+		{80_000_000_000, 1_000_000_000_000, Hold}, // 8%: inside the band
+	} {
+		if v, _, _ := e.JudgeBalance(tc.rem, tc.total); v != tc.want {
+			t.Errorf("balance %d of %d: %v, want %v", tc.rem, tc.total, v, tc.want)
+		}
 	}
 }
 

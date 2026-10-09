@@ -141,12 +141,12 @@ const (
 	//   - an hour of deduplication, because that is the interval at which an
 	//     operator wants to be reminded that a budget is still at 80%, not the
 	//     interval at which requests arrive.
-	defaultNotifyQueueSize       = 256
-	defaultNotifyWorkers         = 1
-	defaultNotifyDedupPeriod     = time.Hour
-	defaultRemainingLowPercent   = 5
-	defaultRemainingLowInterval  = time.Minute
-	defaultRemainingLowRemind    = 6 * time.Hour
+	defaultNotifyQueueSize      = 256
+	defaultNotifyWorkers        = 1
+	defaultNotifyDedupPeriod    = time.Hour
+	defaultRemainingLowPercent  = 5
+	defaultRemainingLowInterval = time.Minute
+
 	defaultNotifyMaxAttempts     = 3
 	defaultNotifyInitialBackoff  = time.Second
 	defaultNotifyMaxBackoff      = 30 * time.Second
@@ -482,7 +482,7 @@ func (c *Config) ApplyDefaults() {
 		c.Notifications.RemainingLow.Percent = defaultRemainingLowPercent
 	}
 	setDur(&c.Notifications.RemainingLow.Interval, defaultRemainingLowInterval)
-	setDur(&c.Notifications.RemainingLow.Remind, defaultRemainingLowRemind)
+
 	setInt(&c.Notifications.QueueSize, defaultNotifyQueueSize)
 	setInt(&c.Notifications.Workers, defaultNotifyWorkers)
 	setDur(&c.Notifications.DedupPeriod, defaultNotifyDedupPeriod)

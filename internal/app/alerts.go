@@ -25,9 +25,10 @@ func buildAlerts(cfg *config.Config, n *notify.Notifier, st *store.Store,
 
 	rl := cfg.Notifications.RemainingLow
 	o := alerts.Options{
-		Notifier: n,
-		Percent:  rl.Percent,
-		Remind:   rl.Remind.Duration(),
+		Notifier:       n,
+		Percent:        rl.Percent,
+		RecoverPercent: rl.RecoverPercent,
+		Remind:         rl.Remind.Duration(),
 		// A transport that has not delivered within five sweeps is retried.
 		RetryAfter: 5 * rl.Interval.Duration(),
 		Now:        now,
@@ -58,8 +59,8 @@ func (a alertStore) AlertRaise(ctx context.Context, key, event string, now, remi
 	return a.s.AlertRaise(ctx, key, event, now, remindBefore, pending, payload)
 }
 
-func (a alertStore) AlertClear(ctx context.Context, key string, now time.Time) (bool, error) {
-	return a.s.AlertClear(ctx, key, now)
+func (a alertStore) AlertResolve(ctx context.Context, key string, now time.Time, pending, payload string) (bool, int64, error) {
+	return a.s.AlertResolve(ctx, key, now, pending, payload)
 }
 
 func (a alertStore) AlertDelivered(ctx context.Context, key string, seq int64, driver string, now time.Time) error {
@@ -116,7 +117,10 @@ func (a *App) evaluateProbes(ctx context.Context) {
 			default:
 				continue
 			}
-			low, pct := eng.LowFraction(left, limit)
+			v, pct := eng.Judge(left, limit)
+			if v == alerts.Hold {
+				continue
+			}
 			fields := []notify.Field{
 				{Name: "source", Value: "provider window"},
 				{Name: "provider", Value: pc.provider},
@@ -132,16 +136,22 @@ func (a *App) evaluateProbes(ctx context.Context) {
 				fields = append(fields, notify.Field{Name: "resets_at", Value: w.ResetAt.UTC().Format(time.RFC3339)})
 			}
 			eng.Observe(ctx, alerts.Condition{
-				Event: notify.EventRemainingLow, Subject: subj, Low: low, Fields: fields,
+				Event: notify.EventRemainingLow, Subject: subj, Low: v == alerts.Low, Fields: fields,
 				Key: "remaining_low|window|" + pc.provider + "|" + pc.credential + "|" + w.Label,
 			})
 		}
 		for _, b := range snap.Balances {
-			low, pct, hasPct := eng.BalanceLow(b.RemainingNano, b.TotalNano)
+			v, pct, hasPct := eng.JudgeBalance(b.RemainingNano, b.TotalNano)
 			if b.Currency != "USD" {
 				// The floor is in USD; a balance in another currency is judged by
 				// its share alone.
-				low = hasPct && pct <= eng.Percent()
+				if !hasPct {
+					continue
+				}
+				v, pct = eng.Judge(float64(b.RemainingNano), float64(b.TotalNano))
+			}
+			if v == alerts.Hold {
+				continue
 			}
 			fields := []notify.Field{
 				{Name: "source", Value: "provider balance"},
@@ -157,7 +167,7 @@ func (a *App) evaluateProbes(ctx context.Context) {
 					notify.Field{Name: "percent_left", Value: alerts.Percent(pct)})
 			}
 			eng.Observe(ctx, alerts.Condition{
-				Event: notify.EventRemainingLow, Subject: subj, Low: low, Fields: fields,
+				Event: notify.EventRemainingLow, Subject: subj, Low: v == alerts.Low, Fields: fields,
 				Key: "remaining_low|balance|" + pc.provider + "|" + pc.credential + "|" + b.Currency,
 			})
 		}
@@ -216,10 +226,19 @@ func (d *dispatcher) observePlan(ctx context.Context, dec *router.Decision, res 
 	if eng == nil || dec == nil || dec.Credential == "" {
 		return
 	}
+	subj := notify.Subject{Kind: "credential", ID: dec.Credential}
 	if res.err == nil {
 		if eng.AnyLow() {
-			eng.Observe(ctx, alerts.Condition{Event: notify.EventQuotaExhausted,
-				Key: "quota_exhausted|" + dec.Provider + "|" + dec.Credential})
+			// Its recovery, announced once if it was exhausted.
+			eng.Observe(ctx, alerts.Condition{Event: notify.EventQuotaExhausted, Subject: subj,
+				Key: "quota_exhausted|" + dec.Provider + "|" + dec.Credential,
+				Fields: []notify.Field{
+					{Name: "subject", Value: "credential:" + dec.Credential},
+					{Name: "provider", Value: dec.Provider},
+					{Name: "credential_id", Value: dec.Credential},
+					{Name: "model", Value: dec.UpstreamModel},
+					{Name: "reason", Value: "serving again"},
+				}})
 		}
 		return
 	}
@@ -252,7 +271,7 @@ func (d *dispatcher) observePlan(ctx context.Context, dec *router.Decision, res 
 		fields = append(fields, notify.Field{Name: "resets_at", Value: res.outcome.ResetAt.UTC().Format(time.RFC3339)})
 	}
 	eng.Observe(ctx, alerts.Condition{
-		Event: notify.EventQuotaExhausted, Subject: notify.Subject{Kind: "credential", ID: dec.Credential},
+		Event: notify.EventQuotaExhausted, Subject: subj,
 		Key: "quota_exhausted|" + dec.Provider + "|" + dec.Credential, Low: true, Fields: fields,
 	})
 }
