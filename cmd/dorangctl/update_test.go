@@ -76,7 +76,7 @@ func TestDeployMovesToTheNewReleaseInOrder(t *testing.T) {
 		"docker pull ghcr.io/ziozzang/dorang:0.2.0",
 		"DORANG_IMAGE=ghcr.io/ziozzang/dorang:0.2.0 docker compose --project-directory " + dir +
 			" run --rm --no-deps -T --entrypoint dorangctl dorang migrate --config /etc/dorang/config.yaml",
-		"docker compose --project-directory " + dir + " up -d --no-deps --pull never dorang dorang-catalog-sync",
+		"docker compose --project-directory " + dir + " up -d --no-deps --no-build --pull never dorang dorang-catalog-sync",
 		"docker compose --project-directory " + dir + " exec -T dorang dorang -version",
 	}
 	if strings.Join(fd.calls, "\n") != strings.Join(want, "\n") {

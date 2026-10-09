@@ -43,8 +43,10 @@ func TestAssetName(t *testing.T) {
 	if n, err := AssetName("dorang", "v0.1.0", "linux", "amd64"); err != nil || n != "dorang_0.1.0_linux_amd64" {
 		t.Errorf("AssetName = %q, %v", n, err)
 	}
-	if _, err := AssetName("dorang", "0.1.0", "windows", "amd64"); err == nil {
-		t.Error("a platform with no build was named")
+	for _, p := range [][2]string{{"windows", "amd64"}, {"linux", "arm64"}, {"darwin", "amd64"}} {
+		if _, err := AssetName("dorang", "0.1.0", p[0], p[1]); err == nil {
+			t.Errorf("%s/%s has no release build and was named", p[0], p[1])
+		}
 	}
 }
 

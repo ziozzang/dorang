@@ -9,6 +9,16 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
+## Unreleased
+
+- Releases are built for two targets, `linux/amd64` and `darwin/arm64`, and the
+  image for `linux/amd64`; `dorang update` names any other platform as having no
+  release build. `scripts/release.sh vX.Y.Z` cuts a release from a pushed tag
+  where GitHub Actions are off, producing exactly what the workflow does.
+- `dorangctl update --deploy` recreates with `--no-build` as well as `--pull
+  never`, so a Compose file that still has a `build:` section cannot turn a
+  missing image into a local build.
+
 ## 0.1.0 — 2026-10-09
 
 The first tagged release.

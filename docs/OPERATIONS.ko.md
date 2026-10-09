@@ -226,6 +226,10 @@ readiness 프로브의 주기와 실패 임계치가 `server.pre_stop_delay`를 
    200을 답하고 게이트웨이가 릴리즈 버전을 보고해야 한다. 아니면 `.env`를 되돌리고 이전 이미지로
    서비스를 재생성한 뒤 실패한다.
 
+릴리즈는 `v*` 태그를 push하면 `.github/workflows/release.yml`이 만든다. Actions가 꺼진 곳에서는
+`scripts/release.sh vX.Y.Z`가 push된 태그로 같은 자산과 이미지를 빌드해 게시한다. 릴리즈 대상은
+`linux/amd64`와 `darwin/arm64`(Apple silicon) 두 가지이고, 이미지는 `linux/amd64`다.
+
 `DIR/.dorang-update.lock`에 flock을 잡으므로, 느린 업데이트 중에 타이머가 다시 돌아도 아무것도 하지
 않는다. 호스트에 릴리즈 `dorangctl`을 두고 타이머로 실행하되, 그 `dorangctl`을 먼저 최신으로 유지한다:
 

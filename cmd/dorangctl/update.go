@@ -181,7 +181,9 @@ func (d *deployment) update(ctx context.Context, tag string, check, force bool) 
 // roll recreates the services from the current .env and waits for health. A
 // non-empty want is the version the gateway must report.
 func (d *deployment) roll(ctx context.Context, want string) error {
-	args := append([]string{"up", "-d", "--no-deps", "--pull", "never"}, d.services...)
+	// --no-build as well as --pull never: a Compose file that still carries a
+	// build: section must not turn a missing image into a local build.
+	args := append([]string{"up", "-d", "--no-deps", "--no-build", "--pull", "never"}, d.services...)
 	if out, err := d.compose(ctx, nil, args...); err != nil {
 		return fmt.Errorf("compose up: %v\n%s", err, out)
 	}

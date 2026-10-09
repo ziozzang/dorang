@@ -137,8 +137,9 @@ func (c *Client) Fetch(ctx context.Context, tag string) (*Release, error) {
 
 // AssetName is the raw executable of binary for a platform.
 func AssetName(binary, version, goos, goarch string) (string, error) {
+	// The two targets a release is built for (scripts/release.sh, release.yml).
 	switch goos + "/" + goarch {
-	case "linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64":
+	case "linux/amd64", "darwin/arm64":
 	default:
 		return "", fmt.Errorf("no release build for %s/%s", goos, goarch)
 	}

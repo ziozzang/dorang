@@ -112,8 +112,9 @@ every row there is a golden test rather than a note.
 
 ### 1.1 Binary
 
-Release archives carry both binaries for `linux/amd64`, `linux/arm64`, `darwin/amd64` and
-`darwin/arm64`, each with a `.sha256` beside it.
+Releases are built for two targets, `linux/amd64` and `darwin/arm64` (Apple silicon). Each has
+an archive carrying both binaries, with a `.sha256` beside it, and the two raw executables; the
+container image is `linux/amd64`. Any other platform builds from source.
 
 ```
 tar xzf dorang_v1.2.3_linux_amd64.tar.gz
@@ -251,6 +252,10 @@ and `DORANG_VERSION=<v>`. For a newer release it:
 4. requires the health URL (`--health`, default `http://127.0.0.1:4000/health/liveliness`) to
    answer 200 within `--health-timeout` and the gateway to report the release's version —
    otherwise it restores `.env`, recreates the services on the previous image, and fails.
+
+A release is cut by pushing a `v*` tag, which runs `.github/workflows/release.yml`; where Actions
+are off, `scripts/release.sh vX.Y.Z` builds and publishes the same assets and image from the
+pushed tag.
 
 It holds an flock on `DIR/.dorang-update.lock`, so a timer that fires during a slow update does
 nothing. Run it from a timer with a release `dorangctl` on the host, keeping that one current
