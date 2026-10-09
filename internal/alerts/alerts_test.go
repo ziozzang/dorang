@@ -88,15 +88,27 @@ func (m *memStore) AlertsPending(_ context.Context, before time.Time, _ int) ([]
 	return out, nil
 }
 
-func (m *memStore) AlertRetryClaim(_ context.Context, key string, seq int64, last, now time.Time) (bool, error) {
+func (m *memStore) AlertRetryClaim(_ context.Context, key string, seq int64, last, now time.Time) ([]string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.rows[key]
-	if r == nil || r.seq != seq || !r.lastSent.Equal(last) {
-		return false, nil
+	if r == nil || r.seq != seq || !r.lastSent.Equal(last) || len(r.pending) == 0 || !r.low {
+		return nil, false, nil
 	}
 	r.lastSent = now
-	return true, nil
+	return append([]string(nil), r.pending...), true, nil
+}
+
+func (m *memStore) AlertsActive(_ context.Context, _ int) ([]Active, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Active
+	for k, r := range m.rows {
+		if r.low {
+			out = append(out, Active{Key: k, LastSent: r.lastSent})
+		}
+	}
+	return out, nil
 }
 
 type sink struct {
@@ -273,5 +285,46 @@ func TestUSD(t *testing.T) {
 		if got := USD(n); got != want {
 			t.Errorf("USD(%d) = %q, want %q", n, got, want)
 		}
+	}
+}
+
+// TestAnotherNodesRecoveryIsSeenAfterRecheck: this process cached the
+// condition as low; another node cleared it and it crossed again. After
+// Recheck this process asks the store, which lets it announce the new crossing
+// instead of waiting out the reminder.
+func TestAnotherNodesRecoveryIsSeenAfterRecheck(t *testing.T) {
+	st := &memStore{rows: map[string]*memRow{}}
+	e, sk, clock := setup(t, st)
+	ctx := context.Background()
+	e.Observe(ctx, cond(true))
+	wait(t, func() bool { return sk.count() == 1 })
+	st.mu.Lock()
+	st.rows["k"].low = false // another node saw the recovery
+	st.mu.Unlock()
+	clock.set(clock.Add(30 * time.Second))
+	e.Observe(ctx, cond(true)) // inside Recheck: trusted cache, quiet
+	time.Sleep(30 * time.Millisecond)
+	if sk.count() != 1 {
+		t.Fatal("asked the store inside Recheck")
+	}
+	clock.set(clock.Add(time.Minute))
+	e.Observe(ctx, cond(true))
+	wait(t, func() bool { return sk.count() == 2 })
+}
+
+// TestLoadPrimesConditionsAfterARestart: a fresh process learns what is low,
+// so its first observation of a recovery clears the row.
+func TestLoadPrimesConditionsAfterARestart(t *testing.T) {
+	st := &memStore{rows: map[string]*memRow{"k": {low: true, seq: 1}}}
+	e, _, _ := setup(t, st)
+	if err := e.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !e.AnyLow() {
+		t.Fatal("a restarted process does not know the condition is low")
+	}
+	e.Observe(context.Background(), cond(false))
+	if st.rows["k"].low || e.AnyLow() {
+		t.Error("the recovery did not clear the stored condition")
 	}
 }

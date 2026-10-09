@@ -1029,6 +1029,12 @@ func (a *App) startBackground() error {
 			pt := time.NewTicker(every)
 			defer pt.Stop()
 			probes = pt.C
+			// One read at start, so a figure that is already low is announced
+			// now rather than a whole interval after a restart.
+			pctx, cancel := context.WithTimeout(ctx, time.Minute)
+			a.pollProbes(pctx)
+			a.evaluateProbes(pctx)
+			cancel()
 		}
 		for {
 			select {

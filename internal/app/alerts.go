@@ -41,7 +41,13 @@ func buildAlerts(cfg *config.Config, n *notify.Notifier, st *store.Store,
 			o.FloorNano = v
 		}
 	}
-	return alerts.New(o)
+	e := alerts.New(o)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.Load(ctx); err != nil {
+		logf("app: alerts: the conditions already low could not be read: %v", err)
+	}
+	return e
 }
 
 // alertStore adapts internal/store to internal/alerts.
@@ -69,8 +75,17 @@ func (a alertStore) AlertsPending(ctx context.Context, before time.Time, limit i
 	return out, err
 }
 
-func (a alertStore) AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) (bool, error) {
+func (a alertStore) AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) ([]string, bool, error) {
 	return a.s.AlertRetryClaim(ctx, key, seq, last, now)
+}
+
+func (a alertStore) AlertsActive(ctx context.Context, limit int) ([]alerts.Active, error) {
+	as, err := a.s.AlertsActive(ctx, limit)
+	out := make([]alerts.Active, len(as))
+	for i, x := range as {
+		out[i] = alerts.Active(x)
+	}
+	return out, err
 }
 
 // evaluateProbes turns every probed credential's last good snapshot into
@@ -176,6 +191,23 @@ var planExhausted = regexp.MustCompile(`(?i)(reached (your|the) [^.]{0,40}limit|
 	`quota (exceeded|exhausted)|exceeded your current quota|insufficient[ _](quota|balance|credits)|` +
 	`out of credits)`)
 
+// planExhaustedReason is the fixed category of a plan-exhausted message, or
+// "" for a message that is not one.
+func planExhaustedReason(msg string) string {
+	m := strings.ToLower(planExhausted.FindString(msg))
+	switch {
+	case m == "":
+		return ""
+	case strings.Contains(m, "insufficient"), strings.Contains(m, "credits"):
+		return "insufficient balance or credits"
+	case strings.Contains(m, "quota"):
+		return "quota exceeded"
+	case strings.Contains(m, "usage limit"):
+		return "usage limit reached"
+	}
+	return "plan limit reached"
+}
+
 // observePlan raises quota_exhausted when an upstream says a credential's plan
 // is used up, and clears it on that credential's next success. The success
 // path costs one atomic load unless some condition is known to be low.
@@ -199,18 +231,22 @@ func (d *dispatcher) observePlan(ctx context.Context, dec *router.Decision, res 
 	if reason == "" {
 		reason = se.Message
 	}
-	if res.outcome.Status != 429 || !planExhausted.MatchString(reason) {
+	if res.outcome.Status != 429 {
 		return
 	}
-	if len(reason) > 240 {
-		reason = reason[:240] + "…"
+	category := planExhaustedReason(reason)
+	if category == "" {
+		return
 	}
+	// The vendor's own words stay out of the notification: an upstream error
+	// can quote the request, an account address or a key fragment, and it
+	// would reach every transport. A fixed category says what happened.
 	fields := []notify.Field{
 		{Name: "subject", Value: "credential:" + dec.Credential},
 		{Name: "provider", Value: dec.Provider},
 		{Name: "credential_id", Value: dec.Credential},
 		{Name: "model", Value: dec.UpstreamModel},
-		{Name: "reason", Value: strings.TrimSpace(reason)},
+		{Name: "reason", Value: category},
 	}
 	if !res.outcome.ResetAt.IsZero() {
 		fields = append(fields, notify.Field{Name: "resets_at", Value: res.outcome.ResetAt.UTC().Format(time.RFC3339)})

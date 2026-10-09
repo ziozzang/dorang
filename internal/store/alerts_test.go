@@ -40,15 +40,23 @@ func TestAlertStateAnnouncesEachCrossingOnce(t *testing.T) {
 		if err != nil || len(pend) != 1 || len(pend[0].Pending) != 1 || pend[0].Pending[0] != "smtp" {
 			t.Fatalf("pending = %+v, %v; want smtp alone", pend, err)
 		}
-		if ok, _ := s.AlertRetryClaim(ctx, key, 1, pend[0].LastSent, t0.Add(2*time.Minute)); !ok {
-			t.Fatal("the retry was not claimed")
+		if owed, ok, _ := s.AlertRetryClaim(ctx, key, 1, pend[0].LastSent, t0.Add(2*time.Minute)); !ok ||
+			len(owed) != 1 || owed[0] != "smtp" {
+			t.Fatalf("the retry was not claimed for smtp: %v %v", owed, ok)
 		}
-		if ok, _ := s.AlertRetryClaim(ctx, key, 1, pend[0].LastSent, t0.Add(2*time.Minute)); ok {
+		if _, ok, _ := s.AlertRetryClaim(ctx, key, 1, pend[0].LastSent, t0.Add(2*time.Minute)); ok {
 			t.Fatal("the same retry was claimed twice")
+		}
+		if act, err := s.AlertsActive(ctx, 10); err != nil || len(act) != 1 || act[0].Key != key {
+			t.Fatalf("active = %+v, %v", act, err)
 		}
 		_ = s.AlertDelivered(ctx, key, 1, "smtp", t0)
 		if pend, _ := s.AlertsPending(ctx, t0.Add(time.Hour), 10); len(pend) != 0 {
 			t.Fatalf("delivered everywhere and still pending: %+v", pend)
+		}
+		// A listing taken before the last delivery cannot be claimed into a duplicate.
+		if _, ok, _ := s.AlertRetryClaim(ctx, key, 1, t0.Add(2*time.Minute), t0.Add(3*time.Minute)); ok {
+			t.Fatal("a retry was claimed with nothing owed")
 		}
 
 		// Still low past remind: one reminder.

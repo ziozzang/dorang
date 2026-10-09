@@ -136,17 +136,56 @@ func (s *Store) AlertsPending(ctx context.Context, before time.Time, limit int) 
 }
 
 // AlertRetryClaim claims the retry of announcement seq of key, which was last
-// attempted at last, so that one node retries it.
-func (s *Store) AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) (bool, error) {
-	res, err := s.exec(ctx, `
+// attempted at last, so that one node retries it, and returns the transports
+// still owed it as of the claim — a delivery recorded since the listing is not
+// sent again. ok is false when nothing is owed any more or another node won.
+func (s *Store) AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) ([]string, bool, error) {
+	var pending string
+	err := s.queryRow(ctx, `
 		UPDATE alert_state SET last_sent = ?, updated_at = ?
-		 WHERE alert_key = ? AND seq = ? AND last_sent = ?`,
-		Micros(now), Micros(now), key, seq, Micros(last))
-	if err != nil {
-		return false, err
+		 WHERE alert_key = ? AND seq = ? AND last_sent = ? AND pending <> '' AND low = ?
+		RETURNING pending`,
+		Micros(now), Micros(now), key, seq, Micros(last), true).Scan(&pending)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
 	}
-	n, _ := res.RowsAffected()
-	return n == 1, nil
+	if err != nil {
+		return nil, false, err
+	}
+	return strings.Split(pending, ","), true, nil
+}
+
+// AlertActive is a condition the store holds as low.
+type AlertActive struct {
+	Key      string
+	LastSent time.Time
+}
+
+// AlertsActive lists the conditions that are low, so that a process that has
+// just started knows them: a recovery it observes must clear them.
+func (s *Store) AlertsActive(ctx context.Context, limit int) ([]AlertActive, error) {
+	rows, err := s.query(ctx, `
+		SELECT alert_key, last_sent FROM alert_state WHERE low = ? ORDER BY alert_key LIMIT ?`,
+		true, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AlertActive
+	for rows.Next() {
+		var (
+			a    AlertActive
+			last sql.NullInt64
+		)
+		if err := rows.Scan(&a.Key, &last); err != nil {
+			return nil, err
+		}
+		if last.Valid {
+			a.LastSent = TimeAt(last.Int64)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func removeItem(list, item string) string {

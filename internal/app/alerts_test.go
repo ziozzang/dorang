@@ -29,3 +29,16 @@ func TestDecimalNano(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanExhaustedReasonIsACategory(t *testing.T) {
+	for msg, want := range map[string]string{
+		"You reached your Pro 5-hour limit. Max is $100/month (ref: abc) user@example.com": "plan limit reached",
+		"You exceeded your current quota":                                                  "quota exceeded",
+		"insufficient_quota: sk-abc123":                                                    "insufficient balance or credits",
+		"Too many requests":                                                                "",
+	} {
+		if got := planExhaustedReason(msg); got != want {
+			t.Errorf("%q: %q, want %q", msg, got, want)
+		}
+	}
+}

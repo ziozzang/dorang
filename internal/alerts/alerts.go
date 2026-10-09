@@ -39,7 +39,14 @@ type Store interface {
 	AlertClear(ctx context.Context, key string, now time.Time) (bool, error)
 	AlertDelivered(ctx context.Context, key string, seq int64, driver string, now time.Time) error
 	AlertsPending(ctx context.Context, before time.Time, limit int) ([]Pending, error)
-	AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) (bool, error)
+	AlertRetryClaim(ctx context.Context, key string, seq int64, last, now time.Time) ([]string, bool, error)
+	AlertsActive(ctx context.Context, limit int) ([]Active, error)
+}
+
+// Active is a condition the store holds as low.
+type Active struct {
+	Key      string
+	LastSent time.Time
 }
 
 // Pending is an announcement some transport still owes.
@@ -75,13 +82,19 @@ type Options struct {
 	// RetryAfter is how long an undelivered announcement waits before Sweep
 	// sends it again to the transports that still owe it.
 	RetryAfter time.Duration
-	Now        func() time.Time
-	Logf       func(string, ...any)
+	// Recheck bounds how long this process trusts what it last learned about a
+	// condition before asking the store again. Another node may have cleared
+	// or raised it since; the store is the authority. Default 1m.
+	Recheck time.Duration
+	Now     func() time.Time
+	Logf    func(string, ...any)
 }
 
 type cached struct {
 	low      bool
 	lastSent time.Time
+	// checked is when the store last confirmed this state.
+	checked time.Time
 }
 
 // Engine is the state machine. A nil *Engine observes nothing.
@@ -110,6 +123,9 @@ func New(o Options) *Engine {
 	}
 	if o.RetryAfter <= 0 {
 		o.RetryAfter = 5 * time.Minute
+	}
+	if o.Recheck <= 0 {
+		o.Recheck = time.Minute
 	}
 	if o.Now == nil {
 		o.Now = time.Now
@@ -166,11 +182,13 @@ func (e *Engine) Observe(ctx context.Context, c Condition) {
 	now := e.o.Now()
 	e.mu.Lock()
 	st, known := e.cache[c.Key]
+	// Without a store the cache is the only state there is, and always fresh.
+	fresh := known && (e.o.Store == nil || now.Sub(st.checked) < e.o.Recheck)
 	switch {
-	case !c.Low && known && !st.low:
+	case !c.Low && fresh && !st.low:
 		e.mu.Unlock()
 		return
-	case c.Low && known && st.low && now.Sub(st.lastSent) < e.o.Remind:
+	case c.Low && fresh && st.low && now.Sub(st.lastSent) < e.o.Remind:
 		e.mu.Unlock()
 		return
 	}
@@ -185,7 +203,7 @@ func (e *Engine) Observe(ctx context.Context, c Condition) {
 				return
 			}
 		}
-		e.set(c.Key, cached{})
+		e.set(c.Key, cached{checked: now})
 		if was {
 			e.o.Logf("alerts: %s recovered", c.Key)
 		}
@@ -209,9 +227,15 @@ func (e *Engine) Observe(ctx context.Context, c Condition) {
 			return
 		}
 	}
-	// Whoever announced, this process now knows the condition is low and was
-	// announced about now; it will not ask again before the reminder is due.
-	e.set(c.Key, cached{low: true, lastSent: now})
+	// Whoever announced, the condition is low and was announced recently. A
+	// lost claim keeps the cached announcement time: another node announced at
+	// least since the reminder was last due, and the store is asked again
+	// after Recheck either way.
+	lastSent := now
+	if !announce && known && st.low {
+		lastSent = st.lastSent
+	}
+	e.set(c.Key, cached{low: true, lastSent: lastSent, checked: now})
 	if !announce {
 		return
 	}
@@ -260,6 +284,24 @@ type payloadDoc struct {
 	Fields []notify.Field `json:"fields"`
 }
 
+// Load primes the cache with the conditions the store holds as low, so that a
+// process that has just started clears them when it observes a recovery (the
+// request path asks only while something is known to be low).
+func (e *Engine) Load(ctx context.Context) error {
+	if e == nil || e.o.Store == nil {
+		return nil
+	}
+	act, err := e.o.Store.AlertsActive(ctx, 10_000)
+	if err != nil {
+		return err
+	}
+	for _, a := range act {
+		// checked stays zero: the first observation of each asks the store.
+		e.set(a.Key, cached{low: true, lastSent: a.LastSent})
+	}
+	return nil
+}
+
 // Sweep resends announcements a transport has not delivered after RetryAfter,
 // to that transport only. It is a no-op without a store.
 func (e *Engine) Sweep(ctx context.Context) {
@@ -281,11 +323,11 @@ func (e *Engine) Sweep(ctx context.Context) {
 		if json.Unmarshal([]byte(p.Payload), &doc) != nil {
 			continue
 		}
-		claimed, err := e.o.Store.AlertRetryClaim(ctx, p.Key, p.Seq, p.LastSent, now)
+		owed, claimed, err := e.o.Store.AlertRetryClaim(ctx, p.Key, p.Seq, p.LastSent, now)
 		if err != nil || !claimed {
 			continue
 		}
-		e.send(ev, p.Key, p.Seq, notify.Subject{Kind: doc.Kind, ID: doc.ID}, doc.Fields, p.Pending)
+		e.send(ev, p.Key, p.Seq, notify.Subject{Kind: doc.Kind, ID: doc.ID}, doc.Fields, owed)
 	}
 }
 
