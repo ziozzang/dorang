@@ -66,6 +66,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return e.runHealth(args[1:])
 	case "spend":
 		return e.runSpend(args[1:])
+	case "update":
+		return e.runUpdate(args[1:])
 	}
 	fmt.Fprintf(stderr, "dorangctl: unknown command %q\n", args[0])
 	usage(stderr)
@@ -119,6 +121,13 @@ commands:
                                compare each vendor account's own usage figure
                                (kinds declaring usage_api) with the ledger's
                                reported and dorang cost columns. Read-only
+  update [--check] [--force] [--version vX.Y.Z]
+                               replace this executable with a GitHub release build,
+                               verified against the release's SHA256SUMS
+  update --deploy DIR [--check] [--version vX.Y.Z]
+                               move a Docker Compose deployment (DORANG_IMAGE in
+                               DIR/.env) to the release image: pull, migrate,
+                               recreate, health-check, roll back on failure
   health [--addr URL] [--ready]
                                probe a running gateway; exit 0 only if healthy.
                                This is what the container image's HEALTHCHECK runs

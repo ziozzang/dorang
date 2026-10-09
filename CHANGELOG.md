@@ -9,7 +9,19 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
-## Unreleased
+## 0.1.0 — 2026-10-09
+
+The first tagged release.
+
+### Releases install themselves
+
+A `v*` tag publishes raw executables per platform and one `SHA256SUMS` beside the
+archives and the `ghcr.io/ziozzang/dorang` image. `dorang update` and `dorangctl
+update` install a release's build after checking its digest and replace the
+running file by rename; a running gateway logs a line once a day when a newer
+release exists (`DORANG_NO_UPDATE_CHECK` turns it off); and `dorangctl update
+--deploy DIR` moves a Compose deployment to the release image — pull, migrate,
+recreate, health and version check, roll back on failure. OPERATIONS §1.4.
 
 ### What the upstream says a request cost is recorded, and can be billed
 

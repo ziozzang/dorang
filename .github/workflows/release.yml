@@ -39,10 +39,17 @@ jobs:
           go build -trimpath -ldflags "$LD" -o "dist/dorangctl" ./cmd/dorangctl
           tar -C dist -czf "dorang_${V}_${GOOS}_${GOARCH}.tar.gz" dorang dorangctl
           sha256sum "dorang_${V}_${GOOS}_${GOARCH}.tar.gz" > "dorang_${V}_${GOOS}_${GOARCH}.tar.gz.sha256"
+          # The raw executables `dorang update` and `dorangctl update` install
+          # (internal/selfupdate): <binary>_<version without v>_<goos>_<goarch>.
+          cp dist/dorang    "dorang_${V#v}_${GOOS}_${GOARCH}"
+          cp dist/dorangctl "dorangctl_${V#v}_${GOOS}_${GOARCH}"
       - uses: actions/upload-artifact@v4
         with:
           name: dorang-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "*.tar.gz*"
+          path: |
+            *.tar.gz*
+            dorang_*_${{ matrix.goos }}_${{ matrix.goarch }}
+            dorangctl_*_${{ matrix.goos }}_${{ matrix.goarch }}
 
   image:
     runs-on: ubuntu-latest
@@ -85,6 +92,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
+      # One digest file over every asset. An update installs an executable
+      # only when its SHA-256 matches the line here.
+      - name: checksums
+        run: cd dist && sha256sum $(ls | grep -v '\.sha256$') > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

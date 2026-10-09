@@ -215,6 +215,52 @@ against — see §10, and `deploy/kubernetes.yaml` for probe settings the defaul
 teardown, the last two each bounded by `server.shutdown_grace`. Budget
 `pre_stop_delay + 2 × shutdown_grace + 10s`.
 
+### 1.4 Updating from a release
+
+A release (`v*` tag) publishes, besides the archives: a raw executable per binary and platform,
+`dorang_0.1.0_linux_amd64` and `dorangctl_0.1.0_linux_amd64`; one `SHA256SUMS` over every asset;
+and the image `ghcr.io/ziozzang/dorang:0.1.0`.
+
+**A binary install updates itself.** `dorang update` and `dorangctl update` look up the latest
+release, download this platform's executable, install it only if its SHA-256 matches
+`SHA256SUMS`, and replace the running file by rename in its own directory. `--check` only
+reports; `--version v0.1.0` installs that release; `--force` reinstalls the current one. The
+directory must be writable by whoever runs it. `GITHUB_TOKEN`, when set, raises the API's rate
+limit.
+
+**A running gateway says when a release is out.** Once at start and then every 24 hours it asks
+for the latest release and logs one line per newer version:
+
+```
+dorang: release 0.2.0 is available (running v0.1.0): https://github.com/ziozzang/dorang/releases/tag/v0.2.0
+```
+
+A development build never asks, a failed lookup says nothing, and `DORANG_NO_UPDATE_CHECK=1`
+turns it off.
+
+**A Compose deployment follows releases with `dorangctl update --deploy DIR`.** The Compose file
+runs `image: ${DORANG_IMAGE}`, and `DIR/.env` carries `DORANG_IMAGE=ghcr.io/ziozzang/dorang:<v>`
+and `DORANG_VERSION=<v>`. For a newer release it:
+
+1. pulls the release image;
+2. runs that image's `dorangctl migrate` once through `docker compose run` — a failed migration
+   stops here, with nothing replaced;
+3. rewrites `.env` in place (a timestamped backup beside it) and recreates the services
+   (`--services`, default `dorang,dorang-catalog-sync`) with `--no-deps --pull never`; the
+   database is never recreated;
+4. requires the health URL (`--health`, default `http://127.0.0.1:4000/health/liveliness`) to
+   answer 200 within `--health-timeout` and the gateway to report the release's version —
+   otherwise it restores `.env`, recreates the services on the previous image, and fails.
+
+It holds an flock on `DIR/.dorang-update.lock`, so a timer that fires during a slow update does
+nothing. Run it from a timer with a release `dorangctl` on the host, keeping that one current
+first:
+
+```
+# crontab: hourly, both steps, one log
+17 * * * * dorangctl update && dorangctl update --deploy /srv/dorang >> /srv/dorang/update.log 2>&1
+```
+
 ---
 
 ## 2. First start

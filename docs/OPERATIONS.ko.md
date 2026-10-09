@@ -197,6 +197,43 @@ readiness 프로브의 주기와 실패 임계치가 `server.pre_stop_delay`를 
 `terminationGracePeriodSeconds`는 pre-stop 지연에 드레인과 드레인 이후 해체(뒤 둘은 각각
 `server.shutdown_grace`로 제한)를 더한 것보다 커야 한다. `pre_stop_delay + 2 × shutdown_grace + 10s`로 잡을 것.
 
+### 1.4 릴리즈로 업데이트
+
+릴리즈(`v*` 태그)는 아카이브 외에 다음을 게시한다: 바이너리·플랫폼마다 raw 실행 파일
+(`dorang_0.1.0_linux_amd64`, `dorangctl_0.1.0_linux_amd64`), 모든 자산을 덮는 `SHA256SUMS` 하나,
+그리고 이미지 `ghcr.io/ziozzang/dorang:0.1.0`.
+
+**바이너리 설치는 스스로 업데이트한다.** `dorang update`와 `dorangctl update`는 최신 릴리즈를 찾아 이
+플랫폼의 실행 파일을 받고, SHA-256이 `SHA256SUMS`와 일치할 때만 같은 디렉터리에서 rename으로 실행
+중인 파일을 교체한다. `--check`는 보고만 하고, `--version v0.1.0`은 그 릴리즈를 설치하며, `--force`는
+현재 릴리즈를 다시 설치한다. 실행하는 사용자가 그 디렉터리에 쓸 수 있어야 한다. `GITHUB_TOKEN`이
+있으면 API 호출 한도가 올라간다.
+
+**실행 중인 게이트웨이는 릴리즈가 나오면 알린다.** 시작할 때 한 번, 이후 24시간마다 최신 릴리즈를
+묻고 더 새로운 버전마다 한 줄을 로그에 남긴다. 개발 빌드는 묻지 않고, 조회 실패는 아무 말도 하지
+않으며, `DORANG_NO_UPDATE_CHECK=1`로 끈다.
+
+**Compose 배포는 `dorangctl update --deploy DIR`로 릴리즈를 따라간다.** Compose 파일은
+`image: ${DORANG_IMAGE}`를 쓰고 `DIR/.env`에 `DORANG_IMAGE=ghcr.io/ziozzang/dorang:<v>`와
+`DORANG_VERSION=<v>`가 있다. 더 새로운 릴리즈가 있으면:
+
+1. 릴리즈 이미지를 pull한다.
+2. 그 이미지의 `dorangctl migrate`를 `docker compose run`으로 한 번 실행한다 — 마이그레이션이
+   실패하면 여기서 멈추고 아무것도 교체되지 않는다.
+3. `.env`를 제자리에서 다시 쓰고(옆에 타임스탬프 백업) 서비스(`--services`, 기본
+   `dorang,dorang-catalog-sync`)를 `--no-deps --pull never`로 재생성한다. 데이터베이스는 재생성하지 않는다.
+4. 헬스 URL(`--health`, 기본 `http://127.0.0.1:4000/health/liveliness`)이 `--health-timeout` 안에
+   200을 답하고 게이트웨이가 릴리즈 버전을 보고해야 한다. 아니면 `.env`를 되돌리고 이전 이미지로
+   서비스를 재생성한 뒤 실패한다.
+
+`DIR/.dorang-update.lock`에 flock을 잡으므로, 느린 업데이트 중에 타이머가 다시 돌아도 아무것도 하지
+않는다. 호스트에 릴리즈 `dorangctl`을 두고 타이머로 실행하되, 그 `dorangctl`을 먼저 최신으로 유지한다:
+
+```
+# crontab: 매시, 두 단계, 로그 하나
+17 * * * * dorangctl update && dorangctl update --deploy /srv/dorang >> /srv/dorang/update.log 2>&1
+```
+
 ---
 
 ## 2. 첫 기동

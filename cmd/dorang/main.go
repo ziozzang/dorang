@@ -21,6 +21,7 @@ import (
 
 	"github.com/ziozzang/dorang/internal/app"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/selfupdate"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -48,10 +49,13 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "update" {
+		return runUpdate(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("dorang", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: dorang [flags]\n\nflags:\n")
+		fmt.Fprintf(stderr, "usage: dorang [flags]\n       dorang update [--check] [--force] [--version vX.Y.Z]\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	var (
@@ -219,6 +223,13 @@ func serve(cfg *config.Config, path string, explicit bool, stdout, stderr io.Wri
 	fmt.Fprintf(stdout, "dorang %s listening on %s (%s)\n",
 		versionString(), ln.Addr(), describeSource(path, explicit))
 
+	// Once a day, a line in the log when a newer release exists. Silent on a
+	// development build, on a failed lookup, and under DORANG_NO_UPDATE_CHECK.
+	notifyCtx, stopNotify := context.WithCancel(context.Background())
+	defer stopNotify()
+	(&selfupdate.Client{Token: os.Getenv("GITHUB_TOKEN")}).Notify(notifyCtx, versionString(),
+		selfupdate.CheckInterval, logf)
+
 	// ServeSignals rather than a second signal loop here. The wiring it holds —
 	// the pre-stop delay of §13, and the second signal that skips it — is the
 	// wiring internal/server tests; a copy of it in this file would be the copy
@@ -267,4 +278,28 @@ func versionString() string {
 		return bi.Main.Version
 	}
 	return "devel"
+}
+
+// runUpdate replaces this executable with a release build of it.
+func runUpdate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("dorang update", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		check = fs.Bool("check", false, "only report whether a newer release exists")
+		force = fs.Bool("force", false, "reinstall even when already current")
+		tag   = fs.String("version", "", "install this release instead of the latest")
+	)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	c := &selfupdate.Client{Token: os.Getenv("GITHUB_TOKEN")}
+	if err := c.Update(ctx, selfupdate.Options{
+		Binary: "dorang", Current: versionString(), Tag: *tag, Check: *check, Force: *force, Out: stdout,
+	}); err != nil {
+		fmt.Fprintf(stderr, "dorang: update: %v\n", err)
+		return 1
+	}
+	return 0
 }
