@@ -107,7 +107,10 @@ models:
 
   - { kind: ollama-cloud, model: "deepseek-v4-pro",       verified: 2026-07-28 }
   - { kind: ollama-cloud, model: "deepseek-v4-pro:0813",  verified: 2026-09-12 }
-  - { kind: ollama-cloud, model: "deepseek-v4.1-flash",   verified: 2026-09-12 }
+  # 2026-10-18: Ollama Pro serves the dated :1017 release; pin routing to it.
+  # Keep the bare id catalogued for existing clients and provider listings.
+  - { kind: ollama-cloud, model: "deepseek-v4.1-flash",   verified: 2026-10-18 }
+  - { kind: ollama-cloud, model: "deepseek-v4.1-flash:1017", verified: 2026-10-18 }
   - { kind: ollama-cloud, model: "glm-5.3",               verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "glm-5.3-flash",         verified: 2026-09-12 }
   - { kind: ollama-cloud, model: "glm-5.2",               verified: 2026-07-28 }

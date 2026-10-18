@@ -86,7 +86,7 @@ func TestDefaultParses(t *testing.T) {
 		// deepseek names stay: off the listing, still resolving.
 		// 2026-09-28: 22 → 18. Four retired (410 on /api/show) and deleted:
 		// deepseek-v4-flash, deepseek-v4-flash:0731, qwen3.5:397b, glm-5.1.
-		"ollama-cloud": {VerificationVerified: 18},
+		"ollama-cloud": {VerificationVerified: 19},
 
 		// 2026-08-03, by asking: five of the eight answered as themselves and
 		// three answered as a different model. All eight were dated
