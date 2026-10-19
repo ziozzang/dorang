@@ -300,6 +300,25 @@ func scrubBytes(body []byte, secrets []string) []byte {
 // only accurate one anybody has.
 func upstreamError(status int, body []byte, h http.Header, secrets []string) *server.Error {
 	e := server.Normalize(status, body)
+	if status == http.StatusTooManyRequests {
+		// Concurrent-request limits are temporary, even when a provider uses
+		// insufficient_quota for them. Only explicit usage/balance exhaustion
+		// is a quota refusal; an otherwise unexplained 429 is temporary.
+		msg := strings.ToLower(e.NativeMessage)
+		concurrency := strings.Contains(msg, "concurrent") || strings.Contains(msg, "concurrency") ||
+			strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests")
+		quota := e.Code == "insufficient_quota" || e.NativeType == "insufficient_quota" ||
+			strings.Contains(msg, "usage limit") || strings.Contains(msg, "quota exceeded") ||
+			strings.Contains(msg, "quota exhausted") || strings.Contains(msg, "insufficient balance") ||
+			strings.Contains(msg, "exceeded your current quota") || strings.Contains(msg, "out of credits") ||
+			(strings.Contains(msg, "reached your") && strings.Contains(msg, "limit"))
+		if quota && !concurrency {
+			e.Code = "insufficient_quota"
+			e.Message = "the upstream account has exhausted its usage quota"
+		} else {
+			e.Code = "rate_limit_exceeded"
+		}
+	}
 	// Every field of the normalized error that came from the upstream's bytes,
 	// scrubbed before anything can render it.
 	//

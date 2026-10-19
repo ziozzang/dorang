@@ -158,6 +158,17 @@ func newProbeApp(t *testing.T, yaml string, f *fakeZAI, clk *probeClock) *App {
 		t.Fatalf("app.New: %v", err)
 	}
 	t.Cleanup(func() { _ = a.Close(context.Background()) })
+	// App startup polls in a background goroutine. A simultaneous manual poll
+	// may return ErrThrottled before that first result reaches the tracker.
+	// Wait for a completed successful round, not merely an HTTP call count.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.probes.Load().reg.PollOnce(context.Background()).Succeeded == 1 {
+			return a
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("startup quota reading did not finish")
 	return a
 }
 

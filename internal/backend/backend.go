@@ -676,6 +676,13 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 				res.Err.RetryAfterSeconds = secs
 			}
 		}
+		if resp.StatusCode == http.StatusTooManyRequests && res.Err.Code == "rate_limit_exceeded" &&
+			res.RetryAfter == 0 && res.ResetAt.IsZero() {
+			// A short fallback for a temporary limit without recovery headers.
+			// Supplying it also prevents exponential account stand-down.
+			res.RetryAfter = time.Second
+			res.Err.RetryAfterSeconds = 1
+		}
 		res.Retryable = true
 		b.report(&res, *x.target, x.call)
 		return res

@@ -116,6 +116,11 @@ func (s *substitutionLog) first(deployment, served string) bool {
 }
 
 type dispatchState struct {
+	// Missing marginal prices are reported once per provider/model and config
+	// generation. Flat subscriptions legitimately hit this path on every call;
+	// accounting below must still run for every request.
+	missingPrices substitutionLog
+
 	router    *router.Router
 	pricing   *pricing.Catalog
 	catalog   *catalog.Catalog
@@ -713,6 +718,8 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		// it left.
 		MaxTokensField: dec.MaxTokensField,
 	}
+	ctx, cancel := dec.Reservation.Context(ctx)
+	defer cancel()
 	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
 }
 
@@ -1100,8 +1107,10 @@ func (d *dispatcher) settle(st *dispatchState, c *call, dec *router.Decision,
 	switch {
 	case cost.Missing:
 		// §8.3: an unpriced model warns rather than costing zero in silence.
-		d.logf("app: no marginal price rule matched %s/%s; the request has no marginal price",
-			dec.Provider, dec.UpstreamModel)
+		if st.missingPrices.first(dec.Provider, dec.UpstreamModel) {
+			d.logf("app: no marginal price rule matched %s/%s; the request has no marginal price (further warnings suppressed until configuration reload)",
+				dec.Provider, dec.UpstreamModel)
+		}
 		// It is not necessarily free, and this is the arm where that matters
 		// most. A flat plan is a catalog with NO marginal_usage rule at all
 		// (§8.1), so every one of its requests arrives here, and the plan
@@ -1561,6 +1570,7 @@ func routeError(err error) error {
 			// by condition rather than by status: 429 is `rate_limit_error` to
 			// an OpenAI client and `overloaded_error` to an Anthropic one.
 			e.AltType = server.TypeOverloaded
+			e.RetryAfterSeconds = 1
 		}
 		if !re.ResetAt.IsZero() {
 			e.RetryAfterSeconds = int(time.Until(re.ResetAt).Seconds()) + 1

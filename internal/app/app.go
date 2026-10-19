@@ -331,7 +331,11 @@ func New(ctx context.Context, opts Options) (*App, error) {
 	a.Store = st
 
 	// 3. Routing substrate.
-	a.Broker = capacity.New(brokerConfig(cfg, a.now))
+	bc := brokerConfig(cfg, a.now)
+	if cfg.Cluster.Enabled && cfg.Cluster.CapacityMode == config.CapacityModeSharedPG && st.Driver() == store.DialectPostgres {
+		bc.SharedAccounts = capacity.NewPGAccounts(st.DB(), nodeID(cfg))
+	}
+	a.Broker = capacity.New(bc)
 	a.Health = health.New(health.Options{Now: a.now})
 	a.Interner = prefix.NewInterner()
 	if cfg.Routing.Prefix.IsEnabled() {

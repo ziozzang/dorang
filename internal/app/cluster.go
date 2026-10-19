@@ -317,9 +317,9 @@ func (a *App) shareCapacity(nodes int) {
 		return
 	}
 	if prev := a.Broker.Share(); prev != nodes {
-		a.logf("app: cluster: %d live node(s); every capacity ceiling is now divided by %d "+
+		a.logf("app: cluster: %d live node(s); non-shared capacity ceilings are divided by %d "+
 			"(was %d). An idle node's share is not lent to a busy one; a ceiling below the "+
-			"node count keeps 1 per node and exceeds itself by nodes-ceiling (DESIGN §5.6)",
+			"node count keeps 1 per node and exceeds itself by nodes-ceiling. PostgreSQL account slots are shared without this division (DESIGN §5.6)",
 			nodes, nodes, prev)
 	}
 	a.Broker.SetShare(nodes)

@@ -61,6 +61,9 @@ func (c *call) estimate() tokenest.Estimate {
 // silently stop being reachable from an upstream signal: the fix and this
 // classifier read the same field, or one of them does nothing.
 func upstreamCause(status int, e *server.Error) router.Cause {
+	if status == 429 && e != nil && e.Code == router.CodeQuotaExhausted {
+		return router.CauseQuotaExhausted
+	}
 	if cause := router.Classify(status, nil); cause != router.CauseNone {
 		return cause
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1225,8 +1226,15 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 
 	var lastErr error
 	var unhealthy, saturated int
+	var busyCandidates []candidate
 	for i := range cands {
 		c := &cands[i]
+		// Give the preferred pool its bounded queue before spilling to a lower
+		// priority provider. Exhausted/unhealthy pools still fall back immediately.
+		if len(busyCandidates) > 0 && slices.Contains(chain, StrategyPriority) &&
+			c.dep.Priority > busyCandidates[0].dep.Priority && r.deps.Capacity.WaitBudget(req.Principal) > 0 {
+			break
+		}
 		// Health is consulted here rather than in the filter, and exactly once
 		// per candidate, because Allow spends a half-open probe.
 		if !r.deps.Health.Allow(c.dep.ID) {
@@ -1243,9 +1251,49 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 		}
 		if res == nil {
 			saturated++
+			busyCandidates = append(busyCandidates, *c)
 			continue
 		}
 		return r.decide(c, chain, cands, req, st, g, p, res, now), nil
+	}
+
+	// Try every account in the preferred pool before waiting. Equivalent deployments may
+	// share a broker wait so either account releasing a slot wakes this request.
+	if !p.hard && len(busyCandidates) > 0 && ctx.Err() == nil {
+		if wait := r.deps.Capacity.WaitBudget(req.Principal); wait > 0 {
+			first := &busyCandidates[0]
+			var creds []capacity.Candidate
+			for i := range busyCandidates {
+				c := &busyCandidates[i]
+				if c.dep.Provider == first.dep.Provider && c.dep.UpstreamModel == first.dep.UpstreamModel &&
+					c.dep.ProviderGroup == first.dep.ProviderGroup && c.dep.Timeout == first.dep.Timeout && !c.pinned {
+					creds = append(creds, c.creds...)
+				}
+			}
+			wctx, cancel := context.WithTimeout(ctx, wait)
+			res, err := r.deps.Capacity.Acquire(wctx, capacity.Request{
+				Provider: first.dep.Provider, Model: first.dep.UpstreamModel,
+				ProviderGroup: first.dep.ProviderGroup, PrincipalID: req.Principal,
+				PrincipalMax: req.PrincipalMax, Candidates: creds,
+				Preferred: first.preferred, OnCapacity: capacity.Spill,
+				Batch: req.Batch, TTL: first.dep.Timeout,
+			})
+			cancel()
+			if err == nil {
+				for i := range busyCandidates {
+					c := &busyCandidates[i]
+					for _, cred := range c.creds {
+						if cred.ID == res.CredentialID() && c.dep.Provider == first.dep.Provider &&
+							c.dep.UpstreamModel == first.dep.UpstreamModel &&
+							c.dep.ProviderGroup == first.dep.ProviderGroup && c.dep.Timeout == first.dep.Timeout && !c.pinned {
+							return r.decide(c, chain, cands, req, st, g, p, res, now), nil
+						}
+					}
+				}
+				res.Release()
+			}
+			lastErr = err
+		}
 	}
 
 	// The refusal distinguishes "everything is busy" from "everything is down",
@@ -1299,9 +1347,9 @@ func (r *Router) acquire(ctx context.Context, req *Request, c *candidate) (*capa
 		// spill to another account, so the alternative to waiting is failing.
 		// The budget comes from the principal's max_queue_wait when the router
 		// has no tighter one of its own, which is what gives that setting a
-		// consumer on the interactive path. An UNPINNED request still never
-		// queues — it spills or falls back (§7.4a2, §7.6), and queueing it
-		// instead would trade a fast hop onto a healthy backend for a slow wait
+		// consumer on the interactive path. Unpinned requests queue in dispatch
+		// only after trying every candidate; waiting here would prevent a fast
+		// hop onto a free account and instead force a slow wait
 		// on a saturated one.
 		wait := r.cfg.PinnedWait
 		if wait <= 0 {

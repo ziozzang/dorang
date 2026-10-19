@@ -535,6 +535,14 @@ func (s *Service) attempt(ctx context.Context, rec *BatchRecord, row *RowRecord,
 // the call ends — including a panic, which would otherwise leak a slot on every
 // axis the row was admitted on until the broker's sweeper reclaimed it.
 func (s *Service) execOnce(ctx context.Context, resv Reservation, req *ExecRequest) (res *ExecResult, err error) {
+	// Shared account reservations cancel the generation when ownership is lost.
+	if leased, ok := resv.(interface {
+		Context(context.Context) (context.Context, context.CancelFunc)
+	}); ok {
+		leasedCtx, cancel := leased.Context(ctx)
+		defer cancel()
+		ctx = leasedCtx
+	}
 	defer func() {
 		resv.Release()
 		if p := recover(); p != nil {
