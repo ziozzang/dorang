@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1228,6 +1229,12 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 	var busyCandidates []candidate
 	for i := range cands {
 		c := &cands[i]
+		// Give the preferred pool its bounded queue before spilling to a lower
+		// priority provider. Exhausted/unhealthy pools still fall back immediately.
+		if len(busyCandidates) > 0 && slices.Contains(chain, StrategyPriority) &&
+			c.dep.Priority > busyCandidates[0].dep.Priority && r.deps.Capacity.WaitBudget(req.Principal) > 0 {
+			break
+		}
 		// Health is consulted here rather than in the filter, and exactly once
 		// per candidate, because Allow spends a half-open probe.
 		if !r.deps.Health.Allow(c.dep.ID) {
@@ -1250,7 +1257,7 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 		return r.decide(c, chain, cands, req, st, g, p, res, now), nil
 	}
 
-	// Try every available account before waiting. Equivalent deployments may
+	// Try every account in the preferred pool before waiting. Equivalent deployments may
 	// share a broker wait so either account releasing a slot wakes this request.
 	if !p.hard && len(busyCandidates) > 0 && ctx.Err() == nil {
 		if wait := r.deps.Capacity.WaitBudget(req.Principal); wait > 0 {

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"github.com/ziozzang/dorang/internal/config"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,7 @@ models:
       - {provider: ollama, upstream_model: m1, credentials: [account1]}
       - {provider: ollama, upstream_model: m1, credentials: [account2]}
   - name: m2
+    strategy: [priority]
     deployments:
       - {provider: ollama, upstream_model: m2, credentials: [account1]}
       - {provider: ollama, upstream_model: m2, credentials: [account2]}
@@ -59,7 +61,7 @@ func TestTenRequestsShareTwoAccountsAcrossModels(t *testing.T) {
 	}
 }
 
-func tenRequestsShareAccounts(t *testing.T, stream bool) {
+func tenRequestsShareAccounts(t *testing.T, stream bool, cfgMut ...func(*config.Config)) {
 	t.Setenv("DORANG_SECOND_TEST_KEY", "second-account-test-key")
 	var active, peak, calls [2]atomic.Int64
 	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
@@ -94,7 +96,20 @@ func tenRequestsShareAccounts(t *testing.T, stream bool) {
 	}))
 	t.Cleanup(up.Close)
 	t.Cleanup(func() { unblock(0); unblock(1) })
-	a := newWiringApp(t, accountCapacityYAML(up.URL, "2s"), nil, func(o *Options) { o.Upstream = up.Client() })
+	var mut func(*config.Config)
+	if len(cfgMut) > 0 {
+		mut = cfgMut[0]
+	}
+	yaml := accountCapacityYAML(up.URL, "2s")
+	// Production has a lower-priority provider too. Saturation must wait for
+	// an account in the preferred pool instead of sending these four elsewhere.
+	yaml = strings.Replace(yaml, "credentials:\n", fmt.Sprintf("  - {name: fallback, kind: openai, base_url: %q}\ncredentials:\n", up.URL), 1)
+	yaml = strings.Replace(yaml, "models:\n", "  - {id: fallback, provider: fallback, key_env: DORANG_APP_TEST_KEY}\nmodels:\n", 1)
+	for _, model := range []string{"m1", "m2"} {
+		line := fmt.Sprintf("      - {provider: ollama, upstream_model: %s, credentials: [account2]}", model)
+		yaml = strings.Replace(yaml, line, line+fmt.Sprintf("\n      - {provider: fallback, upstream_model: %s, credentials: [fallback], priority: 1}", model), 1)
+	}
+	a := newWiringApp(t, yaml, mut, func(o *Options) { o.Upstream = up.Client() })
 	key := issueKey(t, a, nil)
 	done := make(chan *httptest.ResponseRecorder, 10)
 	for i := 0; i < 10; i++ {

@@ -125,6 +125,9 @@ func (q QueueConfig) empty() bool {
 // afterwards. A Broker's configuration is immutable; hot reload replaces the
 // broker rather than mutating one (DESIGN §4.1).
 type Config struct {
+	// SharedAccounts enables exact PostgreSQL account slots instead of static node shares.
+	SharedAccounts *PGAccounts
+
 	// Global is the process-wide ceiling.
 	Global int
 	// ProviderGroups maps a provider-group name to its ceiling.
@@ -300,6 +303,8 @@ func (bk *bucket) committed() int {
 // Broker admits requests against every axis that constrains them.
 // The zero value is not usable; call New.
 type Broker struct {
+	shared *PGAccounts
+
 	// share is how many nodes divide every configured ceiling; 1 unclustered.
 	//
 	// Atomic and not under b.mu on purpose: it is read once per needs() call on
@@ -365,6 +370,7 @@ type Broker struct {
 // Call Close to stop it.
 func New(cfg Config) *Broker {
 	b := &Broker{
+		shared:     cfg.SharedAccounts,
 		global:     cfg.Global,
 		pgroups:    copyLimits(cfg.ProviderGroups),
 		cgroups:    copyLimits(cfg.CredentialGroups),
@@ -451,6 +457,11 @@ func New(cfg Config) *Broker {
 		b.wg.Add(1)
 		go b.sweepLoop()
 	}
+	if b.shared != nil {
+		b.wg.Add(1)
+		go b.sharedWakeLoop()
+	}
+
 	return b
 }
 
@@ -614,6 +625,13 @@ func (b *Broker) needs(req *Request, c *Candidate, out []axisNeed) []axisNeed {
 // can exceed the configured ceiling, it is bounded by (nodes - limit), and
 // [Broker.ShareOvershoot] publishes it rather than leaving it to be discovered.
 func (b *Broker) divideByShare(out []axisNeed) []axisNeed {
+	if b.shared != nil {
+		for _, need := range out {
+			if need.key.axis == AxisCredentialGroup {
+				return out
+			}
+		}
+	}
 	n := int(b.share.Load())
 	if n <= 1 {
 		return out
@@ -924,12 +942,28 @@ func (b *Broker) tryLocked(req *Request, blockBuf []*bucket, w *waiter) (*Reserv
 		} else {
 			blk, ok, perm = b.checkLocked(needs, w)
 		}
+		var account *accountLease
+		if ok && b.shared != nil && c != nil && b.cgroups[c.CapacityGroup] > 0 {
+			var err error
+			account, err = b.shared.try(c.CapacityGroup, b.cgroups[c.CapacityGroup])
+			if account == nil || err != nil {
+				ok = false
+				key := cgroupKey(c.CapacityGroup)
+				blk = b.buckets[key]
+				if blk == nil {
+					blk = &bucket{limit: b.cgroups[c.CapacityGroup], queueMax: b.queues.cgroups[c.CapacityGroup]}
+					b.buckets[key] = blk
+				}
+			}
+		}
 		if ok {
 			id := ""
 			if c != nil {
 				id = c.ID
 			}
-			return b.commitLocked(needs, id, req.TTL, w), nil, false
+			res := b.commitLocked(needs, id, req.TTL, w)
+			res.account = account
+			return res, nil, false
 		}
 		if perm {
 			// No release can ever unblock this candidate, so queuing on it
@@ -1310,6 +1344,8 @@ func (b *Broker) serveLocked(bk *bucket, freed int, pass uint64) {
 // Reservation is a committed set of axis slots. Release returns them.
 // A Reservation is safe for concurrent use.
 type Reservation struct {
+	account *accountLease
+
 	b        *Broker
 	credID   string
 	deadline time.Time
@@ -1358,6 +1394,9 @@ func (r *Reservation) Release() {
 	delete(b.live, r)
 	b.releaseLocked(r.held)
 	b.mu.Unlock()
+	if r.account != nil {
+		r.account.release()
+	}
 }
 
 // Sweep reclaims every reservation whose deadline has passed and returns how
@@ -1371,7 +1410,7 @@ func (b *Broker) Sweep() int {
 
 	var doomed []*Reservation
 	for r := range b.live {
-		if !r.deadline.IsZero() && now.After(r.deadline) {
+		if r.account == nil && !r.deadline.IsZero() && now.After(r.deadline) {
 			doomed = append(doomed, r)
 		}
 	}

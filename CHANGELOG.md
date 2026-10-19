@@ -9,6 +9,28 @@ published number, a documented control or a passing test turned out not to mean
 what it said. Those are kept rather than tidied away — see `docs/DESIGN.md`
 §17.1, which is the ledger of the patterns behind them.
 
+## 0.3.1 — 2026-10-19
+
+- Ollama 계정 하나의 동시 요청을 3개로 제한하고, 두 계정을 함께 쓰면 최대
+  6개를 진행할 수 있습니다. `capacity_group`과 계정별 한도를 설정하면
+  모델이 달라도 같은 계정의 요청을 함께 셉니다. 모든 계정이 바쁘면 다른
+  후보를 확인한 뒤 정해진 시간과 인원 안에서 기다립니다.
+- PostgreSQL 공유 모드에서는 실행 칸을 노드 수로 고정 분할하지 않습니다.
+  실제 진행 중인 요청만 공유 DB의 칸을 차지하므로 대기 노드가 있어도
+  활성 노드는 두 계정의 6칸을 모두 쓸 수 있습니다. 죽거나 멈춘 노드의 칸은
+  최대 15초 뒤 회수하고, DB 연결을 잃은 요청은 취소합니다. 스키마 추가는 없습니다.
+- 일시적인 속도·동시 요청 제한은 `rate_limit_exceeded`와 `Retry-After`로,
+  실제 사용량 소진은 `insufficient_quota`로 구분합니다. 아직 답변을 보내지
+  않았다면 제한된 계정 대신 다른 계정을 시도합니다. 일시 제한 하나로
+  서비스 전체를 오래 고장 처리하지 않습니다.
+- 가격 정보가 없는 모델의 동일한 경고가 반복되어 로그를 채우는 일을 줄였습니다.
+
+계정 공유 제한은 PostgreSQL 저장소의 `shared-pg` 모드에 적용됩니다. 모든
+키와 진입 노드(:4000 직접 연결 포함)를 같은 계정 그룹·버전으로 맞춰야 합니다.
+다른 프로그램이 같은 계정을 게이트웨이 밖에서 쓰는 요청은 셀 수 없습니다.
+다른 공유 모드의 동작은 바뀌지 않았습니다. 자세한 설정과 시험은
+[Ollama 계정 동시성](docs/OLLAMA-CAPACITY.md)을 참조하십시오.
+
 ## 0.3.0 — 2026-10-09
 
 - **State alerts announce transitions only**: once when a problem starts, once

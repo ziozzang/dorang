@@ -718,6 +718,8 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 		// it left.
 		MaxTokensField: dec.MaxTokensField,
 	}
+	ctx, cancel := dec.Reservation.Context(ctx)
+	defer cancel()
 	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
 }
 
