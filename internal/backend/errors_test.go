@@ -61,7 +61,7 @@ func TestErrorNormalization(t *testing.T) {
 			name:     "integer code",
 			status:   429,
 			body:     `{"error":{"message":"slow down","type":"RateLimitError","code":429}}`,
-			wantType: server.TypeRateLimit, wantCode: "429",
+			wantType: server.TypeRateLimit, wantCode: "rate_limit_exceeded",
 			shape: server.ShapeNested, wantNativeHas: "slow down",
 		},
 		{
@@ -576,5 +576,30 @@ func TestOpaqueRefusalKeepsItsMachineReadableHalf(t *testing.T) {
 	// Everything else still lands where it did.
 	if got := encodeError(errNilRequest); got.Code != CodeConversionFailed {
 		t.Errorf("an ordinary encode failure now reports %q", got.Code)
+	}
+}
+
+func TestQuotaAndTemporaryLimitsAreDistinct(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, code string
+		retry            int
+	}{
+		{"concurrency mislabeled quota", `{"error":{"code":"insufficient_quota","message":"too many concurrent requests"}}`, "rate_limit_exceeded", 1},
+		{"bare Ollama concurrency", `{"error":"too many concurrent requests"}`, "rate_limit_exceeded", 1},
+		{"plain rate", `{"error":{"message":"slow down"}}`, "rate_limit_exceeded", 1},
+		{"quota code", `{"error":{"code":"insufficient_quota","message":"credits exhausted"}}`, "insufficient_quota", 0},
+		{"quota type", `{"error":{"type":"insufficient_quota","message":"credits exhausted"}}`, "insufficient_quota", 0},
+		{"Ollama five-hour plan", `{"error":"You reached your Pro 5-hour limit"}`, "insufficient_quota", 0},
+		{"Ollama session", `{"error":"session usage limit exceeded"}`, "insufficient_quota", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeUpstream(t)
+			f.answer(429, tc.body)
+			p := testProvider(t, f, "openai", catalog.APIOpenAIChat)
+			res := testBackend("sk").Do(context.Background(), target(p), chatCall(catalog.APIOpenAIChat), nil)
+			if res.Err == nil || res.Err.Code != tc.code || res.Err.RetryAfterSeconds != tc.retry {
+				t.Fatalf("error=%+v; want %s retry %d", res.Err, tc.code, tc.retry)
+			}
+		})
 	}
 }

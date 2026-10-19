@@ -1568,6 +1568,7 @@ func routeError(err error) error {
 			// by condition rather than by status: 429 is `rate_limit_error` to
 			// an OpenAI client and `overloaded_error` to an Anthropic one.
 			e.AltType = server.TypeOverloaded
+			e.RetryAfterSeconds = 1
 		}
 		if !re.ResetAt.IsZero() {
 			e.RetryAfterSeconds = int(time.Until(re.ResetAt).Seconds()) + 1

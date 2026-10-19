@@ -250,7 +250,7 @@ func (d *dispatcher) observePlan(ctx context.Context, dec *router.Decision, res 
 	if reason == "" {
 		reason = se.Message
 	}
-	if res.outcome.Status != 429 {
+	if res.outcome.Status != 429 || se.Code == "rate_limit_exceeded" {
 		return
 	}
 	category := planExhaustedReason(reason)
