@@ -720,7 +720,13 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 	}
 	ctx, cancel := dec.Reservation.Context(ctx)
 	defer cancel()
-	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
+	out := d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w)
+	// A failed attempt must not label a subsequent fallback's answer with its
+	// own privacy verdict. Streaming headers already sent are immutable.
+	if out.Err != nil && !out.FirstByteSent {
+		w.Header().Del("X-Gateway-Zdr")
+	}
+	return backendResult(out)
 }
 
 // backendCall renders one hop's request in the terms L5 takes.

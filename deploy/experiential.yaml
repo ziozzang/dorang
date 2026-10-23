@@ -1,0 +1,113 @@
+# Experiential: public = ZDR 아님, 공개 자료 전용. ZDR = 보관 금지 조건 강제.
+# 계정 전체 시작 예산: RPM 60 / TPM 60000을 두 별칭에 30 / 30000씩 분배.
+# 이는 공급자 공식 한도가 아닌 운영자 상한. TPS(초당 토큰 수)는 별도 지원 없음.
+# max_concurrency=4는 노드별 묶음 상한. 자세한 범위와 변경 절차는 docs/EXPERIENTIAL.md.
+# catalog_sync 미설정: 이 두 모델만 명시적으로 등록. 기존 라우트에 자동 혼합하지 않음.
+# uncensored-public: 공개 자료 전용. uncensored-zdr: BYOK 연결 전 비활성.
+providers:
+- name: experiential
+  kind: experiential
+  base_url: https://api.experientiallabs.ai/v1
+  timeout: 1200s
+  max_concurrency: 4
+  capacity_group: experiential-account
+  params:
+    set:
+      provider:
+        require_no_training: true
+  usage_probe:
+    enabled: true
+    fetcher: experiential
+    interval: 5m
+- name: experiential-zdr
+  kind: experiential-zdr
+  base_url: https://api.experientiallabs.ai/v1
+  timeout: 1200s
+  max_concurrency: 4
+  capacity_group: experiential-account
+  params:
+    set:
+      provider:
+        zdr: true
+        require_no_training: true
+  usage_probe:
+    enabled: true
+    fetcher: experiential-zdr
+    interval: 5m
+credentials:
+- id: experiential-1
+  provider: experiential
+  key_file: /etc/dorang/secrets/experiential-key
+  capacity_group: experiential-account
+- id: experiential-zdr-1
+  provider: experiential-zdr
+  key_file: /etc/dorang/secrets/experiential-key
+  capacity_group: experiential-account
+capacity:
+  provider_groups:
+    experiential-account:
+      max_concurrency: 4
+  credential_groups:
+    experiential-account:
+      max_concurrency: 4
+models:
+- name: experiential/deepseek-v4.1-flash-public
+  strategy:
+  - priority
+  - least_busy
+  deployments:
+  - provider: experiential
+    upstream_model: deepseek-v4.1-flash
+    credentials:
+    - experiential-1
+    enabled: true
+    limits:
+    - metric: rpm
+      value: 30
+    - metric: tpm
+      value: 30000
+- name: experiential/deepseek-v4.1-flash-zdr
+  strategy:
+  - priority
+  - least_busy
+  deployments:
+  - provider: experiential-zdr
+    upstream_model: deepseek-v4.1-flash
+    credentials:
+    - experiential-zdr-1
+    enabled: true
+    limits:
+    - metric: rpm
+      value: 30
+    - metric: tpm
+      value: 30000
+- name: experiential/deepseek-v4.1-flash-uncensored-public
+  strategy:
+  - priority
+  - least_busy
+  deployments:
+  - provider: experiential
+    upstream_model: deepseek-v4.1-flash-uncensored
+    credentials:
+    - experiential-1
+    enabled: true
+    limits:
+    - metric: rpm
+      value: 30
+    - metric: tpm
+      value: 30000
+- name: experiential/deepseek-v4.1-flash-uncensored-zdr
+  strategy:
+  - priority
+  - least_busy
+  deployments:
+  - provider: experiential-zdr
+    upstream_model: deepseek-v4.1-flash-uncensored
+    credentials:
+    - experiential-zdr-1
+    enabled: false
+    limits:
+    - metric: rpm
+      value: 30
+    - metric: tpm
+      value: 30000

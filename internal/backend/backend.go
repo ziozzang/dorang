@@ -449,6 +449,9 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 	}
 
 	payload, err := x.ad.encode(x)
+	if err == nil {
+		payload, err = p.applySetParams(payload, x.ctype)
+	}
 	if err != nil {
 		res.Err = encodeError(err)
 		return res
@@ -632,6 +635,25 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	// value is carried raw and parsed by the pricing layer, so this package
 	// keeps no opinion about what a load report means.
 	res.LoadMetrics = resp.Header.Get(loadsignal.Header)
+	// The dedicated Experiential ZDR kind requires the upstream's confirmation
+	// before any completion bytes reach the client. It never relaxes to public.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		(x.prov.kind == "experiential" || x.prov.kind == "experiential-zdr") {
+		zdr := resp.Header.Get("X-Gateway-Zdr")
+		if x.prov.kind == "experiential-zdr" && zdr != "true" {
+			drain(resp.Body)
+			res.Total = b.now().Sub(start)
+			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+				"Experiential did not confirm zero data retention; response refused").WithCode("zdr_confirmation_missing")
+			b.report(&res, *x.target, x.call)
+			return res
+		}
+		// Copy only the privacy verdict, never arbitrary upstream headers. This is
+		// also available on buffered responses because w is the original writer.
+		if w != nil && (zdr == "true" || zdr == "false") {
+			w.Header().Set("X-Gateway-Zdr", zdr)
+		}
+	}
 
 	// A 30x never reaches the redirect-following code because the client is
 	// built not to have any (§10.6). It arrives here as an ordinary response

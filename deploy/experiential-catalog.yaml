@@ -1,0 +1,110 @@
+# 정책 근거: https://platform.experientiallabs.ai/docs/data-controls
+# /v1/models 제공 기능·가격: 2026-10-23 확인. 기능별 실측을 뜻하지 않음.
+version: 1
+kinds:
+  experiential:
+    api: openai-chat
+    base_url: https://api.experientiallabs.ai/v1
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    reported_cost: usage.cost
+    reported_cost_unit: usd
+    note: ZDR 아님·공개 자료 전용; require_no_training 조건만 강제.
+  experiential-zdr:
+    api: openai-chat
+    base_url: https://api.experientiallabs.ai/v1
+    category: chat
+    supports_tools: true
+    supports_streaming: true
+    reported_cost: usage.cost
+    reported_cost_unit: usd
+    note: 보관 금지 조건 및 x-gateway-zdr=true 필수. Pro 필요; 미확인 응답 거절.
+models:
+- kind: experiential
+  model: deepseek-v4.1-flash
+  verified: '2026-10-23'
+  context_window: 1048576
+  supports_tools: true
+  supports_streaming: true
+  reasoning:
+    capability: effort_scale
+    levels: &id001
+    - none
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    verified: '2026-10-23'
+  pricing:
+    currency: USD
+    input_per_mtok: '0.3'
+    output_per_mtok: '1.2'
+    cached_input_per_mtok: '0.006'
+    verified: '2026-10-23'
+  note: ZDR 아님·공개 자료 전용; require_no_training 조건만 강제. 무료 모델이 아니라 크레딧/구독으로 결제하며 가격은
+    공급자 카탈로그 기준.
+  max_output_tokens: 393216
+- kind: experiential-zdr
+  model: deepseek-v4.1-flash
+  verified: '2026-10-23'
+  context_window: 1048576
+  supports_tools: true
+  supports_streaming: true
+  reasoning:
+    capability: effort_scale
+    levels: *id001
+    verified: '2026-10-23'
+  pricing:
+    currency: USD
+    input_per_mtok: '0.3'
+    output_per_mtok: '1.2'
+    cached_input_per_mtok: '0.006'
+    verified: '2026-10-23'
+  note: 보관 금지 조건 및 x-gateway-zdr=true 필수. Pro 필요; 미확인 응답 거절. 무료 모델이 아니라 크레딧/구독으로 결제하며
+    가격은 공급자 카탈로그 기준.
+  max_output_tokens: 393216
+- kind: experiential
+  model: deepseek-v4.1-flash-uncensored
+  verified: '2026-10-23'
+  supports_tools: true
+  supports_streaming: true
+  note: 공개 자료 전용·ZDR 불가. provider.zdr=true는 BYOK 필요로 거절됨. ZDR 별칭은 BYOK 연결과 검증 전 비활성.
+    기능·가격은 별도 조회로 확인.
+  context_window: 1048576
+  max_output_tokens: 393216
+  reasoning:
+    capability: effort_scale
+    levels: &id002
+    - none
+    - low
+    - high
+    - max
+    verified: '2026-10-23'
+  pricing:
+    currency: USD
+    input_per_mtok: '0.3'
+    output_per_mtok: '1.2'
+    cached_input_per_mtok: '0.03'
+    verified: '2026-10-23'
+- kind: experiential-zdr
+  model: deepseek-v4.1-flash-uncensored
+  verified: '2026-10-23'
+  supports_tools: true
+  supports_streaming: true
+  note: 공개 자료 전용·ZDR 불가. provider.zdr=true는 BYOK 필요로 거절됨. ZDR 별칭은 BYOK 연결과 검증 전 비활성.
+    기능·가격은 별도 조회로 확인.
+  context_window: 1048576
+  max_output_tokens: 393216
+  reasoning:
+    capability: effort_scale
+    levels: *id002
+    verified: '2026-10-23'
+  pricing:
+    currency: USD
+    input_per_mtok: '0.3'
+    output_per_mtok: '1.2'
+    cached_input_per_mtok: '0.03'
+    verified: '2026-10-23'
