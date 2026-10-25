@@ -11,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/httpguard"
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // Defaults for the zero fields of [Options].
@@ -600,6 +603,12 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 	}
 
 	if rt.NeedsBody {
+		// Parsed JSON and multipart routes do not decompress request bodies.
+		// Opaque passthrough routes preserve the encoded bytes and headers.
+		if !httpguard.Identity(rq.HTTP.Header) {
+			return NewError(http.StatusUnsupportedMediaType, TypeInvalidRequest,
+				"compressed request bodies are not supported").WithCode("unsupported_content_encoding")
+		}
 		rq.Body = &rq.body
 		if e := rq.body.read(rq.HTTP, cfg.maxBody, s.replay); e != nil {
 			if e.Status == http.StatusRequestEntityTooLarge {
@@ -624,6 +633,10 @@ func (s *Server) serve(cfg *snapshot, rw *responseWriter, rq *Request) error {
 				rq.Model = form.Get("model")
 				rq.Stream, _ = form.Bool("stream")
 			} else {
+				if err := parseguard.JSONDepth(b); err != nil {
+					return NewError(http.StatusBadRequest, TypeInvalidRequest,
+						err.Error()).WithCode(CodeInvalidRequest)
+				}
 				model, stream, ok := peekRequest(b)
 				if !ok {
 					return NewError(http.StatusBadRequest, TypeInvalidRequest,

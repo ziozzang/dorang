@@ -369,12 +369,12 @@ func (b *Body) read(r *http.Request, max int64, budget *replayBudget) *Error {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil
 	}
-	if max > 0 && r.ContentLength > max {
-		return tooLarge(max)
-	}
 	limit := max
 	if limit <= 0 {
 		limit = defaultMaxBodyBytes
+	}
+	if r.ContentLength > limit {
+		return tooLarge(limit)
 	}
 
 	b.bufp = bodyPool.Get().(*[]byte)
@@ -392,7 +392,8 @@ func (b *Body) read(r *http.Request, max int64, budget *replayBudget) *Error {
 		if len(b.buf) == cap(b.buf) {
 			b.buf = append(b.buf, 0)[:len(b.buf)]
 		}
-		n, err := r.Body.Read(b.buf[len(b.buf):cap(b.buf)])
+		end := min(int64(cap(b.buf)), limit+1)
+		n, err := r.Body.Read(b.buf[len(b.buf):end])
 		b.buf = b.buf[:len(b.buf)+n]
 		total += int64(n)
 		if total > limit {

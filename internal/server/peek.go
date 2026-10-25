@@ -2,10 +2,11 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // peekRequest scans a request body for the two fields the gate needs — the
