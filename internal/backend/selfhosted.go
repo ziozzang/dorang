@@ -1,10 +1,10 @@
 package backend
 
 import (
-	"encoding/json"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // prepareRequest applies everything that depends on the chosen deployment

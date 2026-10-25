@@ -5,8 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // finalize writes the output and error files and moves the batch to its terminal

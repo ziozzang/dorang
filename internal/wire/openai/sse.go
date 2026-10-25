@@ -2,10 +2,10 @@ package openai
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // DefaultMaxFrameBytes bounds how much of an unterminated frame the scanner

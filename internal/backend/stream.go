@@ -3,7 +3,6 @@ package backend
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"

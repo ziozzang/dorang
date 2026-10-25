@@ -2,13 +2,13 @@ package probe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/quota"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // z.ai publishes a coding-plan credential's own quota, which makes it the one

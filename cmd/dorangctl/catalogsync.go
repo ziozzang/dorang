@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -19,9 +18,11 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/httpguard"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -139,7 +140,7 @@ func (e env) catalogSync(args []string) int {
 		overlays: splitComma(*overlays), only: map[string]bool{}, registry: *registry,
 		write: *write, writeDir: *writeDir,
 		includePrivate: *includePrivate, includePaid: *includePaid,
-		client: &http.Client{Timeout: *timeout},
+		client: &http.Client{Transport: httpguard.Transport(), Timeout: *timeout},
 	}
 	for _, p := range splitComma(*only) {
 		o.only[p] = true
@@ -862,7 +863,7 @@ func loadModelsDev(client *http.Client, src string) (modelsDev, error) {
 		}
 		raw = readAtMost(resp.Body, 64<<20)
 	} else {
-		b, err := os.ReadFile(src)
+		b, err := parseguard.ReadFile(src)
 		if err != nil {
 			return nil, err
 		}
@@ -1011,7 +1012,7 @@ func writeSyncOverlay(path string, doc syncOverlayDoc) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if prev, err := os.ReadFile(path); err == nil && bytes.Equal(stripHeader(prev), body) {
+	if prev, err := parseguard.ReadFile(path); err == nil && bytes.Equal(stripHeader(prev), body) {
 		return false, nil
 	}
 	header := fmt.Sprintf(`# Written by dorangctl catalog sync on %s.

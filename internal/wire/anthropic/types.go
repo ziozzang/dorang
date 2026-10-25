@@ -1,8 +1,9 @@
 package anthropic
 
 import (
-	"encoding/json"
 	"errors"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Object discriminators.

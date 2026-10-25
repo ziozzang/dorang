@@ -3,7 +3,6 @@ package backend
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/loadsignal"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"

@@ -1,11 +1,11 @@
 package wirejson
 
 import (
-	"encoding/json"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Splitting the unmodelled members out of an object, without parsing it again.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // baseYAML is a minimal configuration that loads and validates cleanly. Tests

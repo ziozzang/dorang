@@ -1,10 +1,10 @@
 package openai
 
 import (
-	"encoding/json"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // The image surfaces: POST /v1/images/generations, /v1/images/edits and

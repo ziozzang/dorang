@@ -8,9 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/ziozzang/dorang/internal/canonical"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Warning is something an import could not represent. Import never drops

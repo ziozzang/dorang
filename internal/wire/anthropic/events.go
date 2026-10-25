@@ -1,6 +1,6 @@
 package anthropic
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // Event names (COMPATIBILITY 6.2).
 //

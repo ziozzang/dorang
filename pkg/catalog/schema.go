@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // maxAliasHops bounds kind-alias resolution so a cycle is reported at load

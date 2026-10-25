@@ -8,16 +8,18 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/httpguard"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // FormatGCPServiceAccount is a Google Cloud service-account key file, which is
@@ -80,7 +82,7 @@ func NewServiceAccountRefresher(cfg ServiceAccountConfig) (*ServiceAccountRefres
 	}
 	c := cfg.Client
 	if c == nil {
-		c = &http.Client{Timeout: cfg.Timeout}
+		c = &http.Client{Transport: httpguard.Transport(), Timeout: cfg.Timeout}
 	}
 	return &ServiceAccountRefresher{cfg: cfg, client: c}, nil
 }
@@ -98,7 +100,7 @@ type serviceAccountKey struct {
 // Refresh mints a token. prev is read for its Refresh (the key id, kept so the
 // credential stays refreshable) and for nothing else.
 func (r *ServiceAccountRefresher) Refresh(ctx context.Context, prev Token) (Token, error) {
-	raw, err := os.ReadFile(r.cfg.Path)
+	raw, err := parseguard.ReadFile(r.cfg.Path)
 	if err != nil {
 		return Token{}, fmt.Errorf("%w: %s: %v", ErrTokenStoreUnreadable, r.cfg.Path, errNoPath(err))
 	}

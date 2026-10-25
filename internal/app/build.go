@@ -3,15 +3,12 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync/atomic"
 	"time"
-
-	"net/http"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/ziozzang/dorang/internal/backend"
 	"github.com/ziozzang/dorang/internal/canonical"
@@ -19,10 +16,12 @@ import (
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/health"
 	"github.com/ziozzang/dorang/internal/meter"
+	"github.com/ziozzang/dorang/internal/parseguard"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -706,7 +705,7 @@ func buildPricing(cfg *config.Config) (*pricing.Catalog, error) {
 	}
 	var d doc
 	if p := config.ExpandPath(cfg.Pricing.Catalog); p != "" {
-		b, err := os.ReadFile(p)
+		b, err := parseguard.ReadFile(p)
 		switch {
 		case err == nil:
 			if err := yaml.Unmarshal(b, &d); err != nil {

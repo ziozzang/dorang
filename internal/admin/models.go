@@ -1,11 +1,12 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
 	"strings"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // deploymentView is a deployments row on the wire.

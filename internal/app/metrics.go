@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/metrics"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 )
 

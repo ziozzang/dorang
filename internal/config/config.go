@@ -5,7 +5,7 @@ import (
 	"sort"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Version is the only configuration schema version this build understands.

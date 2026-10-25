@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 //go:embed provider_defaults.yaml
@@ -199,7 +201,7 @@ func expand(path string, origin OriginKind) ([]source, error) {
 		return nil, err
 	}
 	if !info.IsDir() {
-		data, err := os.ReadFile(path)
+		data, err := parseguard.ReadFile(path)
 		if err != nil {
 			return nil, err
 		}
@@ -228,7 +230,7 @@ func expand(path string, origin OriginKind) ([]source, error) {
 	out := make([]source, 0, len(names))
 	for _, n := range names {
 		full := filepath.Join(path, n)
-		data, err := os.ReadFile(full)
+		data, err := parseguard.ReadFile(full)
 		if err != nil {
 			return nil, err
 		}

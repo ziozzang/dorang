@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/httpguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // HTTPRefresher is the RFC 6749 §6 refresh_token grant.
@@ -133,7 +135,7 @@ func NewHTTPRefresher(cfg RefreshConfig) (*HTTPRefresher, error) {
 	}
 	r := &HTTPRefresher{cfg: cfg, client: cfg.Client}
 	if r.client == nil {
-		r.client = &http.Client{Timeout: cfg.Timeout}
+		r.client = &http.Client{Transport: httpguard.Transport(), Timeout: cfg.Timeout}
 	}
 	return r, nil
 }

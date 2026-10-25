@@ -1,10 +1,10 @@
 package backend
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/rerank"
 )
 

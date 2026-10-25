@@ -3,7 +3,6 @@ package wirejson
 import (
 	"bytes"
 	"encoding"
-	"encoding/json"
 	"math"
 	"reflect"
 	"slices"
@@ -12,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Writing a nested wire type into its parent's buffer instead of into a slice
@@ -703,6 +704,14 @@ func isEmptyValue(v reflect.Value) bool {
 
 const hexDigits = "0123456789abcdef"
 
+// Go 1.27's JSON encoder emits the UTF-8 replacement rune literally where
+// earlier releases emitted an escape. Keep this appender byte-identical to
+// the encoder selected by the supported toolchain, including malformed text.
+var invalidUTF8Replacement = func() []byte {
+	b, _ := json.Marshal("\xff")
+	return b[1 : len(b)-1]
+}()
+
 // AppendString appends s as a JSON string literal with HTML escaping OFF.
 //
 // It is encoding/json's appendString with escapeHTML false, which is the
@@ -743,7 +752,7 @@ func AppendString(dst []byte, s string) []byte {
 		c, size := utf8.DecodeRuneInString(s[i : i+n])
 		if c == utf8.RuneError && size == 1 {
 			dst = append(dst, s[start:i]...)
-			dst = append(dst, "\\ufffd"...)
+			dst = append(dst, invalidUTF8Replacement...)
 			i += size
 			start = i
 			continue

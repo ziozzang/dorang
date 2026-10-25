@@ -1,9 +1,8 @@
 package anthropic
 
 import (
-	"encoding/json"
-
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // DecodeOptions controls an Anthropic -> canonical conversion.

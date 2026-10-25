@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"

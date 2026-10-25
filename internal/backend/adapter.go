@@ -1,13 +1,13 @@
 package backend
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/bedrock"
 	"github.com/ziozzang/dorang/internal/wire/openai"

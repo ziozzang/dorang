@@ -1,9 +1,9 @@
 package openai
 
 import (
-	"encoding/json"
 	"errors"
 
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 

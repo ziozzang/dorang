@@ -2,13 +2,14 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // TrafficBuffer retains only bounded request metadata, never headers or payloads.

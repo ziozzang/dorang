@@ -11,8 +11,9 @@ import (
 
 	"github.com/ziozzang/dorang/internal/app"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 	"github.com/ziozzang/dorang/pkg/catalog"
-	"gopkg.in/yaml.v3"
 )
 
 // runConfig implements `config lint` and `config check`.
@@ -122,7 +123,7 @@ func (e env) runImport(args []string) int {
 		return 2
 	}
 	path := args[1]
-	data, err := os.ReadFile(path)
+	data, err := parseguard.ReadFile(path)
 	if err != nil {
 		if isNotExist(err) {
 			return e.fail("no such file: %s", path)

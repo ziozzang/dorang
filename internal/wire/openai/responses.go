@@ -1,9 +1,8 @@
 package openai
 
 import (
-	"encoding/json"
-
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // The Responses API: POST /v1/responses and its sub-resources.

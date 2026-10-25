@@ -1,10 +1,10 @@
 package openai
 
 import (
-	"encoding/json"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // ResponseOptions controls a canonical -> OpenAI response conversion.

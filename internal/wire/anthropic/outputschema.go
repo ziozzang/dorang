@@ -1,9 +1,10 @@
 package anthropic
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // maxSchemaDepth bounds recursion while resolving references.

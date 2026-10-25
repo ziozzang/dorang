@@ -1,7 +1,7 @@
 # Build. Pinned by digest at release time; a floating tag here would make the
 # image irreproducible, which matters more than convenience for something that
 # holds provider credentials.
-FROM golang:1.25-alpine AS build
+FROM golang:1.27.3-alpine AS build
 
 WORKDIR /src
 

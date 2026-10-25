@@ -2,7 +2,8 @@ package shadow
 
 import (
 	"bytes"
-	"encoding/json"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // sseFrame is one parsed event.

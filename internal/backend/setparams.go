@@ -1,8 +1,9 @@
 package backend
 
 import (
-	"encoding/json"
 	"errors"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Apply after encoding: unknown vendor fields survive conversion and a caller

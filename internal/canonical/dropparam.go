@@ -1,9 +1,10 @@
 package canonical
 
 import (
-	"encoding/json"
 	"sort"
 	"strings"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Operator-requested parameter removal — DESIGN §10.3's `params.drop[]`.

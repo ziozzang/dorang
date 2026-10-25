@@ -1,6 +1,6 @@
 package canonical
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // ModerationRequest is a protocol-neutral content-classification call.
 type ModerationRequest struct {

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const testSecret = "sk-SUPERSECRET-do-not-print-me" // pragma: allowlist secret — fixture, asserts redaction

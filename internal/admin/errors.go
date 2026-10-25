@@ -1,10 +1,11 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Sentinel errors a dependency may return. They are matched with errors.Is and

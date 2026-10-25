@@ -1,13 +1,14 @@
 package shadow
 
 import (
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Record is one line of the JSONL report.

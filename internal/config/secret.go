@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"strings"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // EnvDevelopment is the only server.env under which an inline literal secret is
@@ -193,7 +195,7 @@ func (s *SecretRef) resolve(env, path string, c *collector) {
 		}
 		s.value, s.resolved, s.fromFile = v, true, false
 	case s.File != "":
-		b, err := os.ReadFile(ExpandPath(s.File))
+		b, err := parseguard.ReadFile(ExpandPath(s.File))
 		if err != nil {
 			c.add(path+".key_file", "cannot read secret file: %s", redactPathError(err, s.File))
 			return

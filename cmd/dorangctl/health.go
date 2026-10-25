@@ -54,7 +54,7 @@ func (e env) runHealth(args []string) int {
 	// egress proxy would be checking the proxy.
 	client := &http.Client{
 		Timeout:   *timeout,
-		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		Transport: &http.Transport{DisableCompression: true, Proxy: nil, DisableKeepAlives: true},
 	}
 	resp, err := client.Do(req)
 	if err != nil {

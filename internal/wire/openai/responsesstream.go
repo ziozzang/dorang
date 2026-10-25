@@ -3,10 +3,10 @@ package openai
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"io"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Responses stream event names.

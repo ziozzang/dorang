@@ -99,7 +99,24 @@ func (d *DiskBlobs) Open(ctx context.Context, ref string) (io.ReadSeekCloser, er
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(p)
+	// Root.Open prevents a replaced blob or a symlink from escaping the
+	// storage directory, including races between the lookup and open.
+	root, err := os.OpenRoot(d.root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	info, err := root.Lstat(filepath.Base(p))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w: blob %s", ErrNotFound, ref)
+	}
+	if err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: blob must be a regular file", ErrInvalidRequest)
+	}
+	if err != nil {
+		return nil, err
+	}
+	f, err := root.Open(filepath.Base(p))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("%w: blob %s", ErrNotFound, ref)
 	}

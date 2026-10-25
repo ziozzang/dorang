@@ -1,9 +1,10 @@
 package admin
 
 import (
-	"encoding/json"
 	"net"
 	"net/http"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // maxUserAgent bounds what a caller can write into the audit table through a

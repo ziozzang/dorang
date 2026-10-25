@@ -2,11 +2,11 @@ package backend
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 

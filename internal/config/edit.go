@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Surgical config editing.
