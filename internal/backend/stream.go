@@ -3,7 +3,6 @@ package backend
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"
@@ -100,7 +100,7 @@ func (b *Backend) relay(x *exchange, resp *http.Response, w http.ResponseWriter)
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 
-	fw := &flushWriter{w: w}
+	fw := &flushWriter{w: w, onErr: func(err error) { x.clientWriteErr = err }}
 
 	// The byte relay can only run when nothing in the body has to change beyond
 	// the model name. Two things are exactly such a change:
@@ -916,11 +916,17 @@ func (r *relayWatch) failure(secrets []string) error {
 type flushWriter struct {
 	w http.ResponseWriter
 	n int64
+	// onErr is told of a failed write to the client, which is the caller's
+	// connection failing and not the upstream.
+	onErr func(error)
 }
 
 func (f *flushWriter) Write(p []byte) (int, error) {
 	n, err := f.w.Write(p)
 	f.n += int64(n)
+	if err != nil && f.onErr != nil {
+		f.onErr(err)
+	}
 	if fl, ok := f.w.(http.Flusher); ok {
 		fl.Flush()
 	}

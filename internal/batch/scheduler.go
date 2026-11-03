@@ -2,13 +2,14 @@ package batch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // execute is one batch's whole life in this process: validate, wait for a

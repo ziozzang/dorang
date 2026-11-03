@@ -1,9 +1,10 @@
 package loadsignal
 
 import (
-	"encoding/json"
 	"strings"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // RequestHeader asks a vLLM backend for a load report on the response, and Header is the

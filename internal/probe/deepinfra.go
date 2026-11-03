@@ -2,12 +2,12 @@ package probe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/quota"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 const (

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Load reads, defaults, resolves and validates a configuration file.

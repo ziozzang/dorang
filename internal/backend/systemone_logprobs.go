@@ -2,7 +2,6 @@ package backend
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/systemone"
 	"github.com/ziozzang/dorang/pkg/catalog"

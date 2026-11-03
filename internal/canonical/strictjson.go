@@ -2,12 +2,14 @@ package canonical
 
 import (
 	"bytes"
-	"encoding/json"
 	"reflect"
 	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Case-sensitive JSON decoding (COMPATIBILITY 2.0, DESIGN §18 W10).
@@ -75,8 +77,11 @@ import (
 // StrictUnmarshal decodes data into v with case-SENSITIVE field matching.
 //
 // It is json.Unmarshal with the fold-matching removed; see the file comment.
-// Errors, including the exact text of decode errors, are encoding/json's.
+// Decode errors are encoding/json's, except for the document nesting limit.
 func StrictUnmarshal(data []byte, v any) error {
+	if err := parseguard.JSONDepth(data); err != nil {
+		return err
+	}
 	return json.Unmarshal(StrictBytes(data, v), v)
 }
 
@@ -93,6 +98,9 @@ func StrictUnmarshal(data []byte, v any) error {
 // StrictBytes returns data unchanged and leaves strictness to its
 // UnmarshalJSON.
 func StrictBytes(data []byte, v any) []byte {
+	if parseguard.JSONDepth(data) != nil {
+		return data
+	}
 	ti := infoOf(reflect.TypeOf(v))
 	if ti == nil || !ti.deep {
 		return data

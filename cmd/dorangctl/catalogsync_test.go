@@ -13,9 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/ziozzang/dorang/pkg/catalog"
+	"go.yaml.in/yaml/v3"
 )
 
 const syncTestKey = "sync-test-key-7f3a9c"

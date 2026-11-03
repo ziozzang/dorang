@@ -2,8 +2,9 @@ package config
 
 import (
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"sort"
+
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // SetupEdit patches only named fields, preserving unowned configuration.

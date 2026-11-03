@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // spooler is the durable staging area between the trace ring and the sink. It
@@ -251,7 +253,7 @@ func openDiskSpool(dir string, maxBytes, segBytes int64, fsync bool) (*diskSpool
 }
 
 func (s *diskSpool) readCursor() (seq uint64, off int64) {
-	b, err := os.ReadFile(filepath.Join(s.dir, cursorName))
+	b, err := parseguard.ReadFile(filepath.Join(s.dir, cursorName))
 	if err != nil {
 		return 0, 0
 	}

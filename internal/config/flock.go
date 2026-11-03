@@ -2,9 +2,10 @@ package config
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"syscall"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // Advisory file locking for the config file.
@@ -29,7 +30,7 @@ func readLocked(path string) ([]byte, error) {
 		return nil, fmt.Errorf("shared lock: %w", err)
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-	return io.ReadAll(f)
+	return parseguard.Read(f, parseguard.MaxFileBytes)
 }
 
 // EditLocked applies edit to a file's contents with an exclusive advisory lock
@@ -55,13 +56,16 @@ func EditLocked(path string, edit func(current []byte) ([]byte, error)) error {
 	}
 	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
 
-	cur, err := io.ReadAll(f)
+	cur, err := parseguard.Read(f, parseguard.MaxFileBytes)
 	if err != nil {
 		return err
 	}
 	next, err := edit(cur)
 	if err != nil {
 		return err
+	}
+	if int64(len(next)) > parseguard.MaxFileBytes {
+		return parseguard.ErrSize
 	}
 	if _, err := f.WriteAt(next, 0); err != nil {
 		return fmt.Errorf("write: %w", err)

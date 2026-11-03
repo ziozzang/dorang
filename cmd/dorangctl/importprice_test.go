@@ -8,7 +8,7 @@ import (
 	"github.com/ziozzang/dorang/internal/app"
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/pricing"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // theIncumbentsCard is a rate card as the file dorang is migrated FROM writes

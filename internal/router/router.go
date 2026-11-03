@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1226,7 +1227,7 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 
 	var lastErr error
 	var unhealthy, saturated int
-	var busyCandidates []candidate
+	var busyCandidates, standing []candidate
 	for i := range cands {
 		c := &cands[i]
 		// Give the preferred pool its bounded queue before spilling to a lower
@@ -1239,6 +1240,7 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 		// per candidate, because Allow spends a half-open probe.
 		if !r.deps.Health.Allow(c.dep.ID) {
 			unhealthy++
+			standing = append(standing, *c)
 			continue
 		}
 		res, err := r.acquire(ctx, req, c)
@@ -1296,6 +1298,19 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 		}
 	}
 
+	// Every candidate is standing down and none is merely busy. Refusing is
+	// certain failure, while the stand-downs are guesses that may already be
+	// stale (a 429 that cleared, a circuit opened by a hung-up client), and the
+	// caller cannot tell "all four are broken" from "all four are resting".
+	// Let ONE request through the candidate that recovers soonest; the answer
+	// it gets is the evidence the circuit was waiting for. Not for a request
+	// pinned to an account: that one may not go elsewhere, and this is a gamble.
+	if !p.hard && saturated == 0 && len(busyCandidates) == 0 && len(standing) > 0 && ctx.Err() == nil {
+		if dec := r.lastResort(ctx, standing, chain, cands, req, st, g, p, now); dec != nil {
+			return dec, nil
+		}
+	}
+
 	// The refusal distinguishes "everything is busy" from "everything is down",
 	// because those call for opposite responses from whoever reads it.
 	if p.hard && p.credential != "" {
@@ -1318,6 +1333,15 @@ func (r *Router) dispatch(ctx context.Context, cands []candidate, chain []Strate
 	if saturated == 0 && unhealthy > 0 {
 		e.Code = CodeNoCandidate
 		e.Message = "every candidate of this model is out of service"
+		// Say why and for how long, so the caller (and the log line the server
+		// writes for the refusal) can tell a 7-second rate-limit rest from a
+		// dead key without a trip to the admin surface.
+		if why, wait := r.standingSummary(standing); why != "" {
+			e.Message += ": " + why
+			if wait > 0 {
+				e.ResetAt = now.Add(wait)
+			}
+		}
 	}
 	if unhealthy == 0 && saturated == 0 && lastErr != nil {
 		e.Message = lastErr.Error()
@@ -1529,38 +1553,59 @@ func (r *Router) Report(d *Decision, o Outcome) {
 	r.deps.Health.Report(d.Deployment, health.Outcome{
 		Err:          o.Err,
 		Failure:      failure,
+		Abandoned:    cause == CauseAborted,
 		TTFT:         o.TTFT,
 		Total:        o.Total,
 		OutputTokens: o.OutputTokens,
 	})
 
+	// A request that went through a stand-down as a last resort and was served
+	// proves the deployment is back, so it ends the stand-down at once rather
+	// than leaving a working deployment closed to everyone else until the
+	// cooldown runs out.
+	if d.forced && ok {
+		r.deps.Health.MarkHealthy(d.Deployment)
+		r.logf("router: deployment %s answered a last-resort request; stand-down ended", d.Deployment)
+	}
+
 	switch cause {
 	case CauseAuth:
 		// §7.6: the credential is marked exhausted. It does not recover on a
 		// cooldown the way a 5xx does — a wrong key stays wrong.
-		r.deps.Health.MarkUnavailable(d.Deployment, r.cfg.Fallback.AuthCooldown)
+		r.standDown(d.Deployment, r.cfg.Fallback.AuthCooldown, "auth_failed (upstream "+statusText(o.Status)+")")
 	case CauseQuotaExhausted:
 		if w := o.RetryAfter; w > 0 {
-			r.deps.Health.MarkUnavailable(d.Deployment, w)
+			r.standDown(d.Deployment, w, "quota_exhausted, upstream Retry-After "+w.Round(time.Second).String())
 		} else if !o.ResetAt.IsZero() {
 			if w := o.ResetAt.Sub(r.now()); w > 0 {
-				r.deps.Health.MarkUnavailable(d.Deployment, w)
+				r.standDown(d.Deployment, w, "quota_exhausted, window resets in "+w.Round(time.Second).String())
 			}
 		}
 	case CauseRateLimit:
 		if o.RetryAfter > 0 {
-			r.deps.Health.MarkUnavailable(d.Deployment, o.RetryAfter)
+			r.standDown(d.Deployment, o.RetryAfter, "upstream_429, Retry-After "+o.RetryAfter.Round(time.Second).String())
 		} else if w := o.ResetAt.Sub(r.now()); !o.ResetAt.IsZero() && w > 0 {
 			// The provider named the instant its window recovers; that is a
 			// better cooldown than any guess, so it wins over the backoff.
-			r.deps.Health.MarkUnavailable(d.Deployment, w)
+			r.standDown(d.Deployment, w, "upstream_429, window resets in "+w.Round(time.Second).String())
 		} else {
 			// Headerless: the provider gave no recovery time. Stand the
 			// deployment down with exponential backoff, so an account that keeps
 			// refusing is switched away from for longer each time instead of being
 			// re-probed every RateLimitCooldown forever. A success resets it.
-			r.deps.Health.MarkRateLimited(d.Deployment,
-				r.cfg.Fallback.RateLimitCooldown, r.cfg.Fallback.RateLimitCooldownMax)
+			if w := r.deps.Health.MarkRateLimited(d.Deployment,
+				r.cfg.Fallback.RateLimitCooldown, r.cfg.Fallback.RateLimitCooldownMax); w > 0 {
+				reason := "upstream_429 without Retry-After, backoff " + w.Round(time.Second).String()
+				r.deps.Health.SetReason(d.Deployment, reason)
+				r.logf("router: deployment %s stood down for %s: %s", d.Deployment, w.Round(time.Second), reason)
+			}
+		}
+	case CauseUpstream5xx, CauseTimeout:
+		if s := r.deps.Health.Stats(d.Deployment); s.State == health.Open && s.ConsecFails > 0 {
+			reason := cause.String() + " x" + strconv.FormatInt(s.ConsecFails, 10) +
+				" (" + errText(o.Err) + ")"
+			r.deps.Health.SetReason(d.Deployment, reason)
+			r.logf("router: deployment %s circuit open: %s", d.Deployment, reason)
 		}
 	}
 
@@ -1694,4 +1739,109 @@ func containsString(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// standDown takes a deployment out of selection for d and remembers why, so an
+// operator asking "why is this model out of service" gets an answer from the
+// admin surface and the log rather than from reading this file.
+func (r *Router) standDown(id string, d time.Duration, reason string) {
+	r.deps.Health.MarkUnavailable(id, d)
+	r.deps.Health.SetReason(id, reason)
+	r.logf("router: deployment %s stood down for %s: %s", id, d.Round(time.Second), reason)
+}
+
+func (r *Router) logf(format string, args ...any) {
+	if r.cfg.Logf != nil {
+		r.cfg.Logf(format, args...)
+	}
+}
+
+func statusText(status int) string {
+	if status == 0 {
+		return "no status"
+	}
+	return strconv.Itoa(status)
+}
+
+// errText is a bounded one-line rendering of an attempt's error for the log.
+func errText(err error) string {
+	if err == nil {
+		return "no error"
+	}
+	s := err.Error()
+	if len(s) > 120 {
+		s = s[:120]
+	}
+	return s
+}
+
+// lastResortGap is the least time between two last-resort requests to the same
+// stood-down deployment.
+const lastResortGap = 2 * time.Second
+
+// lastResortMaxWait bounds which stand-downs a last-resort request may override.
+// Short ones are guesses — a circuit opened by a few failures, the first rungs
+// of a headerless 429 backoff — and a request is the cheapest way to find out
+// they are stale. A long one is the provider or an operator saying "not until
+// then" (a named quota reset, a dead key), and ignoring that spends a request
+// to be refused again.
+const lastResortMaxWait = 30 * time.Second
+
+// lastResort tries the stood-down candidate that recovers soonest. It returns
+// nil when none can be reserved or another request used the same chance a
+// moment ago.
+func (r *Router) lastResort(ctx context.Context, standing []candidate, chain []Strategy,
+	cands []candidate, req *Request, st *sessionState, g *Group, p pins, now time.Time) *Decision {
+
+	order := make([]int, len(standing))
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortStableFunc(order, func(a, b int) int {
+		return int(r.deps.Health.Remaining(standing[a].dep.ID) - r.deps.Health.Remaining(standing[b].dep.ID))
+	})
+	for _, i := range order {
+		c := &standing[i]
+		if r.deps.Health.Remaining(c.dep.ID) > lastResortMaxWait {
+			break
+		}
+		if !r.deps.Health.ForceProbe(c.dep.ID, lastResortGap) {
+			continue
+		}
+		res, err := r.acquire(ctx, req, c)
+		if err != nil || res == nil {
+			continue
+		}
+		r.logf("router: every candidate stood down; trying %s as a last resort (%s)",
+			c.dep.ID, r.reasonOf(c.dep.ID))
+		d := r.decide(c, chain, cands, req, st, g, p, res, now)
+		d.forced = true
+		return d
+	}
+	return nil
+}
+
+// standingSummary renders "id: reason (Ns left)" for each stood-down candidate
+// and the shortest wait among them.
+func (r *Router) standingSummary(standing []candidate) (string, time.Duration) {
+	var parts []string
+	var soonest time.Duration
+	for i := range standing {
+		id := standing[i].dep.ID
+		left := r.deps.Health.Remaining(id)
+		if left > 0 && (soonest == 0 || left < soonest) {
+			soonest = left
+		}
+		parts = append(parts, id+": "+r.reasonOf(id)+" ("+left.Round(time.Second).String()+" left)")
+	}
+	return strings.Join(parts, "; "), soonest
+}
+
+func (r *Router) reasonOf(id string) string {
+	for _, d := range r.deps.Health.Details() {
+		if d.ID == id && d.Reason != "" {
+			return d.Reason
+		}
+	}
+	return "reason not recorded"
 }

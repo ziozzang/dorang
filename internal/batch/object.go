@@ -1,6 +1,6 @@
 package batch
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // Object type strings, on the wire exactly as OpenAI spells them.
 const (

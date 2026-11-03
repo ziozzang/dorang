@@ -1,12 +1,13 @@
 package probe
 
 import (
-	"encoding/json"
 	"errors"
 	"math"
 	"strconv"
 	"strings"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Providers spell the same three things — an instant, a proportion, an amount —

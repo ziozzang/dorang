@@ -2,7 +2,8 @@ package store
 
 import (
 	"database/sql"
-	"encoding/json"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // List-valued columns are JSON text in both dialects. They are configuration,

@@ -1,6 +1,6 @@
 package canonical
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // ImageOp names which of the three image operations a request is.
 type ImageOp string

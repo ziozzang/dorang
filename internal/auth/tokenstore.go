@@ -3,7 +3,6 @@ package auth
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Where an OAuth token is read from (DESIGN §11.2b).
@@ -540,7 +542,7 @@ func (s *fileStore) Describe() string { return s.path }
 func (s *fileStore) Writable() bool   { return !s.readOnly }
 
 func (s *fileStore) Load() (Token, error) {
-	b, err := os.ReadFile(s.path)
+	b, err := parseguard.ReadFile(s.path)
 	if err != nil {
 		// os errors carry the path and the syscall, never file content.
 		return Token{}, fmt.Errorf("%w: %s: %v", ErrTokenStoreUnreadable, s.path, errNoPath(err))

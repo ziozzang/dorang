@@ -16,12 +16,12 @@
 package bedrock
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // DefaultCapabilities is what Converse can carry. Absent on purpose:

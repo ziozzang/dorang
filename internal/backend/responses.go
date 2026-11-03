@@ -2,7 +2,6 @@ package backend
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 )

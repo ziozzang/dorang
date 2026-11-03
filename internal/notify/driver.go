@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,9 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/httpguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Driver names, matching internal/config's emailDrivers.
@@ -101,6 +103,7 @@ func (d *smtpDriver) Deliver(ctx context.Context, m *Message) error {
 	if err != nil {
 		return fmt.Errorf("notify: smtp: dial: %w", err)
 	}
+	conn = &smtpReplyConn{Conn: conn, left: maxSMTPReplyBytes}
 	// One deadline for the whole exchange. Without it a server that accepts the
 	// connection and then says nothing holds a worker forever, which is the
 	// same outage the queue exists to prevent, one layer down.
@@ -160,6 +163,29 @@ func (d *smtpDriver) Deliver(ctx context.Context, m *Message) error {
 		return fmt.Errorf("notify: smtp: close: %w", err)
 	}
 	return c.Quit()
+}
+
+// net/smtp has no reply-size option. This ceiling covers all incoming bytes
+// in one delivery (including STARTTLS), before textproto accumulates a line.
+const maxSMTPReplyBytes = 64 << 10
+
+var errSMTPReplyTooLarge = errors.New("SMTP replies exceed 64 KiB")
+
+type smtpReplyConn struct {
+	net.Conn
+	left int
+}
+
+func (c *smtpReplyConn) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		return 0, errSMTPReplyTooLarge
+	}
+	if len(p) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.Conn.Read(p)
+	c.left -= n
+	return n, err
 }
 
 func (d *smtpDriver) dial(ctx context.Context) (net.Conn, error) {
@@ -414,7 +440,9 @@ func (d *httpDriver) Deliver(ctx context.Context, m *Message) error {
 
 	client := d.client
 	if client == nil {
-		client = http.DefaultClient
+		// The request context already carries the configured delivery timeout.
+		// A second, fixed timeout would cut off deployments allowing more time.
+		client = defaultWebhookClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -427,6 +455,8 @@ func (d *httpDriver) Deliver(ctx context.Context, m *Message) error {
 	}
 	return nil
 }
+
+var defaultWebhookClient = &http.Client{Transport: httpguard.Transport()}
 
 // --- lua --------------------------------------------------------------------
 

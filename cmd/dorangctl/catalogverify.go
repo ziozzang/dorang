@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,8 +11,9 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
+	"github.com/ziozzang/dorang/internal/httpguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -139,7 +139,7 @@ func (e env) catalogVerify(args []string) int {
 			"unasked model must stay unasked rather than acquire a date", *keyEnv)
 	}
 
-	client := &http.Client{Timeout: *timeout}
+	client := &http.Client{Transport: httpguard.Transport(), Timeout: *timeout}
 	today := time.Now().UTC().Format(time.DateOnly)
 	reports := make([]probeReport, 0, len(models))
 	for _, ref := range models {

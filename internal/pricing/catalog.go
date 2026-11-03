@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Component indices. The order is fixed; componentInfo below is indexed by it.
@@ -571,7 +571,7 @@ type subSnapshot struct {
 
 // LoadCatalog reads and compiles a price catalog from disk.
 func LoadCatalog(path string) (*Catalog, error) {
-	data, err := os.ReadFile(path)
+	data, err := parseguard.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("pricing: load catalog: %w", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
 
@@ -91,6 +92,8 @@ type Spec struct {
 	// every removal is reported in x-dorang-dropped-params, which is the whole
 	// difference between this and the operator editing their clients.
 	DropParams []string
+	// SetParams forces operator-supplied JSON fields after wire conversion.
+	SetParams map[string]any
 	// ResponsesOnly says the host behind Kind serves `/responses` and nothing
 	// else. It is copied from the catalog kind by whoever builds the Spec, so
 	// the adapter choice and the check on the two settings below read the
@@ -176,8 +179,9 @@ type Provider struct {
 	ad      adapter
 	// native holds one adapter per surface the host serves natively beyond the
 	// primary, keyed by the caller family it serves. [Provider.pick] reads it.
-	native map[catalog.API]adapter
-	drop   []string
+	native    map[catalog.API]adapter
+	drop      []string
+	setParams map[string]json.RawMessage
 	// azureAPIVersion: see [Spec.AzureAPIVersion].
 	azureAPIVersion string
 	// vertexProject and vertexLocation: see [Spec.VertexProject].
@@ -252,17 +256,32 @@ func NewProvider(s Spec) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.Kind == "experiential-zdr" {
+		policy, ok := s.SetParams["provider"].(map[string]any)
+		if !ok || policy["zdr"] != true {
+			return nil, errors.New("backend: experiential-zdr requires params.set.provider.zdr=true")
+		}
+	}
+	setParams := make(map[string]json.RawMessage, len(s.SetParams))
+	for k, v := range s.SetParams {
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return nil, errors.New("backend: params.set must contain JSON values")
+		}
+		setParams[k] = encoded
+	}
 	return &Provider{
-		name:    s.Name,
-		kind:    s.Kind,
-		api:     api,
-		base:    base,
-		timeout: s.Timeout,
-		retry:   s.Retry.withDefaults(),
-		engine:  EngineForKind(s.Kind),
-		ad:      ad,
-		native:  native,
-		drop:    drop,
+		name:      s.Name,
+		kind:      s.Kind,
+		api:       api,
+		base:      base,
+		timeout:   s.Timeout,
+		retry:     s.Retry.withDefaults(),
+		engine:    EngineForKind(s.Kind),
+		ad:        ad,
+		native:    native,
+		drop:      drop,
+		setParams: setParams,
 
 		azureAPIVersion: s.AzureAPIVersion,
 		vertexProject:   s.VertexProject,

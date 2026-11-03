@@ -2,13 +2,13 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/store"
 	"github.com/ziozzang/dorang/internal/wire/openai"

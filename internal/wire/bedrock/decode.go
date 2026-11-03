@@ -1,10 +1,10 @@
 package bedrock
 
 import (
-	"encoding/json"
 	"errors"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Response is the Converse response body.

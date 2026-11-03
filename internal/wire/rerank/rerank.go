@@ -15,10 +15,10 @@
 package rerank
 
 import (
-	"encoding/json"
 	"errors"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 

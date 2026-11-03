@@ -9,9 +9,10 @@ package wirejson
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"sync"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // errNotObject is what a splice reports when the value it was handed did not

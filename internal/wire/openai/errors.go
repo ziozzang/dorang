@@ -1,11 +1,11 @@
 package openai
 
 import (
-	"encoding/json"
 	"errors"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Error is the inner object of the OpenAI error envelope.

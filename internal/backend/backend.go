@@ -3,7 +3,6 @@ package backend
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/ziozzang/dorang/internal/canonical"
 	"github.com/ziozzang/dorang/internal/loadsignal"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -399,6 +399,11 @@ type Result struct {
 	Transport bool
 	// Timeout distinguishes a deadline from a refusal.
 	Timeout bool
+	// Aborted reports that the exchange ended without evidence about the
+	// deployment: the caller hung up, or a stream that was already flowing was
+	// cut by the provider time limit. Such an end must not stand the deployment
+	// down — see router.CauseAborted.
+	Aborted bool
 	// Retryable reports that ANOTHER deployment may be tried. It never means
 	// "call this provider again": that decision was already made and spent.
 	Retryable bool
@@ -449,6 +454,9 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 	}
 
 	payload, err := x.ad.encode(x)
+	if err == nil {
+		payload, err = p.applySetParams(payload, x.ctype)
+	}
 	if err != nil {
 		res.Err = encodeError(err)
 		return res
@@ -466,6 +474,7 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 			res.Total = b.now().Sub(start)
 			res.Err, res.Timeout = aerr.err, aerr.timeout
 			res.Transport = aerr.transport
+			res.Aborted = aerr.aborted
 			res.Retryable = true
 			if aerr.credential {
 				// A credential dorang cannot use is not a transport failure and
@@ -492,6 +501,8 @@ type attemptError struct {
 	transport  bool
 	timeout    bool
 	credential bool
+	// aborted: the caller's context ended the attempt, not the upstream.
+	aborted bool
 }
 
 // send builds and issues one HTTP request.
@@ -573,6 +584,9 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 		e, timeout := transportError(err)
 		return nil, &attemptError{
 			err: e, transport: true, timeout: timeout,
+			// context.Canceled can only come from the caller's context: the
+			// provider time limit above is a deadline, not a cancellation.
+			aborted: errors.Is(err, context.Canceled),
 			// Only a connection that was never established may be repeated: a
 			// POST that reached the server may have been executed, and a second
 			// one bills the caller twice for one answer.
@@ -632,6 +646,25 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 	// value is carried raw and parsed by the pricing layer, so this package
 	// keeps no opinion about what a load report means.
 	res.LoadMetrics = resp.Header.Get(loadsignal.Header)
+	// The dedicated Experiential ZDR kind requires the upstream's confirmation
+	// before any completion bytes reach the client. It never relaxes to public.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		(x.prov.kind == "experiential" || x.prov.kind == "experiential-zdr") {
+		zdr := resp.Header.Get("X-Gateway-Zdr")
+		if x.prov.kind == "experiential-zdr" && zdr != "true" {
+			drain(resp.Body)
+			res.Total = b.now().Sub(start)
+			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
+				"Experiential did not confirm zero data retention; response refused").WithCode("zdr_confirmation_missing")
+			b.report(&res, *x.target, x.call)
+			return res
+		}
+		// Copy only the privacy verdict, never arbitrary upstream headers. This is
+		// also available on buffered responses because w is the original writer.
+		if w != nil && (zdr == "true" || zdr == "false") {
+			w.Header().Set("X-Gateway-Zdr", zdr)
+		}
+	}
 
 	// A 30x never reaches the redirect-following code because the client is
 	// built not to have any (§10.6). It arrives here as an ordinary response
@@ -742,6 +775,15 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		res.ServedModel, res.ModelAgreement = x.served, x.agree
 		if err != nil {
 			res.Err = streamError(err)
+			// Who ended it. The caller leaving (its context ended, or a write to
+			// it failed) says nothing about the upstream; neither does the
+			// provider time limit firing on a stream that had already been
+			// delivering — a long generation is not a broken deployment. Only
+			// a stream that failed on its own account, or hit the limit before
+			// delivering anything, is evidence.
+			res.Aborted = ctx.Err() != nil || x.clientWriteErr != nil ||
+				(sent > 0 && errors.Is(err, context.DeadlineExceeded))
+			res.Timeout = errors.Is(err, context.DeadlineExceeded)
 			// Another DEPLOYMENT may be tried precisely while nothing has been
 			// written. Once a byte is out, FirstByteSent forbids the hop on its
 			// own; saying "retryable" as well would be describing a hop that
@@ -776,6 +818,8 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		if !x.prov.ResponsesForceStream || !eventStream(resp.Header.Get("Content-Type"), body) {
 			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
 				"could not read the upstream response").WithCode(CodeUpstreamBody)
+			// The caller leaving mid-read is not the upstream failing.
+			res.Aborted = ctx.Err() != nil
 			res.Retryable = true
 			b.report(&res, *x.target, x.call)
 			return res

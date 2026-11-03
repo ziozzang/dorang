@@ -1,6 +1,6 @@
 package wirejson
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // UnmarshalSelf decodes b into v by calling v's own UnmarshalJSON, instead of
 // asking encoding/json to hand v the bytes it was already given.

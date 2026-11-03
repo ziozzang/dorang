@@ -1,6 +1,6 @@
 package canonical
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // StopReason is why generation ended, in the richer of the two enumerations.
 //

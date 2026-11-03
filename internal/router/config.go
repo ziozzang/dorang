@@ -311,6 +311,9 @@ func DefaultChains() map[Cause][]Target {
 // Config is the router's static configuration. It is immutable once [New]
 // returns: a hot reload builds a new Router and swaps the pointer (§4.1, §15.2).
 type Config struct {
+	// Logf, when set, receives one line each time a deployment is stood down or
+	// let through a stand-down, naming the reason. Optional.
+	Logf func(string, ...any)
 	// Groups are the model groups.
 	Groups []Group
 	// Aliases maps a virtual name to a group name. Aliases do not chain.

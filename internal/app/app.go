@@ -42,6 +42,7 @@ import (
 	"github.com/ziozzang/dorang/internal/meter"
 	"github.com/ziozzang/dorang/internal/metrics"
 	"github.com/ziozzang/dorang/internal/notify"
+	"github.com/ziozzang/dorang/internal/parseguard"
 	"github.com/ziozzang/dorang/internal/prefix"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
@@ -511,6 +512,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		catalog:  cat,
 		quota:    qs,
 		now:      a.now,
+		logf:     a.logf,
 	})
 	if err != nil {
 		return nil, err
@@ -731,6 +733,7 @@ func (a *App) Reload(cfg *config.Config) error {
 		catalog:  cat,
 		quota:    qs,
 		now:      a.now,
+		logf:     a.logf,
 	})
 	if err != nil {
 		return err
@@ -1288,7 +1291,7 @@ func resolvePepper(cfg *config.Config) (pepper string, generated bool, err error
 		}
 	}
 	path := pepperPath(cfg)
-	if b, err := os.ReadFile(path); err == nil && len(b) >= 32 {
+	if b, err := parseguard.ReadFile(path); err == nil && len(b) >= 32 {
 		return string(b), true, nil
 	}
 	var raw [32]byte

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // Duration is a time.Duration that reads the forms the design writes:

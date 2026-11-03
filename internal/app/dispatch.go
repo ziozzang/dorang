@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -22,6 +21,7 @@ import (
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/router"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -720,7 +720,13 @@ func (d *dispatcher) attempt(ctx context.Context, st *dispatchState, c *call,
 	}
 	ctx, cancel := dec.Reservation.Context(ctx)
 	defer cancel()
-	return backendResult(d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w))
+	out := d.backend.Do(ctx, target, d.backendCall(st, c, dec, rq), w)
+	// A failed attempt must not label a subsequent fallback's answer with its
+	// own privacy verdict. Streaming headers already sent are immutable.
+	if out.Err != nil && !out.FirstByteSent {
+		w.Header().Del("X-Gateway-Zdr")
+	}
+	return backendResult(out)
 }
 
 // backendCall renders one hop's request in the terms L5 takes.
@@ -845,7 +851,7 @@ func backendResult(br backend.Result) result {
 	// provider again": the in-provider retry was already made and spent. A
 	// failure the fallback chain has no target for is terminal even when the
 	// backend was willing to hand it on.
-	res.retryable = br.Retryable && (br.Status < 400 || cause.Chainable())
+	res.retryable = br.Retryable && !br.Aborted && (br.Status < 400 || cause.Chainable())
 	res.outcome = router.Outcome{
 		Err: br.Err, Status: br.Status, Cause: cause,
 		TTFT: br.TTFT, Total: br.Total,
@@ -871,6 +877,11 @@ func backendCause(br backend.Result) router.Cause {
 		// upstream signal at all — and it is the ONLY overflow path a deployment
 		// that declares no window has, which is the ordinary self-hosted case.
 		return upstreamCause(br.Status, br.Err)
+	case br.Aborted:
+		// The caller hung up, or a stream already flowing hit the provider's
+		// time limit. Neither says anything about the deployment, so neither may
+		// count against it.
+		return router.CauseAborted
 	case br.Timeout:
 		return router.CauseTimeout
 	case br.Err.Code == backend.CodeCredentialUnavailable:

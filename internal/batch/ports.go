@@ -2,9 +2,10 @@ package batch
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // This file declares every interface the package consumes. None of them is

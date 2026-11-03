@@ -24,7 +24,7 @@ func defaultClient() *http.Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Transport: &http.Transport{
+		Transport: &http.Transport{DisableCompression: true,
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
 				Timeout:   5 * time.Second,

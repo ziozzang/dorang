@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // FieldError is one problem, at the YAML path it was found at.

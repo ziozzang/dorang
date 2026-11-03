@@ -43,6 +43,14 @@ const (
 	// conditions an operator can route around, and this is the one condition
 	// that must never be routed around, so [ParseCause] refuses it.
 	CauseBadRequest
+	// CauseAborted is an attempt that ended without any evidence about the
+	// deployment: the client hung up, or a stream that was already flowing was
+	// cut by the request's own time limit. It has no chain (the client is gone,
+	// or bytes were already sent) and it counts for NOTHING against
+	// availability — a caller closing its connection must not stand a healthy
+	// deployment down for every other caller. Like CauseBadRequest it is not a
+	// configuration key.
+	CauseAborted
 
 	numCauses
 )
@@ -50,13 +58,15 @@ const (
 var causeNames = [numCauses]string{
 	"none", "rate_limit", "quota_exhausted", "context_window",
 	"content_policy", "upstream_5xx", "timeout", "budget_exceeded", "auth",
-	"bad_request",
+	"bad_request", "aborted",
 }
 
 // configurable reports whether a cause may appear as a fallbacks.on key. The two
 // that may not are the zero value and [CauseBadRequest]: neither names a
 // condition an operator chooses a chain for.
-func (c Cause) configurable() bool { return c != CauseNone && c != CauseBadRequest }
+func (c Cause) configurable() bool {
+	return c != CauseNone && c != CauseBadRequest && c != CauseAborted
+}
 
 // String returns the configuration spelling of the cause, matching the keys of
 // fallbacks.on in DESIGN §4.2.
@@ -85,7 +95,7 @@ func ParseCause(s string) (Cause, bool) {
 // all, so no configuration can override this.
 func (c Cause) Chainable() bool {
 	switch c {
-	case CauseNone, CauseBudgetExceeded, CauseAuth, CauseBadRequest:
+	case CauseNone, CauseBudgetExceeded, CauseAuth, CauseBadRequest, CauseAborted:
 		return false
 	}
 	return true

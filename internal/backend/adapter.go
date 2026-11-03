@@ -1,13 +1,13 @@
 package backend
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 	"github.com/ziozzang/dorang/internal/wire/bedrock"
 	"github.com/ziozzang/dorang/internal/wire/openai"
@@ -27,6 +27,11 @@ type exchange struct {
 	target *Target
 	prov   *Provider
 	req    *canonical.Request
+
+	// clientWriteErr is the first error writing the streamed answer to the
+	// caller. Set by the relay's writer; it tells a caller who left apart from
+	// an upstream that failed.
+	clientWriteErr error
 
 	// usageExtra is what the upstream reported that no counter names, left here
 	// by the decoder for the caller to pick up.

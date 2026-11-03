@@ -3,13 +3,14 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Source tables for the directory import: the incumbent's teams and users.

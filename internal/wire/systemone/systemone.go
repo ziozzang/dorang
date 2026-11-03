@@ -30,13 +30,13 @@ package systemone
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Shared limits. See the package comment for which contract each comes from.

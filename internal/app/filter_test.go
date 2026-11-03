@@ -545,7 +545,9 @@ func TestABurstCannotTurnTheMaskOff(t *testing.T) {
 	// is never approached and the mask was never at risk — which is a green
 	// result for a scenario that did not happen. The ceiling above is chosen for
 	// margin, and this is what stops that margin from quietly emptying the test.
-	if st := a.Hooks.Stats(); st.Timeouts == 0 && st.Refused == 0 {
+	// Instruction-budget exhaustion is pressure too: a fast scheduler can
+	// reject all segments at the instruction limit before any wall timeout.
+	if st := a.Hooks.Stats(); st.Timeouts == 0 && st.Refused == 0 && st.LimitHits == 0 {
 		t.Fatalf("the burst overran nothing: %+v. The segments are affordable at this "+
 			"wall clock, so the filter was never under the pressure that switched "+
 			"the mask off, and what follows proves nothing", st)

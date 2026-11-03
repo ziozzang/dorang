@@ -2,7 +2,6 @@ package backend
 
 import (
 	"bufio"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -10,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 

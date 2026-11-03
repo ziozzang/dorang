@@ -1142,3 +1142,7 @@ func (h *harness) newKey(spec map[string]any) (id, token string) {
 	h.tokens = append(h.tokens, token)
 	return id, token
 }
+
+type fakeDeployments []DeploymentState
+
+func (f fakeDeployments) Deployments(context.Context) ([]DeploymentState, error) { return f, nil }

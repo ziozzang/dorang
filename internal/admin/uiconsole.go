@@ -2,7 +2,6 @@ package admin
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -10,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 type consolePage struct {

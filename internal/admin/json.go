@@ -1,13 +1,14 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // maxRequestBody bounds an administrative request body. Administrative payloads

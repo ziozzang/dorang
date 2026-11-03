@@ -3,11 +3,11 @@ package anthropic
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"io"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // DefaultMaxFrameBytes bounds one SSE frame. An upstream that never sends a

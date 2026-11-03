@@ -18,10 +18,11 @@ package wiretest
 
 import (
 	"bytes"
-	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Leaves flattens a JSON document to path -> literal value.

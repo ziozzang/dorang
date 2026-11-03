@@ -2,12 +2,12 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/anthropic"
 )
 

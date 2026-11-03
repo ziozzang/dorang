@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,8 +17,10 @@ import (
 
 	"github.com/ziozzang/dorang/internal/admin"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/httpguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 	"github.com/ziozzang/dorang/pkg/catalog"
-	"gopkg.in/yaml.v3"
 )
 
 type adminSetup struct{ a *App }
@@ -405,7 +406,7 @@ func (s *adminSetup) Discover(ctx context.Context, id string) (map[string]any, e
 		key, _ := cred.Key.Value()
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: httpguard.Transport(), Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	res, err := client.Do(req)
 	if err != nil {
 		return map[string]any{"status": "unreachable", "models": []string{}, "credential": id}, nil

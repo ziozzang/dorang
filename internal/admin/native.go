@@ -649,3 +649,50 @@ func (c *call) adminStatus() error {
 	})
 	return nil
 }
+
+// GET /admin/deployments/health
+//
+// Which deployments the router is currently sending to, and for each one that
+// is not: why it was stood down (an upstream 429 with its Retry-After, a dead
+// key, consecutive failures) and how long until it is tried again. Without this
+// the only visible symptom of a stood-down deployment is a client being told
+// "every candidate of this model is out of service".
+func (c *call) adminDeploymentHealth() error {
+	if err := c.requireGlobal("deployment health"); err != nil {
+		return err
+	}
+	if c.a.cfg.Deployments == nil {
+		return dependencyOff("deployment health tracker", "deployment health")
+	}
+	states, err := c.a.cfg.Deployments.Deployments(c.ctx())
+	if err != nil {
+		return err
+	}
+	type view struct {
+		Deployment       string  `json:"deployment"`
+		State            string  `json:"state"`
+		Reason           string  `json:"reason,omitempty"`
+		RetryInSeconds   float64 `json:"retry_in_seconds"`
+		ConsecutiveFails int64   `json:"consecutive_failures"`
+		RateLimitStrikes int64   `json:"rate_limit_strikes"`
+		Requests         int64   `json:"requests"`
+		Failures         int64   `json:"failures"`
+		Opens            int64   `json:"opens"`
+		LastSuccess      *Stamp  `json:"last_success,omitempty"`
+	}
+	out := make([]view, 0, len(states))
+	for _, s := range states {
+		v := view{
+			Deployment: s.ID, State: s.State, Reason: s.Reason, RetryInSeconds: s.RemainingSeconds,
+			ConsecutiveFails: s.ConsecutiveFails, RateLimitStrikes: s.RateLimitStrikes,
+			Requests: s.Requests, Failures: s.Failures, Opens: s.Opens,
+		}
+		if !s.LastSuccess.IsZero() {
+			st := Stamp(s.LastSuccess)
+			v.LastSuccess = &st
+		}
+		out = append(out, v)
+	}
+	writeJSON(c.w, c.r, http.StatusOK, map[string]any{"deployments": out})
+	return nil
+}

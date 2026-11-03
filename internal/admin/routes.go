@@ -96,6 +96,7 @@ func (a *API) registerNative() {
 	a.read("/admin/credentials/health", (*call).adminCredentials)
 	a.read("/admin/quota", (*call).adminQuota)
 	a.read("/admin/capacity", (*call).adminCapacity)
+	a.read("/admin/deployments/health", (*call).adminDeploymentHealth)
 	a.read("/admin/catalog/explain", (*call).adminCatalogExplain)
 	a.read("/admin/catalog/unverified", (*call).adminCatalogUnverified)
 	a.write("/admin/pricing/preview", (*call).adminPricingPreview)

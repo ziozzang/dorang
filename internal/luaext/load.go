@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // PolicyExt is the extension of a policy file.
@@ -90,7 +92,7 @@ func LoadDir(dir string, allowed uint8) ([]*Program, error) {
 				filepath.Join(dir, name), h)
 		}
 
-		src, err := os.ReadFile(filepath.Join(dir, name))
+		src, err := parseguard.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			return nil, fmt.Errorf("luaext: %s: %w", filepath.Join(dir, name), err)
 		}

@@ -156,6 +156,7 @@ func defaultPassthroughClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 		Transport: &http.Transport{
+			DisableCompression:    true,
 			Proxy:                 http.ProxyFromEnvironment,
 			MaxIdleConns:          256,
 			MaxIdleConnsPerHost:   64,

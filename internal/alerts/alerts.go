@@ -28,7 +28,6 @@ package alerts
 
 import (
 	"context"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +35,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/notify"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Store is the durable half: internal/store implements it.

@@ -3,10 +3,11 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Batch, BatchRow and File are the persisted shapes of DESIGN §9.2's `batches`,

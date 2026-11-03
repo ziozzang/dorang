@@ -16,7 +16,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +27,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ziozzang/dorang/internal/httpguard"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Repo is where releases are published.
@@ -73,7 +76,7 @@ func (r *Release) Find(name string) (Asset, bool) {
 }
 
 // Client is the HTTP side of a lookup. The zero value uses the GitHub API and
-// http.DefaultClient; tests point API at a fake.
+// a client without automatic decompression; tests point API at a fake.
 type Client struct {
 	HTTP  *http.Client
 	API   string
@@ -81,11 +84,14 @@ type Client struct {
 	Token string // optional; raises the API's rate limit
 }
 
+// The caller supplies the overall update deadline (up to 30 minutes for Compose).
+var defaultClient = &http.Client{Transport: httpguard.Transport()}
+
 func (c *Client) http() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return http.DefaultClient
+	return defaultClient
 }
 
 func (c *Client) endpoint(tag string) string {
@@ -225,7 +231,7 @@ func (c *Client) download(ctx context.Context, url string, limit int64) ([]byte,
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download: %s", resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, limit))
+	return parseguard.Read(resp.Body, limit)
 }
 
 // DownloadVerified writes the asset to a temporary file in dir and returns its

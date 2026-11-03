@@ -61,6 +61,16 @@ type entry struct {
 var table = []entry{
 	{
 		Support: Support{
+			Provider: "experiential",
+			Aliases:  []string{"experientiallabs", "experiential-zdr"},
+			Endpoint: "https://api.experientiallabs.ai/api/v1/credits",
+			Auth:     "the same API key that serves inference, as a bearer token",
+			Note:     "Account-wide prepaid credits in USD: total_credits minus total_usage. Documented and measured 2026-10-23.",
+		},
+		src: experientialSource{},
+	},
+	{
+		Support: Support{
 			Provider: "zai",
 			Aliases:  []string{"z.ai", "glm", "zhipu", "zhipuai", "bigmodel"},
 			Endpoint: zaiBaseURL + zaiPath,

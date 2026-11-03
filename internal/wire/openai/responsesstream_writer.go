@@ -3,13 +3,13 @@ package openai
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // The client-facing half of the Responses event stream.

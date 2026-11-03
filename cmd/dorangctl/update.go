@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ziozzang/dorang/internal/parseguard"
 	"github.com/ziozzang/dorang/internal/selfupdate"
 )
 
@@ -119,7 +120,7 @@ func (d *deployment) update(ctx context.Context, tag string, check, force bool) 
 	defer unlock()
 
 	envPath := filepath.Join(d.dir, ".env")
-	raw, err := os.ReadFile(envPath)
+	raw, err := parseguard.ReadFile(envPath)
 	if err != nil {
 		return err
 	}

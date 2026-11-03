@@ -1,6 +1,6 @@
 package canonical
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // Role identifies who authored a message.
 //

@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +20,7 @@ import (
 	"github.com/ziozzang/dorang/internal/config"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/router"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/server"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 	"github.com/ziozzang/dorang/pkg/catalog"

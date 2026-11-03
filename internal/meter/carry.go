@@ -4,6 +4,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // The numeric path's durable carry-over.
@@ -67,7 +69,7 @@ func removeCarry(dir string) error {
 // record — partial counters are worth more than none, and losing the whole file
 // to its last few bytes is the failure mode this format exists to avoid.
 func readCarry(dir string) ([]Bucket, error) {
-	b, err := os.ReadFile(filepath.Join(dir, carryName))
+	b, err := parseguard.ReadFile(filepath.Join(dir, carryName))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil

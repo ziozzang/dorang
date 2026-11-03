@@ -2,10 +2,11 @@ package shadow
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
 	"sort"
 	"strings"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // This file turns a response into its shape: the thing §14.1 says is comparable

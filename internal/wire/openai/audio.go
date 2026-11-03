@@ -1,9 +1,8 @@
 package openai
 
 import (
-	"encoding/json"
-
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // The audio surfaces: POST /v1/audio/speech, /v1/audio/transcriptions and

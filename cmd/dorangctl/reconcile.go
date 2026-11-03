@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -14,6 +12,8 @@ import (
 
 	"github.com/ziozzang/dorang/internal/app"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/parseguard"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/store"
 	"github.com/ziozzang/dorang/pkg/catalog"
 )
@@ -260,7 +260,7 @@ func getJSON(ctx context.Context, c *http.Client, url, secret string, into any) 
 		return err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := parseguard.Read(resp.Body, 8<<20)
 	if err != nil {
 		return err
 	}

@@ -2,7 +2,6 @@ package probe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ziozzang/dorang/internal/quota"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // Anthropic publishes a Claude Pro/Max subscription's own utilization to the

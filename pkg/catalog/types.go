@@ -5,7 +5,7 @@ import (
 	"slices"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	yaml "github.com/ziozzang/dorang/internal/safeyaml"
 )
 
 // API names the wire adapter a provider kind speaks (DESIGN §4.3).

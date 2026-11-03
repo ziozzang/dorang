@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"unicode/utf8"
 
 	"github.com/ziozzang/dorang/internal/prefix"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // validateConfig is what one validation pass needs. It is separated from

@@ -2,9 +2,10 @@ package probe
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // DeepSeek publishes a credential's prepaid balance, authenticated with the

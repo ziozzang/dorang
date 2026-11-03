@@ -32,10 +32,8 @@ const HeaderShadowRequestID = "X-Dorang-Shadow-Request-Id"
 // is a weaker guarantee than "we only ever copied these". Everything the wire
 // protocols actually need is here; anything else is the caller's business with
 // dorang, not with the reference.
-// Accept-Encoding is deliberately absent. Setting it explicitly turns off Go's
-// transparent gzip handling, so the reply would arrive compressed and every
-// comparison would decide the reference sent an unreadable body. Leaving it to
-// the transport keeps the comparison looking at JSON.
+// Accept-Encoding is deliberately absent. The default transport disables
+// decompression so a reference cannot make comparison workers expand a bomb.
 var forwardedHeaders = []string{
 	"Content-Type",
 	"Accept",
@@ -57,7 +55,7 @@ func defaultClient(timeout time.Duration) *http.Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Transport: &http.Transport{
+		Transport: &http.Transport{DisableCompression: true,
 			Proxy:                 http.ProxyFromEnvironment,
 			MaxIdleConns:          32,
 			MaxIdleConnsPerHost:   8,

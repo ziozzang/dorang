@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -115,8 +116,7 @@ func (s *Server) relayWebSocket(w http.ResponseWriter, rq *Request, pt *passthro
 			"could not send the upgrade request upstream").WithCode("passthrough_upgrade_failed")
 	}
 
-	br := bufio.NewReader(up)
-	resp, err := http.ReadResponse(br, out)
+	resp, br, err := readUpgradeResponse(up, out)
 	if err != nil {
 		return NewError(http.StatusBadGateway, TypeAPIError,
 			"upstream did not answer the upgrade").WithCode("passthrough_upgrade_failed")
@@ -124,6 +124,17 @@ func (s *Server) relayWebSocket(w http.ResponseWriter, rq *Request, pt *passthro
 	_ = up.SetDeadline(time.Time{})
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		// A declined upgrade is an ordinary HTTP response. Its raw socket
+		// does not inherit cancellation from http.Transport, so arrange that
+		// cancellation interrupts a peer that never finishes its body.
+		bodyCtx := rq.Context()
+		if pt.timeout > 0 {
+			var cancelBody context.CancelFunc
+			bodyCtx, cancelBody = context.WithTimeout(bodyCtx, pt.timeout)
+			defer cancelBody()
+		}
+		stop := context.AfterFunc(bodyCtx, func() { _ = up.Close() })
+		defer stop()
 		// The upstream declined. Relay its answer as an ordinary response
 		// rather than inventing one: a 401 from the provider is information
 		// the caller needs, and a synthesized 502 would hide it.
@@ -239,4 +250,44 @@ func dialTarget(u *url.URL) (network, addr string, cfg *tls.Config) {
 		cfg = &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 	}
 	return "tcp", net.JoinHostPort(host, port), cfg
+}
+
+// Upgrade responses bypass http.Transport, so its header ceiling does not
+// apply. Bound this read before net/http builds a peer-controlled header map.
+const maxUpgradeHeaderBytes = 64 << 10
+
+var errUpgradeHeaderTooLarge = errors.New("websocket upgrade headers exceed 64 KiB")
+
+type upgradeHeaderReader struct {
+	r       io.Reader
+	left    int
+	headers bool
+}
+
+func (r *upgradeHeaderReader) Read(p []byte) (int, error) {
+	if r.headers {
+		if r.left == 0 {
+			return 0, errUpgradeHeaderTooLarge
+		}
+		if len(p) > r.left {
+			p = p[:r.left]
+		}
+	}
+	n, err := r.r.Read(p)
+	if r.headers {
+		r.left -= n
+	}
+	return n, err
+}
+
+func readUpgradeResponse(r io.Reader, req *http.Request) (*http.Response, *bufio.Reader, error) {
+	limited := &upgradeHeaderReader{r: r, left: maxUpgradeHeaderBytes, headers: true}
+	br := bufio.NewReader(limited)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Keep the same buffer: it may already hold the first WebSocket frame.
+	limited.headers = false
+	return resp, br, nil
 }

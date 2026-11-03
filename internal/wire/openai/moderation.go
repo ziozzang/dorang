@@ -1,10 +1,10 @@
 package openai
 
 import (
-	"encoding/json"
 	"sort"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // The moderations surface: POST /v1/moderations.

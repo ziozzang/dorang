@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	lua "github.com/yuin/gopher-lua"
 	"github.com/yuin/gopher-lua/parse"
+	"github.com/ziozzang/dorang/internal/parseguard"
 )
 
 // APIVersion is the version of the value shape a plugin sees.
@@ -161,7 +161,7 @@ func newLuaRuntime(plugins []Plugin, limits Limits, logf func(string, ...any)) (
 			if p.Path == "" {
 				return nil, fmt.Errorf("luaext: plugin %q: needs a path", p.Name)
 			}
-			b, err := os.ReadFile(p.Path)
+			b, err := parseguard.ReadFile(p.Path)
 			if err != nil {
 				return nil, fmt.Errorf("luaext: plugin %q: %w", p.Name, err)
 			}

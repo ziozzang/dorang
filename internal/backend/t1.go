@@ -1,9 +1,8 @@
 package backend
 
 import (
-	"encoding/json"
-
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/openai"
 )
 

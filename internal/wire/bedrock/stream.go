@@ -1,11 +1,11 @@
 package bedrock
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // StreamDecoder turns converse-stream messages into neutral events.

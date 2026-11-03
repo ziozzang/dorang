@@ -3,12 +3,12 @@ package openai
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"io"
 	"strconv"
 	"time"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // UsageChunkChoices selects the shape of the usage chunk's choices array.

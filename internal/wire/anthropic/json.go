@@ -2,12 +2,12 @@ package anthropic
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"sort"
 	"sync"
 
 	"github.com/ziozzang/dorang/internal/canonical"
+	json "github.com/ziozzang/dorang/internal/safejson"
 	"github.com/ziozzang/dorang/internal/wire/wirejson"
 )
 

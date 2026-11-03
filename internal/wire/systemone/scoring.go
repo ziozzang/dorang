@@ -2,11 +2,12 @@ package systemone
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
+
+	json "github.com/ziozzang/dorang/internal/safejson"
 )
 
 // ScoringQuestion is one question in the shape a logprob scorer renders: the

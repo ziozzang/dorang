@@ -1,6 +1,6 @@
 package canonical
 
-import "encoding/json"
+import json "github.com/ziozzang/dorang/internal/safejson"
 
 // File is an uploaded binary part.
 //
