@@ -512,6 +512,7 @@ func New(ctx context.Context, opts Options) (*App, error) {
 		catalog:  cat,
 		quota:    qs,
 		now:      a.now,
+		logf:     a.logf,
 	})
 	if err != nil {
 		return nil, err
@@ -732,6 +733,7 @@ func (a *App) Reload(cfg *config.Config) error {
 		catalog:  cat,
 		quota:    qs,
 		now:      a.now,
+		logf:     a.logf,
 	})
 	if err != nil {
 		return err

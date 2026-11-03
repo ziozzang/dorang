@@ -94,6 +94,9 @@ type Config struct {
 
 	Credentials CredentialReporter
 	Capacity    CapacityReporter
+	// Deployments reports each deployment's routing state and the reason it is
+	// stood down. Optional; nil answers 501 with a named dependency.
+	Deployments DeploymentReporter
 	// Surface reports this node's live HTTP counters — what GET /metrics
 	// exposes — for the monitoring screen's real-time pulse. Optional; nil
 	// leaves that section off, the same rule the other reporters follow.

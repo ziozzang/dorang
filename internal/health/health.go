@@ -23,6 +23,7 @@ package health
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,6 +110,13 @@ type Outcome struct {
 	Total time.Duration
 	// OutputTokens is used with Total to derive a generation rate.
 	OutputTokens int64
+	// Abandoned marks an attempt that ended without telling anything about the
+	// deployment: the client hung up, or a stream that was already flowing was
+	// cut by the request's own deadline. It is neither a failure nor a success,
+	// so it leaves the circuit and every counter alone — except that a
+	// half-open probe slot it was holding is given back, so the next request
+	// can run the probe that this one never finished.
+	Abandoned bool
 }
 
 type record struct {
@@ -127,6 +135,13 @@ type record struct {
 	// never). The router reads it to keep traffic on the account that is
 	// currently working rather than drifting back to an earlier-listed sibling.
 	lastOKNano atomic.Int64
+	// lastForceNano is when a request last went through an open circuit as a
+	// last resort (see [Tracker.ForceProbe]).
+	lastForceNano atomic.Int64
+	// probeAtNano is when the half-open probe was last handed out.
+	probeAtNano atomic.Int64
+	// why is the human-readable reason the circuit last opened, for operators.
+	why atomic.Pointer[string]
 
 	// EWMAs are stored as float64 bits so they can be updated without a lock.
 	// Contention here is benign: a lost update costs one sample of accuracy in
@@ -184,7 +199,22 @@ func (t *Tracker) Allow(id string) bool {
 	case Closed:
 		return true
 	case HalfOpen:
-		return r.probesLeft.Add(-1) >= 0
+		if r.probesLeft.Add(-1) >= 0 {
+			return true
+		}
+		// The probe is out and has not reported. A probe is an ordinary request,
+		// and an ordinary streaming request runs for minutes — refusing every
+		// other caller until it ends keeps a deployment closed for as long as its
+		// slowest answer takes, which is how a recovered deployment stayed
+		// "out of service" for minutes after it was fine. A probe that has been
+		// out longer than the cooldown is treated as lost and its slot is handed
+		// to one more request; the late report of the old probe is harmless.
+		started := r.probeAtNano.Load()
+		now := t.opts.Now().UnixNano()
+		if now-started >= int64(t.opts.Cooldown) && r.probeAtNano.CompareAndSwap(started, now) {
+			return true
+		}
+		return false
 	case Open:
 		openedAt := r.openedAtNano.Load()
 		if t.opts.Now().UnixNano()-openedAt < int64(t.opts.Cooldown) {
@@ -193,6 +223,7 @@ func (t *Tracker) Allow(id string) bool {
 		// Only one goroutine wins the transition; the rest see HalfOpen and
 		// compete for the probe slots below.
 		if r.state.CompareAndSwap(uint32(Open), uint32(HalfOpen)) {
+			r.probeAtNano.Store(t.opts.Now().UnixNano())
 			r.probesLeft.Store(int64(t.opts.HalfOpenProbes))
 		}
 		return r.probesLeft.Add(-1) >= 0
@@ -204,6 +235,13 @@ func (t *Tracker) Allow(id string) bool {
 func (t *Tracker) Report(id string, o Outcome) {
 	r := t.rec(id)
 	r.requests.Add(1)
+
+	if o.Abandoned {
+		if State(r.state.Load()) == HalfOpen {
+			r.probesLeft.Add(1)
+		}
+		return
+	}
 
 	if o.Failure {
 		r.failures.Add(1)
@@ -262,6 +300,7 @@ func (t *Tracker) Report(id string, o Outcome) {
 }
 
 func (t *Tracker) open(r *record) {
+	t.setReason(r, "consecutive_failures")
 	r.state.Store(uint32(Open))
 	r.openedAtNano.Store(t.opts.Now().UnixNano())
 	r.probesLeft.Store(0)
@@ -278,11 +317,12 @@ func (t *Tracker) MarkUnavailable(id string, d time.Duration) {
 	// Keeping one clock and one comparison on the hot path is worth this
 	// indirection; getting its sign backwards is not, which is why the test
 	// asserts a retry-after strictly longer than the cooldown.
-	if excess := d - t.opts.Cooldown; excess > 0 {
-		r.openedAtNano.Store(t.opts.Now().Add(excess).UnixNano())
-	} else {
-		r.openedAtNano.Store(t.opts.Now().UnixNano())
-	}
+	//
+	// A wait SHORTER than the cooldown pushes openedAt into the past by the
+	// difference, so a provider that said "retry in 1s" is retried in 1s and not
+	// in the tracker's default 5s: honouring Retry-After means the shorter
+	// answers too.
+	r.openedAtNano.Store(t.opts.Now().Add(d - t.opts.Cooldown).UnixNano())
 	r.probesLeft.Store(0)
 	r.opens.Add(1)
 }
@@ -366,6 +406,93 @@ func backoffDuration(base, max time.Duration, n int64) time.Duration {
 		return max
 	}
 	return d
+}
+
+func (t *Tracker) setReason(r *record, reason string) {
+	if reason == "" {
+		r.why.Store(nil)
+		return
+	}
+	r.why.Store(&reason)
+}
+
+// SetReason records why a deployment was just stood down, for [Tracker.Details].
+// It changes nothing about availability.
+func (t *Tracker) SetReason(id, reason string) {
+	t.setReason(t.rec(id), reason)
+}
+
+// Remaining is how much longer the circuit stays open. Zero means the
+// deployment is selectable now (closed, half-open, or its cooldown elapsed).
+func (t *Tracker) Remaining(id string) time.Duration {
+	r := t.rec(id)
+	if State(r.state.Load()) != Open {
+		return 0
+	}
+	left := time.Duration(r.openedAtNano.Load() + int64(t.opts.Cooldown) - t.opts.Now().UnixNano())
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+// ForceProbe lets ONE request through an open circuit as a last resort, when
+// every candidate of a model is open and refusing would be certain failure
+// while trying might succeed. It admits at most one request per gap per
+// deployment, so a deployment that really is down is not hammered by every
+// caller. It does not change the circuit; the router calls MarkHealthy when the
+// forced request succeeds.
+func (t *Tracker) ForceProbe(id string, gap time.Duration) bool {
+	r := t.rec(id)
+	now := t.opts.Now().UnixNano()
+	for {
+		last := r.lastForceNano.Load()
+		if last != 0 && now-last < int64(gap) {
+			return false
+		}
+		if r.lastForceNano.CompareAndSwap(last, now) {
+			return true
+		}
+	}
+}
+
+// Detail is one deployment's current availability with the reason it is out.
+type Detail struct {
+	ID               string
+	State            State
+	Reason           string
+	Remaining        time.Duration
+	ConsecFails      int64
+	RateLimitStrikes int64
+	Requests         int64
+	Failures         int64
+	Opens            int64
+	LastSuccess      time.Time
+}
+
+// Details lists every tracked deployment, sorted by id.
+func (t *Tracker) Details() []Detail {
+	ids := t.IDs()
+	sort.Strings(ids)
+	out := make([]Detail, 0, len(ids))
+	for _, id := range ids {
+		r := t.rec(id)
+		d := Detail{
+			ID: id, State: State(r.state.Load()), Remaining: t.Remaining(id),
+			ConsecFails: r.consecFails.Load(), RateLimitStrikes: r.rlStrikes.Load(),
+			Requests: r.requests.Load(), Failures: r.failures.Load(), Opens: r.opens.Load(),
+		}
+		if d.State != Closed {
+			if w := r.why.Load(); w != nil {
+				d.Reason = *w
+			}
+		}
+		if n := r.lastOKNano.Load(); n != 0 {
+			d.LastSuccess = time.Unix(0, n)
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // MarkHealthy forces the circuit closed, e.g. after an operator intervention or

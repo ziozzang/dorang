@@ -23,6 +23,9 @@ func withReporters(c *Config) {
 			UnavailableUntil: testNow.Add(time.Minute), ConsecutiveFailures: 5,
 		},
 	}}
+	c.Deployments = fakeDeployments{{
+		ID: "ollama-1", State: "open", Reason: "upstream_429, Retry-After 20s", RemainingSeconds: 12.5, Opens: 2,
+	}}
 	c.Capacity = fakeCapacity{occ: CapacityOccupancy{
 		Axes: []AxisOccupancy{
 			{Axis: "model", Key: "prov-a|a/model", InUse: 3, Limit: 10, Waiting: 1},
@@ -305,5 +308,15 @@ func TestMemoryHealthHistoryRefusesUnboundedRange(t *testing.T) {
 	hist := NewMemoryHealthHistory(4, testNow)
 	if _, err := hist.History(context.Background(), HealthQuery{}); err == nil {
 		t.Fatal("an unbounded history query was accepted")
+	}
+}
+
+func TestAdminDeploymentHealthShowsWhyADeploymentIsOut(t *testing.T) {
+	h := newHarness(t, withReporters)
+	body := h.expectStatus(h.do(http.MethodGet, "/admin/deployments/health", nil), http.StatusOK)
+	d := body["deployments"].([]any)[0].(map[string]any)
+	if d["deployment"] != "ollama-1" || d["state"] != "open" ||
+		d["reason"] != "upstream_429, Retry-After 20s" || d["retry_in_seconds"] != 12.5 {
+		t.Fatalf("deployment view = %v", d)
 	}
 }

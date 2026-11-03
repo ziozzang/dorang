@@ -399,6 +399,11 @@ type Result struct {
 	Transport bool
 	// Timeout distinguishes a deadline from a refusal.
 	Timeout bool
+	// Aborted reports that the exchange ended without evidence about the
+	// deployment: the caller hung up, or a stream that was already flowing was
+	// cut by the provider time limit. Such an end must not stand the deployment
+	// down — see router.CauseAborted.
+	Aborted bool
 	// Retryable reports that ANOTHER deployment may be tried. It never means
 	// "call this provider again": that decision was already made and spent.
 	Retryable bool
@@ -469,6 +474,7 @@ func (b *Backend) Do(ctx context.Context, t Target, c *Call, w http.ResponseWrit
 			res.Total = b.now().Sub(start)
 			res.Err, res.Timeout = aerr.err, aerr.timeout
 			res.Transport = aerr.transport
+			res.Aborted = aerr.aborted
 			res.Retryable = true
 			if aerr.credential {
 				// A credential dorang cannot use is not a transport failure and
@@ -495,6 +501,8 @@ type attemptError struct {
 	transport  bool
 	timeout    bool
 	credential bool
+	// aborted: the caller's context ended the attempt, not the upstream.
+	aborted bool
 }
 
 // send builds and issues one HTTP request.
@@ -576,6 +584,9 @@ func (b *Backend) send(ctx context.Context, x *exchange, endpoint string,
 		e, timeout := transportError(err)
 		return nil, &attemptError{
 			err: e, transport: true, timeout: timeout,
+			// context.Canceled can only come from the caller's context: the
+			// provider time limit above is a deadline, not a cancellation.
+			aborted: errors.Is(err, context.Canceled),
 			// Only a connection that was never established may be repeated: a
 			// POST that reached the server may have been executed, and a second
 			// one bills the caller twice for one answer.
@@ -764,6 +775,15 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		res.ServedModel, res.ModelAgreement = x.served, x.agree
 		if err != nil {
 			res.Err = streamError(err)
+			// Who ended it. The caller leaving (its context ended, or a write to
+			// it failed) says nothing about the upstream; neither does the
+			// provider time limit firing on a stream that had already been
+			// delivering — a long generation is not a broken deployment. Only
+			// a stream that failed on its own account, or hit the limit before
+			// delivering anything, is evidence.
+			res.Aborted = ctx.Err() != nil || x.clientWriteErr != nil ||
+				(sent > 0 && errors.Is(err, context.DeadlineExceeded))
+			res.Timeout = errors.Is(err, context.DeadlineExceeded)
 			// Another DEPLOYMENT may be tried precisely while nothing has been
 			// written. Once a byte is out, FirstByteSent forbids the hop on its
 			// own; saying "retryable" as well would be describing a hop that
@@ -798,6 +818,8 @@ func (b *Backend) finish(ctx context.Context, x *exchange, resp *http.Response,
 		if !x.prov.ResponsesForceStream || !eventStream(resp.Header.Get("Content-Type"), body) {
 			res.Err = server.NewError(http.StatusBadGateway, server.TypeAPIError,
 				"could not read the upstream response").WithCode(CodeUpstreamBody)
+			// The caller leaving mid-read is not the upstream failing.
+			res.Aborted = ctx.Err() != nil
 			res.Retryable = true
 			b.report(&res, *x.target, x.call)
 			return res

@@ -274,7 +274,10 @@ type Decision struct {
 	PriorityHintDropped bool
 
 	interned uint32
-	st       *sessionState
+	// forced marks a request let through a stood-down deployment as a last
+	// resort; its success ends the stand-down.
+	forced bool
+	st     *sessionState
 }
 
 // sessionState is the part of a routing session that survives a hop. It lives

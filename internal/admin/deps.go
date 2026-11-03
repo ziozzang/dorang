@@ -824,6 +824,26 @@ type CapacityOccupancy struct {
 	Expired      uint64
 }
 
+// DeploymentState is one deployment's current availability: whether it is
+// being routed to and, when it is not, why and for how long.
+type DeploymentState struct {
+	ID               string
+	State            string
+	Reason           string
+	RemainingSeconds float64
+	ConsecutiveFails int64
+	RateLimitStrikes int64
+	Requests         int64
+	Failures         int64
+	Opens            int64
+	LastSuccess      time.Time
+}
+
+// DeploymentReporter supplies the health tracker's current view.
+type DeploymentReporter interface {
+	Deployments(ctx context.Context) ([]DeploymentState, error)
+}
+
 // CapacityReporter supplies capacity occupancy.
 type CapacityReporter interface {
 	Occupancy(ctx context.Context) (CapacityOccupancy, error)

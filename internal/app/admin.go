@@ -13,6 +13,7 @@ import (
 	"github.com/ziozzang/dorang/internal/capacity"
 	"github.com/ziozzang/dorang/internal/cluster"
 	"github.com/ziozzang/dorang/internal/config"
+	"github.com/ziozzang/dorang/internal/health"
 	"github.com/ziozzang/dorang/internal/pricing"
 	"github.com/ziozzang/dorang/internal/quota"
 	"github.com/ziozzang/dorang/internal/server"
@@ -227,6 +228,7 @@ func (a *App) buildAdmin() (*admin.API, error) {
 		Routing: &adminRouting{cfg: a.Config},
 
 		Capacity:    &adminCapacityReporter{b: a.Broker},
+		Deployments: &adminDeploymentReporter{h: a.Health},
 		Credentials: &adminCredentials{a: a},
 		// The monitoring screen's real-time pulse: this node's live HTTP
 		// counters, the same set GET /metrics exposes. Late-bound to a.Server
@@ -1210,6 +1212,25 @@ func (a *adminCapacityReporter) Occupancy(context.Context) (admin.CapacityOccupa
 		out.Axes = append(out.Axes, admin.AxisOccupancy{
 			Axis: ax.Axis.String(), Key: ax.Key,
 			InUse: ax.InUse, Limit: ax.Limit, Waiting: ax.Waiting,
+		})
+	}
+	return out, nil
+}
+
+type adminDeploymentReporter struct{ h *health.Tracker }
+
+func (a *adminDeploymentReporter) Deployments(context.Context) ([]admin.DeploymentState, error) {
+	if a.h == nil {
+		return nil, nil
+	}
+	ds := a.h.Details()
+	out := make([]admin.DeploymentState, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, admin.DeploymentState{
+			ID: d.ID, State: d.State.String(), Reason: d.Reason,
+			RemainingSeconds: d.Remaining.Seconds(),
+			ConsecutiveFails: d.ConsecFails, RateLimitStrikes: d.RateLimitStrikes,
+			Requests: d.Requests, Failures: d.Failures, Opens: d.Opens, LastSuccess: d.LastSuccess,
 		})
 	}
 	return out, nil

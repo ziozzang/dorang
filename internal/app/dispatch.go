@@ -851,7 +851,7 @@ func backendResult(br backend.Result) result {
 	// provider again": the in-provider retry was already made and spent. A
 	// failure the fallback chain has no target for is terminal even when the
 	// backend was willing to hand it on.
-	res.retryable = br.Retryable && (br.Status < 400 || cause.Chainable())
+	res.retryable = br.Retryable && !br.Aborted && (br.Status < 400 || cause.Chainable())
 	res.outcome = router.Outcome{
 		Err: br.Err, Status: br.Status, Cause: cause,
 		TTFT: br.TTFT, Total: br.Total,
@@ -877,6 +877,11 @@ func backendCause(br backend.Result) router.Cause {
 		// upstream signal at all — and it is the ONLY overflow path a deployment
 		// that declares no window has, which is the ordinary self-hosted case.
 		return upstreamCause(br.Status, br.Err)
+	case br.Aborted:
+		// The caller hung up, or a stream already flowing hit the provider's
+		// time limit. Neither says anything about the deployment, so neither may
+		// count against it.
+		return router.CauseAborted
 	case br.Timeout:
 		return router.CauseTimeout
 	case br.Err.Code == backend.CodeCredentialUnavailable:

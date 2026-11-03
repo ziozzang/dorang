@@ -191,6 +191,7 @@ type routerDeps struct {
 	catalog  *catalog.Catalog
 	quota    *quotaSet
 	now      func() time.Time
+	logf     func(string, ...any)
 }
 
 // buildRouter compiles models[], aliases and classes into a router.
@@ -283,6 +284,7 @@ func buildRouter(cfg *config.Config, cat *catalog.Catalog, deps routerDeps) (*ro
 		Fallback: fallbackConfig(cfg),
 		Priority: priorityConfig(cfg),
 		Now:      deps.now,
+		Logf:     deps.logf,
 	}
 	rc.OnCapacity = onCapacity(cfg)
 	if rot, ok := router.ParseRotation(cfg.KeyRotation.Strategy); ok {
